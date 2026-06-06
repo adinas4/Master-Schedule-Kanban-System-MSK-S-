@@ -1,0 +1,150 @@
+{
+  "info": {
+    "name": "PO-Driven Inbound - QA",
+    "_postman_id": "e1a6d5b2-1e7f-4c51-9a59-2a1d1d7b3f01",
+    "description": "Collection untuk uji PO -> Schedule -> Receiving (over-receive protection).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Create PO",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/po",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "po"]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"poNumber\": \"PO-TEST-001\",\n  \"poDate\": \"2026-03-01\",\n  \"supplierId\": \"SUP-001\",\n  \"remarks\": \"PO test\",\n  \"lines\": [\n    { \"lineNo\": 1, \"itemCode\": \"ITEM-001\", \"qtyOrder\": 200 },\n    { \"lineNo\": 2, \"itemCode\": \"ITEM-002\", \"qtyOrder\": 300 }\n  ]\n}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "try {",
+              "  const json = pm.response.json();",
+              "  if (json && json.header && json.header.po_number) {",
+              "    pm.environment.set('poNumber', json.header.po_number);",
+              "  }",
+              "} catch (e) {}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Import Bulk Schedule by PO",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/schedules/bulk",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "schedules", "bulk"]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"items\": [\n    {\n      \"poNumber\": \"{{poNumber}}\",\n      \"requestDate\": \"2026-03-01\",\n      \"deliveryTime\": \"08:00\",\n      \"notes\": \"Auto from PO\"\n    }\n  ]\n}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "try {",
+              "  const json = pm.response.json();",
+              "  if (Array.isArray(json) && json.length > 0 && json[0].id) {",
+              "    pm.environment.set('scheduleId', json[0].id);",
+              "    pm.environment.set('itemCode', json[0].item);",
+              "  }",
+              "} catch (e) {}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get PO Lines (Remaining)",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/po-lines?poNumber={{poNumber}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "po-lines"],
+          "query": [
+            { "key": "poNumber", "value": "{{poNumber}}" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Receive Over (Expect 409)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/schedules/{{scheduleId}}/receive",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "schedules", "{{scheduleId}}", "receive"]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"receivedQty\": 999999,\n  \"qcStatus\": \"ok\",\n  \"arrivalDate\": \"2026-03-01\",\n  \"doNumber\": \"DO-OVER-001\",\n  \"docQty\": 999999\n}"
+        }
+      }
+    },
+    {
+      "name": "Receive OK",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/schedules/{{scheduleId}}/receive",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "schedules", "{{scheduleId}}", "receive"]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"receivedQty\": 100,\n  \"qcStatus\": \"ok\",\n  \"arrivalDate\": \"2026-03-01\",\n  \"doNumber\": \"DO-OK-001\",\n  \"docQty\": 100\n}"
+        }
+      }
+    },
+    {
+      "name": "Get PO Header & Lines (Check Status)",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/po/{{poNumber}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "po", "{{poNumber}}"]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,1217 @@
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.inbound-apple {
+  font-family: 'Manrope', 'SF Pro Text', 'SF Pro Display', 'Segoe UI', sans-serif;
+  --inbound-surface: #f8fafc;
+  --inbound-card: #ffffff;
+  --inbound-border: rgba(148, 163, 184, 0.4);
+  --inbound-accent: #0ea5e9;
+  --inbound-accent-soft: #e0f2fe;
+  --inbound-success: #16a34a;
+  --inbound-warning: #f59e0b;
+  --inbound-danger: #ef4444;
+  --inbound-muted: #64748b;
+}
+
+.kanban-preview-page {
+  width: 210mm;
+  max-width: 100%;
+  background: transparent;
+  margin: 0 auto;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+.kanban-preview-grid {
+  width: 190mm;
+  margin: 0.5 auto;
+  display: block;
+}
+
+.kanban-preview-grid .kanban-card {
+  margin-bottom: 0;
+}
+
+.kanban-preview-grid .kanban-card:nth-child(4n) {
+  margin-bottom: 0;
+}
+
+.kanban-page {
+  width: 210mm;
+  min-height: 297mm;
+  margin: 0 auto 6mm;
+  padding: 5mm;
+  background: #fff;
+  box-sizing: border-box;
+}
+
+.kanban-preview-grid .kanban-cutline-row {
+  height: 5mm;
+}
+
+.kanban-cutline-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 5mm;
+}
+
+.kanban-cutline-row::before,
+.kanban-cutline-row::after {
+  content: '';
+  flex: 1;
+  border-top: 1px dashed #94a3b8;
+}
+
+.kanban-cutline-icon {
+  color: #475569;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+.inbound-print-portal {
+  display: none;
+}
+
+.page-footer {
+  display: none;
+}
+
+.dn-print-page {
+  font-size: 11px;
+  color: #0f172a;
+}
+
+.rn-print-page {
+  font-size: 11px;
+  color: #0f172a;
+}
+
+.rn-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #0f172a;
+}
+
+.rn-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.rn-logo {
+  height: 38px;
+  object-fit: contain;
+}
+
+.rn-company {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.rn-dept {
+  font-size: 9px;
+  color: #64748b;
+}
+
+.rn-doc {
+  text-align: right;
+}
+
+.rn-title {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.rn-number {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.rn-info-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  padding: 8px 12px 10px;
+}
+
+.rn-info-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rn-info-row {
+  display: grid;
+  grid-template-columns: 90px 8px 1fr;
+  gap: 4px;
+  align-items: baseline;
+}
+
+.rn-info-label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: #334155;
+}
+
+.rn-info-sep {
+  text-align: center;
+  color: #334155;
+}
+
+.rn-info-value {
+  font-size: 10px;
+  color: #0f172a;
+}
+
+.rn-info-emphasis {
+  font-weight: 700;
+}
+
+.rn-print-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 10.5pt;
+  border: 1px solid #0f172a;
+  margin-top: 6px;
+}
+
+.rn-print-table th,
+.rn-print-table td {
+  border: 1px solid #0f172a;
+  padding: 4px;
+}
+
+.rn-print-table thead {
+  background: #f0f0f0;
+}
+
+.rn-print-table th {
+  text-align: center;
+  font-weight: 700;
+}
+
+.rn-print-table th:nth-child(1),
+.rn-print-table td:nth-child(1),
+.rn-print-table th:nth-child(2),
+.rn-print-table td:nth-child(2),
+.rn-print-table th:nth-child(4),
+.rn-print-table td:nth-child(4),
+.rn-print-table th:nth-child(6),
+.rn-print-table td:nth-child(6) {
+  text-align: center;
+}
+
+.rn-print-table th:nth-child(5),
+.rn-print-table td:nth-child(5) {
+  text-align: right;
+}
+
+.rn-nowrap {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rn-part-cell {
+  line-height: 1.2;
+}
+
+.rn-part-no {
+  font-weight: 700;
+}
+
+.rn-part-name {
+  font-size: 9px;
+  color: #1f2937;
+}
+
+.rn-uniq {
+  font-weight: 700;
+}
+
+.rn-signature-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.rn-signature-card {
+  border: 1px solid #0f172a;
+  padding: 8px;
+  min-height: 90px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.rn-signature-title {
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.rn-signature-space {
+  flex: 1;
+}
+
+.rn-signature-label {
+  font-size: 9px;
+  text-align: center;
+  color: #64748b;
+}
+
+.print-only {
+  display: none !important;
+}
+
+.screen-only {
+  display: block;
+}
+
+.report-print-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #111;
+  margin-bottom: 12px;
+}
+
+.report-header-left {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.report-logo {
+  width: 40px;
+  height: 40px;
+  object-fit: contain;
+}
+
+.report-company {
+  font-size: 14px;
+  font-weight: 700;
+  color: #111827;
+}
+
+.report-dept {
+  font-size: 11px;
+  color: #475569;
+}
+
+.report-header-right {
+  text-align: right;
+}
+
+.report-title {
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.report-meta {
+  font-size: 11px;
+  color: #475569;
+  margin-top: 4px;
+}
+
+.report-signatures {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.report-sign-card {
+  border: 1px solid #111;
+  text-align: center;
+  padding: 6px;
+}
+
+.report-sign-title {
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.report-sign-space {
+  height: 48px;
+}
+
+.report-sign-label {
+  font-size: 10px;
+  color: #334155;
+}
+
+.scorecard-card {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.scorecard-left {
+  min-width: 0;
+}
+
+.scorecard-right {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  border-left: 1px solid #e5e7eb;
+  padding-left: 16px;
+  align-items: stretch;
+  justify-content: stretch;
+}
+
+@media (min-width: 768px) {
+  .scorecard-card {
+    flex-direction: row;
+    align-items: stretch;
+  }
+}
+
+.kpi-rail {
+  position: relative;
+  padding: 8px;
+  border-radius: 14px;
+  border: 1px solid #e5e7eb;
+  background: linear-gradient(90deg, #eef2ff 0%, #ecfdf5 32%, #fffbeb 68%, #f8fafc 100%);
+}
+
+.kpi-tile {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 8px;
+  min-width: 0;
+  border-radius: 10px;
+  min-height: 92px;
+  height: 100%;
+  background: #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
+}
+
+.kpi-tile--time { background: #e9edff; }
+.kpi-tile--qty { background: #e7fbf4; }
+.kpi-tile--packing { background: #fff6db; }
+.kpi-tile--rating { background: #f3f5f9; }
+
+.dn-header-container {
+  border-bottom: 1px solid #0f172a;
+}
+
+.dn-header-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+}
+
+.dn-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dn-logo {
+  height: 42px;
+  object-fit: contain;
+}
+
+.dn-brand-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+}
+
+.dn-company {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.dn-dept {
+  font-size: 9px;
+  color: #64748b;
+}
+
+.dn-doc {
+  text-align: right;
+}
+
+.dn-title {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.dn-number {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.dn-print-date {
+  font-size: 9px;
+  color: #64748b;
+}
+
+.dn-header-info {
+  display: grid;
+  grid-template-columns: 1.2fr 0.8fr 1fr;
+  gap: 12px;
+  padding: 8px 12px 10px;
+  align-items: start;
+}
+
+.dn-info-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+}
+
+.dn-info-row {
+  display: grid;
+  grid-template-columns: 78px 8px 1fr;
+  gap: 4px;
+  align-items: baseline;
+}
+
+.dn-info-label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: #334155;
+  text-align: left;
+}
+
+.dn-info-sep {
+  text-align: center;
+  color: #334155;
+}
+
+.dn-info-value {
+  font-size: 10px;
+  color: #0f172a;
+  text-align: left;
+}
+
+.dn-part-cell {
+  white-space: normal;
+  line-height: 1.2;
+}
+
+.dn-part-no {
+  font-weight: 700;
+  display: block;
+}
+
+.dn-part-name {
+  font-weight: 400;
+  color: #334155;
+  display: block;
+  font-size: 9px;
+}
+
+.dn-qr-block {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dn-qr {
+  width: 88px;
+  height: 88px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #0f172a;
+  padding: 4px;
+  background: #fff;
+}
+
+@media print {
+  @page {
+    size: A4;
+    margin: 15mm;
+    margin-bottom: 25mm;
+  }
+
+  html,
+  body {
+    background: #fff;
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    min-height: 100%;
+    overflow: visible;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  #root,
+  .app-container,
+  .content-wrapper {
+    width: 100%;
+    height: auto;
+    min-height: auto;
+    overflow: visible;
+    position: static;
+    display: block;
+  }
+
+  body.kanban-print-active #root,
+  body.rn-print-active #root {
+    min-height: auto;
+    position: relative;
+    overflow: visible;
+    padding: 0;
+  }
+
+  body.scorecard-print-active #root {
+    position: relative;
+    overflow: visible;
+  }
+
+  body.scorecard-print-active #root * {
+    visibility: hidden !important;
+  }
+
+  body.scorecard-print-active .scorecard-print-scope,
+  body.scorecard-print-active .scorecard-print-scope * {
+    visibility: visible !important;
+  }
+
+  body.scorecard-print-active .scorecard-print-scope {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+  }
+
+  body.report-print-active #root {
+    position: relative;
+    overflow: visible;
+  }
+
+  body.report-print-active .content-wrapper > :not(.report-print-host) {
+    display: none !important;
+  }
+
+  body.report-print-active .report-print-host {
+    display: block !important;
+  }
+
+  .print-only {
+    display: block !important;
+  }
+
+  .screen-only {
+    display: none !important;
+  }
+
+  .report-print-header {
+    display: flex !important;
+  }
+
+  .report-signatures {
+    display: grid !important;
+  }
+
+  .print\\:hidden {
+    display: none !important;
+  }
+
+  .print\\:block {
+    display: block !important;
+  }
+
+  .report-print-scope {
+    padding-bottom: 22mm;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .report-print-scope table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .report-print-scope th,
+  .report-print-scope td {
+    border: 1px solid #111 !important;
+  }
+
+  .report-print-scope thead {
+    background: #f0f0f0 !important;
+  }
+
+  .report-page-footer {
+    position: fixed;
+    bottom: 6mm;
+    right: 8mm;
+    font-size: 10px;
+    color: #111;
+  }
+
+  .report-page-footer::after {
+    content: "Page " counter(page) " of " counter(pages);
+  }
+
+  /* Keep KPI rail on the right in print */
+  .scorecard-card {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    gap: 16px;
+    align-items: stretch;
+  }
+
+  .scorecard-right {
+    display: grid !important;
+    grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
+    gap: 10px !important;
+    border-left: 1px solid #e5e7eb;
+    padding-left: 16px;
+  }
+
+
+  body.inbound-print-active #root {
+    display: none !important;
+  }
+
+  body.kanban-print-active .kanban-print-scope,
+  body.rn-print-active .kanban-print-scope {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    overflow: visible;
+  }
+
+  body.inbound-print-active .inbound-print-portal {
+    display: block !important;
+    position: static;
+    width: 100%;
+    overflow: visible;
+  }
+
+  body.inbound-print-active .inbound-schedule-print-wrapper {
+    position: static;
+    inset: auto;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    overflow: visible;
+  }
+
+  body.inbound-print-active .inbound-schedule-print-wrapper,
+  body.inbound-print-active .inbound-schedule-print-wrapper.hidden {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+  }
+
+  body.kanban-print-active .content-wrapper > :not(.kanban-print-scope):not(.kanban-print-host),
+  body.rn-print-active .content-wrapper > :not(.kanban-print-scope):not(.kanban-print-host) {
+    display: none !important;
+  }
+
+  body.kanban-print-active .kanban-print-host > :not(.kanban-print-scope),
+  body.rn-print-active .kanban-print-host > :not(.kanban-print-scope) {
+    display: none !important;
+  }
+
+  body.kanban-print-active .kanban-print-scope,
+  body.rn-print-active .kanban-print-scope {
+    position: static;
+    width: 210mm;
+    min-height: 297mm;
+    background: #fff;
+    padding: 0;
+    box-sizing: border-box;
+    overflow: visible;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: flex-start;
+    counter-reset: dnPage;
+  }
+
+  .kanban-print-only {
+    display: block !important;
+  }
+
+  *::-webkit-scrollbar {
+    width: 0 !important;
+    height: 0 !important;
+  }
+
+  .kanban-print-page {
+    width: 210mm;
+    height: auto;
+    min-height: 297mm;
+    margin: 0.5;
+    max-height: none;
+    max-width: none;
+    overflow: visible !important;
+  }
+
+  .kanban-print-grid {
+    display: block;
+    width: 190mm;
+    padding: 0;
+    justify-content: center;
+    align-content: start;
+  }
+
+  .kanban-preview-page {
+    width: 210mm;
+    height: auto;
+    padding: 0;
+    margin: 0.5;
+  }
+
+  .kanban-page {
+    width: 210mm;
+    height: 297mm;
+    padding: 0;
+    background: #fff;
+    break-after: page;
+    page-break-after: always;
+    margin-bottom: 0;
+  }
+
+  .kanban-page:last-child {
+    break-after: auto;
+    page-break-after: auto;
+  }
+
+  .kanban-card {
+    page-break-inside: avoid;
+    break-inside: avoid;
+    box-sizing: border-box;
+    margin-bottom: 12px;
+    display: block;
+    border-width: 1px !important;
+    border-style: solid !important;
+    border-color: #475569 !important;
+    color: #111827;
+    hyphens: none;
+  }
+
+  .kanban-cutline-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    margin: 8px auto;
+    width: calc(100% - 30px);
+    border-top: 1px dashed #94a3b8;
+    position: relative;
+    padding-top: 6px;
+  }
+
+  .kanban-cutline-row::before,
+  .kanban-cutline-row::after {
+    content: '';
+    flex: 1;
+    border-top: 1px dashed #94a3b8;
+    margin: 0 6px;
+  }
+
+  .kanban-cutline-icon {
+    color: #475569;
+    line-height: 1;
+    padding: 0 4px;
+    background: #fff;
+  }
+
+  .kanban-print-page,
+  .kanban-print-grid,
+  .kanban-card,
+  .kanban-cutline-row,
+  .kanban-print-only {
+    -webkit-print-color-adjust: exact !important;
+  }
+
+  .kanban-print-grid {
+    page-break-after: always;
+  }
+
+  .kanban-print-page:last-child .kanban-cutline-row {
+    display: none;
+  }
+
+  .kanban-print-scroll {
+    padding-bottom: 4px;
+  }
+
+  .kanban-card img {
+    image-rendering: -webkit-optimize-contrast;
+    image-rendering: crisp-edges;
+  }
+
+  body.kanban-print-active .kanban-print-scroll,
+  body.rn-print-active .kanban-print-scroll {
+    overflow: visible !important;
+    max-height: none !important;
+  }
+
+  .dn-print-table thead {
+    display: table-header-group;
+  }
+
+  .dn-print-table tfoot {
+    display: table-footer-group;
+  }
+
+  .print-body {
+    padding-bottom: 24mm;
+  }
+
+  .page-footer {
+    display: block;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 12mm;
+    font-size: 10px;
+    text-align: right;
+    padding-right: 4mm;
+    background: #fff;
+    color: #111827;
+    z-index: 10;
+    counter-increment: dnPage;
+  }
+
+  .page-footer::after {
+    content: "Page " counter(dnPage);
+  }
+
+  .dn-print-table,
+  .rn-print-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font-size: 10.5pt !important;
+    margin-bottom: 6mm;
+  }
+
+  .dn-print-table th,
+  .dn-print-table td,
+  .rn-print-table th,
+  .rn-print-table td {
+    padding: 4px;
+  }
+
+  .dn-col-part {
+    line-height: 1.2;
+  }
+
+  .dn-print-footer-space {
+    height: 18mm;
+    border: 0 !important;
+    padding: 0 !important;
+  }
+
+
+
+  .dn-print-table td {
+    white-space: nowrap;
+  }
+
+  .dn-part-cell {
+    font-size: 10px;
+    white-space: normal;
+  }
+
+  .dn-header-container {
+    min-height: 0;
+    padding-bottom: 8px;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .dn-header-info {
+    column-gap: 14px;
+  }
+
+  .dn-qr {
+    width: 88px;
+    height: 88px;
+  }
+
+  .inbound-schedule-print-wrapper {
+    width: 100%;
+    margin-bottom: 14px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #cbd5f5;
+    display: none;
+  }
+
+  body.inbound-print-active .inbound-schedule-print-wrapper {
+    display: flex !important;
+  }
+
+  .print-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+  }
+
+  .print-header .header-left h1 {
+    font-size: 28px;
+    margin: 0;
+    color: #0f172a;
+    letter-spacing: -0.5px;
+  }
+
+  .print-header .header-left p {
+    margin: 4px 0 0;
+    font-size: 12px;
+    color: #475569;
+  }
+
+  .print-header .header-right img {
+    height: 60px;
+    object-fit: contain;
+  }
+
+  .print-report-meta {
+    margin-top: 8px;
+    display: grid;
+    gap: 2px;
+    font-size: 12px;
+    color: #475569;
+  }
+
+  .print-report-meta span {
+    display: inline-block;
+    min-width: 120px;
+  }
+
+  .print-report-meta strong {
+    color: #0f172a;
+    font-weight: 600;
+  }
+
+  .inbound-schedule-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(140px, 1fr));
+    gap: 8px;
+    margin-top: 6px;
+  }
+
+  .summary-card {
+    border-radius: 18px;
+    padding: 12px 14px;
+    min-height: 80px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    justify-content: center;
+    -webkit-print-color-adjust: exact;
+    border: 1px solid #e8eaef;
+    background: #fff;
+    box-shadow: none;
+  }
+
+  .summary-label {
+    font-size: 0.65rem;
+    letter-spacing: 0.18em;
+    font-weight: 700;
+    color: #0f172a;
+  }
+
+  .summary-value {
+    font-size: 2rem;
+    font-weight: 700;
+    color: #0f172a;
+    margin-top: 4px;
+  }
+
+  .summary-meta {
+    font-size: 0.75rem;
+    color: #475569;
+  }
+
+  .summary-card--total {
+    border-color: #c7d2fe;
+    background: linear-gradient(135deg, #eef2ff 0%, #ffffff 100%);
+  }
+
+  .summary-card--ontime {
+    border-color: #d1fae5;
+    background: linear-gradient(135deg, #ecfccb 0%, #ffffff 100%);
+  }
+
+  .summary-card--late {
+    border-color: #fecaca;
+    background: linear-gradient(135deg, #fee2e2 0%, #ffffff 100%);
+  }
+
+  .summary-card--early {
+    border-color: #bfdbfe;
+    background: linear-gradient(135deg, #dbeafe 0%, #ffffff 100%);
+  }
+
+  .summary-card--pending {
+    border-color: #fef08a;
+    background: linear-gradient(135deg, #fefce8 0%, #ffffff 100%);
+  }
+
+  .print-schedule-groups {
+    margin-top: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .print-date-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .print-date-heading {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    color: #1e1b4b;
+    text-transform: uppercase;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+  }
+
+  .print-date-icon {
+    width: 34px;
+    height: 34px;
+    border-radius: 12px;
+    border: 1px solid #c7d2fe;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #eef2ff;
+  }
+
+  .print-date-label {
+    flex: 1;
+  }
+
+  .print-date-table-wrapper {
+    border: 1px solid #cbd5f5;
+    border-radius: 12px;
+    overflow: hidden;
+    background: #ffffff;
+  }
+
+  .print-date-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+    color: #1f2937;
+  }
+
+  .print-date-table th,
+  .print-date-table td {
+    border-bottom: 1px solid #e2e8f0;
+    padding: 8px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .print-date-table td {
+    font-weight: 500;
+    text-transform: none;
+    letter-spacing: normal;
+    font-size: 10px;
+  }
+
+  .print-date-table thead {
+    background: #e0e7ff;
+  }
+
+  .print-date-table tbody tr:last-child td {
+    border-bottom: none;
+  }
+
+  .print-status-badge {
+    display: inline-flex;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    border: 1px solid transparent;
+  }
+
+  .print-status--ontime { background: #dcfce7; color: #166534; border-color: #86efac; }
+  .print-status--late { background: #fee2e2; color: #991b1b; border-color: #fecaca; }
+  .print-status--pending { background: #fefce8; color: #92400e; border-color: #fef08a; }
+  .print-status--early { background: #dbeafe; color: #3730a3; border-color: #bfdbfe; }
+
+  .print-balance--negative {
+    color: #b91c1c;
+    font-weight: 700;
+  }
+
+  .print-balance--positive {
+    color: #047857;
+    font-weight: 700;
+  }
+
+  .inbound-schedule-print-table {
+    border-collapse: collapse;
+  }
+
+  .inbound-schedule-print-table thead {
+    background: #eef2ff;
+  }
+
+  .inbound-schedule-print-table th,
+  .inbound-schedule-print-table td {
+    border: 1px solid #e2e8f0;
+    padding: 10px;
+    vertical-align: middle;
+    white-space: nowrap;
+    page-break-inside: avoid;
+  }
+
+  .inbound-schedule-print-table tbody tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+}

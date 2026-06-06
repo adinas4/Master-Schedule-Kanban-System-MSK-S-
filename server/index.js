@@ -1,0 +1,18939 @@
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import pg from "pg";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import crypto from "crypto";
+import path from "path";
+import { fileURLToPath } from "url";
+import fs from "fs/promises";
+import multer from "multer";
+import sharp from "sharp";
+import { AsyncLocalStorage } from "async_hooks";
+
+dotenv.config();
+
+// Prevent timezone shifts for DATE columns (OID 1082).
+pg.types.setTypeParser(1082, (val) => val);
+
+const app = express();
+const port = Number(process.env.PORT || 4000);
+const jwtSecret = process.env.JWT_SECRET || "dev-secret-change";
+const requestContext = new AsyncLocalStorage();
+
+app.use(cors());
+// Increase payload limit to support large Excel imports
+app.use(express.json({ limit: "50mb" }));
+app.use((req, res, next) => {
+  requestContext.run({ userId: null, role: null }, () => next());
+});
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const uploadsRoot = path.join(__dirname, "uploads");
+const itemsUploadDir = path.join(uploadsRoot, "items");
+const itemsThumbDir = path.join(itemsUploadDir, "thumbs");
+
+app.use("/uploads", express.static(uploadsRoot));
+
+const TEST_ITEM_PREFIX = /^TEST-/i;
+const isPlainObject = (value) => Object.prototype.toString.call(value) === "[object Object]";
+const isTestItemKey = (key) => {
+  const normalized = String(key || "").toLowerCase();
+  if (normalized === "code") return true;
+  if (normalized === "item" || normalized === "item_code" || normalized === "itemcode") return true;
+  if (normalized === "item_id" || normalized === "itemid") return true;
+  if (normalized === "product_code" || normalized === "productcode") return true;
+  if (normalized === "parent_code" || normalized === "child_code") return true;
+  if (normalized.endsWith("_code") || normalized.endsWith("code")) {
+    return ["item", "product", "parent", "child", "material", "component"].some((token) => normalized.includes(token));
+  }
+  return false;
+};
+const hasTestItemCode = (payload) => {
+  if (!isPlainObject(payload)) return false;
+  return Object.entries(payload).some(([key, value]) => (
+    isTestItemKey(key) && typeof value === "string" && TEST_ITEM_PREFIX.test(value.trim())
+  ));
+};
+const filterTestItems = (payload) => {
+  if (Array.isArray(payload)) {
+    const filtered = [];
+    for (const entry of payload) {
+      if (isPlainObject(entry) && hasTestItemCode(entry)) continue;
+      filtered.push(filterTestItems(entry));
+    }
+    return filtered;
+  }
+  if (isPlainObject(payload)) {
+    const result = {};
+    for (const [key, value] of Object.entries(payload)) {
+      result[key] = filterTestItems(value);
+    }
+    return result;
+  }
+  return payload;
+};
+const safeFilterTestItems = (payload) => {
+  try {
+    return filterTestItems(payload);
+  } catch (error) {
+    console.error("Test-item response filter failed:", error);
+    return payload;
+  }
+};
+const shouldFilterTestItems = (req) => req.method === "GET" && String(req.path || "").startsWith("/api/");
+
+app.use((req, res, next) => {
+  if (!shouldFilterTestItems(req)) {
+    next();
+    return;
+  }
+  const originalJson = res.json.bind(res);
+  res.json = (payload) => {
+    if (res.headersSent) return res;
+    return originalJson(safeFilterTestItems(payload));
+  };
+  next();
+});
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true, service: "monitoring-supplier-api" });
+});
+
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, service: "monitoring-supplier-api" });
+});
+
+const pool = new pg.Pool({
+  host: process.env.PGHOST || "localhost",
+  port: Number(process.env.PGPORT || 5432),
+  user: process.env.PGUSER || "postgres",
+  password: process.env.PGPASSWORD || "",
+  database: process.env.PGDATABASE || "monitoring_supplier",
+});
+
+const isMutatingQuery = (queryText = "") => {
+  if (!queryText) return false;
+  const normalized = String(queryText).trim().toLowerCase();
+  return /^(insert|update|delete|merge|truncate|alter|create|drop)\b/.test(normalized);
+};
+
+const getContextUserId = () => requestContext.getStore()?.userId || null;
+const setAuditUserId = (client, userId) => (
+  client.query("select set_config('app.user_id', $1, true)", [String(userId)])
+);
+
+const originalPoolQuery = pool.query.bind(pool);
+pool.query = async (...args) => {
+  const text = typeof args[0] === "string" ? args[0] : args[0]?.text;
+  const userId = getContextUserId();
+  if (!userId || !isMutatingQuery(text)) {
+    return originalPoolQuery(...args);
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await setAuditUserId(client, userId);
+    client.__auditUserSet = true;
+    const result = await client.query(...args);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+const originalPoolConnect = pool.connect.bind(pool);
+const wrapPoolClientWithAudit = (client, userId) => {
+  if (!client || !userId || typeof client.query !== "function") return client;
+  if (!client.__auditBaseQuery) {
+    client.__auditBaseQuery = client.query.bind(client);
+  }
+  const originalClientQuery = client.__auditBaseQuery;
+  client.query = async (...qargs) => {
+    const text = typeof qargs[0] === "string" ? qargs[0] : qargs[0]?.text;
+    const normalized = String(text || "").trim().toLowerCase();
+    if (normalized.startsWith("begin")) {
+      client.__auditTxOpen = true;
+      client.__auditUserSet = false;
+      return originalClientQuery(...qargs);
+    }
+    if (normalized.startsWith("commit") || normalized.startsWith("rollback")) {
+      client.__auditTxOpen = false;
+      client.__auditUserSet = false;
+      return originalClientQuery(...qargs);
+    }
+    if (client.__auditTxOpen && !client.__auditUserSet && isMutatingQuery(text)) {
+      await originalClientQuery("select set_config('app.user_id', $1, true)", [String(userId)]);
+      client.__auditUserSet = true;
+    }
+    return originalClientQuery(...qargs);
+  };
+  return client;
+};
+pool.connect = (...args) => {
+  const userId = getContextUserId();
+  const callback = typeof args[0] === "function" ? args[0] : null;
+  if (callback) {
+    return originalPoolConnect((err, client, done) => {
+      if (err || !userId || !client) {
+        callback(err, client, done);
+        return;
+      }
+      callback(null, wrapPoolClientWithAudit(client, userId), done);
+    });
+  }
+  return originalPoolConnect(...args).then((client) => wrapPoolClientWithAudit(client, userId));
+};
+
+const SCHEDULE_CACHE_TTL_MS = 15000;
+const scheduleCache = new Map();
+const serializeScheduleQuery = (query = {}) => {
+  const entries = Object.entries(query).map(([key, value]) => {
+    if (Array.isArray(value)) {
+      return [key, value.join(",")];
+    }
+    return [key, value == null ? "" : String(value)];
+  });
+  entries.sort(([a], [b]) => a.localeCompare(b));
+  return entries.map(([key, value]) => `${key}=${value}`).join("&");
+};
+const getScheduleCache = (key) => {
+  const entry = scheduleCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    scheduleCache.delete(key);
+    return null;
+  }
+  return entry.data;
+};
+const setScheduleCache = (key, data) => {
+  scheduleCache.set(key, { data, expiresAt: Date.now() + SCHEDULE_CACHE_TTL_MS });
+};
+const clearScheduleCache = () => {
+  scheduleCache.clear();
+};
+
+const MAX_ORIGINAL_BYTES = 200 * 1024;
+const MAX_THUMB_BYTES = 30 * 1024;
+const THUMB_SIZE = 150;
+
+const ensureUploadDirs = async () => {
+  await fs.mkdir(itemsThumbDir, { recursive: true });
+};
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype || !file.mimetype.startsWith("image/")) {
+      cb(new Error("File harus berupa gambar."));
+      return;
+    }
+    cb(null, true);
+  },
+});
+
+const sanitizeFileToken = (value) => String(value || "").trim().replace(/[^a-z0-9_-]+/gi, "_");
+
+const removeLocalUploadFile = async (urlValue) => {
+  if (!urlValue || typeof urlValue !== "string") return;
+  if (!urlValue.startsWith("/uploads/")) return;
+  const relativePath = urlValue.replace("/uploads/", "");
+  const targetPath = path.join(uploadsRoot, relativePath);
+  await fs.unlink(targetPath).catch(() => undefined);
+};
+
+const buildWebpVariant = async (inputBuffer, { width, height, fit, maxBytes, qualityStart, qualityMin, qualityStep }) => {
+  let quality = qualityStart;
+  let output = null;
+  while (quality >= qualityMin) {
+    let pipeline = sharp(inputBuffer).rotate();
+    if (width || height) {
+      pipeline = pipeline.resize(width || null, height || null, { fit, withoutEnlargement: true });
+    }
+    output = await pipeline.webp({ quality }).toBuffer();
+    if (output.length <= maxBytes) break;
+    quality -= qualityStep;
+  }
+  return output;
+};
+
+const buildOriginalWebp = async (inputBuffer) => {
+  const widthTargets = [1600, 1200, 1000, 800];
+  for (const width of widthTargets) {
+    const output = await buildWebpVariant(inputBuffer, {
+      width,
+      height: width,
+      fit: "inside",
+      maxBytes: MAX_ORIGINAL_BYTES,
+      qualityStart: 82,
+      qualityMin: 40,
+      qualityStep: 7,
+    });
+    if (output && output.length <= MAX_ORIGINAL_BYTES) return output;
+  }
+  return buildWebpVariant(inputBuffer, {
+    width: 800,
+    height: 800,
+    fit: "inside",
+    maxBytes: MAX_ORIGINAL_BYTES,
+    qualityStart: 60,
+    qualityMin: 30,
+    qualityStep: 5,
+  });
+};
+
+const buildThumbWebp = async (inputBuffer) => buildWebpVariant(inputBuffer, {
+  width: THUMB_SIZE,
+  height: THUMB_SIZE,
+  fit: "cover",
+  maxBytes: MAX_THUMB_BYTES,
+  qualityStart: 70,
+  qualityMin: 30,
+  qualityStep: 6,
+});
+
+const permissionKeys = [
+  "viewReport",
+  "viewScorecard",
+  "viewMaster",
+  "manageMaster",
+  "manageVendors",
+  "manageItems",
+  "viewPrl",
+  "prlProcess",
+  "prlImport",
+  "editSchedules",
+  "deleteRecords",
+  "importExport",
+  "useAI",
+  "manageUsers",
+  "resetAll",
+  "production",
+];
+
+const defaultPermissionsByRole = {
+  admin: {
+    viewReport: true,
+    viewScorecard: true,
+    viewMaster: true,
+    manageMaster: true,
+    manageVendors: true,
+    manageItems: true,
+    viewPrl: true,
+    prlProcess: true,
+    prlImport: true,
+    editSchedules: true,
+    deleteRecords: true,
+    importExport: true,
+    useAI: true,
+    manageUsers: true,
+    resetAll: true,
+    production: true,
+  },
+  ppic: {
+    viewReport: true,
+    viewScorecard: true,
+    viewMaster: true,
+    manageMaster: true,
+    manageVendors: false,
+    manageItems: true,
+    viewPrl: true,
+    prlProcess: false,
+    prlImport: true,
+    editSchedules: true,
+    deleteRecords: false,
+    importExport: true,
+    useAI: true,
+    manageUsers: false,
+    resetAll: false,
+    production: true,
+  },
+  warehouse: {
+    viewReport: true,
+    viewScorecard: false,
+    viewMaster: true,
+    manageMaster: false,
+    manageVendors: false,
+    manageItems: false,
+    viewPrl: false,
+    prlProcess: false,
+    prlImport: false,
+    editSchedules: true,
+    deleteRecords: false,
+    importExport: true,
+    useAI: false,
+    manageUsers: false,
+    resetAll: false,
+    production: true,
+  },
+  purchasing: {
+    viewReport: true,
+    viewScorecard: true,
+    viewMaster: true,
+    manageMaster: false,
+    manageVendors: true,
+    manageItems: false,
+    viewPrl: true,
+    prlProcess: true,
+    prlImport: false,
+    editSchedules: true,
+    deleteRecords: false,
+    importExport: true,
+    useAI: true,
+    manageUsers: false,
+    resetAll: false,
+    production: false,
+  },
+  management: {
+    viewReport: true,
+    viewScorecard: true,
+    viewMaster: true,
+    manageMaster: false,
+    manageVendors: false,
+    manageItems: false,
+    viewPrl: true,
+    prlProcess: false,
+    prlImport: false,
+    editSchedules: false,
+    deleteRecords: false,
+    importExport: false,
+    useAI: false,
+    manageUsers: false,
+    resetAll: false,
+    production: false,
+  },
+  user: {
+    viewReport: true,
+    viewScorecard: true,
+    viewMaster: true,
+    manageMaster: false,
+    manageVendors: false,
+    manageItems: false,
+    viewPrl: true,
+    prlProcess: false,
+    prlImport: false,
+    editSchedules: false,
+    deleteRecords: false,
+    importExport: false,
+    useAI: false,
+    manageUsers: false,
+    resetAll: false,
+    production: false,
+  },
+  supplier: {
+    viewReport: false,
+    viewScorecard: true,
+    viewMaster: false,
+    manageMaster: false,
+    manageVendors: false,
+    manageItems: false,
+    viewPrl: false,
+    prlProcess: false,
+    prlImport: false,
+    editSchedules: false,
+    deleteRecords: false,
+    importExport: false,
+    useAI: false,
+    manageUsers: false,
+    resetAll: false,
+    production: false,
+  },
+};
+
+const allowedRoles = new Set(["admin", "ppic", "warehouse", "purchasing", "management", "user", "supplier"]);
+
+const normalizePermissions = (input, role) => {
+  const base = defaultPermissionsByRole[role] || defaultPermissionsByRole.user;
+  const normalized = { ...base };
+  if (input && typeof input === "object") {
+    for (const key of permissionKeys) {
+      if (typeof input[key] === "boolean") normalized[key] = input[key];
+    }
+  }
+  return normalized;
+};
+
+const SETTINGS_KEYS = {
+  GEMINI_API_KEY: "GEMINI_API_KEY",
+  GEMINI_MODEL: "GEMINI_MODEL",
+  CLOSING_DATE: "CLOSING_DATE",
+  DAILY_USAGE_WINDOW_DAYS: "DAILY_USAGE_WINDOW_DAYS",
+  LEAD_TIME_WINDOW_DAYS: "LEAD_TIME_WINDOW_DAYS",
+  LEAD_TIME_OUTLIER_IQR_MULT: "LEAD_TIME_OUTLIER_IQR_MULT",
+};
+
+const getSettingValue = async (client, key) => {
+  const result = await client.query("select value from app_settings where key = $1", [key]);
+  return result.rows[0]?.value ?? "";
+};
+
+const setSettingValue = async (client, key, value) => {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) {
+    await client.query("delete from app_settings where key = $1", [key]);
+    return "";
+  }
+  await client.query(
+    `
+    insert into app_settings (key, value, updated_at)
+    values ($1, $2, now())
+    on conflict (key)
+    do update set value = excluded.value, updated_at = now()
+    `,
+    [key, trimmed],
+  );
+  return trimmed;
+};
+
+const getNumberSetting = async (client, key, fallback) => {
+  const raw = await getSettingValue(client, key);
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const ensureGeminiModel = async (client) => {
+  let modelValue = await getSettingValue(client, SETTINGS_KEYS.GEMINI_MODEL);
+  if (!String(modelValue || "").trim()) {
+    modelValue = "gemini-2.5-flash";
+    await setSettingValue(client, SETTINGS_KEYS.GEMINI_MODEL, modelValue);
+  }
+  return modelValue;
+};
+
+const AI_ANALYSIS_ROW_LIMIT = 300;
+const AI_ANALYSIS_CHAR_LIMIT = 120000;
+
+const escapeCsvValue = (value) => {
+  if (value === null || value === undefined) return "";
+  const text = String(value);
+  if (/[",\n\r]/.test(text)) {
+    return `"${text.replace(/"/g, '""')}"`;
+  }
+  return text;
+};
+
+const normalizeAnalysisColumns = (columns, rows) => {
+  if (Array.isArray(columns) && columns.length > 0) {
+    return columns.map((col) => {
+      if (col && typeof col === "object") {
+        const key = String(col.key || col.label || "").trim();
+        return {
+          key: key || String(col.label || ""),
+          label: String(col.label || col.key || ""),
+        };
+      }
+      const label = String(col || "");
+      return { key: label, label };
+    }).filter((col) => String(col.key || "").trim());
+  }
+  if (!rows.length) return [];
+  return Object.keys(rows[0]).map((key) => ({ key, label: key }));
+};
+
+const rowsToCsv = (columns, rows) => {
+  const header = columns.map((col) => escapeCsvValue(col.label || col.key)).join(",");
+  const lines = rows.map((row) => columns.map((col) => escapeCsvValue(row[col.key])).join(","));
+  return [header, ...lines].join("\n");
+};
+
+const ensureSchema = async () => {
+  await pool.query(`
+    create table if not exists schedules (
+      id serial primary key,
+      po_number text not null,
+      supplier text not null,
+      item text not null,
+      request_date date not null,
+      delivery_time text,
+      request_qty integer not null default 0,
+      arrival_date date,
+      received_qty integer not null default 0,
+      do_number text,
+      status text,
+      notes text,
+      has_split boolean not null default false,
+      is_split_result boolean not null default false,
+      actual_locked boolean not null default false,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists users (
+      id serial primary key,
+      username text not null unique,
+      password_hash text not null,
+      role text not null default 'user',
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    alter table users
+    add column if not exists permissions jsonb not null default '{}'::jsonb;
+  `);
+
+  await pool.query(`
+    alter table users
+    add column if not exists supplier_id text;
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists actual_locked boolean not null default false;
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists po_line_id integer;
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists supplier_id text;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_schedules_supplier_id
+    on schedules (supplier_id);
+  `);
+
+  await pool.query(`
+    update schedules s
+    set supplier_id = ph.supplier_id
+    from po_headers ph
+    where s.supplier_id is null
+      and lower(trim(s.po_number)) = lower(trim(ph.po_number))
+      and ph.supplier_id is not null;
+  `);
+
+  await pool.query(`
+    update schedules s
+    set supplier_id = mv.id
+    from master_vendors mv
+    where s.supplier_id is null
+      and (
+        mv.id = s.supplier
+        or mv.name = s.supplier
+      );
+  `);
+
+  await pool.query(`
+    update schedules
+    set supplier = supplier_id
+    where supplier_id is not null
+      and coalesce(trim(supplier), '') <> coalesce(trim(supplier_id), '');
+  `);
+
+  await pool.query(`
+    create index if not exists idx_schedules_request_date_id
+    on schedules (request_date, id);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_schedules_po_line_id
+    on schedules (po_line_id);
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_type WHERE typname = 'moving_status_enum'
+      ) THEN
+        CREATE TYPE moving_status_enum AS ENUM ('FAST', 'SLOW', 'DEAD', 'SEASONAL');
+      END IF;
+    END
+    $$;
+  `);
+
+  await pool.query(`
+    create table if not exists items (
+      code text primary key,
+      name text not null,
+      part_no text,
+      type text not null,
+      unit text not null,
+      model text,
+      weight numeric,
+      price numeric,
+      vendor_id text,
+      location_id text,
+      supplier_name text,
+      location_name text,
+      packing_name text,
+      line_production text,
+      image_url text,
+      image_thumb_url text,
+      cycle text,
+      shelf_life_days integer,
+      shelf_life_months integer,
+      moving_status moving_status_enum not null default 'SLOW',
+      is_seasonal boolean not null default false,
+      safety_stock numeric not null default 0,
+      lead_time_days integer not null default 0,
+      cycle_time_seconds numeric not null default 0,
+      order_lot_size numeric not null default 0,
+      max_delivery_per_rit numeric not null default 0,
+      process_flow jsonb not null default '[]'::jsonb,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists safety_stock numeric not null default 0;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists price numeric;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists vendor_id text;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists location_id text;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists image_url text;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists image_thumb_url text;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists part_no text;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists shelf_life_days integer;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists shelf_life_months integer;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists moving_status moving_status_enum;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists is_seasonal boolean not null default false;
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'items'
+          AND column_name = 'moving_status'
+          AND udt_name <> 'moving_status_enum'
+      ) THEN
+        ALTER TABLE items
+        ALTER COLUMN moving_status TYPE moving_status_enum
+        USING (
+          CASE
+            WHEN moving_status IS NULL THEN 'SLOW'
+            WHEN upper(moving_status) IN ('FAST','SLOW','DEAD','SEASONAL') THEN upper(moving_status)::moving_status_enum
+            WHEN upper(moving_status) = 'FAST_MOVING' THEN 'FAST'::moving_status_enum
+            WHEN upper(moving_status) = 'SLOW_MOVING' THEN 'SLOW'::moving_status_enum
+            ELSE 'SLOW'::moving_status_enum
+          END
+        );
+      END IF;
+    END
+    $$;
+  `);
+
+  await pool.query(`
+    alter table items
+    alter column moving_status set default 'SLOW';
+  `);
+
+  await pool.query(`
+    update items
+    set moving_status = 'SLOW'
+    where moving_status is null;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists pack_qty numeric not null default 0;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists supplier_name text;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists location_name text;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists packing_name text;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists line_production text;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists lead_time_days integer not null default 0;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists cycle_time_seconds numeric not null default 0;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists order_lot_size numeric not null default 0;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists max_delivery_per_rit numeric not null default 0;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists process_flow jsonb not null default '[]'::jsonb;
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = current_schema() AND table_name = 'bom'
+      ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = current_schema() AND table_name = 'master_bom'
+      ) THEN
+        ALTER TABLE bom RENAME TO master_bom;
+      END IF;
+    END
+    $$;
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'master_bom' AND column_name = 'ratio_qty'
+      ) THEN
+        ALTER TABLE master_bom RENAME COLUMN ratio_qty TO quantity;
+      END IF;
+    END
+    $$;
+  `);
+  await pool.query(`
+    create table if not exists master_bom_headers (
+      id serial primary key,
+      parent_code text not null references items(code) on delete cascade,
+      bom_version text,
+      effective_date date,
+      reference text,
+      created_at timestamptz not null default now()
+    );
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'master_bom_headers_parent_version_unique'
+      ) THEN
+        ALTER TABLE master_bom_headers
+        ADD CONSTRAINT master_bom_headers_parent_version_unique UNIQUE (parent_code, bom_version);
+      END IF;
+    END
+    $$;
+  `);
+  await pool.query(`
+    create table if not exists master_bom (
+      id serial primary key,
+      header_id integer references master_bom_headers(id) on delete cascade,
+      parent_code text not null references items(code) on delete cascade,
+      child_code text not null references items(code) on delete cascade,
+      quantity numeric not null default 0,
+      scrap_factor numeric not null default 0,
+      created_at timestamptz not null default now()
+    );
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists header_id integer;
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'master_bom_header_id_fkey'
+      ) THEN
+        ALTER TABLE master_bom
+        ADD CONSTRAINT master_bom_header_id_fkey FOREIGN KEY (header_id)
+        REFERENCES master_bom_headers(id) ON DELETE CASCADE;
+      END IF;
+    END
+    $$;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists quantity numeric not null default 0;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists scrap_factor numeric not null default 0;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists component_type text;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists component_description text;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists model_spec text;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists line_production text;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists supplier_name text;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists packing text;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists cycle_time_seconds numeric;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists process_flow jsonb not null default '[]'::jsonb;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists cost_rp numeric not null default 0;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists lead_time_days integer not null default 0;
+  `);
+
+  await pool.query(`
+    alter table master_bom
+    add column if not exists assembly_note text;
+  `);
+  await pool.query(`
+    insert into master_bom_headers (parent_code, bom_version, reference)
+    select distinct parent_code, 'Legacy', 'Migrated from master_bom'
+    from master_bom
+    where header_id is null
+    on conflict (parent_code, bom_version) do nothing;
+  `);
+  await pool.query(`
+    update master_bom b
+    set header_id = h.id
+    from master_bom_headers h
+    where b.header_id is null
+      and b.parent_code = h.parent_code
+      and h.bom_version = 'Legacy';
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'master_bom_parent_child_unique'
+      ) THEN
+        ALTER TABLE master_bom DROP CONSTRAINT master_bom_parent_child_unique;
+      END IF;
+    END
+    $$;
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'master_bom_header_child_unique'
+      ) THEN
+        ALTER TABLE master_bom
+        ADD CONSTRAINT master_bom_header_child_unique UNIQUE (header_id, child_code);
+      END IF;
+    END
+    $$;
+  `);
+
+  await pool.query(`
+    create table if not exists stock_batches (
+      id serial primary key,
+      item_code text not null references items(code),
+      qty_in numeric not null,
+      qty_out numeric not null default 0,
+      arrival_date date,
+      do_number text,
+      batch_no text,
+      production_date date,
+      expired_date date,
+      schedule_id integer unique references schedules(id) on delete set null,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists stock_movements (
+      id serial primary key,
+      item_code text not null references items(code),
+      batch_id integer references stock_batches(id),
+      qty numeric not null,
+      direction text not null check (direction in ('in','out')),
+      reason text,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    alter table stock_movements
+    add column if not exists source_ref_type text;
+  `);
+
+  await pool.query(`
+    alter table stock_movements
+    add column if not exists source_ref_id integer;
+  `);
+
+  await pool.query(`
+    alter table stock_movements
+    add column if not exists source_ref_line_id integer;
+  `);
+
+  await pool.query(`
+    create table if not exists inventory_ledgers (
+      id serial primary key,
+      date timestamptz not null default now(),
+      item_id text not null references items(code),
+      transaction_type text not null check (transaction_type in ('RECEIVING','PRODUCTION','ADJUSTMENT_SO','RETURN','SCRAP','REVERSAL')),
+      reference_doc text,
+      qty_in numeric not null default 0,
+      qty_out numeric not null default 0,
+      balance numeric not null default 0,
+      user_id integer references users(id),
+      remarks text,
+      batch_id integer,
+      kanban_id text
+    );
+  `);
+  await pool.query(`
+    DO $$
+    DECLARE
+      constraint_name text;
+    BEGIN
+      SELECT c.conname INTO constraint_name
+      FROM pg_constraint c
+      JOIN pg_class t ON c.conrelid = t.oid
+      WHERE t.relname = 'inventory_ledgers'
+        AND c.contype = 'c'
+        AND pg_get_constraintdef(c.oid) LIKE '%transaction_type%';
+      IF constraint_name IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE inventory_ledgers DROP CONSTRAINT %I', constraint_name);
+      END IF;
+    END
+    $$;
+  `);
+  await pool.query(`
+    alter table inventory_ledgers
+    add constraint inventory_ledgers_transaction_type_check
+    check (transaction_type in ('RECEIVING','PRODUCTION','ADJUSTMENT_SO','RETURN','SCRAP','REVERSAL'));
+  `);
+
+  await pool.query(`
+    alter table inventory_ledgers
+    add column if not exists source_ref_type text;
+  `);
+
+  await pool.query(`
+    alter table inventory_ledgers
+    add column if not exists source_ref_id integer;
+  `);
+
+  await pool.query(`
+    alter table inventory_ledgers
+    add column if not exists source_ref_line_id integer;
+  `);
+
+  await pool.query(`
+    create table if not exists inventory_reservations (
+      id bigserial primary key,
+      item_code text not null references items(code) on delete cascade,
+      supplier_id text,
+      source_type text not null default 'manual'
+        check (source_type in ('manual','kanban_request','prl','delivery_note','schedule')),
+      source_id text,
+      reserved_qty numeric not null default 0,
+      fulfilled_qty numeric not null default 0,
+      status text not null default 'open'
+        check (status in ('open','partial','fulfilled','released','cancelled')),
+      need_by_date date,
+      notes text,
+      created_by integer references users(id),
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_inventory_reservations_item_status
+    on inventory_reservations (item_code, status, need_by_date);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_inventory_reservations_source
+    on inventory_reservations (source_type, source_id);
+  `);
+
+  await pool.query(`
+    create table if not exists inventory_allocations (
+      id bigserial primary key,
+      reservation_id bigint references inventory_reservations(id) on delete cascade,
+      item_code text not null references items(code) on delete cascade,
+      batch_id integer references stock_batches(id) on delete set null,
+      allocated_qty numeric not null default 0,
+      issued_qty numeric not null default 0,
+      status text not null default 'allocated'
+        check (status in ('allocated','issued','released','cancelled')),
+      created_by integer references users(id),
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_inventory_allocations_reservation
+    on inventory_allocations (reservation_id, status);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_inventory_allocations_item
+    on inventory_allocations (item_code, status);
+  `);
+  await pool.query(`
+    create index if not exists idx_inventory_ledgers_item_date
+    on inventory_ledgers (item_id, date);
+  `);
+
+  await pool.query(`
+    create table if not exists so_sessions (
+      id serial primary key,
+      period text not null,
+      status text not null check (status in ('OPEN','REVIEW','POSTED')),
+      created_by integer references users(id),
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists so_items (
+      id serial primary key,
+      session_id integer not null references so_sessions(id) on delete cascade,
+      item_code text not null references items(code),
+      item_name text,
+      part_no text,
+      unit text,
+      snp numeric,
+      price numeric,
+      book_qty numeric not null,
+      input_box integer not null default 0,
+      input_loose integer not null default 0,
+      actual_qty numeric,
+      difference numeric,
+      reason text,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      unique (session_id, item_code)
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_so_items_session_id
+    on so_items (session_id);
+  `);
+
+  await pool.query(`
+    create table if not exists fifo_violations (
+      id serial primary key,
+      item_code text not null,
+      batch_id integer,
+      chosen_batch_no text,
+      oldest_batch_no text,
+      reason text,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    alter table stock_batches
+    add column if not exists batch_no text;
+  `);
+
+  await pool.query(`
+    alter table stock_batches
+    add column if not exists is_loose boolean not null default false;
+  `);
+
+  await pool.query(`
+    alter table stock_batches
+    add column if not exists production_date date;
+  `);
+
+  await pool.query(`
+    alter table stock_batches
+    add column if not exists expired_date date;
+  `);
+
+  await pool.query(`
+    create table if not exists kanban_settings (
+      item_code text primary key references items(code) on delete cascade,
+      min_qty numeric not null default 0,
+      max_qty numeric not null default 0,
+      lot_qty numeric not null default 0,
+      lead_time_days integer not null default 0,
+      default_supplier text,
+      drop_zone text,
+      active boolean not null default true,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    alter table kanban_settings
+    add column if not exists drop_zone text;
+  `);
+
+  await pool.query(`
+    create table if not exists kanban_requests (
+      id serial primary key,
+      item_code text not null references items(code),
+      request_code text,
+      request_group text,
+      split_index integer,
+      split_total integer,
+      request_qty numeric not null,
+      trigger_type text not null check (trigger_type in ('stock_min','manual','scan')),
+      status text not null check (status in ('triggered','requested','approved','rejected','dn_created','scheduled','in_transit','receiving','fifo','closed')),
+      created_by integer references users(id),
+      approved_by integer references users(id),
+      dn_id integer,
+      schedule_id integer,
+      notes text,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    alter table kanban_requests
+    add column if not exists request_code text;
+  `);
+
+  await pool.query(`
+    alter table kanban_requests
+    add column if not exists request_group text;
+  `);
+
+  await pool.query(`
+    alter table kanban_requests
+    add column if not exists split_index integer;
+  `);
+
+  await pool.query(`
+    alter table kanban_requests
+    add column if not exists split_total integer;
+  `);
+
+  await pool.query(`
+    alter table kanban_requests
+    add column if not exists created_by integer references users(id);
+  `);
+
+  await pool.query(`
+    alter table kanban_requests
+    add column if not exists approved_by integer references users(id);
+  `);
+
+  await pool.query(`
+    alter table kanban_requests
+    add column if not exists dn_id integer;
+  `);
+
+  await pool.query(`
+    alter table kanban_requests
+    add column if not exists schedule_id integer;
+  `);
+
+  await pool.query(`
+    alter table kanban_requests
+    add column if not exists notes text;
+  `);
+
+  await pool.query(`
+    alter table kanban_requests
+    add column if not exists created_at timestamptz not null default now();
+  `);
+
+  await pool.query(`
+    alter table kanban_requests
+    add column if not exists updated_at timestamptz not null default now();
+  `);
+
+  await pool.query(`
+    alter table kanban_requests
+    add column if not exists sla_due_at timestamptz;
+  `);
+
+  await pool.query(`
+    alter table kanban_requests
+    add column if not exists exception_code text;
+  `);
+
+  await pool.query(`
+    alter table kanban_requests
+    add column if not exists exception_note text;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_kanban_requests_status_sla_due_at
+    on kanban_requests (status, sla_due_at);
+  `);
+
+  await pool.query(`
+    create table if not exists delivery_notes (
+      id serial primary key,
+      dn_number text not null unique,
+      request_id integer not null references kanban_requests(id),
+      supplier text not null,
+      planned_date date not null,
+      status text not null check (status in ('draft','open','sent','in_transit','closed','cancelled','received','partial')),
+      remarks text,
+      cycle text,
+      rit text,
+      delivery_time text,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    DO $$
+    DECLARE
+      constraint_name text;
+    BEGIN
+      select conname into constraint_name
+      from pg_constraint
+      where conrelid = 'delivery_notes'::regclass
+        and contype = 'c'
+        and pg_get_constraintdef(oid) like '%status%';
+      if constraint_name is not null then
+        execute format('alter table delivery_notes drop constraint %I', constraint_name);
+      end if;
+    END
+    $$;
+  `);
+
+  await pool.query(`
+    alter table delivery_notes
+    add constraint delivery_notes_status_check
+    check (status in ('draft','open','sent','in_transit','closed','cancelled','received','partial'));
+  `);
+
+  await pool.query(`
+    alter table delivery_notes
+    add column if not exists remarks text;
+  `);
+
+  await pool.query(`
+    alter table delivery_notes
+    add column if not exists cycle text;
+  `);
+
+  await pool.query(`
+    alter table delivery_notes
+    add column if not exists rit text;
+  `);
+
+  await pool.query(`
+    alter table delivery_notes
+    add column if not exists delivery_time text;
+  `);
+
+  await pool.query(`
+    alter table delivery_notes
+    add column if not exists supplier_id text;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_delivery_notes_supplier_id
+    on delivery_notes (supplier_id);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_delivery_notes_dn_lower
+    on delivery_notes (lower(dn_number));
+  `);
+
+  await pool.query(`
+    update delivery_notes dn
+    set supplier_id = mv.id
+    from master_vendors mv
+    where dn.supplier_id is null
+      and (mv.id = dn.supplier or mv.name = dn.supplier);
+  `);
+
+  await pool.query(`
+    create table if not exists delivery_note_items (
+      id serial primary key,
+      dn_id integer not null references delivery_notes(id) on delete cascade,
+      request_id integer not null references kanban_requests(id),
+      item_code text not null,
+      item_name text,
+      part_no text,
+      unit text,
+      pack_qty numeric,
+      type_pack text,
+      request_qty numeric not null,
+      drop_zone text,
+      created_at timestamptz not null default now(),
+      unique (dn_id, request_id)
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_delivery_note_items_dn_id
+    on delivery_note_items (dn_id);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_delivery_note_items_item_code
+    on delivery_note_items (item_code);
+  `);
+
+  await pool.query(`
+    create table if not exists kanban_cards (
+      id serial primary key,
+      dn_id integer not null references delivery_notes(id) on delete cascade,
+      item_code text not null references items(code),
+      request_id integer references kanban_requests(id),
+      card_seq integer not null,
+      total_cards integer not null,
+      card_qty numeric not null default 0,
+      card_uid text not null unique,
+      lot_batch text,
+      created_at timestamptz not null default now(),
+      unique (dn_id, item_code, card_seq)
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_kanban_cards_dn
+    on kanban_cards (dn_id);
+  `);
+
+  await pool.query(`
+    create table if not exists receive_notes (
+      id serial primary key,
+      rn_number text not null unique,
+      dn_id integer references delivery_notes(id),
+      schedule_id integer not null references schedules(id),
+      item_code text,
+      received_qty numeric not null,
+      qc_status text not null check (qc_status in ('ok','hold','reject')),
+      status text not null check (status in ('open','closed')),
+      received_at timestamptz not null default now(),
+      notes text,
+      received_by integer references users(id),
+      source text
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists receive_note_headers (
+      id serial primary key,
+      rn_number text not null unique,
+      supplier text not null,
+      remarks text,
+      truck_no text,
+      driver_name text,
+      created_by integer references users(id),
+      created_at timestamptz not null default now()
+    );
+  `);
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists truck_no text;
+  `);
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists driver_name text;
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists status text not null default 'draft';
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists source text;
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists do_number text;
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists document_date date;
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists po_number text;
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists duplicate_status text not null default 'unique';
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists posting_error text;
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists validated_at timestamptz;
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists validated_by integer references users(id);
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists posted_at timestamptz;
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists posted_by integer references users(id);
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists reversed_at timestamptz;
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists reversed_by integer references users(id);
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists reversal_of integer references receive_note_headers(id);
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists idempotency_key text;
+  `);
+
+  await pool.query(`
+    update receive_note_headers
+    set
+      status = 'posted',
+      source = coalesce(source, 'LEGACY_DN'),
+      do_number = coalesce(do_number, rn_number),
+      document_date = coalesce(document_date, created_at::date),
+      duplicate_status = coalesce(nullif(trim(duplicate_status), ''), 'unique'),
+      posted_at = coalesce(posted_at, created_at)
+    where coalesce(source, '') = ''
+      and status = 'draft'
+      and posted_at is null;
+  `);
+
+  await pool.query(`
+    do $$
+    begin
+      if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'receive_note_headers_status_check_v2'
+      ) then
+        alter table receive_note_headers
+        add constraint receive_note_headers_status_check_v2
+        check (status in ('draft','validated','posted','reversed'));
+      end if;
+    end
+    $$;
+  `);
+
+  await pool.query(`
+    do $$
+    begin
+      if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'receive_note_headers_duplicate_status_check'
+      ) then
+        alter table receive_note_headers
+        add constraint receive_note_headers_duplicate_status_check
+        check (duplicate_status in ('unique','merged_to_existing','duplicate_blocked'));
+      end if;
+    end
+    $$;
+  `);
+
+  await pool.query(`
+    create unique index if not exists idx_receive_note_headers_active_do
+    on receive_note_headers (lower(trim(supplier)), lower(trim(do_number)))
+    where do_number is not null and status in ('draft','validated','posted');
+  `);
+
+  await pool.query(`
+    create unique index if not exists idx_receive_note_headers_posted_idempotency
+    on receive_note_headers (idempotency_key)
+    where idempotency_key is not null and status = 'posted';
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receive_note_headers_status_created
+    on receive_note_headers (status, created_at desc);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receive_note_headers_po_number
+    on receive_note_headers (po_number);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receive_note_headers_supplier_do
+    on receive_note_headers (supplier, do_number);
+  `);
+
+  await pool.query(`
+    create table if not exists receive_note_items (
+      id serial primary key,
+      rn_id integer not null references receive_note_headers(id) on delete cascade,
+      origin_dn_id integer not null references delivery_notes(id),
+      item_code text not null references items(code),
+      item_name text,
+      part_no text,
+      unit text,
+      pack_qty numeric,
+      doc_qty numeric not null default 0,
+      received_qty numeric not null default 0,
+      drop_zone text,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receive_note_items_rn_id
+    on receive_note_items (rn_id);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receive_note_items_dn_id
+    on receive_note_items (origin_dn_id);
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    alter column origin_dn_id drop not null;
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists line_no integer not null default 1;
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists schedule_id integer;
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists qc_status text not null default 'ok';
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists line_status text not null default 'draft';
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists arrival_date date;
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists notes text;
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists production_date date;
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists expired_date date;
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists posted_qty numeric not null default 0;
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists match_status text not null default 'matched';
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists match_basis text;
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists override_reason text;
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists exception_code text;
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists reversal_of_item_id integer;
+  `);
+
+  await pool.query(`
+    update receive_note_items rni
+    set line_no = src.line_no
+    from (
+      select id, row_number() over (partition by rn_id order by id asc) as line_no
+      from receive_note_items
+    ) src
+    where rni.id = src.id
+      and coalesce(rni.line_no, 0) <> src.line_no;
+  `);
+
+  await pool.query(`
+    update receive_note_items rni
+    set
+      qc_status = 'ok',
+      line_status = 'posted',
+      arrival_date = coalesce(arrival_date, rnh.document_date, rnh.created_at::date),
+      posted_qty = case when coalesce(posted_qty, 0) = 0 then coalesce(received_qty, 0) else posted_qty end,
+      match_status = coalesce(nullif(trim(match_status), ''), 'matched'),
+      match_basis = coalesce(match_basis, 'legacy_dn')
+    from receive_note_headers rnh
+    where rnh.id = rni.rn_id
+      and rnh.posted_at is not null
+      and rni.line_status = 'draft';
+  `);
+
+  await pool.query(`
+    do $$
+    begin
+      if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'receive_note_items_schedule_id_fkey'
+      ) then
+        alter table receive_note_items
+        add constraint receive_note_items_schedule_id_fkey
+        foreign key (schedule_id) references schedules(id) on delete set null;
+      end if;
+    end
+    $$;
+  `);
+
+  await pool.query(`
+    do $$
+    begin
+      if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'receive_note_items_reversal_of_item_id_fkey'
+      ) then
+        alter table receive_note_items
+        add constraint receive_note_items_reversal_of_item_id_fkey
+        foreign key (reversal_of_item_id) references receive_note_items(id);
+      end if;
+    end
+    $$;
+  `);
+
+  await pool.query(`
+    do $$
+    begin
+      if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'receive_note_items_qc_status_check_v2'
+      ) then
+        alter table receive_note_items
+        add constraint receive_note_items_qc_status_check_v2
+        check (qc_status in ('ok','hold','reject'));
+      end if;
+    end
+    $$;
+  `);
+
+  await pool.query(`
+    do $$
+    begin
+      if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'receive_note_items_line_status_check_v2'
+      ) then
+        alter table receive_note_items
+        add constraint receive_note_items_line_status_check_v2
+        check (line_status in ('draft','validated','posted','reversed','error'));
+      end if;
+    end
+    $$;
+  `);
+
+  await pool.query(`
+    do $$
+    begin
+      if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'receive_note_items_match_status_check'
+      ) then
+        alter table receive_note_items
+        add constraint receive_note_items_match_status_check
+        check (match_status in ('matched','over_receipt','mismatch_item','unmatched','held'));
+      end if;
+    end
+    $$;
+  `);
+
+  await pool.query(`
+    create unique index if not exists idx_receive_note_items_line_no
+    on receive_note_items (rn_id, line_no);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receive_note_items_schedule_id
+    on receive_note_items (schedule_id);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receive_note_items_match_status
+    on receive_note_items (match_status);
+  `);
+
+  await pool.query(`
+    alter table receive_notes
+    alter column schedule_id drop not null;
+  `);
+
+  await pool.query(`
+    alter table receive_notes
+    alter column dn_id drop not null;
+  `);
+
+  await pool.query(`
+    alter table receive_notes
+    add column if not exists item_code text;
+  `);
+
+  await pool.query(`
+    alter table receive_notes
+    add column if not exists doc_qty numeric;
+  `);
+
+  await pool.query(`
+    alter table receive_notes
+    add column if not exists is_loose boolean not null default false;
+  `);
+
+  await pool.query(`
+    alter table receive_notes
+    add column if not exists received_by integer references users(id);
+  `);
+
+  await pool.query(`
+    alter table receive_notes
+    add column if not exists source text;
+  `);
+
+  await pool.query(`
+    alter table receive_notes
+    add column if not exists po_line_id integer;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receive_notes_dn_id
+    on receive_notes (dn_id);
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists po_line_id integer;
+  `);
+
+  await pool.query(`
+    create table if not exists dn_receive_scans (
+      id serial primary key,
+      dn_id integer not null references delivery_notes(id) on delete cascade,
+      item_code text not null references items(code),
+      qr_value text not null,
+      qty numeric not null default 0,
+      scanned_by integer references users(id),
+      scanned_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create unique index if not exists idx_dn_receive_scans_unique
+    on dn_receive_scans (dn_id, qr_value);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_dn_receive_scans_dn
+    on dn_receive_scans (dn_id);
+  `);
+
+  await pool.query(`
+    create table if not exists inbound_cards (
+      id serial primary key,
+      schedule_id integer not null references schedules(id) on delete cascade,
+      card_uid text not null unique,
+      item_code text not null,
+      item_name text,
+      pack_qty numeric not null default 0,
+      card_qty numeric not null default 0,
+      card_seq integer not null,
+      total_cards integer not null,
+      batch_no text,
+      status text not null check (status in ('pending','received','void')),
+      received_at timestamptz,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists kanban_events (
+      id serial primary key,
+      request_id integer not null references kanban_requests(id),
+      event text not null,
+      by_user integer references users(id),
+      meta jsonb,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists production_orders (
+      id serial primary key,
+      product_code text not null references items(code),
+      supplier text,
+      qty numeric not null,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists production_import_batches (
+      id serial primary key,
+      file_name text,
+      total_rows integer not null default 0,
+      success_rows integer not null default 0,
+      status text not null check (status in ('processing','success','failed')),
+      error_message text,
+      created_at timestamptz not null default now(),
+      finished_at timestamptz,
+      created_by integer references users(id)
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists wip_stock_movements (
+      id serial primary key,
+      production_date date not null,
+      item_code text not null references items(code),
+      from_location text not null,
+      to_location text not null,
+      qty_good numeric not null,
+      qty_reject numeric not null default 0,
+      document_no text,
+      shift_label text,
+      operator_name text,
+      import_batch_id integer,
+      created_by integer references users(id),
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists wip_import_batches (
+      id serial primary key,
+      file_name text,
+      total_rows integer not null default 0,
+      success_rows integer not null default 0,
+      total_qty numeric not null default 0,
+      status text not null check (status in ('processing','success','failed')),
+      error_message text,
+      created_at timestamptz not null default now(),
+      finished_at timestamptz,
+      created_by integer references users(id)
+    );
+  `);
+
+  await pool.query(`
+    alter table wip_stock_movements
+    add column if not exists document_no text;
+  `);
+  await pool.query(`
+    alter table wip_stock_movements
+    add column if not exists shift_label text;
+  `);
+  await pool.query(`
+    alter table wip_stock_movements
+    add column if not exists operator_name text;
+  `);
+  await pool.query(`
+    alter table wip_stock_movements
+    add column if not exists import_batch_id integer;
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'wip_stock_movements_import_batch_id_fkey'
+      ) THEN
+        ALTER TABLE wip_stock_movements
+        ADD CONSTRAINT wip_stock_movements_import_batch_id_fkey
+        FOREIGN KEY (import_batch_id) REFERENCES wip_import_batches(id)
+        ON DELETE SET NULL;
+      END IF;
+    END
+    $$;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_wip_import_batches_created_at
+    on wip_import_batches (created_at);
+  `);
+
+  await pool.query(`
+    alter table production_orders
+    add column if not exists supplier text;
+  `);
+
+  await pool.query(`
+    alter table production_orders
+    add column if not exists part_no text;
+  `);
+
+  await pool.query(`
+    alter table production_orders
+    add column if not exists source text;
+  `);
+
+  await pool.query(`
+    alter table production_orders
+    add column if not exists kanban_id text;
+  `);
+
+  await pool.query(`
+    alter table production_orders
+    add column if not exists created_by integer;
+  `);
+
+  await pool.query(`
+    alter table production_orders
+    add column if not exists scanned_at timestamptz;
+  `);
+
+  await pool.query(`
+    alter table production_orders
+    add column if not exists production_date date;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_production_orders_kanban_id on production_orders (kanban_id);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_production_orders_created_at on production_orders (created_at);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_production_orders_production_date on production_orders (production_date);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_production_import_batches_created_at on production_import_batches (created_at);
+  `);
+
+  await pool.query(`
+    create table if not exists production_consumption (
+      id serial primary key,
+      production_id integer not null references production_orders(id) on delete cascade,
+      item_code text not null references items(code),
+      batch_id integer references stock_batches(id),
+      qty numeric not null
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists prl_records (
+      id serial primary key,
+      item_code text not null references items(code) on delete cascade,
+      year integer not null,
+      part_no text,
+      description text,
+      model text,
+      qty_per_kanban numeric,
+      uom text,
+      type_pack text,
+      volume text,
+      months jsonb not null default '{}'::jsonb,
+      status jsonb not null default '{}'::jsonb,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      unique (item_code, year)
+    );
+  `);
+
+  await pool.query(`
+    alter table prl_records
+    add column if not exists status jsonb not null default '{}'::jsonb;
+  `);
+
+  await pool.query(`
+    alter table prl_records
+    add column if not exists source_type text;
+  `);
+
+  await pool.query(`
+    alter table prl_records
+    add column if not exists source_ref text;
+  `);
+
+  await pool.query(`
+    alter table prl_records
+    add column if not exists suggested_qty numeric not null default 0;
+  `);
+
+  await pool.query(`
+    alter table prl_records
+    add column if not exists approved_qty numeric;
+  `);
+
+  await pool.query(`
+    alter table prl_records
+    add column if not exists approved_by integer references users(id);
+  `);
+
+  await pool.query(`
+    alter table prl_records
+    add column if not exists approved_at timestamptz;
+  `);
+
+  await pool.query(`
+    alter table prl_records
+    add column if not exists due_date date;
+  `);
+
+  await pool.query(`
+    alter table prl_records
+    add column if not exists priority_score numeric not null default 0;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_prl_records_due_date
+    on prl_records (year, due_date);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_prl_records_source
+    on prl_records (source_type, source_ref);
+  `);
+
+  await pool.query(`
+    create table if not exists master_plants (
+      id text primary key,
+      name text not null,
+      site text not null
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists master_areas (
+      id text primary key,
+      name text not null,
+      plant_id text not null references master_plants(id) on delete cascade
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists master_deliveries (
+      id text primary key,
+      area_id text not null references master_areas(id) on delete cascade,
+      address text not null
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists master_warehouses (
+      id text primary key,
+      name text not null,
+      site text not null,
+      type text not null default 'MAIN'
+    );
+  `);
+
+  await pool.query(`
+    alter table master_warehouses
+    add column if not exists type text not null default 'MAIN';
+  `);
+
+  await pool.query(`
+    update master_warehouses
+    set type = 'MAIN'
+    where type is null or type = '';
+  `);
+
+  await pool.query(`
+    create table if not exists master_vendors (
+      id text primary key,
+      name text not null,
+      type text not null,
+      role text not null default 'Delivery Note',
+      email text,
+      lead_time_days integer not null default 0,
+      cycle text,
+      rit text,
+      delivery_time text,
+      delivery_schedule jsonb
+    );
+  `);
+
+  await pool.query(`
+    alter table master_vendors
+    add column if not exists lead_time_days integer not null default 0;
+  `);
+  await pool.query(`
+    alter table master_vendors
+    add column if not exists daily_capacity_qty numeric not null default 0;
+  `);
+
+  await pool.query(`
+    alter table master_vendors
+    add column if not exists role text not null default 'Delivery Note';
+  `);
+
+  await pool.query(`
+    alter table master_vendors
+    add column if not exists subcon_warehouse_id text;
+  `);
+
+  await pool.query(`
+    alter table master_vendors
+    add column if not exists cycle text;
+  `);
+
+  await pool.query(`
+    alter table master_vendors
+    add column if not exists rit text;
+  `);
+
+  await pool.query(`
+    alter table master_vendors
+    add column if not exists delivery_time text;
+  `);
+
+  await pool.query(`
+    alter table master_vendors
+    add column if not exists delivery_schedule jsonb;
+  `);
+
+  await pool.query(`
+    update master_vendors
+    set role = 'Delivery Note'
+    where role is null or role = '';
+  `);
+
+  await pool.query(`
+    update master_vendors
+    set lead_time_days = 0
+    where lead_time_days is null;
+  `);
+  await pool.query(`
+    update master_vendors
+    set daily_capacity_qty = 0
+    where daily_capacity_qty is null;
+  `);
+
+  await pool.query(`
+    update master_vendors
+    set delivery_schedule = jsonb_build_array(
+      jsonb_build_object(
+        'rit', rit,
+        'time', delivery_time,
+        'cycle', cycle
+      )
+    )
+    where (delivery_schedule is null or delivery_schedule = '[]'::jsonb)
+      and (coalesce(cycle, '') <> '' or coalesce(rit, '') <> '' or coalesce(delivery_time, '') <> '');
+  `);
+
+  await pool.query(`
+    create table if not exists po_headers (
+      po_number text primary key,
+      po_date date not null,
+      supplier_id text not null references master_vendors(id),
+      status text not null default 'open' check (status in ('open','partial','closed')),
+      remarks text,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists po_lines (
+      id serial primary key,
+      po_number text not null references po_headers(po_number) on delete cascade,
+      line_no integer not null,
+      item_code text not null references items(code),
+      qty_order numeric not null check (qty_order >= 0),
+      qty_received numeric not null default 0 check (qty_received >= 0),
+      qty_remaining numeric generated always as (qty_order - qty_received) stored,
+      unique (po_number, line_no)
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_po_headers_supplier_date
+    on po_headers (supplier_id, po_date);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_po_headers_status
+    on po_headers (status);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_po_headers_number_lower
+    on po_headers (lower(po_number));
+  `);
+
+  await pool.query(`
+    create index if not exists idx_po_headers_supplier_lower
+    on po_headers (lower(supplier_id));
+  `);
+
+  await pool.query(`
+    create index if not exists idx_master_vendors_id_lower
+    on master_vendors (lower(id));
+  `);
+
+  await pool.query(`
+    create index if not exists idx_master_vendors_name_lower
+    on master_vendors (lower(name));
+  `);
+
+  await pool.query(`
+    create index if not exists idx_items_code_lower
+    on items (lower(code));
+  `);
+
+  await pool.query(`
+    create index if not exists idx_items_name_lower
+    on items (lower(name));
+  `);
+
+  await pool.query(`
+    create index if not exists idx_schedules_po_lower
+    on schedules (lower(po_number));
+  `);
+
+  await pool.query(`
+    create index if not exists idx_schedules_item_lower
+    on schedules (lower(item));
+  `);
+
+  await pool.query(`
+    create index if not exists idx_schedules_supplier_lower
+    on schedules (lower(supplier));
+  `);
+
+  await pool.query(`
+    create index if not exists idx_po_lines_po_item
+    on po_lines (po_number, item_code);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_po_lines_remaining
+    on po_lines (qty_remaining);
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists item_code text;
+  `);
+
+  await pool.query(`
+    update schedules s
+    set item_code = pl.item_code
+    from po_lines pl
+    where s.po_line_id = pl.id
+      and (s.item_code is null or s.item_code = '');
+  `);
+
+  await pool.query(`
+    update schedules s
+    set item_code = i.code
+    from items i
+    where (s.item_code is null or s.item_code = '')
+      and lower(trim(s.item)) = lower(trim(i.code));
+  `);
+
+  const poLineItemNameCheck = await pool.query(
+    `
+    select 1
+    from information_schema.columns
+    where table_schema = current_schema()
+      and table_name = 'po_lines'
+      and column_name = 'item_name'
+    limit 1
+    `,
+  );
+  if (poLineItemNameCheck.rows.length > 0) {
+    await pool.query(`
+      update schedules s
+      set item_code = pl.item_code
+      from po_lines pl
+      where (s.item_code is null or s.item_code = '')
+        and s.po_number = pl.po_number
+        and lower(trim(s.item)) = lower(trim(pl.item_name));
+    `);
+  } else {
+    await pool.query(`
+      update schedules s
+      set item_code = pl.item_code
+      from po_lines pl
+      where (s.item_code is null or s.item_code = '')
+        and s.po_number = pl.po_number
+        and lower(trim(s.item)) = lower(trim(pl.item_code));
+    `);
+  }
+
+  await pool.query(`
+    update schedules s
+    set item_code = i.code
+    from items i
+    where (s.item_code is null or s.item_code = '')
+      and lower(trim(s.item)) = lower(trim(i.name));
+  `);
+
+  await pool.query(`
+    update schedules s
+    set item = s.item_code
+    where s.item_code is not null
+      and (s.item is null or s.item = '' or s.item <> s.item_code);
+  `);
+
+  await pool.query(`
+    update schedules s
+    set item_code = null
+    where s.item_code is not null
+      and not exists (select 1 from items i where i.code = s.item_code);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_schedules_item_code
+    on schedules (item_code);
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'schedules_item_code_fkey'
+      ) THEN
+        ALTER TABLE schedules
+        ADD CONSTRAINT schedules_item_code_fkey
+        FOREIGN KEY (item_code) REFERENCES items(code);
+      END IF;
+    END
+    $$;
+  `);
+
+  await pool.query(`
+    create or replace function enforce_po_received() returns trigger as $$
+    begin
+      return new;
+    end;
+    $$ language plpgsql;
+  `);
+
+  await pool.query(`
+    drop trigger if exists trg_po_lines_guard on po_lines;
+  `);
+
+  await pool.query(`
+    create trigger trg_po_lines_guard
+    before insert or update on po_lines
+    for each row execute function enforce_po_received();
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists po_number text;
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'schedules_po_header_fkey'
+      ) THEN
+        ALTER TABLE schedules
+        ADD CONSTRAINT schedules_po_header_fkey
+        FOREIGN KEY (po_number)
+        REFERENCES po_headers(po_number)
+        ON UPDATE CASCADE
+        NOT VALID;
+      END IF;
+    END
+    $$;
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'schedules_po_line_fkey'
+      ) THEN
+        ALTER TABLE schedules
+        ADD CONSTRAINT schedules_po_line_fkey
+        FOREIGN KEY (po_line_id)
+        REFERENCES po_lines(id)
+        ON DELETE SET NULL
+        NOT VALID;
+      END IF;
+    END
+    $$;
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'receive_notes_po_line_fkey'
+      ) THEN
+        ALTER TABLE receive_notes
+        ADD CONSTRAINT receive_notes_po_line_fkey
+        FOREIGN KEY (po_line_id)
+        REFERENCES po_lines(id)
+        ON DELETE SET NULL
+        NOT VALID;
+      END IF;
+    END
+    $$;
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'receive_note_items_po_line_fkey'
+      ) THEN
+        ALTER TABLE receive_note_items
+        ADD CONSTRAINT receive_note_items_po_line_fkey
+        FOREIGN KEY (po_line_id)
+        REFERENCES po_lines(id)
+        ON DELETE SET NULL
+        NOT VALID;
+      END IF;
+    END
+    $$;
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'receive_note_headers_po_header_fkey'
+      ) THEN
+        ALTER TABLE receive_note_headers
+        ADD CONSTRAINT receive_note_headers_po_header_fkey
+        FOREIGN KEY (po_number)
+        REFERENCES po_headers(po_number)
+        ON DELETE SET NULL
+        NOT VALID;
+      END IF;
+    END
+    $$;
+  `);
+
+  await pool.query(`
+    create table if not exists master_locations (
+      id text primary key,
+      warehouse_id text not null references master_warehouses(id) on delete cascade,
+      area_id text references master_areas(id) on delete set null,
+      category text not null,
+      line_description text,
+      fifo_lane text,
+      machine_note text
+    );
+  `);
+
+  await pool.query(`
+    alter table master_locations
+    add column if not exists line_description text;
+  `);
+
+  await pool.query(`
+    alter table master_locations
+    add column if not exists area_id text references master_areas(id) on delete set null;
+  `);
+
+  await pool.query(`
+    alter table master_locations
+    add column if not exists machine_note text;
+  `);
+
+  await pool.query(`
+    create table if not exists subcon_deliveries (
+      id serial primary key,
+      sj_number text unique,
+      vendor_id text not null references master_vendors(id),
+      warehouse_id text,
+      item_code text not null references items(code),
+      qty numeric not null,
+      delivery_date date not null,
+      reference text,
+      notes text,
+      status text not null default 'OPEN',
+      closed_at timestamptz,
+      created_by integer references users(id),
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    alter table subcon_deliveries
+    add column if not exists sj_number text;
+  `);
+
+  await pool.query(`
+    alter table subcon_deliveries
+    add column if not exists status text not null default 'OPEN';
+  `);
+
+  await pool.query(`
+    alter table subcon_deliveries
+    add column if not exists closed_at timestamptz;
+  `);
+
+  await pool.query(`
+    alter table subcon_deliveries
+    add column if not exists updated_at timestamptz not null default now();
+  `);
+
+  await pool.query(`
+    update subcon_deliveries
+    set status = 'OPEN'
+    where status is null or status = '';
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'subcon_deliveries_sj_number_unique'
+      ) THEN
+        ALTER TABLE subcon_deliveries
+        ADD CONSTRAINT subcon_deliveries_sj_number_unique UNIQUE (sj_number);
+      END IF;
+    END
+    $$;
+  `);
+
+  await pool.query(`
+    create table if not exists subcon_receipts (
+      id serial primary key,
+      vendor_id text not null references master_vendors(id),
+      delivery_id integer references subcon_deliveries(id),
+      warehouse_id text,
+      product_code text not null references items(code),
+      qty numeric not null,
+      receipt_date date not null,
+      reference text,
+      notes text,
+      created_by integer references users(id),
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    alter table subcon_receipts
+    add column if not exists delivery_id integer;
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'subcon_receipts_delivery_id_fkey'
+      ) THEN
+        ALTER TABLE subcon_receipts
+        ADD CONSTRAINT subcon_receipts_delivery_id_fkey FOREIGN KEY (delivery_id)
+        REFERENCES subcon_deliveries(id) ON DELETE SET NULL;
+      END IF;
+    END
+    $$;
+  `);
+
+  await pool.query(`
+    create table if not exists subcon_backflush_lines (
+      id serial primary key,
+      receipt_id integer not null references subcon_receipts(id) on delete cascade,
+      delivery_id integer references subcon_deliveries(id),
+      item_code text not null references items(code),
+      qty numeric not null
+    );
+  `);
+
+  await pool.query(`
+    alter table subcon_backflush_lines
+    add column if not exists delivery_id integer;
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'subcon_backflush_lines_delivery_id_fkey'
+      ) THEN
+        ALTER TABLE subcon_backflush_lines
+        ADD CONSTRAINT subcon_backflush_lines_delivery_id_fkey FOREIGN KEY (delivery_id)
+        REFERENCES subcon_deliveries(id) ON DELETE SET NULL;
+      END IF;
+    END
+    $$;
+  `);
+
+  await pool.query(`
+    create table if not exists subcon_stock_movements (
+      id serial primary key,
+      vendor_id text not null references master_vendors(id),
+      warehouse_id text,
+      item_code text not null references items(code),
+      qty numeric not null,
+      direction text not null check (direction in ('in','out')),
+      reason text,
+      ref_type text,
+      ref_id integer,
+      created_by integer references users(id),
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists subcon_stock_opname (
+      id serial primary key,
+      vendor_id text not null references master_vendors(id),
+      item_code text not null references items(code),
+      actual_qty numeric not null,
+      opname_date date not null,
+      notes text,
+      created_by integer references users(id),
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists master_packings (
+      code text primary key,
+      name text not null
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists master_models (
+      code text primary key,
+      name text not null,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists master_processes (
+      code text primary key,
+      name text not null,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists master_categories (
+      code text primary key,
+      name text not null
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists master_customers (
+      id text primary key,
+      name text not null,
+      email text,
+      lead_time_days integer not null default 0
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists item_suppliers (
+      item_code text not null references items(code) on delete cascade,
+      vendor_id text not null references master_vendors(id) on delete cascade,
+      share_percent numeric not null default 0,
+      primary key (item_code, vendor_id)
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists item_customers (
+      item_code text not null references items(code) on delete cascade,
+      customer_id text not null references master_customers(id) on delete cascade,
+      share_percent numeric not null default 0,
+      primary key (item_code, customer_id)
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists master_config (
+      id integer primary key,
+      fifo_method jsonb not null default '{}'::jsonb,
+      document_numbering jsonb not null default '{}'::jsonb,
+      qc_status text[] not null default array[]::text[],
+      hold_location text,
+      request_id_format text
+    );
+  `);
+
+  await pool.query(`
+    create table if not exists app_settings (
+      key text primary key,
+      value text,
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(
+    `
+    insert into app_settings (key, value)
+    values
+      ($1, $2),
+      ($3, $4),
+      ($5, $6)
+    on conflict (key) do nothing
+    `,
+    [
+      SETTINGS_KEYS.DAILY_USAGE_WINDOW_DAYS, "90",
+      SETTINGS_KEYS.LEAD_TIME_WINDOW_DAYS, "180",
+      SETTINGS_KEYS.LEAD_TIME_OUTLIER_IQR_MULT, "1.5",
+    ],
+  );
+
+  await pool.query(`
+    create table if not exists item_daily_usage (
+      item_code text primary key references items(code),
+      daily_usage_qty numeric not null default 0,
+      window_days integer not null default 0,
+      window_start date,
+      window_end date,
+      total_usage numeric not null default 0,
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    alter table item_daily_usage
+    add column if not exists uom text;
+  `);
+
+  await pool.query(`
+    alter table item_daily_usage
+    add column if not exists source text;
+  `);
+
+  await pool.query(`
+    alter table item_daily_usage
+    add column if not exists effective_date date;
+  `);
+
+  await pool.query(`
+    create table if not exists item_daily_usage_history (
+      id bigserial primary key,
+      item_code text not null references items(code),
+      daily_usage_qty numeric not null,
+      window_days integer not null,
+      window_start date,
+      window_end date,
+      total_usage numeric not null,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    alter table item_daily_usage_history
+    add column if not exists uom text;
+  `);
+
+  await pool.query(`
+    alter table item_daily_usage_history
+    add column if not exists source text;
+  `);
+
+  await pool.query(`
+    alter table item_daily_usage_history
+    add column if not exists effective_date date;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_item_daily_usage_updated_at
+    on item_daily_usage (updated_at);
+  `);
+
+  await pool.query(`
+    create table if not exists supplier_lead_time_history (
+      id bigserial primary key,
+      supplier_id text not null references master_vendors(id),
+      po_number text,
+      po_date date,
+      schedule_id integer unique references schedules(id) on delete set null,
+      item_code text,
+      received_qty numeric,
+      received_date date,
+      lead_time_days integer,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_supplier_lead_time_supplier_date
+    on supplier_lead_time_history (supplier_id, received_date);
+  `);
+
+  await pool.query(`
+    create table if not exists supplier_lead_time_stats (
+      supplier_id text primary key references master_vendors(id),
+      avg_lead_time_days numeric not null default 0,
+      sample_size integer not null default 0,
+      window_start date,
+      window_end date,
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    alter table master_vendors
+    add column if not exists actual_lead_time_days numeric;
+  `);
+
+  await pool.query(`
+    alter table master_vendors
+    add column if not exists actual_lead_time_updated_at timestamptz;
+  `);
+
+  await pool.query(`
+    create table if not exists audit_logs (
+      id bigserial primary key,
+      user_id integer references users(id),
+      action text not null,
+      table_name text not null,
+      record_id text,
+      old_data jsonb,
+      new_data jsonb,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_audit_logs_table_record
+    on audit_logs (table_name, record_id);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_audit_logs_created_at
+    on audit_logs (created_at);
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists dn_id integer references delivery_notes(id) on delete set null;
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists request_id integer references kanban_requests(id) on delete set null;
+  `);
+
+  await pool.query(`
+    alter table master_config
+    add column if not exists document_numbering jsonb not null default '{}'::jsonb;
+  `);
+
+  await pool.query(`
+    alter table master_config
+    add column if not exists qc_status text[] not null default array[]::text[];
+  `);
+
+  await pool.query(`
+    alter table master_config
+    add column if not exists hold_location text;
+  `);
+
+  await pool.query(`
+    alter table master_config
+    add column if not exists working_days jsonb not null default '{}'::jsonb;
+  `);
+
+  await pool.query(`
+    alter table master_config
+    add column if not exists kanban_id_format text;
+  `);
+
+  await pool.query(`
+    alter table master_config
+    add column if not exists request_id_format text;
+  `);
+
+  await pool.query(`
+    alter table app_settings
+    add column if not exists updated_at timestamptz not null default now();
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists type_pack text;
+  `);
+
+  await pool.query(`
+    alter table items
+    add column if not exists qty_on_hand numeric not null default 0;
+  `);
+
+  await pool.query(`
+    create or replace function audit_trigger_fn()
+    returns trigger as $$
+    declare
+      v_user_id integer;
+      v_record_id text;
+    begin
+      v_user_id := nullif(current_setting('app.user_id', true), '')::integer;
+      if (tg_op = 'INSERT') then
+        v_record_id := coalesce(
+          to_jsonb(new)->>'id',
+          to_jsonb(new)->>'code',
+          to_jsonb(new)->>'po_number',
+          to_jsonb(new)->>'rn_number',
+          to_jsonb(new)->>'dn_number',
+          to_jsonb(new)->>'request_id',
+          to_jsonb(new)->>'item_code',
+          to_jsonb(new)->>'schedule_id'
+        );
+        insert into audit_logs (user_id, action, table_name, record_id, old_data, new_data)
+        values (v_user_id, 'INSERT', tg_table_name, v_record_id, null, to_jsonb(new));
+        return new;
+      elsif (tg_op = 'UPDATE') then
+        v_record_id := coalesce(
+          to_jsonb(new)->>'id',
+          to_jsonb(old)->>'id',
+          to_jsonb(new)->>'code',
+          to_jsonb(old)->>'code',
+          to_jsonb(new)->>'po_number',
+          to_jsonb(old)->>'po_number',
+          to_jsonb(new)->>'rn_number',
+          to_jsonb(old)->>'rn_number',
+          to_jsonb(new)->>'dn_number',
+          to_jsonb(old)->>'dn_number',
+          to_jsonb(new)->>'request_id',
+          to_jsonb(old)->>'request_id',
+          to_jsonb(new)->>'item_code',
+          to_jsonb(old)->>'item_code',
+          to_jsonb(new)->>'schedule_id',
+          to_jsonb(old)->>'schedule_id'
+        );
+        insert into audit_logs (user_id, action, table_name, record_id, old_data, new_data)
+        values (v_user_id, 'UPDATE', tg_table_name, v_record_id, to_jsonb(old), to_jsonb(new));
+        return new;
+      elsif (tg_op = 'DELETE') then
+        v_record_id := coalesce(
+          to_jsonb(old)->>'id',
+          to_jsonb(old)->>'code',
+          to_jsonb(old)->>'po_number',
+          to_jsonb(old)->>'rn_number',
+          to_jsonb(old)->>'dn_number',
+          to_jsonb(old)->>'request_id',
+          to_jsonb(old)->>'item_code',
+          to_jsonb(old)->>'schedule_id'
+        );
+        insert into audit_logs (user_id, action, table_name, record_id, old_data, new_data)
+        values (v_user_id, 'DELETE', tg_table_name, v_record_id, to_jsonb(old), null);
+        return old;
+      end if;
+      return null;
+    end;
+    $$ language plpgsql;
+  `);
+
+  await pool.query(`
+    do $$
+    declare
+      r record;
+      trigger_name text;
+    begin
+      for r in
+        select table_name
+        from information_schema.tables
+        where table_schema = 'public'
+          and table_type = 'BASE TABLE'
+          and table_name <> 'audit_logs'
+      loop
+        trigger_name := format('audit_%s', r.table_name);
+        if not exists (
+          select 1
+          from pg_trigger
+          where tgname = trigger_name
+        ) then
+          execute format(
+            'create trigger %I after insert or update or delete on %I for each row execute function audit_trigger_fn()',
+            trigger_name,
+            r.table_name
+          );
+        end if;
+      end loop;
+    end $$;
+  `);
+};
+
+const parsePositiveId = (value) => {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  const integerValue = Math.trunc(num);
+  return integerValue > 0 ? integerValue : null;
+};
+
+const ensureAdminUser = async () => {
+  const username = process.env.ADMIN_USER;
+  const password = process.env.ADMIN_PASSWORD;
+  if (!username || !password) return;
+
+  const existing = await pool.query("select id from users where username = $1", [username]);
+  if (existing.rows.length > 0) return;
+
+  const passwordHash = await bcrypt.hash(password, 10);
+  const permissions = normalizePermissions({}, "admin");
+  await pool.query(
+    "insert into users (username, password_hash, role, permissions) values ($1, $2, 'admin', $3)",
+    [username, passwordHash, permissions],
+  );
+  console.log(`Created admin user: ${username}`);
+};
+
+const toDbSchedule = (payload = {}) => {
+  const itemCode = normalizeItemCode(payload.itemCode ?? payload.item_code);
+  const itemValue = normalizeItemCode(payload.item ?? itemCode);
+  return {
+    poNumber: normalizePoNumber(payload.poNumber ?? payload.po_number),
+    supplier: payload.supplier?.trim() || "",
+    supplierId: String(payload.supplierId ?? payload.supplier_id ?? "").trim(),
+    item: itemValue,
+    itemCode,
+    requestDate: payload.requestDate || null,
+    deliveryTime: payload.deliveryTime || null,
+    requestQty: Number.isFinite(Number(payload.requestQty)) ? Number(payload.requestQty) : 0,
+    arrivalDate: payload.arrivalDate || null,
+    receivedQty: Number.isFinite(Number(payload.receivedQty)) ? Number(payload.receivedQty) : 0,
+    doNumber: payload.doNumber || null,
+    status: payload.status || null,
+    notes: payload.notes || null,
+    hasSplit: Boolean(payload.hasSplit),
+    isSplitResult: Boolean(payload.isSplitResult),
+    actualLocked: Boolean(payload.actualLocked),
+    dnId: parsePositiveId(payload.dnId),
+    requestId: parsePositiveId(payload.requestId),
+    poLineId: parsePositiveId(payload.poLineId ?? payload.po_line_id),
+  };
+};
+
+const mapRowToSchedule = (row) => {
+  const resolvedItemCode = row.resolved_item_code || row.po_item_code || row.item_code || row.item || null;
+  const supplierId = row.supplier_id || row.po_supplier_id || row.supplier || null;
+  return {
+    id: row.id,
+    poNumber: row.po_number,
+    supplier: supplierId,
+    supplierId,
+    supplierName: row.supplier_name || row.supplierName || null,
+    item: resolvedItemCode,
+    itemCode: resolvedItemCode,
+    itemName: row.item_name || row.itemName || null,
+    requestDate: formatDateOnly(row.request_date),
+    deliveryTime: row.delivery_time,
+    requestQty: row.request_qty,
+    arrivalDate: formatDateOnly(row.arrival_date),
+    receivedQty: row.received_qty,
+    doNumber: row.do_number,
+    status: getScheduleStatusFromActual({
+      requestDate: row.request_date,
+      arrivalDate: row.arrival_date,
+    }),
+    poStatus: row.po_status || null,
+    notes: row.notes,
+    hasSplit: row.has_split,
+    isSplitResult: row.is_split_result,
+    actualLocked: row.actual_locked,
+    dnId: row.dn_id,
+    requestId: row.request_id,
+    poLineId: row.po_line_id,
+  };
+};
+
+const formatDateOnly = (value) => {
+  if (!value) return "";
+  if (value instanceof Date) {
+    const y = value.getFullYear();
+    const m = String(value.getMonth() + 1).padStart(2, "0");
+    const d = String(value.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+  const str = String(value);
+  return str.length >= 10 ? str.slice(0, 10) : str;
+};
+
+const formatDateId = (value) => {
+  if (!value) return "-";
+  const dateValue = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(dateValue.getTime())) return "-";
+  return dateValue.toLocaleDateString("id-ID", { day: "2-digit", month: "2-digit", year: "numeric" });
+};
+
+const formatNumberId = (value) => {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "0";
+  return new Intl.NumberFormat("id-ID").format(num);
+};
+
+const escapeHtml = (value) => String(value ?? "")
+  .replaceAll("&", "&amp;")
+  .replaceAll("<", "&lt;")
+  .replaceAll(">", "&gt;")
+  .replaceAll("\"", "&quot;")
+  .replaceAll("'", "&#39;");
+
+const normalizeDateOnly = (value) => {
+  if (!value) return null;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
+  const parsed = new Date(String(value));
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 10);
+};
+
+const normalizeLocationKey = (value) => String(value || "").trim().toLowerCase();
+
+const buildWipStockMap = async (client, itemCodes) => {
+  const map = new Map();
+  if (!Array.isArray(itemCodes) || itemCodes.length === 0) return map;
+  const result = await client.query(
+    `
+    with moves as (
+      select item_code, lower(trim(to_location)) as loc_key, sum(qty_good)::numeric as qty_delta
+      from wip_stock_movements
+      where item_code = any($1)
+        and to_location is not null
+        and trim(to_location) <> ''
+      group by item_code, lower(trim(to_location))
+      union all
+      select item_code, lower(trim(from_location)) as loc_key, -sum(qty_good + qty_reject)::numeric as qty_delta
+      from wip_stock_movements
+      where item_code = any($1)
+        and from_location is not null
+        and trim(from_location) <> ''
+      group by item_code, lower(trim(from_location))
+    )
+    select item_code, loc_key, sum(qty_delta)::numeric as stock_qty
+    from moves
+    group by item_code, loc_key
+    `,
+    [itemCodes],
+  );
+  result.rows.forEach((row) => {
+    if (!row.loc_key) return;
+    const key = `${row.item_code}||${row.loc_key}`;
+    map.set(key, Number(row.stock_qty || 0));
+  });
+  return map;
+};
+
+const isAllowedProductionOutputType = (typeValue) => {
+  const raw = String(typeValue || "").trim().toLowerCase();
+  if (!raw) return false;
+  if (raw.includes("raw")) return false;
+  if (raw.includes("finished") || raw === "fg" || raw.includes(" fg")) return true;
+  if (raw.includes("child")) return true;
+  if (raw.includes("sub-assy") || raw.includes("sub assy") || raw.includes("subassy")) return true;
+  if (raw.includes("sub") && !raw.includes("subcon")) return true;
+  return false;
+};
+
+const addMonthsToDate = (dateValue, months) => {
+  const normalized = normalizeDateOnly(dateValue);
+  if (!normalized) return null;
+  const monthValue = Number(months);
+  if (!Number.isFinite(monthValue) || monthValue <= 0) return null;
+  const date = new Date(`${normalized}T00:00:00.000Z`);
+  if (Number.isNaN(date.getTime())) return null;
+  date.setUTCMonth(date.getUTCMonth() + Math.round(monthValue));
+  return date.toISOString().slice(0, 10);
+};
+
+const getTodayDateOnly = () => new Date().toISOString().slice(0, 10);
+
+const normalizePoNumber = (value) => String(value ?? "").trim();
+const normalizeItemCode = (value) => String(value ?? "").trim();
+
+const resolvePoHeader = async (client, poNumber, { forUpdate = false } = {}) => {
+  const normalized = normalizePoNumber(poNumber);
+  if (!normalized) return null;
+  const lockClause = forUpdate ? "for update of ph" : "";
+  const result = await client.query(
+    `
+    select ph.*, mv.name as supplier_name
+    from po_headers ph
+    left join master_vendors mv on mv.id = ph.supplier_id
+    where ph.po_number = $1
+    ${lockClause}
+    limit 1
+    `,
+    [normalized],
+  );
+  return result.rows[0] || null;
+};
+
+const resolvePoLineById = async (client, poLineId, { forUpdate = false } = {}) => {
+  const idValue = parsePositiveId(poLineId);
+  if (!idValue) return null;
+  const lockClause = forUpdate ? "for update" : "";
+  const result = await client.query(
+    `select * from po_lines where id = $1 ${lockClause}`,
+    [idValue],
+  );
+  return result.rows[0] || null;
+};
+
+const resolvePoLineByPoItem = async (client, poNumber, itemCode, { forUpdate = false } = {}) => {
+  const normalizedPo = normalizePoNumber(poNumber);
+  const normalizedItem = normalizeItemCode(itemCode);
+  if (!normalizedPo || !normalizedItem) return [];
+  const lockClause = forUpdate ? "for update" : "";
+  const result = await client.query(
+    `select * from po_lines where po_number = $1 and item_code = $2 order by line_no asc ${lockClause}`,
+    [normalizedPo, normalizedItem],
+  );
+  return result.rows || [];
+};
+
+const parseDateOnlyValue = (value) => {
+  if (!value) return null;
+  const dateValue = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(dateValue.getTime())) return null;
+  return new Date(dateValue.getFullYear(), dateValue.getMonth(), dateValue.getDate());
+};
+
+const resolveClosingDate = async (client) => {
+  const raw = await getSettingValue(client, SETTINGS_KEYS.CLOSING_DATE);
+  const parsed = parseDateOnlyValue(raw);
+  if (parsed) return parsed;
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), 1);
+};
+
+const assertArrivalDateAllowed = async (client, arrivalDate, user) => {
+  if (!arrivalDate) return;
+  const role = String(user?.role || "").toLowerCase();
+  if (role === "admin") return;
+  const arrival = parseDateOnlyValue(arrivalDate);
+  if (!arrival) return;
+  const closingDate = await resolveClosingDate(client);
+  if (arrival < closingDate) {
+    const error = new Error("Tanggal tiba melewati batas closing bulan. Hubungi Admin.");
+    error.statusCode = 409;
+    throw error;
+  }
+};
+
+const assertScheduleReceiveQty = (schedule, qtyValue, { allowOver = false } = {}) => {
+  if (!Number.isFinite(qtyValue) || qtyValue <= 0) return;
+  const planQty = Number(schedule?.request_qty ?? schedule?.requestQty ?? 0);
+  if (planQty > 0 && qtyValue > planQty && !allowOver) {
+    const error = new Error("Qty diterima melebihi Qty Plan.");
+    error.statusCode = 409;
+    throw error;
+  }
+};
+
+const assertPoLineRemaining = (poLine, qtyValue, { allowOver = false } = {}) => {
+  if (!Number.isFinite(qtyValue) || qtyValue <= 0) {
+    const error = new Error("Qty penerimaan tidak valid.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const qtyOrder = Number(poLine?.qty_order ?? 0);
+  const qtyReceived = Number(poLine?.qty_received ?? 0);
+  const remaining = qtyOrder - qtyReceived;
+  if (Number.isFinite(remaining) && remaining >= 0 && qtyValue > remaining && !allowOver) {
+    const error = new Error(`Qty penerimaan melebihi sisa PO. Sisa: ${remaining}.`);
+    error.statusCode = 409;
+    throw error;
+  }
+};
+
+const getScheduledOutstandingByPoLine = async (client, poLine, { excludeScheduleId } = {}) => {
+  const idValue = parsePositiveId(poLine?.id ?? poLine);
+  if (!idValue) return 0;
+  const values = [idValue];
+  let excludeClause = "";
+  let legacyClause = "";
+  const normalizedPo = normalizePoNumber(poLine?.po_number ?? poLine?.poNumber);
+  const normalizedItem = normalizeItemCode(poLine?.item_code ?? poLine?.itemCode);
+  if (normalizedPo && normalizedItem) {
+    const poIndex = values.length + 1;
+    const itemIndex = values.length + 2;
+    values.push(normalizedPo, normalizedItem);
+    legacyClause = `or (po_line_id is null and po_number = $${poIndex} and coalesce(item_code, item) = $${itemIndex})`;
+  }
+  const excludeId = parsePositiveId(excludeScheduleId);
+  if (excludeId) {
+    values.push(excludeId);
+    excludeClause = `and id <> $${values.length}`;
+  }
+  const result = await client.query(
+    `
+    select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric as scheduled_outstanding
+    from schedules
+    where (po_line_id = $1 ${legacyClause})
+    ${excludeClause}
+    `,
+    values,
+  );
+  return Number(result.rows[0]?.scheduled_outstanding || 0);
+};
+
+const resolvePoLineScheduleRemaining = async (client, poLine, { excludeScheduleId } = {}) => {
+  const qtyOrder = Number(poLine?.qty_order || 0);
+  const qtyReceived = Number(poLine?.qty_received || 0);
+  const scheduledOutstanding = await getScheduledOutstandingByPoLine(client, poLine, { excludeScheduleId });
+  const remaining = qtyOrder - qtyReceived - scheduledOutstanding;
+  return {
+    qtyOrder,
+    qtyReceived,
+    scheduledOutstanding,
+    remaining: Number.isFinite(remaining) ? Math.max(0, remaining) : 0,
+  };
+};
+
+const refreshPoHeaderStatus = async (client, poNumber) => {
+  const normalized = normalizePoNumber(poNumber);
+  if (!normalized) return;
+  await client.query(
+    `
+    update po_headers
+    set status = case
+      when not exists (
+        select 1 from po_lines where po_number = $1 and qty_order > qty_received
+      ) then 'closed'
+      when exists (
+        select 1 from po_lines where po_number = $1 and qty_received > 0
+      ) then 'partial'
+      else 'open'
+    end,
+    updated_at = now()
+    where po_number = $1
+    `,
+    [normalized],
+  );
+};
+
+const reconcilePoSchedulesAndReceipts = async (client, poNumber, { lock = true } = {}) => {
+  const normalized = normalizePoNumber(poNumber);
+  if (!normalized) {
+    return {
+      poNumber: "",
+      linkedSchedules: 0,
+      linkedReceiveNotes: 0,
+      updatedLines: 0,
+      unmatchedSchedules: 0,
+      ambiguousSchedules: 0,
+    };
+  }
+
+  const lineLockClause = lock ? "for update" : "";
+  const scheduleLockClause = lock ? "for update" : "";
+  const lineResult = await client.query(
+    `select id, po_number, line_no, item_code, qty_order, qty_received from po_lines where po_number = $1 order by line_no asc ${lineLockClause}`,
+    [normalized],
+  );
+  if (lineResult.rows.length === 0) {
+    return {
+      poNumber: normalized,
+      linkedSchedules: 0,
+      linkedReceiveNotes: 0,
+      updatedLines: 0,
+      unmatchedSchedules: 0,
+      ambiguousSchedules: 0,
+    };
+  }
+
+  const lineById = new Map();
+  const linesByItem = new Map();
+  for (const line of lineResult.rows) {
+    lineById.set(line.id, line);
+    const itemCode = normalizeItemCode(line.item_code);
+    if (!itemCode) continue;
+    const current = linesByItem.get(itemCode) || [];
+    current.push(line);
+    linesByItem.set(itemCode, current);
+  }
+
+  const scheduleResult = await client.query(
+    `select id, po_number, item, item_code, po_line_id, received_qty, actual_locked from schedules where po_number = $1 order by id asc ${scheduleLockClause}`,
+    [normalized],
+  );
+  const scheduleIds = scheduleResult.rows.map((row) => Number(row.id)).filter(Number.isFinite);
+  const noteResult = await client.query(
+    `
+    select schedule_id, sum(received_qty)::numeric as total_received
+    from receive_notes
+    where schedule_id = any($1)
+    group by schedule_id
+    `,
+    [scheduleIds.length > 0 ? scheduleIds : [0]],
+  );
+  const noteQtyBySchedule = new Map();
+  noteResult.rows.forEach((row) => {
+    const scheduleId = Number(row.schedule_id);
+    if (!Number.isFinite(scheduleId)) return;
+    noteQtyBySchedule.set(scheduleId, Number(row.total_received || 0));
+  });
+
+  const desiredQtyByLine = new Map(lineResult.rows.map((line) => [line.id, 0]));
+  let linkedSchedules = 0;
+  let linkedReceiveNotes = 0;
+  let unmatchedSchedules = 0;
+  let ambiguousSchedules = 0;
+
+  for (const schedule of scheduleResult.rows) {
+    const scheduleId = Number(schedule.id);
+    const itemCode = normalizeItemCode(schedule.item_code || schedule.item);
+    let poLine = lineById.get(parsePositiveId(schedule.po_line_id));
+
+    if (!poLine && itemCode) {
+      const matchedLines = linesByItem.get(itemCode) || [];
+      if (matchedLines.length === 1) {
+        poLine = matchedLines[0];
+      } else if (matchedLines.length > 1) {
+        ambiguousSchedules += 1;
+        continue;
+      }
+    }
+
+    if (!poLine) {
+      unmatchedSchedules += 1;
+      continue;
+    }
+
+    if (parsePositiveId(schedule.po_line_id) !== poLine.id) {
+      const linkResult = await client.query(
+        "update schedules set po_line_id = $1 where id = $2 and coalesce(po_line_id, 0) <> $1",
+        [poLine.id, scheduleId],
+      );
+      linkedSchedules += linkResult.rowCount;
+    }
+
+    const noteQty = Number(noteQtyBySchedule.get(scheduleId) || 0);
+    const legacyQty = schedule.actual_locked ? Number(schedule.received_qty || 0) : 0;
+    const actualQty = noteQty > 0 ? noteQty : legacyQty;
+    if (Number.isFinite(actualQty) && actualQty > 0) {
+      desiredQtyByLine.set(poLine.id, Number(desiredQtyByLine.get(poLine.id) || 0) + actualQty);
+    }
+
+    const noteLinkResult = await client.query(
+      "update receive_notes set po_line_id = $1 where schedule_id = $2 and coalesce(po_line_id, 0) <> $1",
+      [poLine.id, scheduleId],
+    );
+    linkedReceiveNotes += noteLinkResult.rowCount;
+  }
+
+  let updatedLines = 0;
+  for (const line of lineResult.rows) {
+    const desiredQty = Number(desiredQtyByLine.get(line.id) || 0);
+    const currentQty = Number(line.qty_received || 0);
+    if (desiredQty === currentQty) continue;
+    const updateResult = await client.query(
+      "update po_lines set qty_received = $1 where id = $2 and qty_received <> $1",
+      [desiredQty, line.id],
+    );
+    updatedLines += updateResult.rowCount;
+  }
+
+  await refreshPoHeaderStatus(client, normalized);
+  return {
+    poNumber: normalized,
+    linkedSchedules,
+    linkedReceiveNotes,
+    updatedLines,
+    unmatchedSchedules,
+    ambiguousSchedules,
+  };
+};
+
+const resolvePoLineForSchedule = async (client, schedule, { lock = true } = {}) => {
+  if (!schedule) return null;
+  const poNumber = normalizePoNumber(schedule.po_number ?? schedule.poNumber);
+  const itemCode = normalizeItemCode(schedule.item_code ?? schedule.itemCode ?? schedule.item);
+  const poLineId = parsePositiveId(schedule.po_line_id ?? schedule.poLineId);
+  if (!poNumber) return null;
+  let poLine = null;
+  if (poLineId) {
+    poLine = await resolvePoLineById(client, poLineId, { forUpdate: lock });
+  }
+  if (!poLine && itemCode) {
+    const rows = await resolvePoLineByPoItem(client, poNumber, itemCode, { forUpdate: lock });
+    if (rows.length > 1) {
+      const error = new Error("PO line ganda untuk item ini. Pilih baris PO secara spesifik.");
+      error.statusCode = 409;
+      throw error;
+    }
+    poLine = rows[0] || null;
+  }
+  if (!poLine) return null;
+  if (poLine.po_number !== poNumber) {
+    const error = new Error("PO line tidak sesuai dengan Nomor PO schedule.");
+    error.statusCode = 409;
+    throw error;
+  }
+  if (itemCode && poLine.item_code && poLine.item_code !== itemCode) {
+    const error = new Error("Item schedule tidak sesuai dengan PO line.");
+    error.statusCode = 409;
+    throw error;
+  }
+  if (schedule.id && !poLineId) {
+    await client.query(
+      "update schedules set po_line_id = $1 where id = $2 and po_line_id is null",
+      [poLine.id, schedule.id],
+    );
+  }
+  return poLine;
+};
+
+const applyPoReceiptForSchedule = async (client, schedule, qtyValue, { allowOverReceive = false } = {}) => {
+  const poNumber = normalizePoNumber(schedule?.po_number ?? schedule?.poNumber);
+  if (!poNumber) {
+    const error = new Error("Nomor PO wajib diisi untuk penerimaan.");
+    error.statusCode = 409;
+    throw error;
+  }
+  const poLine = await resolvePoLineForSchedule(client, schedule, { lock: true });
+  if (!poLine) {
+    const error = new Error("PO line tidak ditemukan untuk schedule ini.");
+    error.statusCode = 409;
+    throw error;
+  }
+  assertScheduleReceiveQty(schedule, qtyValue, { allowOver: allowOverReceive });
+  assertPoLineRemaining(poLine, qtyValue, { allowOver: allowOverReceive });
+  await client.query(
+    "update po_lines set qty_received = qty_received + $1 where id = $2",
+    [qtyValue, poLine.id],
+  );
+  await refreshPoHeaderStatus(client, poNumber);
+  return poLine;
+};
+
+const resolvePoLineForPayload = async (client, payload, { allowItemFallback = true } = {}) => {
+  const poNumber = normalizePoNumber(payload?.poNumber ?? payload?.po_number);
+  if (!poNumber) {
+    const error = new Error("Nomor PO wajib diisi.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const poLineId = parsePositiveId(payload?.poLineId ?? payload?.po_line_id);
+  let itemCode = normalizeItemCode(payload?.itemCode ?? payload?.item_code);
+  if (!itemCode && allowItemFallback) {
+    itemCode = normalizeItemCode(payload?.item);
+  }
+  if (poLineId) {
+    const poLine = await resolvePoLineById(client, poLineId);
+    if (!poLine) {
+      const error = new Error("PO line tidak ditemukan.");
+      error.statusCode = 404;
+      throw error;
+    }
+    if (poLine.po_number !== poNumber) {
+      const error = new Error("PO line tidak sesuai dengan Nomor PO.");
+      error.statusCode = 409;
+      throw error;
+    }
+    if (itemCode && poLine.item_code !== itemCode) {
+      const error = new Error("Item tidak sesuai dengan PO line.");
+      error.statusCode = 409;
+      throw error;
+    }
+    return poLine;
+  }
+  if (!itemCode) {
+    const error = new Error("Item wajib diisi (kode item).");
+    error.statusCode = 400;
+    throw error;
+  }
+  const rows = await resolvePoLineByPoItem(client, poNumber, itemCode);
+  if (rows.length === 0) {
+    const error = new Error("PO line tidak ditemukan untuk item ini.");
+    error.statusCode = 404;
+    throw error;
+  }
+  if (rows.length > 1) {
+    const error = new Error("PO line ganda untuk item ini. Pilih baris PO secara spesifik.");
+    error.statusCode = 409;
+    throw error;
+  }
+  return rows[0];
+};
+
+const loadRemainingPoLines = async (client, poNumber) => {
+  const normalized = normalizePoNumber(poNumber);
+  if (!normalized) return [];
+  const result = await client.query(
+    `
+    select pl.*,
+      (
+        select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
+        from schedules s
+        where s.po_line_id = pl.id
+           or (s.po_line_id is null and s.po_number = pl.po_number and coalesce(s.item_code, s.item) = pl.item_code)
+      ) as scheduled_outstanding,
+      (
+        pl.qty_order - pl.qty_received - (
+          select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
+          from schedules s2
+          where s2.po_line_id = pl.id
+             or (s2.po_line_id is null and s2.po_number = pl.po_number and coalesce(s2.item_code, s2.item) = pl.item_code)
+        )
+      )::numeric as remaining_after_schedule
+    from po_lines pl
+    where pl.po_number = $1
+      and (
+        pl.qty_order - pl.qty_received - (
+          select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
+          from schedules s3
+          where s3.po_line_id = pl.id
+             or (s3.po_line_id is null and s3.po_number = pl.po_number and coalesce(s3.item_code, s3.item) = pl.item_code)
+        )
+      ) > 0
+    order by pl.line_no asc
+    `,
+    [normalized],
+  );
+  return result.rows || [];
+};
+
+const RECEIPT_HEADER_ACTIVE_STATUSES = ["draft", "validated", "posted"];
+const RECEIPT_QC_BLOCKED_FOR_STOCK = new Set(["hold", "reject"]);
+const RECEIPT_POSTABLE_MATCH_STATUSES = new Set(["matched", "over_receipt"]);
+
+const normalizeReceiptStatus = (value) => String(value || "").trim().toLowerCase();
+
+const normalizeReceiptHeaderPayload = (payload = {}) => ({
+  supplier: String(payload.supplier || "").trim(),
+  source: String(payload.source || "MANUAL").trim() || "MANUAL",
+  doNumber: normalizeDoNumber(payload.doNumber ?? payload.do_number),
+  documentDate: payload.documentDate ?? payload.document_date ?? null,
+  poNumber: normalizePoNumber(payload.poNumber ?? payload.po_number),
+  remarks: payload.remarks || null,
+  truckNo: payload.truckNo ?? payload.truck_no ?? null,
+  driverName: payload.driverName ?? payload.driver_name ?? null,
+  idempotencyKey: String(payload.idempotencyKey ?? payload.idempotency_key ?? "").trim() || null,
+});
+
+const normalizeReceiptDraftLinePayload = (payload = {}) => {
+  const lineRaw = Number(payload.lineNo ?? payload.line_no ?? 1);
+  const docQty = Number(payload.docQty ?? payload.doc_qty ?? 0);
+  const receivedQty = Number(payload.receivedQty ?? payload.received_qty ?? 0);
+  return {
+    lineNo: Number.isFinite(lineRaw) && lineRaw > 0 ? Math.round(lineRaw) : 1,
+    originDnId: parsePositiveId(payload.originDnId ?? payload.origin_dn_id ?? payload.dnId ?? payload.dn_id),
+    itemCode: normalizeItemCode(payload.itemCode ?? payload.item_code ?? payload.item),
+    itemName: payload.itemName ?? payload.item_name ?? null,
+    partNo: payload.partNo ?? payload.part_no ?? null,
+    unit: payload.unit ?? null,
+    packQty: Number.isFinite(Number(payload.packQty ?? payload.pack_qty)) ? Number(payload.packQty ?? payload.pack_qty) : null,
+    docQty: Number.isFinite(docQty) ? docQty : 0,
+    receivedQty: Number.isFinite(receivedQty) ? receivedQty : 0,
+    arrivalDate: payload.arrivalDate ?? payload.arrival_date ?? null,
+    productionDate: payload.productionDate ?? payload.production_date ?? null,
+    expiredDate: payload.expiredDate ?? payload.expired_date ?? null,
+    scheduleId: parsePositiveId(payload.scheduleId ?? payload.schedule_id),
+    poLineId: parsePositiveId(payload.poLineId ?? payload.po_line_id),
+    qcStatus: String(payload.qcStatus ?? payload.qc_status ?? "ok").trim().toLowerCase() || "ok",
+    notes: payload.notes || null,
+    dropZone: payload.dropZone ?? payload.drop_zone ?? null,
+    overrideReason: payload.overrideReason ?? payload.override_reason ?? null,
+    matchBasis: payload.matchBasis ?? payload.match_basis ?? null,
+  };
+};
+
+const getReceiptHeaderById = async (client, id, { forUpdate = false } = {}) => {
+  const headerId = parsePositiveId(id);
+  if (!headerId) return null;
+  const lockClause = forUpdate ? "for update" : "";
+  const result = await client.query(
+    `select * from receive_note_headers where id = $1 ${lockClause}`,
+    [headerId],
+  );
+  return result.rows[0] || null;
+};
+
+const getReceiptLinesByHeader = async (client, headerId, { forUpdate = false } = {}) => {
+  const idValue = parsePositiveId(headerId);
+  if (!idValue) return [];
+  const lockClause = forUpdate ? "for update" : "";
+  const result = await client.query(
+    `select * from receive_note_items where rn_id = $1 order by line_no asc, id asc ${lockClause}`,
+    [idValue],
+  );
+  return result.rows || [];
+};
+
+const getReceiptLineByHeaderLineNo = async (client, headerId, lineNo, { forUpdate = false } = {}) => {
+  const idValue = parsePositiveId(headerId);
+  const normalizedLineNo = Number.isFinite(Number(lineNo)) ? Math.round(Number(lineNo)) : 0;
+  if (!idValue || normalizedLineNo <= 0) return null;
+  const lockClause = forUpdate ? "for update" : "";
+  const result = await client.query(
+    `select * from receive_note_items where rn_id = $1 and line_no = $2 ${lockClause}`,
+    [idValue, normalizedLineNo],
+  );
+  return result.rows[0] || null;
+};
+
+const recomputeDeliveryNoteStatus = async (client, dnId) => {
+  const deliveryNoteId = parsePositiveId(dnId);
+  if (!deliveryNoteId) return null;
+  const summaryResult = await client.query(
+    `
+    with dn_items as (
+      select
+        lower(trim(item_code)) as item_code_key,
+        coalesce(sum(request_qty), 0)::numeric as doc_qty
+      from delivery_note_items
+      where dn_id = $1
+      group by lower(trim(item_code))
+    ),
+    legacy_receipts as (
+      select
+        lower(trim(item_code)) as item_code_key,
+        coalesce(sum(received_qty), 0)::numeric as received_qty
+      from receive_notes
+      where dn_id = $1
+      group by lower(trim(item_code))
+    ),
+    header_receipts as (
+      select
+        lower(trim(rni.item_code)) as item_code_key,
+        coalesce(sum(rni.posted_qty), 0)::numeric as received_qty
+      from receive_note_items rni
+      join receive_note_headers rnh on rnh.id = rni.rn_id
+      where rni.origin_dn_id = $1
+        and rni.line_status = 'posted'
+        and rnh.status = 'posted'
+        and rnh.reversal_of is null
+      group by lower(trim(rni.item_code))
+    )
+    select
+      di.item_code_key,
+      di.doc_qty,
+      (coalesce(lr.received_qty, 0) + coalesce(hr.received_qty, 0))::numeric as received_qty
+    from dn_items di
+    left join legacy_receipts lr on lr.item_code_key = di.item_code_key
+    left join header_receipts hr on hr.item_code_key = di.item_code_key
+    `,
+    [deliveryNoteId],
+  );
+  const rows = summaryResult.rows || [];
+  let hasReceipt = false;
+  let hasShort = false;
+  for (const row of rows) {
+    const docQty = Number(row.doc_qty || 0);
+    const receivedQty = Number(row.received_qty || 0);
+    if (receivedQty > 0) hasReceipt = true;
+    if (receivedQty < docQty) hasShort = true;
+  }
+  const nextStatus = !hasReceipt ? "in_transit" : hasShort ? "partial" : "received";
+  await client.query(
+    "update delivery_notes set status = $1 where id = $2",
+    [nextStatus, deliveryNoteId],
+  );
+  return nextStatus;
+};
+
+const findActiveReceiptHeaderBySupplierDoNumber = async (client, { supplier, doNumber, excludeId = null, forUpdate = false } = {}) => {
+  const supplierValue = String(supplier || "").trim();
+  const doValue = normalizeDoNumber(doNumber);
+  if (!supplierValue || !doValue) return null;
+  const values = [supplierValue, doValue, RECEIPT_HEADER_ACTIVE_STATUSES];
+  let query = `
+    select *
+    from receive_note_headers
+    where lower(trim(supplier)) = lower(trim($1))
+      and lower(trim(do_number)) = lower(trim($2))
+      and status = any($3::text[])
+  `;
+  if (excludeId !== null) {
+    values.push(parsePositiveId(excludeId));
+    query += ` and id <> $${values.length}`;
+  }
+  if (forUpdate) query += " for update";
+  const result = await client.query(query, values);
+  return result.rows[0] || null;
+};
+
+const ensureEditableReceiptHeader = (header) => {
+  if (!header) {
+    const error = new Error("Draft receipt tidak ditemukan.");
+    error.statusCode = 404;
+    throw error;
+  }
+  const statusKey = normalizeReceiptStatus(header.status);
+  if (statusKey === "posted" || statusKey === "reversed") {
+    const error = new Error("Receipt sudah final dan tidak bisa diubah.");
+    error.statusCode = 409;
+    throw error;
+  }
+};
+
+const resolveReceiptSupplierId = async (client, supplierValue) => {
+  const trimmed = String(supplierValue || "").trim();
+  if (!trimmed) return "";
+  return await resolveSupplierCode(client, trimmed, { strict: false });
+};
+
+const loadReceiptScheduleCandidates = async (client, { supplierId, itemCode, poNumber, limit = 10 } = {}) => {
+  if (!supplierId || !itemCode) return [];
+  const normalizedPo = normalizePoNumber(poNumber);
+  const result = await client.query(
+    `
+    select
+      s.id as schedule_id,
+      s.po_number,
+      coalesce(s.item_code, s.item) as item_code,
+      s.request_date,
+      s.request_qty,
+      s.received_qty,
+      greatest(coalesce(s.request_qty, 0) - coalesce(s.received_qty, 0), 0)::numeric as outstanding_qty,
+      case when s.po_number = $3 then 100 else 80 end as score
+    from schedules s
+    where lower(trim(coalesce(s.item_code, s.item))) = lower(trim($1))
+      and lower(trim(coalesce(s.supplier_id, s.supplier))) = lower(trim($2))
+      and greatest(coalesce(s.request_qty, 0) - coalesce(s.received_qty, 0), 0) > 0
+      and upper(coalesce(s.status, '')) not in ('CANCELLED','REJECTED','CLOSED')
+    order by
+      case when s.po_number = $3 then 0 else 1 end,
+      s.request_date asc nulls last,
+      s.id asc
+    limit $4
+    `,
+    [itemCode, supplierId, normalizedPo || "", limit],
+  );
+  return (result.rows || []).map((row) => ({
+    candidateType: "schedule",
+    scheduleId: row.schedule_id,
+    poNumber: row.po_number,
+    poLineId: null,
+    itemCode: row.item_code,
+    requestDate: formatDateOnly(row.request_date),
+    outstandingQty: Number(row.outstanding_qty || 0),
+    remainingQty: Number(row.outstanding_qty || 0),
+    score: Number(row.score || 0),
+    reason: row.po_number === normalizedPo ? "same_po_same_item_open_outstanding" : "same_supplier_same_item_nearest_date",
+  }));
+};
+
+const loadReceiptPoLineCandidates = async (client, { supplierId, itemCode, poNumber, limit = 10 } = {}) => {
+  if (!supplierId || !itemCode) return [];
+  const normalizedPo = normalizePoNumber(poNumber);
+  const result = await client.query(
+    `
+    select
+      pl.id as po_line_id,
+      pl.po_number,
+      pl.item_code,
+      ph.supplier_id,
+      (
+        pl.qty_order - pl.qty_received - (
+          select coalesce(sum(greatest(s.request_qty - s.received_qty, 0)), 0)::numeric
+          from schedules s
+          where s.po_line_id = pl.id
+             or (s.po_line_id is null and s.po_number = pl.po_number and coalesce(s.item_code, s.item) = pl.item_code)
+        )
+      )::numeric as remaining_after_schedule,
+      case when pl.po_number = $3 then 80 else 60 end as score
+    from po_lines pl
+    join po_headers ph on ph.po_number = pl.po_number
+    where lower(trim(pl.item_code)) = lower(trim($1))
+      and lower(trim(ph.supplier_id)) = lower(trim($2))
+      and ph.status in ('open','partial')
+      and (
+        pl.qty_order - pl.qty_received - (
+          select coalesce(sum(greatest(s.request_qty - s.received_qty, 0)), 0)::numeric
+          from schedules s
+          where s.po_line_id = pl.id
+             or (s.po_line_id is null and s.po_number = pl.po_number and coalesce(s.item_code, s.item) = pl.item_code)
+        )
+      ) > 0
+    order by
+      case when pl.po_number = $3 then 0 else 1 end,
+      pl.po_number asc,
+      pl.line_no asc
+    limit $4
+    `,
+    [itemCode, supplierId, normalizedPo || "", limit],
+  );
+  return (result.rows || []).map((row) => ({
+    candidateType: "po_line_create_schedule",
+    scheduleId: null,
+    poNumber: row.po_number,
+    poLineId: row.po_line_id,
+    itemCode: row.item_code,
+    requestDate: null,
+    outstandingQty: Number(row.remaining_after_schedule || 0),
+    remainingQty: Number(row.remaining_after_schedule || 0),
+    score: Number(row.score || 0),
+    reason: row.po_number === normalizedPo ? "same_po_item_open_but_no_schedule" : "open_po_line_no_schedule",
+  }));
+};
+
+const recommendReceiptCandidatesForLine = async (client, { header, line, limit = 10 } = {}) => {
+  if (!header || !line?.item_code) return [];
+  const supplierId = await resolveReceiptSupplierId(client, header.supplier);
+  if (!supplierId) return [];
+  const schedules = await loadReceiptScheduleCandidates(client, {
+    supplierId,
+    itemCode: line.item_code,
+    poNumber: header.po_number,
+    limit,
+  });
+  const poLines = await loadReceiptPoLineCandidates(client, {
+    supplierId,
+    itemCode: line.item_code,
+    poNumber: header.po_number,
+    limit,
+  });
+  return [...schedules, ...poLines]
+    .sort((left, right) => {
+      if (Number(right.score || 0) !== Number(left.score || 0)) return Number(right.score || 0) - Number(left.score || 0);
+      return String(left.poNumber || "").localeCompare(String(right.poNumber || ""));
+    })
+    .slice(0, limit);
+};
+
+const createReceiptDraft = async (client, payload = {}, user = null) => {
+  const data = normalizeReceiptHeaderPayload(payload);
+  if (!data.supplier) {
+    const error = new Error("supplier wajib diisi.");
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!data.doNumber) {
+    const error = new Error("doNumber wajib diisi.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const existing = await findActiveReceiptHeaderBySupplierDoNumber(client, {
+    supplier: data.supplier,
+    doNumber: data.doNumber,
+    forUpdate: true,
+  });
+  if (existing) {
+    const statusKey = normalizeReceiptStatus(existing.status);
+    if (statusKey === "posted") {
+      const error = new Error("Nomor surat jalan sudah pernah diposting untuk supplier ini.");
+      error.statusCode = 409;
+      error.receiptHeader = existing;
+      throw error;
+    }
+    return existing;
+  }
+  const numbering = await getDocumentNumberingConfig(client);
+  const supplierCodeRaw = await resolveSupplierCode(client, data.supplier);
+  const supplierCode = supplierCodeRaw || data.supplier;
+  const rnNumber = await buildDocumentNumber(
+    client,
+    "receive_note_headers",
+    "rn_number",
+    requireFormat(numbering.rnFormat, "RN format"),
+    {
+      dept: numbering.dept,
+      prefix: "RN",
+      supplier: data.supplier,
+      supplierCode,
+      date: data.documentDate || undefined,
+    },
+  );
+  const result = await client.query(
+    `
+    insert into receive_note_headers
+      (rn_number, supplier, remarks, truck_no, driver_name, created_by, status, source, do_number, document_date, po_number, duplicate_status, idempotency_key)
+    values ($1,$2,$3,$4,$5,$6,'draft',$7,$8,$9,$10,'unique',$11)
+    returning *
+    `,
+    [
+      rnNumber,
+      data.supplier,
+      data.remarks,
+      data.truckNo,
+      data.driverName,
+      user?.id || null,
+      data.source,
+      data.doNumber,
+      data.documentDate || null,
+      data.poNumber || null,
+      data.idempotencyKey,
+    ],
+  );
+  return result.rows[0];
+};
+
+const upsertReceiptDraftLine = async (client, draftId, payload = {}) => {
+  const header = await getReceiptHeaderById(client, draftId, { forUpdate: true });
+  ensureEditableReceiptHeader(header);
+  const data = normalizeReceiptDraftLinePayload(payload);
+  if (!data.itemCode) {
+    const error = new Error("itemCode wajib diisi.");
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!(data.receivedQty > 0)) {
+    const error = new Error("receivedQty wajib > 0.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const existing = await getReceiptLineByHeaderLineNo(client, draftId, data.lineNo, { forUpdate: true });
+  if (existing) {
+    const result = await client.query(
+      `
+      update receive_note_items
+      set
+        origin_dn_id = $1,
+        item_code = $2,
+        item_name = $3,
+        part_no = $4,
+        unit = $5,
+        pack_qty = $6,
+        doc_qty = $7,
+        received_qty = $8,
+        drop_zone = $9,
+        schedule_id = $10,
+        po_line_id = $11,
+        qc_status = $12,
+        arrival_date = $13,
+        notes = $14,
+        production_date = $15,
+        expired_date = $16,
+        line_status = 'draft',
+        match_status = 'matched',
+        match_basis = $17,
+        override_reason = $18,
+        exception_code = null
+      where id = $19
+      returning *
+      `,
+      [
+        data.originDnId,
+        data.itemCode,
+        data.itemName,
+        data.partNo,
+        data.unit,
+        data.packQty,
+        data.docQty,
+        data.receivedQty,
+        data.dropZone,
+        data.scheduleId,
+        data.poLineId,
+        data.qcStatus,
+        data.arrivalDate,
+        data.notes,
+        data.productionDate,
+        data.expiredDate,
+        data.matchBasis,
+        data.overrideReason,
+        existing.id,
+      ],
+    );
+    return result.rows[0];
+  }
+  const result = await client.query(
+    `
+    insert into receive_note_items
+      (rn_id, line_no, origin_dn_id, item_code, item_name, part_no, unit, pack_qty, doc_qty, received_qty, drop_zone, schedule_id, po_line_id, qc_status, line_status, arrival_date, notes, production_date, expired_date, posted_qty, match_status, match_basis, override_reason)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'draft',$15,$16,$17,$18,0,'matched',$19,$20)
+    returning *
+    `,
+    [
+      draftId,
+      data.lineNo,
+      data.originDnId,
+      data.itemCode,
+      data.itemName,
+      data.partNo,
+      data.unit,
+      data.packQty,
+      data.docQty,
+      data.receivedQty,
+      data.dropZone,
+      data.scheduleId,
+      data.poLineId,
+      data.qcStatus,
+      data.arrivalDate,
+      data.notes,
+      data.productionDate,
+      data.expiredDate,
+      data.matchBasis,
+      data.overrideReason,
+    ],
+  );
+  return result.rows[0];
+};
+
+const recommendReceiptCandidates = async (client, draftId, lineNo, options = {}) => {
+  const header = await getReceiptHeaderById(client, draftId);
+  if (!header) {
+    const error = new Error("Draft receipt tidak ditemukan.");
+    error.statusCode = 404;
+    throw error;
+  }
+  const line = await getReceiptLineByHeaderLineNo(client, draftId, lineNo);
+  if (!line) {
+    const error = new Error("Line draft tidak ditemukan.");
+    error.statusCode = 404;
+    throw error;
+  }
+  const candidates = await recommendReceiptCandidatesForLine(client, {
+    header,
+    line,
+    limit: Number(options.limit || 10),
+  });
+  return {
+    lineNo: Number(line.line_no || 0),
+    itemCode: line.item_code,
+    supplier: header.supplier,
+    doNumber: header.do_number,
+    candidates,
+  };
+};
+
+const validateReceiptDraft = async (client, draftId, user = null, options = {}) => {
+  const persist = options.persist !== false;
+  const allowOverReceive = Boolean(options.allowOverReceive);
+  const header = await getReceiptHeaderById(client, draftId, { forUpdate: persist });
+  ensureEditableReceiptHeader(header);
+  const lines = await getReceiptLinesByHeader(client, draftId, { forUpdate: persist });
+  const allowedQc = await getQcStatusList(client);
+  const qcList = allowedQc.length > 0 ? allowedQc : ["ok", "hold", "reject"];
+  const safeRows = [];
+  const warningRows = [];
+  const errorRows = [];
+  const heldRows = [];
+
+  if (!String(header.supplier || "").trim()) {
+    errorRows.push({ scope: "header", reason: "supplier_required", message: "supplier wajib diisi." });
+  }
+  if (!normalizeDoNumber(header.do_number)) {
+    errorRows.push({ scope: "header", reason: "do_number_required", message: "doNumber wajib diisi." });
+  }
+  const duplicateHeader = await findActiveReceiptHeaderBySupplierDoNumber(client, {
+    supplier: header.supplier,
+    doNumber: header.do_number,
+    excludeId: header.id,
+  });
+  if (duplicateHeader) {
+    errorRows.push({
+      scope: "header",
+      reason: "duplicate_do_number",
+      message: "Nomor surat jalan aktif sudah ada untuk supplier ini.",
+      existingReceiptId: duplicateHeader.id,
+      existingStatus: duplicateHeader.status,
+    });
+  }
+  if (lines.length === 0) {
+    errorRows.push({ scope: "header", reason: "draft_empty", message: "Draft receipt belum memiliki line." });
+  }
+
+  const supplierId = await resolveReceiptSupplierId(client, header.supplier);
+  for (const line of lines) {
+    const lineNo = Number(line.line_no || 0);
+    const itemCode = normalizeItemCode(line.item_code);
+    const receivedQty = Number(line.received_qty || 0);
+    const qcStatus = String(line.qc_status || "").trim().toLowerCase();
+    const existingLineStatus = normalizeReceiptStatus(line.line_status);
+    let lineStatus = "validated";
+    let matchStatus = "matched";
+    let matchBasis = line.match_basis || null;
+    let exceptionCode = null;
+    let lineIssue = null;
+
+    if (existingLineStatus === "posted") {
+      safeRows.push({
+        lineNo,
+        itemCode,
+        matchStatus: normalizeReceiptStatus(line.match_status) || "matched",
+        qcStatus,
+        alreadyPosted: true,
+      });
+      continue;
+    }
+
+    if (!itemCode) {
+      lineIssue = { type: "error", reason: "item_required", message: "itemCode wajib diisi." };
+    } else if (!(receivedQty > 0)) {
+      lineIssue = { type: "error", reason: "received_qty_invalid", message: "receivedQty wajib > 0." };
+    } else if (!qcList.includes(qcStatus)) {
+      lineIssue = { type: "error", reason: "qc_invalid", message: "qcStatus tidak valid." };
+    }
+
+    if (!lineIssue && line.schedule_id) {
+      const scheduleResult = await client.query("select * from schedules where id = $1", [line.schedule_id]);
+      const schedule = scheduleResult.rows[0] || null;
+      const scheduleItemCode = normalizeItemCode(schedule?.item_code || schedule?.item);
+      const scheduleSupplierId = String(schedule?.supplier_id || schedule?.supplier || "").trim();
+      const scheduleStatus = String(schedule?.status || "").trim().toUpperCase();
+      const outstandingQty = Math.max(0, Number(schedule?.request_qty || 0) - Number(schedule?.received_qty || 0));
+      if (!schedule) {
+        lineIssue = { type: "error", reason: "schedule_not_found", message: "schedule tidak ditemukan." };
+      } else if (scheduleItemCode !== itemCode) {
+        matchStatus = "mismatch_item";
+        exceptionCode = "schedule_item_mismatch";
+        lineIssue = { type: "error", reason: "schedule_item_mismatch", message: "Item fisik tidak sesuai dengan item schedule." };
+      } else if (supplierId && scheduleSupplierId && supplierId !== scheduleSupplierId) {
+        lineIssue = { type: "error", reason: "schedule_supplier_mismatch", message: "Supplier receipt tidak sesuai dengan supplier schedule." };
+      } else if (["CANCELLED", "REJECTED", "CLOSED"].includes(scheduleStatus)) {
+        lineIssue = { type: "error", reason: "schedule_not_receivable", message: "Schedule tidak bisa dipakai untuk receiving." };
+      } else if (receivedQty > outstandingQty) {
+        if (allowOverReceive && String(line.override_reason || "").trim()) {
+          matchStatus = "over_receipt";
+          matchBasis = matchBasis || "schedule";
+          warningRows.push({
+            lineNo,
+            itemCode,
+            matchStatus,
+            reason: "over_receipt",
+            outstandingQty,
+            receivedQty,
+          });
+        } else {
+          lineIssue = { type: "error", reason: "over_receipt_blocked", message: "Qty receive melebihi outstanding schedule." };
+        }
+      } else {
+        matchBasis = matchBasis || "schedule";
+      }
+    }
+
+    if (!lineIssue && !line.schedule_id && line.po_line_id) {
+      const poLine = await resolvePoLineById(client, line.po_line_id);
+      if (!poLine) {
+        lineIssue = { type: "error", reason: "po_line_not_found", message: "PO line tidak ditemukan." };
+      } else if (normalizeItemCode(poLine.item_code) !== itemCode) {
+        matchStatus = "mismatch_item";
+        exceptionCode = "po_line_item_mismatch";
+        lineIssue = { type: "error", reason: "po_line_item_mismatch", message: "Item fisik tidak sesuai dengan PO line." };
+      } else {
+        const poHeader = await resolvePoHeader(client, poLine.po_number);
+        const poSupplierId = String(poHeader?.supplier_id || "").trim();
+        const { remaining } = await resolvePoLineScheduleRemaining(client, poLine);
+        if (supplierId && poSupplierId && supplierId !== poSupplierId) {
+          lineIssue = { type: "error", reason: "po_supplier_mismatch", message: "Supplier receipt tidak sesuai dengan supplier PO." };
+        } else if (receivedQty > remaining) {
+          if (allowOverReceive && String(line.override_reason || "").trim()) {
+            matchStatus = "over_receipt";
+            matchBasis = matchBasis || "po_line";
+            warningRows.push({
+              lineNo,
+              itemCode,
+              matchStatus,
+              reason: "over_receipt",
+              outstandingQty: remaining,
+              receivedQty,
+            });
+          } else {
+            lineIssue = { type: "error", reason: "over_receipt_blocked", message: "Qty receive melebihi outstanding PO line." };
+          }
+        } else {
+          matchBasis = matchBasis || "po_line";
+        }
+      }
+    }
+
+    if (!lineIssue && !line.schedule_id && !line.po_line_id && line.origin_dn_id) {
+      const deliveryNoteItemResult = await client.query(
+        `
+        select
+          dn.id as dn_id,
+          dn.supplier as dn_supplier,
+          dn.dn_number,
+          dni.request_qty,
+          dni.pack_qty
+        from delivery_notes dn
+        join delivery_note_items dni
+          on dni.dn_id = dn.id
+         and lower(trim(dni.item_code)) = lower(trim($2))
+        where dn.id = $1
+        limit 1
+        `,
+        [line.origin_dn_id, itemCode],
+      );
+      const deliveryNoteItem = deliveryNoteItemResult.rows[0] || null;
+      const dnSupplier = String(deliveryNoteItem?.dn_supplier || "").trim();
+      const docQty = Number(deliveryNoteItem?.request_qty || line.doc_qty || 0);
+      if (!deliveryNoteItem) {
+        lineIssue = { type: "error", reason: "delivery_note_item_not_found", message: "Item fisik tidak ada di delivery note." };
+      } else if (supplierId) {
+        const dnSupplierId = await resolveReceiptSupplierId(client, dnSupplier);
+        if (dnSupplierId && dnSupplierId !== supplierId) {
+          lineIssue = { type: "error", reason: "delivery_note_supplier_mismatch", message: "Supplier receipt tidak sesuai dengan supplier delivery note." };
+        }
+      }
+      if (!lineIssue && receivedQty > docQty) {
+        if (allowOverReceive && String(line.override_reason || "").trim()) {
+          matchStatus = "over_receipt";
+          matchBasis = matchBasis || "delivery_note";
+          warningRows.push({
+            lineNo,
+            itemCode,
+            matchStatus,
+            reason: "over_receipt",
+            outstandingQty: docQty,
+            receivedQty,
+          });
+        } else {
+          lineIssue = { type: "error", reason: "over_receipt_blocked", message: "Qty receive melebihi qty delivery note." };
+        }
+      } else if (!lineIssue) {
+        matchBasis = matchBasis || "delivery_note";
+      }
+    }
+
+    if (!lineIssue && !line.schedule_id && !line.po_line_id && !line.origin_dn_id) {
+      matchStatus = "held";
+      matchBasis = matchBasis || "system_recommendation";
+      exceptionCode = "missing_reference";
+      const candidates = await recommendReceiptCandidatesForLine(client, { header, line, limit: 5 });
+      heldRows.push({
+        lineNo,
+        itemCode,
+        matchStatus,
+        reason: "no_reference_selected",
+        candidateCount: candidates.length,
+        candidates,
+      });
+    }
+
+    if (lineIssue) {
+      lineStatus = "error";
+      errorRows.push({
+        lineNo,
+        itemCode,
+        matchStatus,
+        reason: lineIssue.reason,
+        message: lineIssue.message,
+      });
+    } else if (matchStatus === "held") {
+      lineStatus = "validated";
+    } else if (!warningRows.some((row) => row.lineNo === lineNo)) {
+      safeRows.push({
+        lineNo,
+        itemCode,
+        matchStatus,
+        qcStatus,
+      });
+    }
+
+    if (persist) {
+      await client.query(
+        `
+        update receive_note_items
+        set
+          line_status = $1,
+          match_status = $2,
+          match_basis = $3,
+          exception_code = $4,
+          qc_status = $5
+        where id = $6
+        `,
+        [lineStatus, matchStatus, matchBasis, exceptionCode, qcStatus || "ok", line.id],
+      );
+    }
+  }
+
+  const headerStatus = errorRows.length > 0 ? "draft" : "validated";
+  if (persist) {
+    await client.query(
+      `
+      update receive_note_headers
+      set
+        status = $1,
+        validated_at = case when $1 = 'validated' then now() else validated_at end,
+        validated_by = case when $1 = 'validated' then $2 else validated_by end,
+        posting_error = $3
+      where id = $4
+      `,
+      [headerStatus, user?.id || null, errorRows.length > 0 ? errorRows.map((row) => row.reason).join(", ") : null, header.id],
+    );
+  }
+
+  return {
+    headerStatus,
+    safeRows,
+    warningRows,
+    errorRows,
+    heldRows,
+    summary: {
+      totalRows: lines.length,
+      safeCount: safeRows.length,
+      warningCount: warningRows.length,
+      errorCount: errorRows.length,
+      heldCount: heldRows.length,
+    },
+  };
+};
+
+const postReceiptDraft = async (client, draftId, user = null, options = {}) => {
+  const header = await getReceiptHeaderById(client, draftId, { forUpdate: true });
+  ensureEditableReceiptHeader(header);
+  const validation = await validateReceiptDraft(client, draftId, user, {
+    persist: true,
+    allowOverReceive: Boolean(options.allowOverReceive),
+  });
+  if (validation.errorRows.length > 0) {
+    const error = new Error("Draft receipt masih memiliki error.");
+    error.statusCode = 409;
+    error.validation = validation;
+    throw error;
+  }
+  const allowPartial = options.allowPartial !== false;
+  const lines = await getReceiptLinesByHeader(client, draftId, { forUpdate: true });
+  const postedLines = [];
+  const skippedLines = [];
+  const todayDate = new Date().toISOString().slice(0, 10);
+
+  for (const line of lines) {
+    const matchStatus = normalizeReceiptStatus(line.match_status);
+    const lineStatus = normalizeReceiptStatus(line.line_status);
+    const qtyValue = Number(line.received_qty || 0);
+    if (lineStatus === "posted") {
+      skippedLines.push({ lineNo: line.line_no, itemCode: line.item_code, reason: "already_posted" });
+      continue;
+    }
+    if (!(qtyValue > 0)) {
+      skippedLines.push({ lineNo: line.line_no, itemCode: line.item_code, reason: "qty_zero" });
+      continue;
+    }
+    if (!RECEIPT_POSTABLE_MATCH_STATUSES.has(matchStatus)) {
+      if (!allowPartial) {
+        const error = new Error("Ada line receipt yang belum punya referensi valid.");
+        error.statusCode = 409;
+        throw error;
+      }
+      skippedLines.push({ lineNo: line.line_no, itemCode: line.item_code, reason: matchStatus || "not_postable" });
+      continue;
+    }
+
+    const qcStatus = String(line.qc_status || "ok").trim().toLowerCase();
+    const packQty = Number.isFinite(Number(line.pack_qty)) ? Number(line.pack_qty) : await resolveItemPackQty(client, line.item_code);
+    const isLoose = isLooseQty(qtyValue, packQty);
+    const arrivalDate = line.arrival_date || header.document_date || todayDate;
+    const { productionDate: productionDateValue, expiredDate: expiredDateValue } = await resolveBatchDates(
+      client,
+      line.item_code,
+      line.production_date,
+      line.expired_date,
+    );
+    const referenceDoc = header.do_number || header.rn_number;
+    let schedule = null;
+    let poLine = null;
+
+    if (line.schedule_id) {
+      const scheduleResult = await client.query("select * from schedules where id = $1 for update", [line.schedule_id]);
+      schedule = scheduleResult.rows[0] || null;
+    }
+    if (line.po_line_id) {
+      poLine = await resolvePoLineById(client, line.po_line_id, { forUpdate: true });
+    } else if (schedule) {
+      poLine = await resolvePoLineForSchedule(client, schedule, { lock: true });
+    }
+
+    if (poLine) {
+      await client.query(
+        "update po_lines set qty_received = qty_received + $1 where id = $2",
+        [qtyValue, poLine.id],
+      );
+      await refreshPoHeaderStatus(client, poLine.po_number);
+    }
+
+    let batchId = null;
+    if (!RECEIPT_QC_BLOCKED_FOR_STOCK.has(qcStatus)) {
+      if (schedule?.id) {
+        await client.query(
+          `
+          insert into stock_batches (item_code, qty_in, arrival_date, do_number, batch_no, schedule_id, is_loose, production_date, expired_date)
+          values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          on conflict (schedule_id) do update set
+            qty_in = stock_batches.qty_in + excluded.qty_in,
+            arrival_date = coalesce(stock_batches.arrival_date, excluded.arrival_date),
+            do_number = coalesce(stock_batches.do_number, excluded.do_number),
+            batch_no = coalesce(stock_batches.batch_no, excluded.batch_no),
+            is_loose = stock_batches.is_loose or excluded.is_loose,
+            production_date = coalesce(stock_batches.production_date, excluded.production_date),
+            expired_date = coalesce(stock_batches.expired_date, excluded.expired_date)
+          `,
+          [line.item_code, qtyValue, arrivalDate, header.do_number || null, `${header.do_number || header.rn_number}-${line.line_no}`, schedule.id, isLoose, productionDateValue, expiredDateValue],
+        );
+        const batchResult = await client.query("select id from stock_batches where schedule_id = $1", [schedule.id]);
+        batchId = batchResult.rows[0]?.id || null;
+      } else {
+        const batchResult = await client.query(
+          `
+          insert into stock_batches (item_code, qty_in, arrival_date, do_number, batch_no, schedule_id, is_loose, production_date, expired_date)
+          values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          returning id
+          `,
+          [line.item_code, qtyValue, arrivalDate, header.do_number || null, `${header.do_number || header.rn_number}-${line.line_no}`, null, isLoose, productionDateValue, expiredDateValue],
+        );
+        batchId = batchResult.rows[0]?.id || null;
+      }
+      await logStockMovement(client, {
+        itemCode: line.item_code,
+        batchId,
+        qty: qtyValue,
+        direction: "in",
+        reason: "inbound_receipt",
+        sourceRefType: "inbound_receipt",
+        sourceRefId: header.id,
+        sourceRefLineId: line.id,
+      });
+      await client.query(
+        "update items set qty_on_hand = qty_on_hand + $1 where code = $2",
+        [qtyValue, line.item_code],
+      );
+      await insertInventoryLedger(client, {
+        itemCode: line.item_code,
+        transactionType: "RECEIVING",
+        referenceDoc,
+        qtyIn: qtyValue,
+        qtyOut: 0,
+        userId: user?.id || null,
+        remarks: header.remarks || null,
+        batchId,
+        sourceRefType: "inbound_receipt",
+        sourceRefId: header.id,
+        sourceRefLineId: line.id,
+      });
+    }
+
+    if (schedule) {
+      const nextReceived = Number(schedule.received_qty || 0) + qtyValue;
+      const nextStatus = qcStatus === "ok" ? "RECEIVED" : qcStatus === "hold" ? "HOLD" : "REJECTED";
+      await client.query(
+        `
+        update schedules
+        set received_qty = $1,
+            arrival_date = coalesce(arrival_date, $2),
+            do_number = coalesce(do_number, $3),
+            status = $4,
+            updated_at = now()
+        where id = $5
+        `,
+        [nextReceived, arrivalDate, header.do_number || null, nextStatus, schedule.id],
+      );
+    }
+
+    await client.query(
+      `
+      update receive_note_items
+      set line_status = 'posted',
+          posted_qty = $1,
+          arrival_date = coalesce(arrival_date, $2)
+      where id = $3
+      `,
+      [RECEIPT_QC_BLOCKED_FOR_STOCK.has(qcStatus) ? 0 : qtyValue, arrivalDate, line.id],
+    );
+    postedLines.push({
+      lineNo: line.line_no,
+      itemCode: line.item_code,
+      qty: qtyValue,
+      batchId,
+      qcStatus,
+    });
+  }
+
+  await client.query(
+    `
+    update receive_note_headers
+    set status = 'posted',
+        posted_at = now(),
+        posted_by = $1,
+        posting_error = null,
+        duplicate_status = case when duplicate_status = 'duplicate_blocked' then 'unique' else duplicate_status end
+    where id = $2
+    `,
+    [user?.id || null, header.id],
+  );
+
+  return {
+    headerId: header.id,
+    status: "posted",
+    postedLines,
+    skippedLines,
+    validation,
+  };
+};
+
+const reverseReceipt = async (client, receiptId, user = null, payload = {}) => {
+  const header = await getReceiptHeaderById(client, receiptId, { forUpdate: true });
+  if (!header) {
+    const error = new Error("Receipt tidak ditemukan.");
+    error.statusCode = 404;
+    throw error;
+  }
+  if (normalizeReceiptStatus(header.status) !== "posted") {
+    const error = new Error("Hanya receipt posted yang bisa direverse.");
+    error.statusCode = 409;
+    throw error;
+  }
+  const reversalReason = String(payload.reason || "").trim();
+  if (!reversalReason) {
+    const error = new Error("reason wajib diisi untuk reversal.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const numbering = await getDocumentNumberingConfig(client);
+  const supplierCodeRaw = await resolveSupplierCode(client, header.supplier);
+  const reversalRn = await buildDocumentNumber(
+    client,
+    "receive_note_headers",
+    "rn_number",
+    requireFormat(numbering.rnFormat, "RN format"),
+    {
+      dept: numbering.dept,
+      prefix: "RN",
+      supplier: header.supplier,
+      supplierCode: supplierCodeRaw || header.supplier,
+    },
+  );
+  const reversalHeaderResult = await client.query(
+    `
+    insert into receive_note_headers
+      (rn_number, supplier, remarks, truck_no, driver_name, created_by, status, source, do_number, document_date, po_number, duplicate_status, posted_at, posted_by, reversal_of)
+    values ($1,$2,$3,$4,$5,$6,'posted','REVERSAL',null,$7,$8,'unique',now(),$6,$9)
+    returning *
+    `,
+    [
+      reversalRn,
+      header.supplier,
+      reversalReason,
+      header.truck_no || null,
+      header.driver_name || null,
+      user?.id || null,
+      header.document_date || null,
+      header.po_number || null,
+      header.id,
+    ],
+  );
+  const reversalHeader = reversalHeaderResult.rows[0];
+  const lines = await getReceiptLinesByHeader(client, header.id, { forUpdate: true });
+  const reversedLines = [];
+  for (const line of lines) {
+    const postedQty = Number(line.posted_qty || 0);
+    if (!(postedQty > 0)) continue;
+    let batchRow = null;
+    if (line.schedule_id) {
+      const batchResult = await client.query(
+        "select * from stock_batches where schedule_id = $1 for update",
+        [line.schedule_id],
+      );
+      batchRow = batchResult.rows[0] || null;
+    } else {
+      const batchResult = await client.query(
+        `
+        select *
+        from stock_batches
+        where item_code = $1
+          and coalesce(do_number, '') = coalesce($2, '')
+        order by id desc
+        limit 1
+        for update
+        `,
+        [line.item_code, header.do_number || ""],
+      );
+      batchRow = batchResult.rows[0] || null;
+    }
+    if (batchRow) {
+      const qtyOut = Number(batchRow.qty_out || 0);
+      const qtyIn = Number(batchRow.qty_in || 0);
+      if (qtyOut > 0) {
+        const error = new Error("Batch receipt sudah terpakai dan tidak bisa direverse otomatis.");
+        error.statusCode = 409;
+        throw error;
+      }
+      const nextQtyIn = qtyIn - postedQty;
+      if (nextQtyIn <= 0) {
+        await client.query("delete from stock_batches where id = $1", [batchRow.id]);
+      } else {
+        await client.query("update stock_batches set qty_in = $1 where id = $2", [nextQtyIn, batchRow.id]);
+      }
+      await logStockMovement(client, {
+        itemCode: line.item_code,
+        batchId: batchRow.id,
+        qty: postedQty,
+        direction: "out",
+        reason: "receipt_reverse",
+        sourceRefType: "inbound_receipt_reversal",
+        sourceRefId: reversalHeader.id,
+        sourceRefLineId: line.id,
+      });
+    }
+    await client.query(
+      "update items set qty_on_hand = greatest(qty_on_hand - $1, 0) where code = $2",
+      [postedQty, line.item_code],
+    );
+    await insertInventoryLedger(client, {
+      itemCode: line.item_code,
+      transactionType: "REVERSAL",
+      referenceDoc: reversalHeader.rn_number,
+      qtyIn: 0,
+      qtyOut: postedQty,
+      userId: user?.id || null,
+      remarks: reversalReason,
+      sourceRefType: "inbound_receipt_reversal",
+      sourceRefId: reversalHeader.id,
+      sourceRefLineId: line.id,
+    });
+    if (line.po_line_id) {
+      await client.query(
+        "update po_lines set qty_received = greatest(qty_received - $1, 0) where id = $2",
+        [postedQty, line.po_line_id],
+      );
+      const poLine = await resolvePoLineById(client, line.po_line_id);
+      if (poLine?.po_number) {
+        await refreshPoHeaderStatus(client, poLine.po_number);
+      }
+    }
+    if (line.schedule_id) {
+      const scheduleResult = await client.query("select * from schedules where id = $1 for update", [line.schedule_id]);
+      const schedule = scheduleResult.rows[0] || null;
+      if (schedule) {
+        const nextReceived = Math.max(0, Number(schedule.received_qty || 0) - postedQty);
+        const nextStatus = getScheduleStatusFromActual({
+          requestDate: schedule.request_date,
+          arrivalDate: schedule.arrival_date,
+        });
+        await client.query(
+          `
+          update schedules
+          set received_qty = $1,
+              status = $2,
+              actual_locked = case when $1 <= 0 then false else actual_locked end,
+              updated_at = now()
+          where id = $3
+          `,
+          [nextReceived, nextStatus, schedule.id],
+        );
+      }
+    }
+    const reversalLineResult = await client.query(
+      `
+      insert into receive_note_items
+        (rn_id, line_no, origin_dn_id, item_code, item_name, part_no, unit, pack_qty, doc_qty, received_qty, drop_zone, schedule_id, po_line_id, qc_status, line_status, arrival_date, notes, posted_qty, match_status, match_basis, override_reason, exception_code, reversal_of_item_id)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'posted',$15,$16,$17,$18,$19,$20,$21,$22)
+      returning *
+      `,
+      [
+        reversalHeader.id,
+        Number(line.line_no || 0),
+        line.origin_dn_id || null,
+        line.item_code,
+        line.item_name || null,
+        line.part_no || null,
+        line.unit || null,
+        line.pack_qty || null,
+        Number(line.doc_qty || 0),
+        Number(line.received_qty || 0),
+        line.drop_zone || null,
+        line.schedule_id || null,
+        line.po_line_id || null,
+        String(line.qc_status || "ok").trim().toLowerCase(),
+        line.arrival_date || null,
+        reversalReason,
+        -postedQty,
+        line.match_status || "matched",
+        line.match_basis || null,
+        line.override_reason || null,
+        "receipt_reversal",
+        line.id,
+      ],
+    );
+    reversedLines.push(reversalLineResult.rows[0]);
+  }
+  await client.query(
+    `
+    update receive_note_items
+    set line_status = 'reversed'
+    where rn_id = $1 and line_status = 'posted'
+    `,
+    [header.id],
+  );
+  await client.query(
+    `
+    update receive_note_headers
+    set status = 'reversed',
+        reversed_at = now(),
+        reversed_by = $1
+    where id = $2
+    `,
+    [user?.id || null, header.id],
+  );
+  return {
+    receiptId: header.id,
+    reversalId: reversalHeader.id,
+    status: "reversed",
+    reversedLines,
+  };
+};
+
+const diffDays = (fromDate, toDate) => {
+  const start = new Date(`${fromDate}T00:00:00.000Z`);
+  const end = new Date(`${toDate}T00:00:00.000Z`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+  return Math.floor((end - start) / (24 * 60 * 60 * 1000));
+};
+
+const resolveItemShelfLifeMonths = async (client, itemCode) => {
+  if (!itemCode) return 0;
+  const result = await client.query(
+    "select shelf_life_months from items where code = $1",
+    [itemCode],
+  );
+  const rawValue = result.rows[0]?.shelf_life_months;
+  const parsed = Number(rawValue);
+  return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : 0;
+};
+
+const resolveBatchDates = async (client, itemCode, productionDateInput, expiredDateInput) => {
+  const productionDate = normalizeDateOnly(productionDateInput);
+  const expiredDateManual = normalizeDateOnly(expiredDateInput);
+  if (expiredDateManual) {
+    return { productionDate, expiredDate: expiredDateManual };
+  }
+  if (!productionDate) {
+    return { productionDate: null, expiredDate: null };
+  }
+  const shelfLifeMonths = await resolveItemShelfLifeMonths(client, itemCode);
+  const expiredDate = addMonthsToDate(productionDate, shelfLifeMonths);
+  return { productionDate, expiredDate };
+};
+
+const assertBatchNotExpired = (batch, itemCode, warnings, warningSet) => {
+  const today = getTodayDateOnly();
+  const expiredDate = normalizeDateOnly(batch?.expired_date);
+  if (!expiredDate) return;
+  if (expiredDate < today) {
+    const err = new Error("Item Batch ini sudah EXPIRED! Tidak boleh digunakan.");
+    err.statusCode = 409;
+    err.itemCode = itemCode;
+    err.batchId = batch?.id;
+    throw err;
+  }
+  const daysLeft = diffDays(today, expiredDate);
+  if (daysLeft !== null && daysLeft >= 0 && daysLeft < 30) {
+    const key = `${itemCode || ""}:${batch?.id || ""}`;
+    if (!warningSet.has(key)) {
+      warningSet.add(key);
+      warnings.push({
+        itemCode,
+        batchId: batch?.id || null,
+        batchNo: batch?.batch_no || null,
+        expiredDate,
+        daysLeft,
+      });
+    }
+  }
+};
+
+const getBomChildren = async (client, parentCode) => {
+  const result = await client.query(
+    `select b.child_code as child_code, b.quantity as quantity, b.scrap_factor as scrap_factor, i.type as child_type
+     from master_bom b
+     join items i on i.code = b.child_code
+     where b.parent_code = $1`,
+    [parentCode],
+  );
+  return result.rows;
+};
+
+const explodeBom = async (client, parentCode, qty, accumulator, stack = []) => {
+  if (stack.includes(parentCode)) {
+    throw new Error(`BOM cycle detected: ${stack.join(" -> ")} -> ${parentCode}`);
+  }
+  const children = await getBomChildren(client, parentCode);
+  if (children.length === 0) return;
+  for (const child of children) {
+    const baseQty = Number(child.quantity || 0) * qty;
+    const scrapFactor = Number(child.scrap_factor || 0) / 100;
+    const requiredQty = baseQty * (1 + scrapFactor);
+    if ((child.child_type || "").toLowerCase().includes("raw")) {
+      accumulator[child.child_code] = (accumulator[child.child_code] || 0) + requiredQty;
+    } else {
+      await explodeBom(client, child.child_code, requiredQty, accumulator, [...stack, parentCode]);
+    }
+  }
+};
+
+const rollbackProduction = async (client, productionId) => {
+  const rows = await client.query(
+    "select item_code, batch_id, qty from production_consumption where production_id = $1",
+    [productionId],
+  );
+  const summary = new Map();
+  for (const row of rows.rows) {
+    await client.query(
+      "update stock_batches set qty_out = qty_out - $1 where id = $2",
+      [row.qty, row.batch_id],
+    );
+    const key = row.item_code;
+    const prev = summary.get(key) || 0;
+    summary.set(key, prev + Number(row.qty || 0));
+  }
+  await client.query("delete from production_consumption where production_id = $1", [productionId]);
+  return Array.from(summary.entries()).map(([itemCode, qty]) => ({ itemCode, qty }));
+};
+
+const applyProductionConsumption = async (client, productCode, qtyNumber, productionId, supplier = "", userId = null) => {
+  const requirements = {};
+  const warnings = [];
+  const warningSet = new Set();
+  await explodeBom(client, productCode, qtyNumber, requirements);
+  if (Object.keys(requirements).length === 0) {
+    throw new Error("BOM kosong untuk item ini");
+  }
+
+  for (const [itemCode, requiredQty] of Object.entries(requirements)) {
+    let remaining = requiredQty;
+    const supplierFilter = typeof supplier === "string" ? supplier.trim() : "";
+    const orderClause = await getFifoOrderClause(client, itemCode, "b");
+    const orderClauseNoAlias = await getFifoOrderClause(client, itemCode);
+    const batches = supplierFilter
+      ? await client.query(
+          `select b.id, b.qty_in, b.qty_out, b.batch_no, b.expired_date
+           from stock_batches b
+           join schedules s on s.id = b.schedule_id
+           where b.item_code = $1 and b.qty_in > b.qty_out and s.supplier = $2
+           ${orderClause}`,
+          [itemCode, supplierFilter],
+        )
+      : await client.query(
+          `select id, qty_in, qty_out, batch_no, expired_date
+           from stock_batches
+           where item_code = $1 and qty_in > qty_out
+           ${orderClauseNoAlias}`,
+          [itemCode],
+        );
+    for (const batch of batches.rows) {
+      if (remaining <= 0) break;
+      const available = Number(batch.qty_in) - Number(batch.qty_out);
+      assertBatchNotExpired(batch, itemCode, warnings, warningSet);
+      const consumeQty = Math.min(available, remaining);
+      const oldest = await getOldestAvailableBatch(client, itemCode);
+      if (oldest && oldest.id !== batch.id) {
+        await logFifoViolation(client, {
+          itemCode,
+          batchId: batch.id,
+          chosenBatchNo: batch.batch_no || null,
+          oldestBatchNo: oldest.batch_no || null,
+          reason: "production",
+        });
+      }
+      await client.query(
+        "update stock_batches set qty_out = qty_out + $1 where id = $2",
+        [consumeQty, batch.id],
+      );
+      await logStockMovement(client, {
+        itemCode,
+        batchId: batch.id,
+        qty: consumeQty,
+        direction: "out",
+        reason: "production",
+      });
+      await client.query(
+        "insert into production_consumption (production_id, item_code, batch_id, qty) values ($1, $2, $3, $4)",
+        [productionId, itemCode, batch.id, consumeQty],
+      );
+      remaining -= consumeQty;
+    }
+    if (remaining > 0) {
+      throw new Error(`Stok ${itemCode} tidak cukup. Kurang ${remaining}.`);
+    }
+    if (requiredQty > 0) {
+      await insertInventoryLedger(client, {
+        itemCode,
+        transactionType: "PRODUCTION",
+        referenceDoc: `PROD-${productionId}`,
+        qtyIn: 0,
+        qtyOut: requiredQty,
+        userId,
+        remarks: productCode || null,
+      });
+    }
+  }
+
+  return { requirements, warnings };
+};
+
+const logStockMovement = async (client, payload) => {
+  if (!payload?.itemCode || !payload?.qty) return;
+  await client.query(
+    `
+    insert into stock_movements
+      (item_code, batch_id, qty, direction, reason, source_ref_type, source_ref_id, source_ref_line_id)
+    values ($1, $2, $3, $4, $5, $6, $7, $8)
+    `,
+    [
+      payload.itemCode,
+      payload.batchId || null,
+      Number(payload.qty) || 0,
+      payload.direction || "out",
+      payload.reason || null,
+      payload.sourceRefType || null,
+      payload.sourceRefId || null,
+      payload.sourceRefLineId || null,
+    ],
+  );
+};
+
+const insertInventoryLedger = async (client, payload) => {
+  if (!payload?.itemCode) return null;
+  const qtyIn = Number(payload.qtyIn || 0);
+  const qtyOut = Number(payload.qtyOut || 0);
+  if (!Number.isFinite(qtyIn) || !Number.isFinite(qtyOut)) {
+    throw new Error("Qty ledger tidak valid.");
+  }
+  const dateValue = payload.date ? new Date(payload.date) : new Date();
+  if (Number.isNaN(dateValue.getTime())) {
+    throw new Error("Tanggal ledger tidak valid.");
+  }
+  const lastResult = await client.query(
+    "select id, date, balance from inventory_ledgers where item_id = $1 order by date desc, id desc limit 1",
+    [payload.itemCode],
+  );
+  const lastRow = lastResult.rows[0];
+  if (lastRow?.date) {
+    const lastDate = new Date(lastRow.date);
+    if (dateValue < lastDate) {
+      throw new Error("Transaksi backdated tidak diperbolehkan.");
+    }
+  }
+  const prevBalance = Number(lastRow?.balance || 0);
+  const nextBalance = prevBalance + qtyIn - qtyOut;
+  await client.query(
+    `
+    insert into inventory_ledgers
+      (date, item_id, transaction_type, reference_doc, qty_in, qty_out, balance, user_id, remarks, batch_id, kanban_id, source_ref_type, source_ref_id, source_ref_line_id)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    `,
+    [
+      dateValue.toISOString(),
+      payload.itemCode,
+      payload.transactionType,
+      payload.referenceDoc || null,
+      qtyIn,
+      qtyOut,
+      nextBalance,
+      payload.userId || null,
+      payload.remarks || null,
+      payload.batchId || null,
+      payload.kanbanId || null,
+      payload.sourceRefType || null,
+      payload.sourceRefId || null,
+      payload.sourceRefLineId || null,
+    ],
+  );
+  return nextBalance;
+};
+
+const getUserLabel = (user) => {
+  if (!user) return "Unknown";
+  if (user.username) return user.username;
+  if (user.id) return `user#${user.id}`;
+  return "Unknown";
+};
+
+const logFifoViolation = async (client, payload) => {
+  if (!payload?.itemCode) return;
+  await client.query(
+    `
+    insert into fifo_violations (item_code, batch_id, chosen_batch_no, oldest_batch_no, reason)
+    values ($1, $2, $3, $4, $5)
+    `,
+    [
+      payload.itemCode,
+      payload.batchId || null,
+      payload.chosenBatchNo || null,
+      payload.oldestBatchNo || null,
+      payload.reason || null,
+    ],
+  );
+};
+
+const getOldestAvailableBatch = async (client, itemCode) => {
+  const orderClause = await getFifoOrderClause(client, itemCode);
+  const result = await client.query(
+    `
+    select id, batch_no
+    from stock_batches
+    where item_code = $1 and qty_in > qty_out
+    ${orderClause}
+    limit 1
+    `,
+    [itemCode],
+  );
+  return result.rows[0] || null;
+};
+
+const consumeStockFifo = async (client, itemCode, qtyNumber, reason = "consume") => {
+  let remaining = qtyNumber;
+  const consumed = [];
+  const warnings = [];
+  const warningSet = new Set();
+  const orderClause = await getFifoOrderClause(client, itemCode);
+  const batches = await client.query(
+    `select id, qty_in, qty_out, batch_no, expired_date
+     from stock_batches
+     where item_code = $1 and qty_in > qty_out
+     ${orderClause}`,
+    [itemCode],
+  );
+  for (const batch of batches.rows) {
+    if (remaining <= 0) break;
+    const available = Number(batch.qty_in) - Number(batch.qty_out);
+    if (available <= 0) continue;
+    assertBatchNotExpired(batch, itemCode, warnings, warningSet);
+    const oldest = await getOldestAvailableBatch(client, itemCode);
+    if (oldest && oldest.id !== batch.id) {
+      await logFifoViolation(client, {
+        itemCode,
+        batchId: batch.id,
+        chosenBatchNo: batch.batch_no || null,
+        oldestBatchNo: oldest.batch_no || null,
+        reason,
+      });
+    }
+    const consumeQty = Math.min(available, remaining);
+    await client.query(
+      "update stock_batches set qty_out = qty_out + $1 where id = $2",
+      [consumeQty, batch.id],
+    );
+    consumed.push({ batchId: batch.id, qty: consumeQty });
+    await logStockMovement(client, {
+      itemCode,
+      batchId: batch.id,
+      qty: consumeQty,
+      direction: "out",
+      reason,
+    });
+    remaining -= consumeQty;
+  }
+  if (remaining > 0) {
+    throw new Error(`Stok ${itemCode} tidak cukup. Kurang ${remaining}.`);
+  }
+  return { consumed, warnings };
+};
+
+const sanitizeWarehouseToken = (value) => {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+};
+
+const buildSubconWarehouseId = (vendorId) => {
+  const token = sanitizeWarehouseToken(vendorId);
+  return token ? `WH_SUBCON_${token}` : "WH_SUBCON_UNKNOWN";
+};
+
+const resolveVendorRow = async (client, vendorValue) => {
+  const key = String(vendorValue || "").trim();
+  if (!key) return null;
+  const result = await client.query(
+    "select * from master_vendors where id = $1 or name = $1 limit 1",
+    [key],
+  );
+  return result.rows[0] || null;
+};
+
+const resolveItemRow = async (client, itemValue) => {
+  const key = String(itemValue || "").trim();
+  if (!key) return null;
+  const result = await client.query(
+    "select * from items where code = $1 or name = $1 limit 1",
+    [key],
+  );
+  return result.rows[0] || null;
+};
+
+const ensureSubconWarehouse = async (client, vendorRow) => {
+  if (!vendorRow?.id) return null;
+  const vendorId = vendorRow.id;
+  let warehouseId = vendorRow.subcon_warehouse_id || "";
+  if (!warehouseId) {
+    warehouseId = buildSubconWarehouseId(vendorId);
+  }
+  const warehouseName = `Subcon ${vendorRow.name || vendorId}`;
+  await client.query(
+    `
+    insert into master_warehouses (id, name, site, type)
+    values ($1, $2, $3, 'VENDOR_LOCATION')
+    on conflict (id) do update set
+      name = excluded.name,
+      site = excluded.site,
+      type = 'VENDOR_LOCATION'
+    `,
+    [warehouseId, warehouseName, "SUBCON"],
+  );
+  await client.query(
+    "update master_vendors set subcon_warehouse_id = $1 where id = $2",
+    [warehouseId, vendorId],
+  );
+  return warehouseId;
+};
+
+const getSubconStockMap = async (client, vendorId, itemCodes = []) => {
+  if (!vendorId) return new Map();
+  const params = [vendorId];
+  let filter = "";
+  if (itemCodes.length > 0) {
+    params.push(itemCodes);
+    filter = "and item_code = any($2)";
+  }
+  const result = await client.query(
+    `
+    select item_code, sum(case when direction = 'in' then qty else -qty end)::numeric as stock_qty
+    from subcon_stock_movements
+    where vendor_id = $1
+    ${filter}
+    group by item_code
+    `,
+    params,
+  );
+  const map = new Map();
+  result.rows.forEach((row) => {
+    map.set(row.item_code, Number(row.stock_qty || 0));
+  });
+  return map;
+};
+
+const getBomParentsForRm = async (client, rmCode) => {
+  if (!rmCode) return [];
+  const result = await client.query(
+    `
+    select
+      b.parent_code,
+      b.quantity,
+      b.scrap_factor,
+      i.name as parent_name,
+      i.unit as parent_unit,
+      i.type as parent_type
+    from master_bom b
+    join items i on i.code = b.parent_code
+    where b.child_code = $1
+    order by i.type asc, b.parent_code asc
+    `,
+    [rmCode],
+  );
+  return result.rows.map((row) => {
+    const qty = Number(row.quantity || 0);
+    const scrap = Number(row.scrap_factor || 0) / 100;
+    const usagePerUnit = qty * (1 + scrap);
+    return {
+      parentCode: row.parent_code,
+      parentName: row.parent_name,
+      parentUnit: row.parent_unit,
+      parentType: row.parent_type,
+      usagePerUnit: Number.isFinite(usagePerUnit) ? usagePerUnit : 0,
+    };
+  });
+};
+
+const normalizeDoNumber = (value) => {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  return trimmed === "" ? null : trimmed;
+};
+
+const ensureUniqueDoNumber = async (client, data, ignoreId = null) => {
+  const doNumber = normalizeDoNumber(data.doNumber);
+  const poNumber = normalizePoNumber(data.poNumber);
+  const itemCode = normalizeItemCode(data.itemCode || data.item);
+  const poLineId = parsePositiveId(data.poLineId ?? data.po_line_id);
+  if (!doNumber || !poNumber || !itemCode) return;
+
+  const params = [doNumber];
+  let query = `
+    select id
+    from schedules
+    where lower(trim(do_number)) = lower(trim($1))
+  `;
+  if (poLineId) {
+    params.push(poLineId);
+    query += ` and po_line_id = $${params.length}`;
+  } else {
+    params.push(poNumber, itemCode);
+    query += ` and po_number = $${params.length - 1} and lower(trim(coalesce(item_code, item))) = lower(trim($${params.length}))`;
+  }
+  if (ignoreId !== null) {
+    params.push(ignoreId);
+    query += ` and id <> $${params.length}`;
+  }
+  const result = await client.query(query, params);
+  if (result.rows.length > 0) {
+    const error = new Error("Nomor surat jalan sudah ada untuk PO/Item yang sama.");
+    error.statusCode = 409;
+    throw error;
+  }
+};
+
+const formatDateStamp = (value = new Date()) => {
+  const iso = value.toISOString().slice(0, 10);
+  return iso.replace(/-/g, "");
+};
+
+const formatDateStampValue = (value) => {
+  if (!value) return formatDateStamp();
+  const dateValue = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(dateValue.getTime())) return formatDateStamp();
+  return formatDateStamp(dateValue);
+};
+
+const buildInboundBatchNo = (poNumber, requestDate) => {
+  const safePo = String(poNumber || "").trim().replace(/\s+/g, "-");
+  const dateStamp = formatDateStampValue(requestDate);
+  return safePo ? `${safePo}-${dateStamp}` : `INB-${dateStamp}`;
+};
+
+const resolveInboundItemInfo = async (client, itemValue) => {
+  const itemKey = String(itemValue || "").trim();
+  if (!itemKey) {
+    return { itemCode: "", itemName: "", packQty: 0 };
+  }
+  const result = await client.query(
+    `
+    select i.code, i.name, i.pack_qty, ks.lot_qty
+    from items i
+    left join kanban_settings ks on ks.item_code = i.code
+    where i.code = $1 or i.name = $1
+    limit 1
+    `,
+    [itemKey],
+  );
+  if (result.rows.length === 0) {
+    return { itemCode: itemKey, itemName: itemKey, packQty: 0 };
+  }
+  const row = result.rows[0];
+  const packQty = Number(row.pack_qty || row.lot_qty || 0);
+  return {
+    itemCode: row.code || itemKey,
+    itemName: row.name || itemKey,
+    packQty: Number.isFinite(packQty) ? packQty : 0,
+  };
+};
+
+const normalizeQtyByPack = (qty, packQty) => {
+  const qtyValue = Number(qty);
+  if (!Number.isFinite(qtyValue) || qtyValue <= 0) return qtyValue;
+  const packValue = Number(packQty);
+  if (!Number.isFinite(packValue) || packValue <= 0) return qtyValue;
+  return Math.ceil(qtyValue / packValue) * packValue;
+};
+
+const normalizeScheduleQtyByPack = (qty, packQty, remaining) => {
+  const qtyValue = Number(qty);
+  if (!Number.isFinite(qtyValue) || qtyValue <= 0) return qtyValue;
+  const packValue = Number(packQty);
+  if (!Number.isFinite(packValue) || packValue <= 0) return qtyValue;
+  const normalized = normalizeQtyByPack(qtyValue, packValue);
+  const remainingValue = Number(remaining);
+  if (!Number.isFinite(remainingValue) || remainingValue <= 0) return normalized;
+  if (normalized <= remainingValue) return normalized;
+  // Allow the final PO remainder to be scheduled as-is when pack rounding would exceed the remaining balance.
+  if (qtyValue <= remainingValue) return qtyValue;
+  return normalized;
+};
+
+const buildScheduleQtyConflictMessage = ({
+  poNumber,
+  itemCode,
+  requestQty,
+  remaining,
+  requestDate,
+  rowNumber,
+}) => {
+  const parts = [];
+  if (Number.isFinite(rowNumber) && rowNumber > 0) {
+    parts.push(`Baris ${rowNumber}.`);
+  }
+  parts.push(`Qty schedule melebihi sisa PO untuk PO ${poNumber || "-"}`);
+  if (itemCode) {
+    parts.push(`item ${itemCode}.`);
+  } else {
+    parts[parts.length - 1] += ".";
+  }
+  if (requestDate) {
+    parts.push(`Tanggal: ${requestDate}.`);
+  }
+  if (Number.isFinite(Number(requestQty))) {
+    parts.push(`Qty diminta: ${Number(requestQty)}.`);
+  }
+  parts.push(`Sisa tersedia: ${remaining}.`);
+  return parts.join(" ");
+};
+
+const resolveItemPackQty = async (client, itemValue) => {
+  const itemKey = String(itemValue || "").trim();
+  if (!itemKey) return 0;
+  const resolved = await resolveInboundItemInfo(client, itemKey);
+  if (Number.isFinite(resolved.packQty) && resolved.packQty > 0) return resolved.packQty;
+  const ksResult = await client.query(
+    "select lot_qty from kanban_settings where item_code = $1",
+    [itemKey],
+  );
+  const lotQty = Number(ksResult.rows[0]?.lot_qty || 0);
+  return Number.isFinite(lotQty) && lotQty > 0 ? lotQty : 0;
+};
+
+const resolveItemDeliveryLimits = async (client, itemValue) => {
+  const itemKey = String(itemValue || "").trim();
+  if (!itemKey) {
+    return { orderLotSize: 0, maxDeliveryPerRit: 0 };
+  }
+  const result = await client.query(
+    "select order_lot_size, max_delivery_per_rit from items where code = $1 or name = $1 limit 1",
+    [itemKey],
+  );
+  const row = result.rows[0] || {};
+  const orderLotSize = Number(row.order_lot_size || 0);
+  const maxDeliveryPerRit = Number(row.max_delivery_per_rit || 0);
+  return {
+    orderLotSize: Number.isFinite(orderLotSize) ? orderLotSize : 0,
+    maxDeliveryPerRit: Number.isFinite(maxDeliveryPerRit) ? maxDeliveryPerRit : 0,
+  };
+};
+
+const splitRequestQtyByMax = (totalQty, maxPerRit, packQty) => {
+  const totalValue = Number(totalQty);
+  if (!Number.isFinite(totalValue) || totalValue <= 0) return [];
+  const maxValue = Number(maxPerRit);
+  if (!Number.isFinite(maxValue) || maxValue <= 0 || totalValue <= maxValue) {
+    return [totalValue];
+  }
+  const packValue = Number(packQty);
+  if (!Number.isFinite(packValue) || packValue <= 0) {
+    const splits = [];
+    let remaining = totalValue;
+    while (remaining > 0) {
+      const chunk = Math.min(remaining, maxValue);
+      splits.push(chunk);
+      remaining -= chunk;
+    }
+    return splits;
+  }
+  const totalPacks = Math.ceil(totalValue / packValue);
+  const maxPacks = Math.floor(maxValue / packValue);
+  if (maxPacks <= 0) return [totalValue];
+  const splits = [];
+  let remainingPacks = totalPacks;
+  while (remainingPacks > 0) {
+    const packs = Math.min(remainingPacks, maxPacks);
+    splits.push(packs * packValue);
+    remainingPacks -= packs;
+  }
+  return splits;
+};
+
+const insertDeliveryNoteItems = async (client, dnId, requestIds) => {
+  if (!Number.isFinite(Number(dnId))) return [];
+  const idList = (requestIds || []).map((val) => Number(val)).filter((val) => Number.isFinite(val));
+  if (idList.length === 0) return [];
+  const result = await client.query(
+    `
+    select
+      kr.id as request_id,
+      kr.item_code,
+      kr.request_qty,
+      i.name as item_name,
+      i.part_no,
+      i.unit,
+      i.type_pack,
+      coalesce(i.pack_qty, ks.lot_qty, 0) as pack_qty,
+      ks.drop_zone
+    from kanban_requests kr
+    join items i on i.code = kr.item_code
+    left join kanban_settings ks on ks.item_code = kr.item_code
+    where kr.id = any($1::int[])
+    `,
+    [idList],
+  );
+  if (result.rows.length === 0) return [];
+  const inserted = [];
+  for (const row of result.rows) {
+    const payload = [
+      dnId,
+      row.request_id,
+      row.item_code,
+      row.item_name || null,
+      row.part_no || null,
+      row.unit || null,
+      Number.isFinite(Number(row.pack_qty)) ? Number(row.pack_qty) : null,
+      row.type_pack || null,
+      Number(row.request_qty || 0),
+      row.drop_zone || null,
+    ];
+    const insertResult = await client.query(
+      `
+      insert into delivery_note_items
+        (dn_id, request_id, item_code, item_name, part_no, unit, pack_qty, type_pack, request_qty, drop_zone)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      on conflict (dn_id, request_id) do nothing
+      returning *
+      `,
+      payload,
+    );
+    if (insertResult.rows[0]) inserted.push(insertResult.rows[0]);
+  }
+  return inserted;
+};
+
+const isLooseQty = (qty, packQty) => {
+  const qtyValue = Number(qty);
+  const packValue = Number(packQty);
+  if (!Number.isFinite(qtyValue) || qtyValue <= 0) return false;
+  if (!Number.isFinite(packValue) || packValue <= 0) return false;
+  const remainder = qtyValue % packValue;
+  return Math.abs(remainder) > 1e-6 && Math.abs(remainder - packValue) > 1e-6;
+};
+
+const createInboundCardsForSchedule = async (client, scheduleRow) => {
+  if (!scheduleRow) return [];
+  const scheduleId = scheduleRow.id;
+  if (!Number.isFinite(Number(scheduleId))) return [];
+  const existing = await client.query(
+    "select count(*)::int as total from inbound_cards where schedule_id = $1",
+    [scheduleId],
+  );
+  if (Number(existing.rows[0]?.total || 0) > 0) return [];
+  const requestQty = Number(scheduleRow.request_qty || 0);
+  if (!Number.isFinite(requestQty) || requestQty <= 0) return [];
+  const { itemCode, itemName, packQty } = await resolveInboundItemInfo(client, scheduleRow.item);
+  const packValue = Number.isFinite(packQty) && packQty > 0 ? packQty : 1;
+  const totalCards = Math.max(1, Math.ceil(requestQty / packValue));
+  const batchNo = buildInboundBatchNo(scheduleRow.po_number, scheduleRow.request_date);
+  const created = [];
+  for (let idx = 0; idx < totalCards; idx += 1) {
+    const remaining = requestQty - packValue * idx;
+    const cardQty = idx === totalCards - 1 ? (remaining > 0 ? remaining : packValue) : packValue;
+    const cardUid = `INB-${scheduleId}-${String(idx + 1).padStart(3, "0")}-${crypto.randomUUID().slice(0, 8)}`;
+    const result = await client.query(
+      `
+      insert into inbound_cards
+        (schedule_id, card_uid, item_code, item_name, pack_qty, card_qty, card_seq, total_cards, batch_no, status)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending')
+      returning *
+      `,
+      [scheduleId, cardUid, itemCode || scheduleRow.item, itemName || scheduleRow.item, packValue, cardQty, idx + 1, totalCards, batchNo],
+    );
+    created.push(result.rows[0]);
+  }
+  return created;
+};
+
+const getScheduleStatusFromActual = ({ requestDate, arrivalDate }) => {
+  if (!arrivalDate) return "Pending";
+  const reqDate = new Date(requestDate);
+  const arrDate = new Date(arrivalDate);
+  if (Number.isNaN(reqDate.getTime()) || Number.isNaN(arrDate.getTime())) return "Pending";
+  const reqKey = formatDateOnly(reqDate);
+  const arrKey = formatDateOnly(arrDate);
+  if (arrKey === reqKey) return "On Time";
+  return arrKey > reqKey ? "Late" : "Too Early";
+};
+
+
+
+const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const buildKanbanIdRegex = (format) => {
+  const escaped = escapeRegex(String(format || ""));
+  const pattern = escaped
+    .replace(/\{CATEGORY\}/gi, "[A-Za-z0-9_-]+")
+    .replace(/\{SUPPLIER\}/gi, "[A-Za-z0-9_-]+")
+    .replace(/\{MODEL\}/gi, "[A-Za-z0-9_-]+")
+    .replace(/\{PART_NO\}/gi, "[A-Za-z0-9_-]+")
+    .replace(/\{UNIQ\}/gi, "(?<uniq>[A-Za-z0-9._-]+)")
+    .replace(/\{YEAR\}/gi, "\\d{4}")
+    .replace(/\{YY\}/gi, "\\d{2}")
+    .replace(/\{MONTH\}/gi, "\\d{2}")
+    .replace(/\{ROMAN_MONTH\}/gi, "[IVX]+")
+    .replace(/\{COUNTER(?::\\d+)?\}/gi, "\\d+");
+  return new RegExp(`^${pattern}$`, "i");
+};
+
+const getMasterConfigRow = async (client) => {
+  const result = await client.query("select * from master_config where id = 1");
+  return result.rows[0] || null;
+};
+
+const resolveKanbanItemCode = async (client, kanbanId) => {
+  const trimmed = String(kanbanId || "").trim();
+  if (!trimmed) return "";
+  const directResult = await client.query(
+    "select code from items where code = $1 limit 1",
+    [trimmed],
+  );
+  if (directResult.rows.length > 0) return directResult.rows[0].code;
+  const config = await getMasterConfigRow(client);
+  const format = config?.kanban_id_format || "KB-{CATEGORY}-{UNIQ}";
+  const regex = buildKanbanIdRegex(format);
+  const match = trimmed.match(regex);
+  if (match?.groups?.uniq) return match.groups.uniq;
+  return trimmed;
+};
+
+const getDocumentNumberingConfig = async (client) => {
+  const config = await getMasterConfigRow(client);
+  const documentNumbering = config?.document_numbering || {};
+  return {
+    dnFormat: documentNumbering.dnFormat || "",
+    rnFormat: documentNumbering.rnFormat || "",
+    sjSubFormat: documentNumbering.sjSubFormat || "",
+    dept: documentNumbering.dept || "",
+  };
+};
+
+const getQcStatusList = async (client) => {
+  const config = await getMasterConfigRow(client);
+  const list = Array.isArray(config?.qc_status) ? config.qc_status : [];
+  return list.map((val) => String(val).toLowerCase());
+};
+
+const buildDocumentNumber = async (client, table, column, format, context = {}) => {
+  await client.query(`lock table ${table} in share row exclusive mode`);
+  const rawDate = context.date ? new Date(context.date) : new Date();
+  const now = Number.isNaN(rawDate.getTime()) ? new Date() : rawDate;
+  const yearFull = String(now.getFullYear());
+  const yearShort = yearFull.slice(-2);
+  const romanMonths = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"];
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const romanMonth = romanMonths[now.getMonth()];
+  const dept = context.dept || "";
+  const supplier = context.supplier || "";
+  const supplierCode = context.supplierCode || supplier || "";
+  const prefixLabel = context.prefix || "";
+  const vendor = context.vendor || context.supplier || "";
+
+  const resolvedFormat = format && format.includes("{COUNTER}")
+    ? format
+    : `${format || ""}/{COUNTER}`;
+  const counterMatch = resolvedFormat.match(/\{COUNTER(?::(\d+))?\}/i);
+  const counterToken = counterMatch?.[0] || "{COUNTER}";
+  const counterPad = Number(counterMatch?.[1] || 4);
+
+  const formatWithVars = resolvedFormat
+    .replaceAll("{PREFIX}", prefixLabel)
+    .replaceAll("{DEPT}", dept)
+    .replaceAll("{YEAR}", yearFull)
+    .replaceAll("{YY}", yearShort)
+    .replaceAll("{ROMAN_MONTH}", romanMonth)
+    .replaceAll("{MONTH}", month)
+    .replaceAll("{SUPPLIER}", supplier)
+    .replaceAll("{SUPPLIER_CODE}", supplierCode)
+    .replaceAll("{VENDOR}", vendor);
+
+  const parts = formatWithVars.split(counterToken);
+  const prefix = parts[0] || "";
+  const suffix = parts[1] || "";
+  const pattern = `^${escapeRegex(prefix)}(\\d+)${escapeRegex(suffix)}$`;
+  const maxResult = await client.query(
+    `select max((regexp_match(${column}, $1))[1])::int as max_counter
+     from ${table}
+     where ${column} ~ $1`,
+    [pattern],
+  );
+  const maxCounter = Number(maxResult.rows[0]?.max_counter || 0);
+  const nextCounter = maxCounter + 1;
+  const counterValue = String(nextCounter).padStart(counterPad, "0");
+  return `${prefix}${counterValue}${suffix}`;
+};
+
+const requireFormat = (format, label) => {
+  const trimmed = String(format || "").trim();
+  if (trimmed) return trimmed;
+  const error = new Error(`${label} belum diisi di Master Config.`);
+  error.statusCode = 400;
+  throw error;
+};
+
+const normalizeVendorRole = (role) => String(role || "").trim().toLowerCase();
+
+const isScheduleVendor = (role) => normalizeVendorRole(role) === "schedule";
+
+const getVendorRoleForItem = async (client, itemCode) => {
+  const supplierResult = await client.query(
+    "select default_supplier from kanban_settings where item_code = $1",
+    [itemCode],
+  );
+  const supplier = supplierResult.rows[0]?.default_supplier || "";
+  if (!supplier) {
+    return { supplier: "", role: "" };
+  }
+  const roleResult = await client.query(
+    "select role from master_vendors where id = $1 or name = $1 limit 1",
+    [supplier],
+  );
+  return { supplier, role: roleResult.rows[0]?.role || "" };
+};
+
+const resolveSupplierCode = async (client, supplierValue, options = {}) => {
+  const trimmed = String(supplierValue || "").trim();
+  if (!trimmed) return "";
+  const strict = Boolean(options?.strict);
+  const result = await client.query(
+    "select id from master_vendors where id = $1 or name = $1 limit 1",
+    [trimmed],
+  );
+  const resolved = result.rows[0]?.id || "";
+  if (resolved) return resolved;
+  return strict ? "" : trimmed;
+};
+
+const normalizeDeliverySchedule = (input) => {
+  let rows = input;
+  if (typeof rows === "string") {
+    try {
+      rows = JSON.parse(rows);
+    } catch {
+      return [];
+    }
+  }
+  if (typeof rows === "string") {
+    try {
+      rows = JSON.parse(rows);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(rows)) return [];
+  return rows
+    .map((row) => {
+      const ritRaw = row?.rit ?? row?.RIT ?? row?.rit_no ?? row?.ritNo ?? "";
+      const ritNum = Number(ritRaw);
+      const ritValue = Number.isFinite(ritNum) ? ritNum : (ritRaw !== null && ritRaw !== undefined ? String(ritRaw).trim() : "");
+      const timeValue = String(row?.time ?? row?.delivery_time ?? row?.deliveryTime ?? "").trim();
+      const cycleValue = String(row?.cycle ?? "").trim();
+      return {
+        rit: ritValue,
+        time: timeValue || null,
+        cycle: cycleValue || null,
+      };
+    })
+    .filter((row) => row.rit !== "" || row.time || row.cycle);
+};
+
+const resolveVendorSchedule = async (client, supplierValue) => {
+  const trimmed = String(supplierValue || "").trim();
+  if (!trimmed) return [];
+  const result = await client.query(
+    "select delivery_schedule, cycle, rit, delivery_time from master_vendors where id = $1 or name = $1 limit 1",
+    [trimmed],
+  );
+  if (result.rows.length === 0) return [];
+  const row = result.rows[0] || {};
+  const schedule = normalizeDeliverySchedule(row.delivery_schedule);
+  if (schedule.length > 0) return schedule;
+  const legacy = {
+    rit: row.rit ?? "",
+    time: row.delivery_time ?? "",
+    cycle: row.cycle ?? "",
+  };
+  const legacySchedule = normalizeDeliverySchedule([legacy]);
+  return legacySchedule;
+};
+
+const buildRequestNumber = async (client, format, itemCode) => {
+  await client.query("lock table kanban_requests in share row exclusive mode");
+  const baseFormat = requireFormat(format, "Request ID format");
+  const resolvedFormat = baseFormat.includes("{COUNTER}")
+    ? baseFormat
+    : `${baseFormat}/{COUNTER}`;
+  const counterMatch = resolvedFormat.match(/\{COUNTER(?::(\d+))?\}/i);
+  const counterToken = counterMatch?.[0] || "{COUNTER}";
+  const counterPad = Number(counterMatch?.[1] || 3);
+  const formatWithVars = resolvedFormat.replaceAll("{ITEM_ID}", String(itemCode || "").trim());
+  const parts = formatWithVars.split(counterToken);
+  const prefix = parts[0] || "";
+  const suffix = parts[1] || "";
+  const pattern = `^${escapeRegex(prefix)}(\\d+)${escapeRegex(suffix)}$`;
+  const maxResult = await client.query(
+    `select max((regexp_match(request_code, $1))[1])::int as max_counter
+     from kanban_requests
+     where request_code ~ $1`,
+    [pattern],
+  );
+  const maxCounter = Number(maxResult.rows[0]?.max_counter || 0);
+  const nextCounter = maxCounter + 1;
+  const counterValue = String(nextCounter).padStart(counterPad, "0");
+  return `${prefix}${counterValue}${suffix}`;
+};
+
+const getFifoOrderClause = async (client, itemCode, alias = "") => {
+  const config = await getMasterConfigRow(client);
+  const fifoMethod = config?.fifo_method || {};
+  const itemResult = await client.query("select type from items where code = $1", [itemCode]);
+  const itemType = itemResult.rows[0]?.type || "";
+  const methodKey = String(itemType || "").trim();
+  const mode = fifoMethod[methodKey] || fifoMethod[itemType] || "";
+  const normalized = String(mode || "").toLowerCase();
+  const prefix = alias ? `${alias}.` : "";
+  if (normalized.includes("batch")) {
+    return `order by ${prefix}batch_no asc nulls last, ${prefix}arrival_date asc nulls last, ${prefix}id asc`;
+  }
+  return `order by ${prefix}arrival_date asc nulls last, ${prefix}id asc`;
+};
+
+const createKanbanEvent = async (client, requestId, event, userId = null, meta = null) => {
+  await client.query(
+    "insert into kanban_events (request_id, event, by_user, meta) values ($1, $2, $3, $4)",
+    [requestId, event, userId, meta],
+  );
+};
+
+const KANBAN_ACTIVE_STATUSES = new Set([
+  "triggered",
+  "requested",
+  "approved",
+  "dn_created",
+  "scheduled",
+  "in_transit",
+  "receiving",
+]);
+const KANBAN_PRL_TRIGGER_STATUSES = ["triggered", "requested", "approved"];
+const PRL_MONTH_KEYS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+const KANBAN_PRL_SOURCE_PREFIX = "KANBAN-STOCK-GAP:";
+
+const getCurrentPrlPeriod = (referenceDate = new Date()) => {
+  const parsed = referenceDate instanceof Date ? referenceDate : new Date(referenceDate || Date.now());
+  const safeDate = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+  return {
+    year: safeDate.getFullYear(),
+    monthKey: PRL_MONTH_KEYS[safeDate.getMonth()] || PRL_MONTH_KEYS[new Date().getMonth()],
+  };
+};
+
+const formatDateOnlyLocal = (dateValue) => {
+  if (!dateValue) return null;
+  const parsed = dateValue instanceof Date ? dateValue : new Date(dateValue);
+  if (Number.isNaN(parsed.getTime())) return null;
+  const year = parsed.getFullYear();
+  const month = String(parsed.getMonth() + 1).padStart(2, "0");
+  const day = String(parsed.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
+const toPlainObject = (value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return { ...value };
+};
+
+const parseNumericJsonValue = (value) => {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : 0;
+};
+
+const getPrlMonthStatus = (status, monthKey) => String(status?.[monthKey] || "").trim().toLowerCase();
+
+const buildKanbanSlaDueAt = (row) => {
+  const statusKey = String(row?.status || "").trim().toLowerCase();
+  if (["fifo", "closed", "rejected"].includes(statusKey)) return null;
+  const leadTimeDays = Math.max(0, Number(row?.lead_time_days || 0));
+  const updatedAt = row?.updated_at ? new Date(row.updated_at) : null;
+  const createdAt = row?.created_at ? new Date(row.created_at) : null;
+  const baseDate = updatedAt && !Number.isNaN(updatedAt.getTime())
+    ? updatedAt
+    : createdAt && !Number.isNaN(createdAt.getTime())
+      ? createdAt
+      : new Date();
+  const dueAt = new Date(baseDate.getTime());
+  switch (statusKey) {
+    case "triggered":
+    case "requested":
+      dueAt.setHours(dueAt.getHours() + 4);
+      break;
+    case "approved":
+      dueAt.setHours(dueAt.getHours() + 8);
+      break;
+    case "dn_created":
+      dueAt.setHours(dueAt.getHours() + (leadTimeDays > 0 ? leadTimeDays * 24 : 24));
+      break;
+    case "scheduled":
+    case "in_transit":
+      dueAt.setHours(dueAt.getHours() + 24);
+      break;
+    case "receiving":
+      dueAt.setHours(dueAt.getHours() + 4);
+      break;
+    default:
+      dueAt.setHours(dueAt.getHours() + 8);
+      break;
+  }
+  return dueAt;
+};
+
+const buildKanbanException = (row) => {
+  const statusKey = String(row?.status || "").trim().toLowerCase();
+  if (!KANBAN_ACTIVE_STATUSES.has(statusKey)) {
+    return { code: null, note: null };
+  }
+  const requestQty = Number(row?.request_qty || 0);
+  const stockQty = Number(row?.stock_qty || 0);
+  if (["triggered", "requested", "approved"].includes(statusKey) && stockQty < requestQty) {
+    return {
+      code: "STOCK_GAP",
+      note: `Available ${stockQty} below request ${requestQty}.`,
+    };
+  }
+  if (statusKey === "dn_created" && !row?.dn_id) {
+    return {
+      code: "MISSING_DN",
+      note: "Request status sudah DN Created tetapi DN belum terhubung.",
+    };
+  }
+  if (["scheduled", "in_transit", "receiving"].includes(statusKey) && !row?.schedule_id) {
+    return {
+      code: "MISSING_SCHEDULE",
+      note: "Request sudah lanjut proses tetapi schedule belum terhubung.",
+    };
+  }
+  return { code: null, note: null };
+};
+
+const loadKanbanHealthRowsByIds = async (client, requestIds) => {
+  if (!Array.isArray(requestIds) || requestIds.length === 0) return [];
+  const ids = [...new Set(requestIds.map((value) => Number(value)).filter((value) => Number.isFinite(value)))];
+  if (ids.length === 0) return [];
+  const result = await client.query(
+    `
+    with stock as (
+      select item_code, sum(qty_in - qty_out)::numeric as stock_qty
+      from stock_batches
+      group by item_code
+    )
+    select
+      kr.id,
+      kr.item_code,
+      kr.request_qty,
+      kr.status,
+      kr.dn_id,
+      kr.schedule_id,
+      kr.created_at,
+      kr.updated_at,
+      coalesce(ks.lead_time_days, i.lead_time_days, 0) as lead_time_days,
+      coalesce(s.stock_qty, 0) as stock_qty
+    from kanban_requests kr
+    left join kanban_settings ks on ks.item_code = kr.item_code
+    left join items i on i.code = kr.item_code
+    left join stock s on s.item_code = kr.item_code
+    where kr.id = any($1::int[])
+    `,
+    [ids],
+  );
+  return result.rows || [];
+};
+
+const syncKanbanShortagePrlDraftsByItemCodes = async (client, itemCodes, options = {}) => {
+  if (!Array.isArray(itemCodes) || itemCodes.length === 0) {
+    return { synced: 0, cleared: 0 };
+  }
+  const normalizedItemCodes = [...new Set(
+    itemCodes
+      .map((value) => String(value || "").trim())
+      .filter(Boolean),
+  )];
+  if (normalizedItemCodes.length === 0) {
+    return { synced: 0, cleared: 0 };
+  }
+
+  const { year, monthKey } = getCurrentPrlPeriod(options.referenceDate);
+  const aggregateResult = await client.query(
+    `
+    with stock as (
+      select item_code, sum(qty_in - qty_out)::numeric as stock_qty
+      from stock_batches
+      group by item_code
+    ),
+    demand as (
+      select
+        kr.item_code,
+        sum(kr.request_qty)::numeric as total_request_qty,
+        min(kr.sla_due_at) as due_at,
+        string_agg(kr.id::text, ',' order by kr.id) as request_refs
+      from kanban_requests kr
+      where kr.item_code = any($1::text[])
+        and lower(coalesce(kr.status, '')) = any($2::text[])
+      group by kr.item_code
+    )
+    select
+      d.item_code,
+      greatest(d.total_request_qty - coalesce(s.stock_qty, 0), 0)::numeric as shortage_qty,
+      d.due_at,
+      d.request_refs,
+      i.part_no,
+      i.name as description,
+      i.model,
+      i.unit as uom,
+      i.type_pack,
+      coalesce(nullif(i.pack_qty, 0), nullif(ks.lot_qty, 0), nullif(i.order_lot_size, 0), 0) as pack_qty
+    from demand d
+    left join stock s on s.item_code = d.item_code
+    join items i on i.code = d.item_code
+    left join kanban_settings ks on ks.item_code = d.item_code
+    where greatest(d.total_request_qty - coalesce(s.stock_qty, 0), 0) > 0
+    `,
+    [normalizedItemCodes, KANBAN_PRL_TRIGGER_STATUSES],
+  );
+  const aggregateByItemCode = new Map(
+    (aggregateResult.rows || []).map((row) => [row.item_code, row]),
+  );
+  const existingResult = await client.query(
+    `
+    select *
+    from prl_records
+    where year = $1
+      and item_code = any($2::text[])
+    `,
+    [year, normalizedItemCodes],
+  );
+  const existingByItemCode = new Map(
+    (existingResult.rows || []).map((row) => [row.item_code, row]),
+  );
+
+  let synced = 0;
+  let cleared = 0;
+
+  for (const itemCode of normalizedItemCodes) {
+    const existing = existingByItemCode.get(itemCode) || null;
+    const summary = aggregateByItemCode.get(itemCode) || null;
+    if (summary) {
+      const shortageQty = normalizeQtyByPack(
+        Number(summary.shortage_qty || 0),
+        Number(summary.pack_qty || 0),
+      );
+      if (shortageQty <= 0) {
+        continue;
+      }
+      const months = toPlainObject(existing?.months);
+      const status = toPlainObject(existing?.status);
+      const monthStatusKey = getPrlMonthStatus(status, monthKey);
+      if (["active", "manual"].includes(monthStatusKey)) {
+        continue;
+      }
+      const existingMonthQty = parseNumericJsonValue(months[monthKey]);
+      if (!existing || existingMonthQty <= 0) {
+        months[monthKey] = shortageQty;
+      }
+      if (!monthStatusKey || ["draft", "suggested", "pending"].includes(monthStatusKey)) {
+        status[monthKey] = "draft";
+      }
+      const sourceType = String(existing?.source_type || "").trim().toLowerCase() === "kanban_request"
+        || !String(existing?.source_type || "").trim()
+        ? "kanban_request"
+        : existing.source_type;
+      const sourceRef = `${KANBAN_PRL_SOURCE_PREFIX}${year}:${monthKey}:${summary.request_refs || itemCode}`;
+      const dueDate = formatDateOnlyLocal(summary.due_at || new Date()) || formatDateOnlyLocal(new Date());
+      const priorityScore = Math.max(Number(existing?.priority_score || 0), shortageQty);
+      const recordPayload = {
+        partNo: existing?.part_no || summary.part_no || itemCode,
+        description: existing?.description || summary.description || itemCode,
+        model: existing?.model || summary.model || "",
+        qtyPerKanban: existing?.qty_per_kanban ?? (Number(summary.pack_qty || 0) || null),
+        uom: existing?.uom || summary.uom || "",
+        typePack: existing?.type_pack || summary.type_pack || "",
+        volume: existing?.volume || null,
+        months,
+        status,
+        sourceType,
+        sourceRef,
+        suggestedQty: shortageQty,
+        dueDate,
+        priorityScore,
+      };
+
+      if (existing) {
+        await client.query(
+          `
+          update prl_records
+          set
+            part_no = $2,
+            description = $3,
+            model = $4,
+            qty_per_kanban = $5,
+            uom = $6,
+            type_pack = $7,
+            volume = $8,
+            months = $9,
+            status = $10,
+            source_type = $11,
+            source_ref = $12,
+            suggested_qty = $13,
+            due_date = $14,
+            priority_score = $15,
+            updated_at = now()
+          where id = $1
+          `,
+          [
+            existing.id,
+            recordPayload.partNo,
+            recordPayload.description,
+            recordPayload.model,
+            recordPayload.qtyPerKanban,
+            recordPayload.uom,
+            recordPayload.typePack,
+            recordPayload.volume,
+            recordPayload.months,
+            recordPayload.status,
+            recordPayload.sourceType,
+            recordPayload.sourceRef,
+            recordPayload.suggestedQty,
+            recordPayload.dueDate,
+            recordPayload.priorityScore,
+          ],
+        );
+      } else {
+        await client.query(
+          `
+          insert into prl_records
+            (
+              item_code,
+              year,
+              part_no,
+              description,
+              model,
+              qty_per_kanban,
+              uom,
+              type_pack,
+              volume,
+              months,
+              status,
+              source_type,
+              source_ref,
+              suggested_qty,
+              due_date,
+              priority_score,
+              updated_at
+            )
+          values
+            ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now())
+          `,
+          [
+            itemCode,
+            year,
+            recordPayload.partNo,
+            recordPayload.description,
+            recordPayload.model,
+            recordPayload.qtyPerKanban,
+            recordPayload.uom,
+            recordPayload.typePack,
+            recordPayload.volume,
+            recordPayload.months,
+            recordPayload.status,
+            recordPayload.sourceType,
+            recordPayload.sourceRef,
+            recordPayload.suggestedQty,
+            recordPayload.dueDate,
+            recordPayload.priorityScore,
+          ],
+        );
+      }
+      synced += 1;
+      continue;
+    }
+
+    if (!existing) {
+      continue;
+    }
+
+    const sourceRef = String(existing.source_ref || "").trim();
+    const isKanbanManaged = String(existing.source_type || "").trim().toLowerCase() === "kanban_request";
+    const isKanbanLinked = isKanbanManaged || sourceRef.startsWith(KANBAN_PRL_SOURCE_PREFIX);
+    if (!isKanbanLinked && Number(existing.suggested_qty || 0) <= 0) {
+      continue;
+    }
+    const months = toPlainObject(existing.months);
+    const status = toPlainObject(existing.status);
+    const monthStatusKey = getPrlMonthStatus(status, monthKey);
+    if (isKanbanManaged && !["active", "manual"].includes(monthStatusKey)) {
+      months[monthKey] = 0;
+      if (!monthStatusKey || ["draft", "suggested", "pending"].includes(monthStatusKey)) {
+        status[monthKey] = "draft";
+      }
+    }
+    await client.query(
+      `
+      update prl_records
+      set
+        months = $2,
+        status = $3,
+        source_ref = $4,
+        suggested_qty = 0,
+        due_date = null,
+        priority_score = 0,
+        updated_at = now()
+      where id = $1
+      `,
+      [
+        existing.id,
+        months,
+        status,
+        isKanbanLinked ? null : existing.source_ref,
+      ],
+    );
+    cleared += 1;
+  }
+
+  return { synced, cleared };
+};
+
+const syncKanbanRequestHealthByIds = async (client, requestIds, options = {}) => {
+  const rows = await loadKanbanHealthRowsByIds(client, requestIds);
+  if (rows.length === 0) return [];
+  const values = [];
+  const params = [];
+  rows.forEach((row, index) => {
+    const slaDueAt = buildKanbanSlaDueAt(row);
+    const exception = buildKanbanException(row);
+    const offset = index * 4;
+    values.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4})`);
+    params.push(row.id, slaDueAt, exception.code, exception.note);
+  });
+  const result = await client.query(
+    `
+    update kanban_requests as kr
+    set
+      sla_due_at = v.sla_due_at::timestamptz,
+      exception_code = v.exception_code,
+      exception_note = v.exception_note
+    from (
+      values ${values.join(", ")}
+    ) as v(id, sla_due_at, exception_code, exception_note)
+    where kr.id = v.id::int
+    returning kr.*
+    `,
+    params,
+  );
+  if (options.syncPrlDrafts) {
+    await syncKanbanShortagePrlDraftsByItemCodes(
+      client,
+      rows.map((row) => row.item_code),
+      { referenceDate: options.referenceDate },
+    );
+  }
+  return result.rows || [];
+};
+
+const autoTriggerKanbanRequests = async (client, options = {}) => {
+  const settingsResult = await client.query(
+    `
+    select
+      ks.item_code,
+      ks.min_qty,
+      ks.lot_qty,
+      ks.default_supplier,
+      mv.role as vendor_role,
+      coalesce(s.stock_qty, 0) as stock_qty,
+      i.order_lot_size,
+      i.max_delivery_per_rit
+    from kanban_settings ks
+    left join items i on i.code = ks.item_code
+    left join (
+      select item_code, sum(qty_in - qty_out)::numeric as stock_qty
+      from stock_batches
+      group by item_code
+    ) s on s.item_code = ks.item_code
+    left join master_vendors mv on mv.id = ks.default_supplier or mv.name = ks.default_supplier
+    where ks.active = true
+    `,
+  );
+  if (settingsResult.rows.length === 0) return [];
+  const config = await getMasterConfigRow(client);
+  const requestIdFormat = requireFormat(config?.request_id_format, "Request ID format");
+
+  const activeResult = await client.query(
+    "select distinct item_code from kanban_requests where status not in ('closed','rejected')",
+  );
+  const activeSet = new Set(activeResult.rows.map((row) => row.item_code));
+  const created = [];
+
+  for (const row of settingsResult.rows) {
+    const itemCode = row.item_code;
+    if (isScheduleVendor(row.vendor_role)) {
+      continue;
+    }
+    const minQty = Number(row.min_qty || 0);
+    const stockQty = Number(row.stock_qty || 0);
+    if (stockQty >= minQty) continue;
+    if (activeSet.has(itemCode)) continue;
+
+    const orderLotSize = Number(row.order_lot_size || 0);
+    const lotQty = Number(row.lot_qty || 0);
+    const baseLot = orderLotSize > 0 ? orderLotSize : lotQty;
+    const rawRequestQty = baseLot > 0 ? baseLot : Math.max(minQty - stockQty, 0);
+    if (rawRequestQty <= 0) continue;
+    const resolvedPackQty = lotQty > 0 ? lotQty : await resolveItemPackQty(client, itemCode);
+    const requestQty = normalizeQtyByPack(rawRequestQty, resolvedPackQty);
+    if (requestQty <= 0) continue;
+
+    const requestCode = await buildRequestNumber(client, requestIdFormat, itemCode);
+    const maxDeliveryPerRit = Number(row.max_delivery_per_rit || 0);
+    const splitQtys = splitRequestQtyByMax(requestQty, maxDeliveryPerRit, resolvedPackQty);
+    const splitTotal = splitQtys.length || 1;
+    let splitIndex = 1;
+    for (const qtySplit of splitQtys) {
+      const splitCode = splitTotal > 1 && splitIndex > 1 ? `${requestCode}-${splitIndex}/${splitTotal}` : requestCode;
+      const result = await client.query(
+        `
+        insert into kanban_requests (item_code, request_code, request_group, split_index, split_total, request_qty, trigger_type, status, notes)
+        values ($1, $2, $3, $4, $5, $6, 'stock_min', 'requested', $7)
+        returning *
+        `,
+        [itemCode, splitCode, requestCode, splitIndex, splitTotal, qtySplit, options.note || "auto-trigger"],
+      );
+      const request = result.rows[0];
+      await createKanbanEvent(
+        client,
+        request.id,
+        "auto_trigger",
+        options.userId || null,
+        { stockQty, minQty, requestQty: qtySplit, splitIndex, splitTotal, requestGroup: requestCode, maxDeliveryPerRit },
+      );
+      created.push(request);
+      splitIndex += 1;
+    }
+  }
+
+  await syncKanbanRequestHealthByIds(client, created.map((row) => row.id), { syncPrlDrafts: true });
+
+  return created;
+};
+
+const enforceActualLocked = (existing, data, allowUnlock = false) => {
+  if (!existing.actual_locked) return;
+  const fields = [
+    ["do_number", data.doNumber],
+    ["arrival_date", data.arrivalDate],
+    ["received_qty", data.receivedQty],
+    ["notes", data.notes],
+  ];
+  if (allowUnlock) {
+    for (const [key, nextValue] of fields) {
+      const currentValue = existing[key];
+      const normalizedCurrent = currentValue === null ? null : String(currentValue);
+      const normalizedNext = nextValue === null || nextValue === undefined ? null : String(nextValue);
+      if (normalizedCurrent !== normalizedNext) {
+        const error = new Error("Buka kunci dulu sebelum mengubah data aktual.");
+        error.statusCode = 409;
+        throw error;
+      }
+    }
+    return;
+  }
+  for (const [key, nextValue] of fields) {
+    const currentValue = existing[key];
+    const normalizedCurrent = currentValue === null ? null : String(currentValue);
+    const normalizedNext = nextValue === null || nextValue === undefined ? null : String(nextValue);
+    if (normalizedCurrent !== normalizedNext) {
+      const error = new Error("Data aktual sudah dikunci dan tidak bisa diubah.");
+      error.statusCode = 409;
+      throw error;
+    }
+  }
+};
+
+const authenticate = (req, res, next) => {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  try {
+    req.user = jwt.verify(token, jwtSecret);
+    const store = requestContext.getStore();
+    if (store) {
+      store.userId = req.user?.id || null;
+      store.role = req.user?.role || null;
+    }
+    next();
+  } catch {
+    res.status(401).json({ error: "invalid token" });
+  }
+};
+
+const requireRole = (role) => (req, res, next) => {
+  if (req.user?.role !== role) {
+    res.status(403).json({ error: "forbidden" });
+    return;
+  }
+  next();
+};
+
+const requirePermission = (permission) => (req, res, next) => {
+  if (req.user?.role === "admin") {
+    next();
+    return;
+  }
+  if (!req.user?.permissions?.[permission]) {
+    res.status(403).json({ error: "forbidden" });
+    return;
+  }
+  next();
+};
+
+const requireAnyPermission = (...permissions) => (req, res, next) => {
+  if (req.user?.role === "admin") {
+    next();
+    return;
+  }
+  const allowed = permissions.some((permission) => req.user?.permissions?.[permission]);
+  if (!allowed) {
+    res.status(403).json({ error: "forbidden" });
+    return;
+  }
+  next();
+};
+
+const requireSupplier = (req, res, next) => {
+  if (req.user?.role !== "supplier") {
+    res.status(403).json({ error: "forbidden" });
+    return;
+  }
+  if (!req.user?.supplierId) {
+    res.status(403).json({ error: "supplier_id wajib diisi" });
+    return;
+  }
+  next();
+};
+
+const requireNotSupplier = (req, res, next) => {
+  if (req.user?.role === "supplier") {
+    res.status(403).json({ error: "forbidden" });
+    return;
+  }
+  next();
+};
+
+const requireMasterRead = requireAnyPermission("viewMaster", "manageMaster", "manageVendors", "manageItems", "importExport");
+const requireManageMaster = requirePermission("manageMaster");
+const requireManageVendors = requireAnyPermission("manageVendors", "manageMaster");
+const requireManageItems = requireAnyPermission("manageItems", "manageMaster");
+
+app.get("/api/health", async (req, res) => {
+  try {
+    const result = await pool.query("select now() as server_time");
+    res.json({ ok: true, serverTime: result.rows[0]?.server_time });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get("/api/time", (req, res) => {
+  res.json({ ok: true, serverTime: new Date().toISOString() });
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+    if (!username || !password) {
+      res.status(400).json({ error: "username dan password wajib" });
+      return;
+    }
+    const result = await pool.query("select * from users where username = $1", [username]);
+    if (result.rows.length === 0) {
+      res.status(401).json({ error: "kredensial tidak valid" });
+      return;
+    }
+    const user = result.rows[0];
+    const isValid = await bcrypt.compare(password, user.password_hash);
+    if (!isValid) {
+      res.status(401).json({ error: "kredensial tidak valid" });
+      return;
+    }
+    const permissions = normalizePermissions(user.permissions, user.role);
+    const token = jwt.sign(
+      { id: user.id, username: user.username, role: user.role, permissions, supplierId: user.supplier_id || null },
+      jwtSecret,
+      { expiresIn: "12h" },
+    );
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        permissions,
+        supplierId: user.supplier_id || null,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/auth/me", authenticate, (req, res) => {
+  res.json({ user: req.user });
+});
+
+app.get("/api/users", authenticate, requireRole("admin"), async (req, res) => {
+  try {
+    const result = await pool.query("select id, username, role, permissions, supplier_id, created_at from users order by id asc");
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/audit-logs", authenticate, requireRole("admin"), async (req, res) => {
+  try {
+    const whereClauses = [];
+    const values = [];
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const start = String(req.query.start || "").trim();
+    const end = String(req.query.end || "").trim();
+    const userIdRaw = Number(req.query.userId);
+    const includeTotal = String(req.query.includeTotal || "") === "1";
+    const rawLimit = Number(req.query.limit);
+    const rawOffset = Number(req.query.offset);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 1000) : 200;
+    const offset = Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : 0;
+
+    if (start) {
+      values.push(start);
+      whereClauses.push(`l.created_at::date >= $${values.length}`);
+    }
+    if (end) {
+      values.push(end);
+      whereClauses.push(`l.created_at::date <= $${values.length}`);
+    }
+    if (Number.isFinite(userIdRaw) && userIdRaw > 0) {
+      values.push(Math.trunc(userIdRaw));
+      whereClauses.push(`l.user_id = $${values.length}`);
+    }
+    if (q) {
+      const likeValue = `%${q}%`;
+      values.push(likeValue);
+      whereClauses.push(`(
+        lower(coalesce(u.username, '')) like $${values.length}
+        or lower(coalesce(l.table_name, '')) like $${values.length}
+        or lower(coalesce(l.action, '')) like $${values.length}
+        or l.record_id::text ilike $${values.length}
+        or l.old_data::text ilike $${values.length}
+        or l.new_data::text ilike $${values.length}
+      )`);
+    }
+
+    const whereSql = whereClauses.length ? `where ${whereClauses.join(" and ")}` : "";
+    const dataValues = [...values, limit, offset];
+    const dataSql = `
+      select
+        l.id,
+        l.user_id,
+        u.username,
+        l.action,
+        l.table_name,
+        l.record_id,
+        l.old_data,
+        l.new_data,
+        l.created_at
+      from audit_logs l
+      left join users u on u.id = l.user_id
+      ${whereSql}
+      order by l.created_at desc, l.id desc
+      limit $${values.length + 1}
+      offset $${values.length + 2}
+    `;
+    const result = await pool.query(dataSql, dataValues);
+    let total = result.rows.length;
+    if (includeTotal) {
+      const countResult = await pool.query(
+        `
+        select count(*)::int as total
+        from audit_logs l
+        left join users u on u.id = l.user_id
+        ${whereSql}
+        `,
+        values,
+      );
+      total = Number(countResult.rows[0]?.total || 0);
+    }
+    res.json({ rows: result.rows, total });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal memuat audit logs." });
+  }
+});
+
+app.post("/api/users", authenticate, requireRole("admin"), async (req, res) => {
+  try {
+    const { username, password, role, permissions, supplierId, supplier_id } = req.body || {};
+    if (!username || !password) {
+      res.status(400).json({ error: "username dan password wajib" });
+      return;
+    }
+    const normalizedRole = allowedRoles.has(role) ? role : "user";
+    const normalizedPermissions = normalizePermissions(permissions, normalizedRole);
+    let supplierValue = supplierId || supplier_id || null;
+    if (normalizedRole === "supplier") {
+      if (!supplierValue) {
+        res.status(400).json({ error: "supplier_id wajib diisi untuk role supplier" });
+        return;
+      }
+      const vendorCheck = await pool.query("select id from master_vendors where id = $1", [supplierValue]);
+      if (vendorCheck.rows.length === 0) {
+        res.status(400).json({ error: "supplier_id tidak ditemukan" });
+        return;
+      }
+    } else {
+      supplierValue = null;
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      "insert into users (username, password_hash, role, permissions, supplier_id) values ($1, $2, $3, $4, $5) returning id, username, role, permissions, supplier_id, created_at",
+      [username, passwordHash, normalizedRole, normalizedPermissions, supplierValue],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/users/:id", authenticate, requireRole("admin"), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const { role, permissions, supplierId, supplier_id } = req.body || {};
+    const normalizedRole = allowedRoles.has(role) ? role : "user";
+    const normalizedPermissions = normalizePermissions(permissions, normalizedRole);
+    let supplierValue = supplierId || supplier_id || null;
+    if (normalizedRole === "supplier") {
+      if (!supplierValue) {
+        res.status(400).json({ error: "supplier_id wajib diisi untuk role supplier" });
+        return;
+      }
+      const vendorCheck = await pool.query("select id from master_vendors where id = $1", [supplierValue]);
+      if (vendorCheck.rows.length === 0) {
+        res.status(400).json({ error: "supplier_id tidak ditemukan" });
+        return;
+      }
+    } else {
+      supplierValue = null;
+    }
+    const result = await pool.query(
+      "update users set role = $1, permissions = $2, supplier_id = $3, updated_at = now() where id = $4 returning id, username, role, permissions, supplier_id, created_at",
+      [normalizedRole, normalizedPermissions, supplierValue, id],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "user tidak ditemukan" });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/schedules", authenticate, requireNotSupplier, async (req, res) => {
+  try {
+    const whereClauses = [];
+    const filterValues = [];
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const status = String(req.query.status || "").trim();
+    const supplier = String(req.query.supplier || "").trim();
+    const start = String(req.query.start || "").trim();
+    const end = String(req.query.end || "").trim();
+    const order = String(req.query.order || "asc").toLowerCase() === "desc" ? "desc" : "asc";
+    const rawLimit = Number(req.query.limit);
+    const rawOffset = Number(req.query.offset);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 5000) : null;
+    const offset = Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : null;
+    const includeTotal = String(req.query.includeTotal || "") === "1";
+    const wantsMeta = includeTotal || limit !== null || offset !== null;
+    const cacheKey = serializeScheduleQuery(req.query);
+    const cached = getScheduleCache(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
+    }
+
+    whereClauses.push("coalesce(s.item_code, s.item) not ilike 'TEST-%'");
+
+    if (start) {
+      filterValues.push(start);
+      whereClauses.push(`s.request_date >= $${filterValues.length}`);
+    }
+    if (end) {
+      filterValues.push(end);
+      whereClauses.push(`s.request_date <= $${filterValues.length}`);
+    }
+    if (status) {
+      const normalizedStatus = status.toLowerCase();
+      if (normalizedStatus === "pending") {
+        whereClauses.push("s.arrival_date is null");
+      } else if (normalizedStatus === "on time") {
+        whereClauses.push("s.arrival_date = s.request_date");
+      } else if (normalizedStatus === "late") {
+        whereClauses.push("s.arrival_date > s.request_date");
+      } else if (normalizedStatus === "too early") {
+        whereClauses.push("s.arrival_date < s.request_date");
+      } else {
+        filterValues.push(status);
+        whereClauses.push(`s.status = $${filterValues.length}`);
+      }
+    }
+    if (supplier) {
+      filterValues.push(supplier);
+      whereClauses.push(`(
+        lower(coalesce(s.supplier_id, ph.supplier_id, s.supplier)) = lower($${filterValues.length})
+        or lower(coalesce(mv.name, '')) = lower($${filterValues.length})
+      )`);
+    }
+    if (q) {
+      filterValues.push(`%${q}%`);
+      whereClauses.push(`(
+        lower(s.po_number) like $${filterValues.length}
+        or lower(coalesce(s.supplier_id, ph.supplier_id, s.supplier)) like $${filterValues.length}
+        or lower(coalesce(mv.name, '')) like $${filterValues.length}
+        or lower(coalesce(pl.item_code, s.item_code, s.item)) like $${filterValues.length}
+        or lower(coalesce(i.name, '')) like $${filterValues.length}
+        or lower(coalesce(i.part_no, '')) like $${filterValues.length}
+        or lower(coalesce(s.do_number, '')) like $${filterValues.length}
+      )`);
+    }
+
+    const whereSql = whereClauses.length ? ` where ${whereClauses.join(" and ")}` : "";
+    let total = null;
+    if (wantsMeta) {
+      const countResult = await pool.query(
+        `
+        select count(*)::int as total
+        from schedules s
+        left join po_headers ph on ph.po_number = s.po_number
+        left join po_lines pl on pl.id = s.po_line_id
+        left join lateral (
+          select name
+          from master_vendors mv
+          where mv.id = coalesce(s.supplier_id, ph.supplier_id, s.supplier)
+             or mv.id = s.supplier
+             or mv.name = s.supplier
+          order by case
+            when mv.id = coalesce(s.supplier_id, ph.supplier_id, s.supplier) then 0
+            when mv.id = s.supplier then 1
+            when mv.name = s.supplier then 2
+            else 3
+          end
+          limit 1
+        ) mv on true
+        left join items i on lower(i.code) = lower(coalesce(pl.item_code, s.item_code, s.item))
+        ${whereSql}
+        `,
+        filterValues,
+      );
+      total = Number(countResult.rows[0]?.total || 0);
+    }
+
+    const values = [...filterValues];
+    let sql = `
+      select s.*, ph.status as po_status, mv.name as supplier_name,
+        coalesce(s.supplier_id, ph.supplier_id, s.supplier) as supplier_id,
+        ph.supplier_id as po_supplier_id,
+        i.name as item_name,
+        coalesce(pl.item_code, s.item_code, s.item) as resolved_item_code
+      from schedules s
+      left join po_headers ph on ph.po_number = s.po_number
+      left join po_lines pl on pl.id = s.po_line_id
+      left join lateral (
+        select name
+        from master_vendors mv
+        where mv.id = coalesce(s.supplier_id, ph.supplier_id, s.supplier)
+           or mv.id = s.supplier
+           or mv.name = s.supplier
+        order by case
+          when mv.id = coalesce(s.supplier_id, ph.supplier_id, s.supplier) then 0
+          when mv.id = s.supplier then 1
+          when mv.name = s.supplier then 2
+          else 3
+          end
+          limit 1
+      ) mv on true
+      left join items i on lower(i.code) = lower(coalesce(pl.item_code, s.item_code, s.item))
+      ${whereSql}
+    `;
+    sql += ` order by s.request_date ${order}, s.id ${order}`;
+    if (limit) {
+      values.push(limit);
+      sql += ` limit $${values.length}`;
+    }
+    if (offset !== null) {
+      values.push(offset);
+      sql += ` offset $${values.length}`;
+    }
+
+    const result = await pool.query(sql, values);
+    const rows = result.rows.map(mapRowToSchedule);
+    if (wantsMeta) {
+      const payload = { rows, total: total ?? rows.length };
+      setScheduleCache(cacheKey, payload);
+      res.json(payload);
+      return;
+    }
+    setScheduleCache(cacheKey, rows);
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const resolveMonthRange = (value) => {
+  const raw = String(value || "").trim();
+  const match = raw.match(/^(\d{4})-(\d{2})$/);
+  const now = new Date();
+  const year = match ? Number(match[1]) : now.getFullYear();
+  const monthIndex = match ? Number(match[2]) - 1 : now.getMonth();
+  const safeMonth = Number.isFinite(monthIndex) && monthIndex >= 0 && monthIndex <= 11 ? monthIndex : now.getMonth();
+  const startDate = new Date(Date.UTC(year, safeMonth, 1));
+  const endDate = new Date(Date.UTC(year, safeMonth + 1, 0));
+  const month = `${year}-${String(safeMonth + 1).padStart(2, "0")}`;
+  return {
+    start: startDate.toISOString().slice(0, 10),
+    end: endDate.toISOString().slice(0, 10),
+    month,
+  };
+};
+
+const resolveDateOnly = (value) => {
+  const raw = String(value || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  return new Date().toISOString().slice(0, 10);
+};
+
+app.get("/api/schedules/stats", authenticate, requireNotSupplier, async (req, res) => {
+  try {
+    const whereClauses = [];
+    const values = [];
+    const start = String(req.query.start || "").trim();
+    const end = String(req.query.end || "").trim();
+    const month = String(req.query.month || "").trim();
+    const resolvedRange = month ? resolveMonthRange(month) : null;
+    const startValue = start || resolvedRange?.start || "";
+    const endValue = end || resolvedRange?.end || "";
+    if (startValue) {
+      values.push(startValue);
+      whereClauses.push(`request_date >= $${values.length}`);
+    }
+    if (endValue) {
+      values.push(endValue);
+      whereClauses.push(`request_date <= $${values.length}`);
+    }
+    whereClauses.push("item not ilike 'TEST-%'");
+    const whereSql = whereClauses.length ? ` where ${whereClauses.join(" and ")}` : "";
+    const result = await pool.query(
+      `
+      select
+        count(*)::int as total_schedules,
+        count(distinct po_number)::int as total_po,
+        count(distinct request_date)::int as total_schedule_dates,
+        sum(case when arrival_date is null then 1 else 0 end)::int as pending,
+        sum(case when arrival_date > request_date then 1 else 0 end)::int as late,
+        sum(case when arrival_date < request_date then 1 else 0 end)::int as too_early,
+        sum(case when arrival_date = request_date then 1 else 0 end)::int as on_time
+      from schedules${whereSql}
+      `,
+      values,
+    );
+    const row = result.rows[0] || {};
+    res.json({
+      totalPO: Number(row.total_po || 0),
+      totalSchedules: Number(row.total_schedules || 0),
+      totalScheduleDates: Number(row.total_schedule_dates || 0),
+      onTime: Number(row.on_time || 0),
+      late: Number(row.late || 0),
+      pending: Number(row.pending || 0),
+      tooEarly: Number(row.too_early || 0),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/schedules/readiness", authenticate, requireNotSupplier, async (req, res) => {
+  try {
+    const { start, end, month } = req.query || {};
+    const range = resolveMonthRange(month);
+    const startDate = String(start || range.start);
+    const endDate = String(end || range.end);
+    const result = await pool.query(
+      `
+      select
+        to_char(request_date, 'DD') as day,
+        coalesce(sum(request_qty), 0)::int as target,
+        coalesce(sum(received_qty), 0)::int as ready
+      from schedules
+      where request_date between $1 and $2
+        and item not ilike 'TEST-%'
+      group by day
+      order by day asc
+      `,
+      [startDate, endDate],
+    );
+    res.json({
+      month: range.month,
+      start: startDate,
+      end: endDate,
+      rows: result.rows.map((row) => ({
+        day: row.day,
+        target: Number(row.target || 0),
+        ready: Number(row.ready || 0),
+      })),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/schedules/received-summary", authenticate, requireNotSupplier, async (req, res) => {
+  try {
+    const { month } = req.query || {};
+    const currentRange = resolveMonthRange(month);
+    const prevDate = new Date(`${currentRange.start}T00:00:00.000Z`);
+    prevDate.setUTCMonth(prevDate.getUTCMonth() - 1);
+    const prevRange = resolveMonthRange(prevDate.toISOString().slice(0, 7));
+    const result = await pool.query(
+      `
+      select
+        coalesce(sum(case when coalesce(arrival_date, request_date) between $1 and $2 then received_qty else 0 end), 0)::int as current_received,
+        coalesce(sum(case when coalesce(arrival_date, request_date) between $3 and $4 then received_qty else 0 end), 0)::int as prev_received
+      from schedules
+      where item not ilike 'TEST-%'
+      `,
+      [currentRange.start, currentRange.end, prevRange.start, prevRange.end],
+    );
+    const row = result.rows[0] || {};
+    res.json({
+      currentMonth: currentRange.month,
+      prevMonth: prevRange.month,
+      currentReceived: Number(row.current_received || 0),
+      prevReceived: Number(row.prev_received || 0),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/schedules/today-summary", authenticate, requireNotSupplier, async (req, res) => {
+  try {
+    const dateValue = resolveDateOnly(req.query?.date);
+    const result = await pool.query(
+      `
+      select
+        coalesce(sum(request_qty), 0)::int as target,
+        coalesce(sum(received_qty), 0)::int as ready
+      from schedules
+      where request_date = $1
+        and item not ilike 'TEST-%'
+      `,
+      [dateValue],
+    );
+    const row = result.rows[0] || {};
+    res.json({
+      date: dateValue,
+      target: Number(row.target || 0),
+      ready: Number(row.ready || 0),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/schedules/:id/split", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+
+    await client.query("begin");
+    const existingRow = await client.query("select * from schedules where id = $1 for update", [id]);
+    if (existingRow.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "data tidak ditemukan" });
+      return;
+    }
+
+    const existing = existingRow.rows[0];
+    const orderedQty = Math.max(0, Number(existing.request_qty || 0));
+    const receivedQty = Math.max(0, Number(existing.received_qty || 0));
+    const outstandingQty = Math.max(0, orderedQty - receivedQty);
+
+    if (!(receivedQty > 0 && receivedQty < orderedQty)) {
+      await client.query("rollback");
+      res.status(409).json({ error: "Hanya untuk penerimaan parsial." });
+      return;
+    }
+    if (outstandingQty <= 0) {
+      await client.query("rollback");
+      res.status(409).json({ error: "Tidak ada sisa untuk split." });
+      return;
+    }
+    if (existing.has_split) {
+      await client.query("rollback");
+      res.status(409).json({ error: "Jadwal sudah pernah di-split." });
+      return;
+    }
+
+    const notesValue = String(existing.notes || "").trim();
+    const nextNotes = notesValue
+      ? (notesValue.includes("(Parsial)") ? notesValue : `${notesValue} (Parsial)`)
+      : "(Parsial)";
+    const nextRequestQty = receivedQty;
+    const nextStatus = getScheduleStatusFromActual({
+      requestDate: existing.request_date,
+      arrivalDate: existing.arrival_date,
+      requestQty: nextRequestQty,
+      receivedQty,
+    });
+
+    const updatedResult = await client.query(
+      `
+        update schedules
+        set has_split = true,
+            notes = $2,
+            request_qty = $3,
+            status = $4,
+            updated_at = now()
+        where id = $1
+        returning *
+      `,
+      [id, nextNotes, nextRequestQty, nextStatus],
+    );
+    const updatedRow = updatedResult.rows[0];
+
+    let splitItemCode = normalizeItemCode(existing.item_code);
+    if (!splitItemCode && existing.po_line_id) {
+      const poLine = await resolvePoLineById(client, existing.po_line_id);
+      splitItemCode = normalizeItemCode(poLine?.item_code);
+    }
+    if (!splitItemCode) {
+      splitItemCode = normalizeItemCode(existing.item);
+    }
+    if (!splitItemCode) {
+      const error = new Error("Item wajib diisi (kode item).");
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const createdResult = await client.query(
+      `
+        insert into schedules
+          (po_number, supplier, supplier_id, item, item_code, request_date, delivery_time, request_qty, arrival_date, received_qty, do_number, status, notes, has_split, is_split_result, actual_locked, dn_id, request_id, po_line_id)
+        values
+          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,false,true,false,$14,$15,$16)
+        returning *
+      `,
+      [
+        existing.po_number,
+        existing.supplier,
+        existing.supplier_id || existing.supplier,
+        splitItemCode,
+        splitItemCode,
+        existing.request_date,
+        existing.delivery_time,
+        outstandingQty,
+        null,
+        0,
+        null,
+        "Pending",
+        "Hasil Split dari Parsial",
+        existing.dn_id,
+        existing.request_id,
+        existing.po_line_id,
+      ],
+    );
+    const createdRow = createdResult.rows[0];
+
+    await createInboundCardsForSchedule(client, createdRow);
+    await client.query("commit");
+    clearScheduleCache();
+    res.json({
+      updated: mapRowToSchedule(updatedRow),
+      created: mapRowToSchedule(createdRow),
+    });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/schedules", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const data = toDbSchedule(req.body);
+    if (!data.poNumber) {
+      const error = new Error("Nomor PO wajib diisi.");
+      error.statusCode = 400;
+      throw error;
+    }
+    const itemCode = normalizeItemCode(data.itemCode || data.item);
+    if (!itemCode) {
+      const error = new Error("Item wajib diisi (kode item).");
+      error.statusCode = 400;
+      throw error;
+    }
+    data.itemCode = itemCode;
+    data.item = itemCode;
+    const poHeader = await resolvePoHeader(client, data.poNumber);
+    if (!poHeader) {
+      const error = new Error("PO tidak ditemukan.");
+      error.statusCode = 404;
+      throw error;
+    }
+    const supplierId = await resolveSupplierCode(client, data.supplierId || data.supplier || poHeader.supplier_id, { strict: true }) || poHeader.supplier_id;
+    if (!supplierId) {
+      const error = new Error("Supplier wajib diisi dan harus terdaftar di Master Vendor.");
+      error.statusCode = 400;
+      throw error;
+    }
+    data.supplier = supplierId;
+    data.supplierId = supplierId;
+    const poLine = await resolvePoLineForPayload(client, data);
+    const { remaining } = await resolvePoLineScheduleRemaining(client, poLine);
+    if (!Number.isFinite(data.requestQty) || data.requestQty <= 0) {
+      data.requestQty = Math.max(0, remaining);
+    } else {
+      const packQty = await resolveItemPackQty(client, data.item);
+      data.requestQty = normalizeScheduleQtyByPack(data.requestQty, packQty, remaining);
+    }
+    if (data.requestQty > remaining) {
+      const error = new Error(buildScheduleQtyConflictMessage({
+        poNumber: data.poNumber,
+        itemCode: data.itemCode || data.item,
+        requestQty: data.requestQty,
+        remaining,
+        requestDate: data.requestDate,
+      }));
+      error.statusCode = 409;
+      throw error;
+    }
+    data.poLineId = poLine.id;
+    await ensureUniqueDoNumber(client, data);
+    await client.query("begin");
+    const nextStatus = getScheduleStatusFromActual({
+      requestDate: data.requestDate,
+      arrivalDate: data.arrivalDate,
+    });
+    const result = await client.query(
+      `insert into schedules
+        (po_number, supplier, supplier_id, item, item_code, request_date, delivery_time, request_qty, arrival_date, received_qty, do_number, status, notes, has_split, is_split_result, actual_locked, dn_id, request_id, po_line_id)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        returning *`,
+      [
+        data.poNumber,
+        data.supplier,
+        data.supplierId,
+        data.item,
+        data.itemCode,
+        data.requestDate,
+        data.deliveryTime,
+        data.requestQty,
+        data.arrivalDate,
+        data.receivedQty,
+        data.doNumber,
+        nextStatus,
+        data.notes,
+        data.hasSplit,
+        data.isSplitResult,
+        data.actualLocked,
+        data.dnId,
+        data.requestId,
+        data.poLineId,
+      ],
+    );
+    const scheduleRow = result.rows[0];
+    await createInboundCardsForSchedule(client, scheduleRow);
+    await client.query("commit");
+    clearScheduleCache();
+    res.json(mapRowToSchedule(scheduleRow));
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/schedules/bulk", authenticate, requireAnyPermission("editSchedules", "importExport"), async (req, res) => {
+  const items = Array.isArray(req.body.items) ? req.body.items : [];
+  if (items.length === 0) {
+    res.status(400).json({ error: "items kosong" });
+    return;
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const created = [];
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      const data = toDbSchedule(item);
+      // Bulk schedule import is plan-only. Actual receiving must use receive flow.
+      data.arrivalDate = null;
+      data.receivedQty = 0;
+      data.actualLocked = false;
+
+      if (!data.poNumber) {
+        const error = new Error("Nomor PO wajib diisi.");
+        error.statusCode = 400;
+        throw error;
+      }
+      const poHeader = await resolvePoHeader(client, data.poNumber);
+      if (!poHeader) {
+        const error = new Error(`PO ${data.poNumber} tidak ditemukan.`);
+        error.statusCode = 404;
+        throw error;
+      }
+      const poSupplierId = String(poHeader.supplier_id || "").trim();
+      if (!poSupplierId) {
+        const error = new Error(`Supplier PO ${data.poNumber} tidak valid.`);
+        error.statusCode = 409;
+        throw error;
+      }
+
+      if (!data.item) {
+        const requestDateValue = normalizeDateOnly(data.requestDate) || getTodayDateOnly();
+        const deliveryTimeValue = data.deliveryTime || null;
+        const notesValue = data.notes || null;
+        const remainingLines = await loadRemainingPoLines(client, data.poNumber);
+        if (remainingLines.length === 0) {
+          const error = new Error(`PO ${data.poNumber} sudah selesai atau tidak ada sisa qty.`);
+          error.statusCode = 409;
+          throw error;
+        }
+        for (const line of remainingLines) {
+          const remaining = Number(line.remaining_after_schedule ?? (Number(line.qty_order || 0) - Number(line.qty_received || 0)));
+          if (!Number.isFinite(remaining) || remaining <= 0) continue;
+          const nextStatus = getScheduleStatusFromActual({
+            requestDate: requestDateValue,
+            arrivalDate: null,
+          });
+          const result = await client.query(
+            `insert into schedules
+              (po_number, supplier, supplier_id, item, item_code, request_date, delivery_time, request_qty, arrival_date, received_qty, do_number, status, notes, has_split, is_split_result, actual_locked, dn_id, request_id, po_line_id)
+              values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,false,false,false,$13,$14,$15)
+              returning *`,
+            [
+              data.poNumber,
+              poSupplierId,
+              poSupplierId,
+              line.item_code,
+              line.item_code,
+              requestDateValue,
+              deliveryTimeValue,
+              remaining,
+              null,
+              0,
+              null,
+              nextStatus,
+              notesValue,
+              null,
+              null,
+              line.id,
+            ],
+          );
+          const scheduleRow = result.rows[0];
+          await createInboundCardsForSchedule(client, scheduleRow);
+          created.push(mapRowToSchedule(scheduleRow));
+        }
+        continue;
+      }
+      const normalizedItemCode = normalizeItemCode(data.itemCode || data.item);
+      if (!normalizedItemCode) {
+        const error = new Error("Item wajib diisi (kode item).");
+        error.statusCode = 400;
+        throw error;
+      }
+      data.itemCode = normalizedItemCode;
+      data.item = normalizedItemCode;
+      // Force schedule supplier to PO owner to prevent cross-supplier mismatch.
+      if (data.supplier || data.supplierId) {
+        const requestedSupplier = String(data.supplierId || data.supplier || "").trim();
+        if (requestedSupplier) {
+          const resolvedRequested = await resolveSupplierCode(client, requestedSupplier, { strict: true });
+          if (resolvedRequested && String(resolvedRequested).trim().toLowerCase() !== poSupplierId.toLowerCase()) {
+            const error = new Error(`Supplier pada import tidak sesuai dengan supplier PO ${data.poNumber}.`);
+            error.statusCode = 409;
+            throw error;
+          }
+        }
+      }
+      data.supplier = poSupplierId;
+      data.supplierId = poSupplierId;
+
+      const poLine = await resolvePoLineForPayload(client, data);
+      const { remaining } = await resolvePoLineScheduleRemaining(client, poLine);
+      if (!Number.isFinite(data.requestQty) || data.requestQty <= 0) {
+        data.requestQty = Math.max(0, remaining);
+      } else {
+        const packQty = await resolveItemPackQty(client, data.item);
+        data.requestQty = normalizeScheduleQtyByPack(data.requestQty, packQty, remaining);
+      }
+      if (data.requestQty > remaining) {
+        const error = new Error(buildScheduleQtyConflictMessage({
+          poNumber: data.poNumber,
+          itemCode: data.itemCode || data.item || poLine?.item_code,
+          requestQty: data.requestQty,
+          remaining,
+          requestDate: data.requestDate,
+          rowNumber: index + 1,
+        }));
+        error.statusCode = 409;
+        throw error;
+      }
+      data.poLineId = poLine.id;
+      await ensureUniqueDoNumber(client, data);
+      const nextStatus = getScheduleStatusFromActual({
+        requestDate: data.requestDate,
+        arrivalDate: data.arrivalDate,
+      });
+      const result = await client.query(
+        `insert into schedules
+          (po_number, supplier, supplier_id, item, item_code, request_date, delivery_time, request_qty, arrival_date, received_qty, do_number, status, notes, has_split, is_split_result, actual_locked, dn_id, request_id, po_line_id)
+          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+          returning *`,
+        [
+          data.poNumber,
+          data.supplier,
+          data.supplierId,
+          data.item,
+          data.itemCode,
+          data.requestDate,
+          data.deliveryTime,
+          data.requestQty,
+          data.arrivalDate,
+          data.receivedQty,
+          data.doNumber,
+          nextStatus,
+          data.notes,
+          data.hasSplit,
+          data.isSplitResult,
+          data.actualLocked,
+          data.dnId,
+          data.requestId,
+          data.poLineId,
+        ],
+      );
+      const scheduleRow = result.rows[0];
+      await createInboundCardsForSchedule(client, scheduleRow);
+      created.push(mapRowToSchedule(scheduleRow));
+    }
+    await client.query("commit");
+    clearScheduleCache();
+    res.json(created);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+  app.put("/api/schedules/:id", authenticate, requirePermission("editSchedules"), async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id)) {
+        res.status(400).json({ error: "id tidak valid" });
+        return;
+      }
+      const data = toDbSchedule(req.body);
+      const parsedDocQty = Number(req.body?.docQty);
+      let docQtyValue = Number.isFinite(parsedDocQty) && parsedDocQty > 0 ? parsedDocQty : null;
+      const allowOverReceive = Boolean(req.body?.allowOverReceive) && req.user?.role === "admin";
+
+      await client.query("begin");
+      const existingRow = await client.query("select * from schedules where id = $1 for update", [id]);
+      if (existingRow.rows.length === 0) {
+        await client.query("rollback");
+        res.status(404).json({ error: "data tidak ditemukan" });
+        return;
+      }
+      const existing = existingRow.rows[0];
+
+      const allowUnlock = existing.actual_locked && req.user?.role === "admin" && data.actualLocked === false;
+      enforceActualLocked(existing, data, allowUnlock);
+
+      const poNumber = normalizePoNumber(data.poNumber || existing.po_number);
+      if (!poNumber) {
+        await client.query("rollback");
+        res.status(409).json({ error: "Nomor PO wajib diisi." });
+        return;
+      }
+      data.poNumber = poNumber;
+      const poHeader = await resolvePoHeader(client, data.poNumber);
+      if (!poHeader) {
+        await client.query("rollback");
+        res.status(404).json({ error: "PO tidak ditemukan." });
+        return;
+      }
+      const supplierId = await resolveSupplierCode(client, data.supplierId || data.supplier || poHeader.supplier_id, { strict: true }) || poHeader.supplier_id;
+      if (!supplierId) {
+        const error = new Error("Supplier wajib diisi dan harus terdaftar di Master Vendor.");
+        error.statusCode = 400;
+        throw error;
+      }
+      data.supplier = supplierId;
+      data.supplierId = supplierId;
+      const itemCodeCandidate = normalizeItemCode(data.itemCode || data.item_code || existing.item_code);
+      const poLine = await resolvePoLineForPayload(
+        client,
+        {
+          poNumber: data.poNumber,
+          itemCode: itemCodeCandidate,
+          poLineId: data.poLineId || existing.po_line_id,
+        },
+        { allowItemFallback: false },
+      );
+      const resolvedItemCode = normalizeItemCode(poLine?.item_code || itemCodeCandidate);
+      if (!resolvedItemCode) {
+        await client.query("rollback");
+        res.status(400).json({ error: "Item wajib diisi (kode item)." });
+        return;
+      }
+      data.poLineId = poLine.id;
+      data.itemCode = resolvedItemCode;
+      data.item = resolvedItemCode;
+
+      const packQty = await resolveItemPackQty(client, resolvedItemCode);
+      const isLoose = isLooseQty(data.receivedQty, packQty);
+      const { productionDate, expiredDate } = await resolveBatchDates(
+        client,
+        resolvedItemCode,
+        req.body?.productionDate,
+        req.body?.expiredDate,
+      );
+      const { remaining } = await resolvePoLineScheduleRemaining(client, poLine, { excludeScheduleId: id });
+      if (!Number.isFinite(data.requestQty) || data.requestQty <= 0) {
+        data.requestQty = Math.max(0, remaining);
+      } else {
+        data.requestQty = normalizeScheduleQtyByPack(data.requestQty, packQty, remaining);
+      }
+      const allowOverScheduleQty = data.actualLocked && Number(data.receivedQty || 0) > 0;
+      if (!allowOverScheduleQty && data.requestQty > remaining) {
+        await client.query("rollback");
+        res.status(409).json({
+          error: buildScheduleQtyConflictMessage({
+            poNumber: data.poNumber,
+            itemCode: resolvedItemCode,
+            requestQty: data.requestQty,
+            remaining,
+            requestDate: data.requestDate || existing.request_date,
+          }),
+        });
+        return;
+      }
+
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, "arrivalDate")) {
+        await assertArrivalDateAllowed(client, data.arrivalDate, req.user);
+      }
+      if (Number(data.receivedQty || 0) > 0) {
+        assertScheduleReceiveQty(
+          { request_qty: data.requestQty ?? existing.request_qty },
+          Number(data.receivedQty || 0),
+          { allowOver: allowOverReceive },
+        );
+        assertPoLineRemaining(poLine, Number(data.receivedQty || 0), { allowOver: allowOverReceive });
+      }
+
+      await ensureUniqueDoNumber(client, data, id);
+      const nextStatus = getScheduleStatusFromActual({
+        requestDate: data.requestDate || existing.request_date,
+        arrivalDate: data.arrivalDate || existing.arrival_date,
+      });
+      const result = await client.query(
+        `update schedules set
+          po_number = $1,
+          supplier = $2,
+          supplier_id = $3,
+          item = $4,
+          item_code = $5,
+          request_date = $6,
+          delivery_time = $7,
+          request_qty = $8,
+          arrival_date = $9,
+          received_qty = $10,
+          do_number = $11,
+          status = $12,
+          notes = $13,
+          has_split = $14,
+          is_split_result = $15,
+          actual_locked = $16,
+          dn_id = $17,
+          request_id = $18,
+          po_line_id = $19,
+          updated_at = now()
+        where id = $20
+        returning *`,
+        [
+          data.poNumber,
+          data.supplier,
+          data.supplierId,
+          data.item,
+          data.itemCode,
+          data.requestDate,
+          data.deliveryTime,
+          data.requestQty,
+          data.arrivalDate,
+          data.receivedQty,
+          data.doNumber,
+          nextStatus,
+          data.notes,
+          data.hasSplit,
+          data.isSplitResult,
+          data.actualLocked,
+          data.dnId,
+          data.requestId,
+          data.poLineId,
+          id,
+        ],
+      );
+      const updatedRow = result.rows[0];
+
+      if (allowUnlock) {
+        if (Number(existing.received_qty || 0) > 0 && data.poLineId) {
+          await client.query(
+            "update po_lines set qty_received = greatest(qty_received - $1, 0) where id = $2",
+            [Number(existing.received_qty || 0), data.poLineId],
+          );
+          await refreshPoHeaderStatus(client, data.poNumber);
+        }
+        await client.query("delete from stock_batches where schedule_id = $1", [id]);
+        await client.query("commit");
+        clearScheduleCache();
+        res.json(mapRowToSchedule(updatedRow));
+        return;
+      }
+
+      let shouldTriggerKanban = false;
+      if (!existing.actual_locked && data.actualLocked && data.receivedQty > 0) {
+        if (Number(existing.received_qty || 0) > 0) {
+          await client.query("rollback");
+          res.status(409).json({ error: "Schedule sudah memiliki penerimaan. Gunakan inbound scan atau split." });
+          return;
+        }
+        const rnExists = await client.query(
+          "select id from receive_notes where schedule_id = $1 limit 1",
+          [id],
+        );
+        if (rnExists.rows.length > 0) {
+          await client.query("rollback");
+          res.status(409).json({ error: "Receive note sudah ada untuk schedule ini." });
+          return;
+        }
+        const poLineForReceive = await applyPoReceiptForSchedule(
+          client,
+          {
+            id,
+            po_number: data.poNumber,
+            item: data.item || existing.item,
+            request_qty: data.requestQty ?? existing.request_qty,
+            po_line_id: data.poLineId,
+          },
+          data.receivedQty,
+          { allowOverReceive },
+        );
+        if (rnExists.rows.length === 0) {
+          const numbering = await getDocumentNumberingConfig(client);
+          const supplierValue = data.supplier || existing.supplier || "SUPPLIER";
+          const supplierCodeRaw = await resolveSupplierCode(client, supplierValue);
+          const supplierCode = supplierCodeRaw || supplierValue || "SUPPLIER";
+          const rnFormat = requireFormat(numbering.rnFormat, "RN format");
+          const resolvedRnNumber = await buildDocumentNumber(client, "receive_notes", "rn_number", rnFormat, {
+            dept: numbering.dept,
+            prefix: "RN",
+            supplier: supplierValue,
+            supplierCode,
+          });
+          const resolvedDocQty = Number.isFinite(docQtyValue) ? docQtyValue : data.receivedQty;
+          await client.query(
+            `insert into receive_notes
+              (rn_number, dn_id, schedule_id, item_code, received_qty, doc_qty, qc_status, status, notes, is_loose, received_by, source, po_line_id)
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+            [
+              resolvedRnNumber,
+              data.dnId || existing.dn_id || null,
+              id,
+              data.item || null,
+              data.receivedQty,
+              resolvedDocQty,
+              "ok",
+              "open",
+              data.notes || null,
+              isLoose,
+              null,
+              "SCHEDULE_LOCK",
+              poLineForReceive?.id || data.poLineId,
+            ],
+          );
+        }
+        await client.query(
+          `insert into stock_batches (item_code, qty_in, arrival_date, do_number, batch_no, schedule_id, is_loose, production_date, expired_date)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           on conflict (schedule_id) do nothing`,
+          [data.item, data.receivedQty, data.arrivalDate || null, data.doNumber || null, data.doNumber || String(id), id, isLoose, productionDate, expiredDate],
+        );
+        shouldTriggerKanban = true;
+      }
+
+      await client.query("commit");
+      clearScheduleCache();
+      if (shouldTriggerKanban) {
+        await autoTriggerKanbanRequests(pool, { note: "auto-trigger (schedule lock)" });
+      }
+      res.json(mapRowToSchedule(updatedRow));
+    } catch (error) {
+      await client.query("rollback");
+      res.status(error.statusCode || 500).json({ error: error.message });
+    } finally {
+      client.release();
+    }
+  });
+
+app.post("/api/schedules/:id/unlock", authenticate, requireRole("admin"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const existingRow = await client.query("select * from schedules where id = $1 for update", [id]);
+    if (existingRow.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "data tidak ditemukan" });
+      return;
+    }
+    const existing = existingRow.rows[0];
+    const updated = await client.query(
+      "update schedules set actual_locked = false, updated_at = now() where id = $1 returning *",
+      [id],
+    );
+    if (Number(existing.received_qty || 0) > 0 && existing.po_line_id) {
+      await client.query(
+        "update po_lines set qty_received = greatest(qty_received - $1, 0) where id = $2",
+        [Number(existing.received_qty || 0), existing.po_line_id],
+      );
+      await refreshPoHeaderStatus(client, existing.po_number);
+    }
+    await client.query("delete from stock_batches where schedule_id = $1", [id]);
+    await client.query("commit");
+    await autoTriggerKanbanRequests(pool, { note: "auto-trigger (schedule unlock)" });
+    clearScheduleCache();
+    res.json(mapRowToSchedule(updated.rows[0]));
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/po/import", authenticate, requireAnyPermission("manageVendors", "manageItems", "editSchedules", "importExport"), async (req, res) => {
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  if (rows.length === 0) {
+    res.status(400).json({ error: "Rows kosong." });
+    return;
+  }
+  const errors = [];
+  const addError = (rowNumber, poNumber, message) => {
+    errors.push({ row: rowNumber || null, no_po: poNumber || null, error: message });
+  };
+  const parseImportDate = (value) => {
+    if (!value) return null;
+    const parseExcelSerial = (input) => {
+      const serial = Number(input);
+      if (!Number.isFinite(serial) || serial <= 0) return null;
+      const base = Date.UTC(1899, 11, 30);
+      const date = new Date(base + Math.round(serial) * 86400 * 1000);
+      if (Number.isNaN(date.getTime())) return null;
+      return date.toISOString().slice(0, 10);
+    };
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+      return value.toISOString().slice(0, 10);
+    }
+    if (typeof value === "number") {
+      const serialDate = parseExcelSerial(value);
+      if (serialDate) return normalizeDateOnly(serialDate);
+    }
+    const raw = String(value).trim();
+    if (/^\d{1,6}$/.test(raw)) {
+      const serialDate = parseExcelSerial(raw);
+      if (serialDate) return normalizeDateOnly(serialDate);
+    }
+    const match = raw.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+    if (match) {
+      const dd = match[1].padStart(2, "0");
+      const mm = match[2].padStart(2, "0");
+      const yyyy = match[3];
+      return normalizeDateOnly(`${yyyy}-${mm}-${dd}`);
+    }
+    return normalizeDateOnly(raw);
+  };
+
+  const groups = new Map();
+  rows.forEach((row, index) => {
+    const rowNumber = Number(row?.rowNumber ?? row?.row_number ?? row?.row ?? index + 2) || null;
+    const poNumber = normalizePoNumber(row?.poNumber ?? row?.po_number ?? row?.noPo ?? row?.no_po);
+    const supplierRaw = row?.supplierCode ?? row?.supplier_code ?? row?.supplier ?? "";
+    const itemCode = normalizeItemCode(row?.itemCode ?? row?.item_code ?? row?.item);
+    const qtyOrder = Number(row?.qtyOrder ?? row?.qty_order ?? row?.qty ?? row?.quantity ?? 0);
+    const poDate = parseImportDate(row?.poDate ?? row?.po_date ?? row?.tanggal_po ?? row?.tanggalPo ?? row?.date);
+
+    const missing = [];
+    if (!poNumber) missing.push("No. PO");
+    if (!supplierRaw) missing.push("Kode Supplier");
+    if (!itemCode) missing.push("Kode Item");
+    if (!poDate) missing.push("Tanggal PO");
+    if (!Number.isFinite(qtyOrder) || qtyOrder <= 0) missing.push("Qty Order");
+    if (missing.length) {
+      addError(rowNumber, poNumber, `${missing.join(", ")} tidak valid.`);
+      return;
+    }
+
+    const existing = groups.get(poNumber) || {
+      poNumber,
+      poDate,
+      supplierRaw,
+      lines: [],
+      rowNumbers: [],
+    };
+    if (existing.poDate && poDate && existing.poDate !== poDate) {
+      existing.dateMismatch = true;
+    }
+    if (existing.supplierRaw && supplierRaw && existing.supplierRaw !== supplierRaw) {
+      existing.supplierMismatch = true;
+    }
+    existing.lines.push({ rowNumber, itemCode, qtyOrder });
+    existing.rowNumbers.push(rowNumber);
+    groups.set(poNumber, existing);
+  });
+
+  let inserted = 0;
+  for (const group of groups.values()) {
+    if (group.dateMismatch) {
+      group.rowNumbers.forEach((rowNumber) => addError(rowNumber, group.poNumber, "Tanggal PO tidak konsisten."));
+      continue;
+    }
+    if (group.supplierMismatch) {
+      group.rowNumbers.forEach((rowNumber) => addError(rowNumber, group.poNumber, "Kode Supplier tidak konsisten."));
+      continue;
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("begin");
+      const supplierId = await resolveSupplierCode(client, group.supplierRaw, { strict: true });
+      if (!supplierId) {
+        await client.query("rollback");
+        group.rowNumbers.forEach((rowNumber) => addError(rowNumber, group.poNumber, `Kode Supplier ${group.supplierRaw || "-"} tidak ditemukan.`));
+        continue;
+      }
+
+      const exists = await client.query("select po_number from po_headers where po_number = $1 for update", [group.poNumber]);
+      if (exists.rows.length > 0) {
+        await client.query("rollback");
+        group.rowNumbers.forEach((rowNumber) => addError(rowNumber, group.poNumber, "PO sudah ada."));
+        continue;
+      }
+
+      const itemCodes = group.lines.map((line) => line.itemCode).filter(Boolean);
+      const itemResult = await client.query(
+        "select code from items where code = any($1)",
+        [itemCodes.length ? itemCodes : ["__EMPTY__"]],
+      );
+      const itemSet = new Set(itemResult.rows.map((row) => row.code));
+      const invalidLines = group.lines.filter((line) => !itemSet.has(line.itemCode));
+      if (invalidLines.length > 0) {
+        await client.query("rollback");
+        invalidLines.forEach((line) => addError(line.rowNumber, group.poNumber, `Kode Item ${line.itemCode || "-"} tidak ditemukan.`));
+        continue;
+      }
+
+      await client.query(
+        `
+        insert into po_headers (po_number, po_date, supplier_id, status, remarks, created_at, updated_at)
+        values ($1, $2, $3, $4, $5, now(), now())
+        `,
+        [group.poNumber, group.poDate, supplierId, "open", null],
+      );
+
+      let lineNo = 1;
+      for (const line of group.lines) {
+        await client.query(
+          `
+          insert into po_lines (po_number, line_no, item_code, qty_order, qty_received)
+          values ($1, $2, $3, $4, 0)
+          `,
+          [group.poNumber, lineNo, line.itemCode, line.qtyOrder],
+        );
+        lineNo += 1;
+      }
+      await reconcilePoSchedulesAndReceipts(client, group.poNumber);
+      await client.query("commit");
+      inserted += 1;
+    } catch (error) {
+      await client.query("rollback");
+      group.rowNumbers.forEach((rowNumber) => addError(rowNumber, group.poNumber, error.message));
+    } finally {
+      client.release();
+    }
+  }
+
+  res.json({ inserted, errors });
+});
+
+app.post("/api/po", authenticate, requireAnyPermission("manageVendors", "manageItems", "editSchedules", "importExport"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const poNumber = normalizePoNumber(req.body?.poNumber ?? req.body?.po_number);
+    if (!poNumber) {
+      res.status(400).json({ error: "Nomor PO wajib diisi." });
+      return;
+    }
+    const poDate = normalizeDateOnly(req.body?.poDate ?? req.body?.po_date) || getTodayDateOnly();
+    const supplierRaw = req.body?.supplierId ?? req.body?.supplier_id ?? req.body?.supplierCode ?? req.body?.supplier_code ?? req.body?.supplier ?? "";
+    const supplierId = await resolveSupplierCode(client, supplierRaw, { strict: true });
+    if (!supplierId) {
+      res.status(400).json({ error: "Supplier wajib diisi." });
+      return;
+    }
+    const statusRaw = String(req.body?.status || "open").toLowerCase();
+    const status = ["open", "partial", "closed"].includes(statusRaw) ? statusRaw : "open";
+    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
+
+    await client.query("begin");
+    const exists = await client.query("select po_number from po_headers where po_number = $1 for update", [poNumber]);
+    if (exists.rows.length > 0) {
+      await client.query("rollback");
+      res.status(409).json({ error: "PO sudah ada." });
+      return;
+    }
+    const headerResult = await client.query(
+      `
+      insert into po_headers (po_number, po_date, supplier_id, status, remarks, created_at, updated_at)
+      values ($1, $2, $3, $4, $5, now(), now())
+      returning *
+      `,
+      [poNumber, poDate, supplierId, status, req.body?.remarks || null],
+    );
+    const insertedLines = [];
+    if (lines.length > 0) {
+      const normalizedLines = lines.map((line, idx) => ({
+        lineNo: Number.isFinite(Number(line?.lineNo ?? line?.line_no)) ? Number(line?.lineNo ?? line?.line_no) : idx + 1,
+        itemCode: normalizeItemCode(line?.itemCode ?? line?.item_code ?? line?.item),
+        qtyOrder: Number(line?.qtyOrder ?? line?.qty_order ?? line?.qty ?? 0),
+      }));
+      const itemCodes = normalizedLines.map((line) => line.itemCode).filter(Boolean);
+      const itemResult = await client.query(
+        "select code from items where code = any($1)",
+        [itemCodes.length ? itemCodes : ["__EMPTY__"]],
+      );
+      const itemSet = new Set(itemResult.rows.map((row) => row.code));
+      for (const line of normalizedLines) {
+        if (!line.itemCode || !itemSet.has(line.itemCode)) {
+          await client.query("rollback");
+          res.status(409).json({ error: `Item ${line.itemCode || "-"} tidak ditemukan.` });
+          return;
+        }
+        if (!Number.isFinite(line.qtyOrder) || line.qtyOrder <= 0) {
+          await client.query("rollback");
+          res.status(400).json({ error: `Qty order tidak valid untuk item ${line.itemCode}.` });
+          return;
+        }
+      }
+      for (const line of normalizedLines) {
+        const lineResult = await client.query(
+          `
+          insert into po_lines (po_number, line_no, item_code, qty_order, qty_received)
+          values ($1, $2, $3, $4, 0)
+          returning *
+          `,
+          [poNumber, line.lineNo, line.itemCode, line.qtyOrder],
+        );
+        insertedLines.push(lineResult.rows[0]);
+      }
+    }
+    await reconcilePoSchedulesAndReceipts(client, poNumber);
+    const syncedHeader = await resolvePoHeader(client, poNumber);
+    await client.query("commit");
+    res.json({ header: syncedHeader || headerResult.rows[0], lines: insertedLines });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/po/:poNumber/lines", authenticate, requireAnyPermission("manageVendors", "manageItems", "editSchedules", "importExport"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const poNumber = normalizePoNumber(req.params.poNumber);
+    if (!poNumber) {
+      res.status(400).json({ error: "Nomor PO wajib diisi." });
+      return;
+    }
+    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
+    if (lines.length === 0) {
+      res.status(400).json({ error: "Lines kosong." });
+      return;
+    }
+    await client.query("begin");
+    const header = await resolvePoHeader(client, poNumber, { forUpdate: true });
+    if (!header) {
+      await client.query("rollback");
+      res.status(404).json({ error: "PO tidak ditemukan." });
+      return;
+    }
+    const maxResult = await client.query(
+      "select coalesce(max(line_no), 0) as max_line from po_lines where po_number = $1",
+      [poNumber],
+    );
+    let nextLineNo = Number(maxResult.rows[0]?.max_line || 0) + 1;
+    const normalizedLines = lines.map((line) => ({
+      lineNo: Number.isFinite(Number(line?.lineNo ?? line?.line_no)) ? Number(line?.lineNo ?? line?.line_no) : null,
+      itemCode: normalizeItemCode(line?.itemCode ?? line?.item_code ?? line?.item),
+      qtyOrder: Number(line?.qtyOrder ?? line?.qty_order ?? line?.qty ?? 0),
+    }));
+    const itemCodes = normalizedLines.map((line) => line.itemCode).filter(Boolean);
+    const itemResult = await client.query(
+      "select code from items where code = any($1)",
+      [itemCodes.length ? itemCodes : ["__EMPTY__"]],
+    );
+    const itemSet = new Set(itemResult.rows.map((row) => row.code));
+    const insertedLines = [];
+    for (const line of normalizedLines) {
+      const lineNo = line.lineNo || nextLineNo++;
+      if (!line.itemCode || !itemSet.has(line.itemCode)) {
+        await client.query("rollback");
+        res.status(409).json({ error: `Item ${line.itemCode || "-"} tidak ditemukan.` });
+        return;
+      }
+      if (!Number.isFinite(line.qtyOrder) || line.qtyOrder <= 0) {
+        await client.query("rollback");
+        res.status(400).json({ error: `Qty order tidak valid untuk item ${line.itemCode}.` });
+        return;
+      }
+      const lineResult = await client.query(
+        `
+        insert into po_lines (po_number, line_no, item_code, qty_order, qty_received)
+        values ($1, $2, $3, $4, 0)
+        returning *
+        `,
+        [poNumber, lineNo, line.itemCode, line.qtyOrder],
+      );
+      insertedLines.push(lineResult.rows[0]);
+    }
+    await reconcilePoSchedulesAndReceipts(client, poNumber);
+    const syncedHeader = await resolvePoHeader(client, poNumber);
+    await client.query("commit");
+    res.json({ header: syncedHeader || header, lines: insertedLines });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/api/po/:poNumber/lines/:lineId", authenticate, requireAnyPermission("manageVendors", "manageItems", "editSchedules", "importExport"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const poNumber = normalizePoNumber(req.params.poNumber);
+    const lineId = parsePositiveId(req.params.lineId);
+    if (!poNumber) {
+      res.status(400).json({ error: "Nomor PO wajib diisi." });
+      return;
+    }
+    if (!lineId) {
+      res.status(400).json({ error: "Line PO tidak valid." });
+      return;
+    }
+    const qtyOrder = Number(req.body?.qtyOrder ?? req.body?.qty_order ?? req.body?.qty);
+    if (!Number.isFinite(qtyOrder) || qtyOrder <= 0) {
+      res.status(400).json({ error: "Qty order tidak valid." });
+      return;
+    }
+
+    await client.query("begin");
+    const header = await resolvePoHeader(client, poNumber, { forUpdate: true });
+    if (!header) {
+      await client.query("rollback");
+      res.status(404).json({ error: "PO tidak ditemukan." });
+      return;
+    }
+
+    await reconcilePoSchedulesAndReceipts(client, poNumber);
+
+    const lineResult = await client.query(
+      "select * from po_lines where id = $1 and po_number = $2 for update",
+      [lineId, poNumber],
+    );
+    if (lineResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "Line PO tidak ditemukan." });
+      return;
+    }
+
+    const line = lineResult.rows[0];
+    const qtyReceived = Number(line.qty_received || 0);
+    const scheduledOutstanding = await getScheduledOutstandingByPoLine(client, line);
+    const minimumQtyOrder = qtyReceived + scheduledOutstanding;
+    if (qtyOrder < qtyReceived) {
+      await client.query("rollback");
+      res.status(409).json({ error: `Qty order tidak boleh lebih kecil dari qty received (${qtyReceived}).` });
+      return;
+    }
+    if (qtyOrder < minimumQtyOrder) {
+      await client.query("rollback");
+      res.status(409).json({
+        error: `Qty order tidak boleh lebih kecil dari actual + schedule outstanding (${minimumQtyOrder}).`,
+      });
+      return;
+    }
+
+    const updatedLineResult = await client.query(
+      `
+      update po_lines
+      set qty_order = $1
+      where id = $2
+      returning *
+      `,
+      [qtyOrder, lineId],
+    );
+    await refreshPoHeaderStatus(client, poNumber);
+    const latestHeader = await resolvePoHeader(client, poNumber);
+    await client.query("commit");
+    res.json({ header: latestHeader || header, line: updatedLineResult.rows[0] });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/api/po/:poNumber", authenticate, requireAnyPermission("manageVendors", "manageItems", "editSchedules", "importExport"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const poNumber = normalizePoNumber(req.params.poNumber);
+    if (!poNumber) {
+      res.status(400).json({ error: "Nomor PO wajib diisi." });
+      return;
+    }
+    const poDateRaw = req.body?.poDate ?? req.body?.po_date;
+    const supplierRaw = req.body?.supplierId ?? req.body?.supplier_id ?? req.body?.supplierCode ?? req.body?.supplier_code ?? req.body?.supplier;
+    const remarksRaw = req.body?.remarks ?? req.body?.remark ?? req.body?.note;
+
+    await client.query("begin");
+    const existingResult = await client.query("select * from po_headers where po_number = $1 for update", [poNumber]);
+    if (existingResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "PO tidak ditemukan." });
+      return;
+    }
+    const existing = existingResult.rows[0];
+
+    let nextPoDate = existing.po_date;
+    if (poDateRaw !== undefined) {
+      const normalized = normalizeDateOnly(poDateRaw);
+      if (!normalized) {
+        await client.query("rollback");
+        res.status(400).json({ error: "Tanggal PO tidak valid." });
+        return;
+      }
+      nextPoDate = normalized;
+    }
+
+    let nextSupplierId = existing.supplier_id;
+    if (supplierRaw !== undefined) {
+      const resolvedSupplier = await resolveSupplierCode(client, supplierRaw, { strict: true });
+      if (!resolvedSupplier) {
+        await client.query("rollback");
+        res.status(400).json({ error: "Supplier wajib diisi." });
+        return;
+      }
+      nextSupplierId = resolvedSupplier;
+    }
+
+    if (nextSupplierId !== existing.supplier_id) {
+      const scheduleCheck = await client.query(
+        "select 1 from schedules where lower(trim(po_number)) = lower(trim($1)) limit 1",
+        [poNumber],
+      );
+      const scheduleLineCheck = await client.query(
+        "select 1 from schedules s join po_lines pl on pl.id = s.po_line_id where pl.po_number = $1 limit 1",
+        [poNumber],
+      );
+      const receivedCheck = await client.query(
+        "select 1 from po_lines where po_number = $1 and qty_received > 0 limit 1",
+        [poNumber],
+      );
+      if (scheduleCheck.rows.length > 0 || scheduleLineCheck.rows.length > 0 || receivedCheck.rows.length > 0) {
+        await client.query("rollback");
+        res.status(409).json({ error: "Supplier tidak bisa diubah karena PO sudah dipakai di jadwal atau ada penerimaan." });
+        return;
+      }
+    }
+
+    let nextRemarks = existing.remarks;
+    if (remarksRaw !== undefined) {
+      const trimmed = String(remarksRaw || "").trim();
+      nextRemarks = trimmed ? trimmed : null;
+    }
+
+    const updated = await client.query(
+      "update po_headers set po_date = $1, supplier_id = $2, remarks = $3, updated_at = now() where po_number = $4 returning *",
+      [nextPoDate, nextSupplierId, nextRemarks, poNumber],
+    );
+    await client.query("commit");
+    res.json({ header: updated.rows[0] });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/po/:poNumber", authenticate, requireAnyPermission("manageVendors", "manageItems", "editSchedules", "importExport"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const poNumber = normalizePoNumber(req.params.poNumber);
+    if (!poNumber) {
+      res.status(400).json({ error: "Nomor PO wajib diisi." });
+      return;
+    }
+    await client.query("begin");
+    const existingResult = await client.query("select po_number from po_headers where po_number = $1 for update", [poNumber]);
+    if (existingResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "PO tidak ditemukan." });
+      return;
+    }
+    const scheduleCheck = await client.query(
+      "select 1 from schedules where lower(trim(po_number)) = lower(trim($1)) limit 1",
+      [poNumber],
+    );
+    const scheduleLineCheck = await client.query(
+      "select 1 from schedules s join po_lines pl on pl.id = s.po_line_id where pl.po_number = $1 limit 1",
+      [poNumber],
+    );
+    const receivedCheck = await client.query(
+      "select 1 from po_lines where po_number = $1 and qty_received > 0 limit 1",
+      [poNumber],
+    );
+    if (scheduleCheck.rows.length > 0 || scheduleLineCheck.rows.length > 0) {
+      await client.query("rollback");
+      res.status(409).json({ error: "PO tidak bisa dihapus karena sudah dipakai di jadwal." });
+      return;
+    }
+    if (receivedCheck.rows.length > 0) {
+      await client.query("rollback");
+      res.status(409).json({ error: "PO tidak bisa dihapus karena sudah ada penerimaan." });
+      return;
+    }
+    await client.query("delete from po_headers where po_number = $1", [poNumber]);
+    await client.query("commit");
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageItems", "editSchedules", "importExport"), async (req, res) => {
+  try {
+    const whereClauses = [];
+    const filterValues = [];
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const status = String(req.query.status || "").trim();
+    const rawLimit = Number(req.query.limit);
+    const rawOffset = Number(req.query.offset);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 5000) : null;
+    const offset = Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : null;
+    const includeTotal = String(req.query.includeTotal || "") === "1";
+    const wantsMeta = includeTotal || limit !== null || offset !== null;
+    const isSupplierRole = String(req.user?.role || "").toLowerCase() === "supplier";
+    const requesterSupplierId = String(req.user?.supplierId || "").trim();
+
+    if (isSupplierRole) {
+      if (!requesterSupplierId) {
+        res.status(403).json({ error: "Akun supplier belum terhubung ke Supplier ID." });
+        return;
+      }
+      filterValues.push(requesterSupplierId);
+      whereClauses.push(`ph.supplier_id = $${filterValues.length}`);
+    }
+
+    if (q) {
+      filterValues.push(`%${q}%`);
+      whereClauses.push(`(
+        lower(ph.po_number) like $${filterValues.length}
+        or lower(ph.supplier_id) like $${filterValues.length}
+        or lower(coalesce(mv.name, '')) like $${filterValues.length}
+      )`);
+    }
+    if (status) {
+      filterValues.push(status);
+      whereClauses.push(`ph.status = $${filterValues.length}`);
+    }
+
+    const whereSql = whereClauses.length ? ` where ${whereClauses.join(" and ")}` : "";
+    let total = null;
+    if (wantsMeta) {
+      const countResult = await pool.query(
+        `select count(*)::int as total from po_headers ph left join master_vendors mv on mv.id = ph.supplier_id${whereSql}`,
+        filterValues,
+      );
+      total = Number(countResult.rows[0]?.total || 0);
+    }
+
+    const values = [...filterValues];
+    let sql = `
+      with schedule_per_po as (
+        select
+          lower(trim(po_number)) as po_key,
+          count(*)::int as schedule_count,
+          coalesce(sum(request_qty), 0)::numeric as scheduled_qty
+        from schedules
+        group by lower(trim(po_number))
+      )
+      select
+        ph.po_number,
+        to_char(ph.po_date, 'YYYY-MM-DD') as po_date,
+        ph.supplier_id as supplier_code,
+        mv.name as supplier_name,
+        ph.status,
+        coalesce(sum(pl.qty_order), 0) as total_qty_order,
+        coalesce(sum(pl.qty_received), 0) as total_qty_received,
+        count(pl.id)::int as line_count,
+        coalesce(spp.schedule_count, 0)::int as schedule_count,
+        coalesce(spp.scheduled_qty, 0) as total_qty_scheduled
+      from po_headers ph
+      left join master_vendors mv on mv.id = ph.supplier_id
+      left join po_lines pl on pl.po_number = ph.po_number
+      left join schedule_per_po spp on lower(trim(ph.po_number)) = spp.po_key
+      ${whereSql}
+      group by ph.po_number, ph.po_date, ph.supplier_id, mv.name, ph.status, spp.schedule_count, spp.scheduled_qty
+      order by ph.po_date desc nulls last, ph.po_number desc
+    `;
+    if (limit) {
+      values.push(limit);
+      sql += ` limit $${values.length}`;
+    }
+    if (offset !== null) {
+      values.push(offset);
+      sql += ` offset $${values.length}`;
+    }
+
+    const result = await pool.query(sql, values);
+    if (wantsMeta) {
+      res.json({ rows: result.rows, total: total ?? result.rows.length });
+      return;
+    }
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/po/:poNumber", authenticate, requireAnyPermission("manageVendors", "manageItems", "editSchedules", "importExport"), async (req, res) => {
+  try {
+    const poNumber = normalizePoNumber(req.params.poNumber);
+    if (!poNumber) {
+      res.status(400).json({ error: "Nomor PO wajib diisi." });
+      return;
+    }
+    const header = await resolvePoHeader(pool, poNumber);
+    if (!header) {
+      res.status(404).json({ error: "PO tidak ditemukan." });
+      return;
+    }
+    if (String(req.user?.role || "").toLowerCase() === "supplier") {
+      const requesterSupplierId = String(req.user?.supplierId || "").trim();
+      const headerSupplierId = String(header.supplier_id || "").trim();
+      if (!requesterSupplierId || headerSupplierId.toLowerCase() !== requesterSupplierId.toLowerCase()) {
+        res.status(404).json({ error: "PO tidak ditemukan." });
+        return;
+      }
+    }
+    const linesResult = await pool.query(
+      `
+      select
+        pl.*,
+        i.name as item_name,
+        i.unit,
+        i.part_no,
+        i.pack_qty,
+        (
+          select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
+          from schedules s
+          where s.po_line_id = pl.id
+             or (s.po_line_id is null and s.po_number = pl.po_number and coalesce(s.item_code, s.item) = pl.item_code)
+        ) as scheduled_outstanding,
+        (
+          pl.qty_order - pl.qty_received - (
+            select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
+            from schedules s2
+            where s2.po_line_id = pl.id
+               or (s2.po_line_id is null and s2.po_number = pl.po_number and coalesce(s2.item_code, s2.item) = pl.item_code)
+          )
+        )::numeric as remaining_after_schedule
+      from po_lines pl
+      left join items i on i.code = pl.item_code
+      where pl.po_number = $1
+      order by pl.line_no asc
+      `,
+      [poNumber],
+    );
+    res.json({ header, lines: linesResult.rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/po-lines", authenticate, requireAnyPermission("manageVendors", "manageItems", "editSchedules", "importExport"), async (req, res) => {
+  try {
+    const poNumber = normalizePoNumber(req.query?.poNumber);
+    if (!poNumber) {
+      res.status(400).json({ error: "Nomor PO wajib diisi." });
+      return;
+    }
+    const remainingOnly = String(req.query?.remainingOnly ?? "true").toLowerCase() !== "false";
+    const header = await resolvePoHeader(pool, poNumber);
+    if (!header) {
+      res.status(404).json({ error: "PO tidak ditemukan." });
+      return;
+    }
+    if (String(req.user?.role || "").toLowerCase() === "supplier") {
+      const requesterSupplierId = String(req.user?.supplierId || "").trim();
+      const headerSupplierId = String(header.supplier_id || "").trim();
+      if (!requesterSupplierId || headerSupplierId.toLowerCase() !== requesterSupplierId.toLowerCase()) {
+        res.status(404).json({ error: "PO tidak ditemukan." });
+        return;
+      }
+    }
+    const whereClause = remainingOnly ? "and pl.qty_order > pl.qty_received" : "";
+    const result = await pool.query(
+      `
+      select
+        pl.*,
+        i.name as item_name,
+        i.unit,
+        i.part_no,
+        i.pack_qty,
+        (
+          select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
+          from schedules s
+          where s.po_line_id = pl.id
+             or (s.po_line_id is null and s.po_number = pl.po_number and coalesce(s.item_code, s.item) = pl.item_code)
+        ) as scheduled_outstanding,
+        (
+          pl.qty_order - pl.qty_received - (
+            select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
+            from schedules s2
+            where s2.po_line_id = pl.id
+               or (s2.po_line_id is null and s2.po_number = pl.po_number and coalesce(s2.item_code, s2.item) = pl.item_code)
+          )
+        )::numeric as remaining_after_schedule
+      from po_lines pl
+      left join items i on i.code = pl.item_code
+      where pl.po_number = $1
+      ${whereClause}
+      order by pl.line_no asc
+      `,
+      [poNumber],
+    );
+    res.json({ header, lines: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/supplier/po", authenticate, requireSupplier, async (req, res) => {
+  try {
+    const supplierId = req.user?.supplierId;
+    const whereClauses = ["ph.supplier_id = $1"];
+    const filterValues = [supplierId];
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const status = String(req.query.status || "").trim();
+    const start = String(req.query.start || "").trim();
+    const end = String(req.query.end || "").trim();
+    const rawLimit = Number(req.query.limit);
+    const rawOffset = Number(req.query.offset);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 5000) : null;
+    const offset = Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : null;
+    const includeTotal = String(req.query.includeTotal || "") === "1";
+    const wantsMeta = includeTotal || limit !== null || offset !== null;
+
+    if (start) {
+      filterValues.push(start);
+      whereClauses.push(`ph.po_date >= $${filterValues.length}`);
+    }
+    if (end) {
+      filterValues.push(end);
+      whereClauses.push(`ph.po_date <= $${filterValues.length}`);
+    }
+    if (status) {
+      filterValues.push(status);
+      whereClauses.push(`ph.status = $${filterValues.length}`);
+    }
+    if (start) {
+      filterValues.push(start);
+      whereClauses.push(`ph.po_date >= $${filterValues.length}`);
+    }
+    if (end) {
+      filterValues.push(end);
+      whereClauses.push(`ph.po_date <= $${filterValues.length}`);
+    }
+    if (q) {
+      filterValues.push(`%${q}%`);
+      whereClauses.push(`(
+        lower(ph.po_number) like $${filterValues.length}
+        or lower(ph.status) like $${filterValues.length}
+        or exists (
+          select 1
+          from po_lines pl2
+          left join items i2 on i2.code = pl2.item_code
+          where pl2.po_number = ph.po_number
+            and (
+              lower(pl2.item_code) like $${filterValues.length}
+              or lower(coalesce(i2.name, '')) like $${filterValues.length}
+            )
+        )
+      )`);
+    }
+
+    const whereSql = whereClauses.length ? ` where ${whereClauses.join(" and ")}` : "";
+    let total = null;
+    if (wantsMeta) {
+      const countResult = await pool.query(
+        `select count(*)::int as total from po_headers ph left join master_vendors mv on mv.id = ph.supplier_id${whereSql}`,
+        filterValues,
+      );
+      total = Number(countResult.rows[0]?.total || 0);
+    }
+
+    const values = [...filterValues];
+    let sql = `
+      with schedule_per_po as (
+        select
+          s.po_number,
+          count(*)::int as schedule_count,
+          coalesce(sum(s.request_qty), 0)::numeric as scheduled_qty
+        from schedules s
+        join po_headers ph2 on ph2.po_number = s.po_number
+        where ph2.supplier_id = $1
+        group by s.po_number
+      )
+      select
+        ph.po_number,
+        to_char(ph.po_date, 'YYYY-MM-DD') as po_date,
+        ph.supplier_id as supplier_code,
+        ph.status,
+        coalesce(sum(pl.qty_order), 0)::numeric as total_qty_order,
+        coalesce(sum(pl.qty_received), 0)::numeric as total_qty_received,
+        coalesce(sum(pl.qty_order - pl.qty_received), 0)::numeric as total_qty_remaining,
+        count(pl.id)::int as line_count,
+        coalesce(spp.schedule_count, 0)::int as schedule_count,
+        coalesce(spp.scheduled_qty, 0)::numeric as total_qty_scheduled
+      from po_headers ph
+      left join po_lines pl on pl.po_number = ph.po_number
+      left join schedule_per_po spp on spp.po_number = ph.po_number
+      ${whereSql}
+      group by ph.po_number, ph.po_date, ph.supplier_id, ph.status, spp.schedule_count, spp.scheduled_qty
+      order by ph.po_date desc nulls last, ph.po_number desc
+    `;
+    if (limit) {
+      values.push(limit);
+      sql += ` limit $${values.length}`;
+    }
+    if (offset !== null) {
+      values.push(offset);
+      sql += ` offset $${values.length}`;
+    }
+    const result = await pool.query(sql, values);
+    if (wantsMeta) {
+      res.json({ rows: result.rows, total: total ?? result.rows.length });
+      return;
+    }
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/supplier/po/:poNumber/lines", authenticate, requireSupplier, async (req, res) => {
+  try {
+    const supplierId = req.user?.supplierId;
+    const poNumber = normalizePoNumber(req.params.poNumber);
+    if (!poNumber) {
+      res.status(400).json({ error: "Nomor PO wajib diisi." });
+      return;
+    }
+    const headerResult = await pool.query(
+      "select * from po_headers where po_number = $1 and supplier_id = $2",
+      [poNumber, supplierId],
+    );
+    if (headerResult.rows.length === 0) {
+      res.status(404).json({ error: "PO tidak ditemukan." });
+      return;
+    }
+    const linesResult = await pool.query(
+      `
+      select
+        pl.*,
+        i.name as item_name,
+        i.part_no,
+        i.unit,
+        (pl.qty_order - pl.qty_received)::numeric as qty_remaining
+      from po_lines pl
+      left join items i on i.code = pl.item_code
+      where pl.po_number = $1
+      order by pl.line_no asc
+      `,
+      [poNumber],
+    );
+    res.json({ header: headerResult.rows[0], lines: linesResult.rows || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/supplier/schedules", authenticate, requireSupplier, async (req, res) => {
+  try {
+    const supplierId = req.user?.supplierId;
+    const whereClauses = ["ph.supplier_id = $1", "coalesce(s.item_code, s.item) not ilike 'TEST-%'"];
+    const filterValues = [supplierId];
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const status = String(req.query.status || "").trim();
+    const start = String(req.query.start || "").trim();
+    const end = String(req.query.end || "").trim();
+    const order = String(req.query.order || "asc").toLowerCase() === "desc" ? "desc" : "asc";
+    const rawLimit = Number(req.query.limit);
+    const rawOffset = Number(req.query.offset);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 5000) : null;
+    const offset = Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : null;
+    const includeTotal = String(req.query.includeTotal || "") === "1";
+    const wantsMeta = includeTotal || limit !== null || offset !== null;
+
+    if (start) {
+      filterValues.push(start);
+      whereClauses.push(`s.request_date >= $${filterValues.length}`);
+    }
+    if (end) {
+      filterValues.push(end);
+      whereClauses.push(`s.request_date <= $${filterValues.length}`);
+    }
+    if (status) {
+      const normalizedStatus = status.toLowerCase();
+      if (normalizedStatus === "pending") {
+        whereClauses.push("s.arrival_date is null");
+      } else if (normalizedStatus === "on time") {
+        whereClauses.push("s.arrival_date = s.request_date");
+      } else if (normalizedStatus === "late") {
+        whereClauses.push("s.arrival_date > s.request_date");
+      } else if (normalizedStatus === "too early") {
+        whereClauses.push("s.arrival_date < s.request_date");
+      } else {
+        filterValues.push(status);
+        whereClauses.push(`s.status = $${filterValues.length}`);
+      }
+    }
+    if (q) {
+      filterValues.push(`%${q}%`);
+      whereClauses.push(`(
+        lower(s.po_number) like $${filterValues.length}
+        or lower(coalesce(s.item_code, s.item)) like $${filterValues.length}
+        or lower(coalesce(i.name, '')) like $${filterValues.length}
+        or lower(coalesce(i.part_no, '')) like $${filterValues.length}
+        or lower(coalesce(s.do_number, '')) like $${filterValues.length}
+      )`);
+    }
+
+    const whereSql = whereClauses.length ? ` where ${whereClauses.join(" and ")}` : "";
+    let total = null;
+    if (wantsMeta) {
+      const countResult = await pool.query(
+        `
+        select count(*)::int as total
+        from schedules s
+        join po_headers ph on ph.po_number = s.po_number
+        left join items i on lower(i.code) = lower(coalesce(s.item_code, s.item))
+        ${whereSql}
+        `,
+        filterValues,
+      );
+      total = Number(countResult.rows[0]?.total || 0);
+    }
+
+    const values = [...filterValues];
+    let sql = `
+      select s.*, ph.status as po_status, ph.supplier_id as supplier_id,
+        i.name as item_name,
+        coalesce(s.item_code, s.item) as resolved_item_code
+      from schedules s
+      join po_headers ph on ph.po_number = s.po_number
+      left join items i on lower(i.code) = lower(coalesce(s.item_code, s.item))
+      ${whereSql}
+      order by s.request_date ${order}, s.id ${order}
+    `;
+    if (limit) {
+      values.push(limit);
+      sql += ` limit $${values.length}`;
+    }
+    if (offset !== null) {
+      values.push(offset);
+      sql += ` offset $${values.length}`;
+    }
+    const result = await pool.query(sql, values);
+    const rows = result.rows.map(mapRowToSchedule);
+    if (wantsMeta) {
+      res.json({ rows, total: total ?? rows.length });
+      return;
+    }
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/supplier/dn", authenticate, requireSupplier, async (req, res) => {
+  try {
+    const supplierId = req.user?.supplierId;
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const status = String(req.query.status || "").trim().toLowerCase();
+    const dnStatus = String(req.query.dnStatus || "").trim();
+    const start = String(req.query.start || "").trim();
+    const end = String(req.query.end || "").trim();
+    const rawLimit = Number(req.query.limit);
+    const rawOffset = Number(req.query.offset);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 5000) : null;
+    const offset = Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : null;
+    const includeTotal = String(req.query.includeTotal || "") === "1";
+    const wantsMeta = includeTotal || limit !== null || offset !== null;
+
+    const trackingMap = new Map([
+      ["pending", "pending"],
+      ["received", "received"],
+      ["selisih", "selisih/reject"],
+      ["reject", "selisih/reject"],
+      ["selisih/reject", "selisih/reject"],
+      ["completed", "completed"],
+      ["complete", "completed"],
+    ]);
+    const trackingValue = trackingMap.get(status) || "";
+
+    const baseValues = [supplierId];
+    const baseWhere = ["(dn.supplier_id = $1 or mv.id = $1)"];
+    if (start) {
+      baseValues.push(start);
+      baseWhere.push(`dn.planned_date >= $${baseValues.length}`);
+    }
+    if (end) {
+      baseValues.push(end);
+      baseWhere.push(`dn.planned_date <= $${baseValues.length}`);
+    }
+    if (dnStatus) {
+      baseValues.push(dnStatus);
+      baseWhere.push(`dn.status = $${baseValues.length}`);
+    }
+    if (q) {
+      baseValues.push(`%${q}%`);
+      baseWhere.push(`(
+        lower(dn.dn_number) like $${baseValues.length}
+        or exists (
+          select 1
+          from delivery_note_items dni
+          where dni.dn_id = dn.id
+            and (
+              lower(dni.item_code) like $${baseValues.length}
+              or lower(coalesce(dni.item_name, '')) like $${baseValues.length}
+            )
+        )
+      )`);
+    }
+
+    const whereSql = baseWhere.length ? ` where ${baseWhere.join(" and ")}` : "";
+    const cteSql = `
+      with rn_union as (
+        select
+          rn.dn_id,
+          coalesce(rn.item_code, s.item_code, s.item) as item_code,
+          coalesce(rn.doc_qty, s.request_qty, rn.received_qty) as doc_qty,
+          rn.received_qty,
+          rn.qc_status,
+          rn.received_at
+        from receive_notes rn
+        left join schedules s on s.id = rn.schedule_id
+        where rn.dn_id is not null
+        union all
+        select
+          rni.origin_dn_id as dn_id,
+          rni.item_code,
+          rni.doc_qty,
+          rni.received_qty,
+          'ok'::text as qc_status,
+          rnh.created_at as received_at
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+      ),
+      rn_group as (
+        select
+          dn_id,
+          count(*)::int as rn_count,
+          coalesce(sum(doc_qty), 0)::numeric as doc_qty,
+          coalesce(sum(received_qty), 0)::numeric as received_qty,
+          coalesce(sum(case when qc_status <> 'ok' then 1 else 0 end), 0)::int as qc_issue_count,
+          max(received_at) as last_received_at
+        from rn_union
+        group by dn_id
+      ),
+      dn_items as (
+        select
+          dn_id,
+          coalesce(sum(request_qty), 0)::numeric as request_qty,
+          count(*)::int as item_count
+        from delivery_note_items
+        group by dn_id
+      ),
+      dn_base as (
+        select
+          dn.id,
+          dn.dn_number,
+          dn.supplier,
+          dn.supplier_id,
+          dn.planned_date,
+          dn.status,
+          dn.remarks,
+          dn.cycle,
+          dn.rit,
+          dn.delivery_time,
+          dn.created_at,
+          coalesce(di.request_qty, 0)::numeric as request_qty,
+          coalesce(di.item_count, 0)::int as item_count,
+          rg.doc_qty,
+          rg.received_qty,
+          rg.rn_count,
+          rg.qc_issue_count,
+          rg.last_received_at
+        from delivery_notes dn
+        left join dn_items di on di.dn_id = dn.id
+        left join rn_group rg on rg.dn_id = dn.id
+        left join master_vendors mv on mv.id = dn.supplier or mv.name = dn.supplier
+        ${whereSql}
+      ),
+      dn_enriched as (
+        select
+          dn_base.*,
+          coalesce(dn_base.doc_qty, dn_base.request_qty, 0)::numeric as doc_qty_total,
+          coalesce(dn_base.received_qty, 0)::numeric as received_qty_total,
+          (coalesce(dn_base.doc_qty, dn_base.request_qty, 0) - coalesce(dn_base.received_qty, 0))::numeric as diff_qty,
+          case
+            when coalesce(dn_base.rn_count, 0) = 0 then 'Pending'
+            when coalesce(dn_base.qc_issue_count, 0) > 0
+              or coalesce(dn_base.doc_qty, dn_base.request_qty, 0) <> coalesce(dn_base.received_qty, 0)
+              then 'Selisih/Reject'
+            when dn_base.status in ('closed','received') then 'Completed'
+            else 'Received'
+          end as tracking_status
+        from dn_base
+      )
+    `;
+
+    const trackingValues = trackingValue ? [...baseValues, trackingValue] : [...baseValues];
+    const trackingFilter = trackingValue
+      ? ` where lower(tracking_status) = $${trackingValues.length}`
+      : "";
+
+    let total = null;
+    if (wantsMeta) {
+      const countResult = await pool.query(
+        `${cteSql} select count(*)::int as total from dn_enriched${trackingFilter}`,
+        trackingValues,
+      );
+      total = Number(countResult.rows[0]?.total || 0);
+    }
+
+    const dataValues = [...trackingValues];
+    let dataSql = `${cteSql} select * from dn_enriched${trackingFilter} order by planned_date desc nulls last, dn_number desc`;
+    if (limit) {
+      dataValues.push(limit);
+      dataSql += ` limit $${dataValues.length}`;
+    }
+    if (offset !== null) {
+      dataValues.push(offset);
+      dataSql += ` offset $${dataValues.length}`;
+    }
+    const result = await pool.query(dataSql, dataValues);
+    if (wantsMeta) {
+      res.json({ rows: result.rows, total: total ?? result.rows.length });
+      return;
+    }
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/supplier/dn/:dnNumber", authenticate, requireSupplier, async (req, res) => {
+  try {
+    const supplierId = req.user?.supplierId;
+    const dnNumber = String(req.params.dnNumber || "").trim();
+    if (!dnNumber) {
+      res.status(400).json({ error: "Nomor DN wajib diisi." });
+      return;
+    }
+
+    const headerResult = await pool.query(
+      `
+      with rn_union as (
+        select
+          rn.dn_id,
+          coalesce(rn.item_code, s.item_code, s.item) as item_code,
+          coalesce(rn.doc_qty, s.request_qty, rn.received_qty) as doc_qty,
+          rn.received_qty,
+          rn.qc_status,
+          rn.received_at
+        from receive_notes rn
+        left join schedules s on s.id = rn.schedule_id
+        where rn.dn_id is not null
+        union all
+        select
+          rni.origin_dn_id as dn_id,
+          rni.item_code,
+          rni.doc_qty,
+          rni.received_qty,
+          'ok'::text as qc_status,
+          rnh.created_at as received_at
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+      ),
+      rn_group as (
+        select
+          dn_id,
+          count(*)::int as rn_count,
+          coalesce(sum(doc_qty), 0)::numeric as doc_qty,
+          coalesce(sum(received_qty), 0)::numeric as received_qty,
+          coalesce(sum(case when qc_status <> 'ok' then 1 else 0 end), 0)::int as qc_issue_count,
+          max(received_at) as last_received_at
+        from rn_union
+        group by dn_id
+      ),
+      dn_items as (
+        select
+          dn_id,
+          coalesce(sum(request_qty), 0)::numeric as request_qty,
+          count(*)::int as item_count
+        from delivery_note_items
+        group by dn_id
+      )
+      select
+        dn.*,
+        coalesce(di.request_qty, 0)::numeric as request_qty,
+        coalesce(di.item_count, 0)::int as item_count,
+        rg.doc_qty,
+        rg.received_qty,
+        rg.rn_count,
+        rg.qc_issue_count,
+        rg.last_received_at,
+        coalesce(rg.doc_qty, di.request_qty, 0)::numeric as doc_qty_total,
+        coalesce(rg.received_qty, 0)::numeric as received_qty_total,
+        (coalesce(rg.doc_qty, di.request_qty, 0) - coalesce(rg.received_qty, 0))::numeric as diff_qty,
+        case
+          when coalesce(rg.rn_count, 0) = 0 then 'Pending'
+          when coalesce(rg.qc_issue_count, 0) > 0
+            or coalesce(rg.doc_qty, di.request_qty, 0) <> coalesce(rg.received_qty, 0)
+            then 'Selisih/Reject'
+          when dn.status in ('closed','received') then 'Completed'
+          else 'Received'
+        end as tracking_status
+      from delivery_notes dn
+      left join dn_items di on di.dn_id = dn.id
+      left join rn_group rg on rg.dn_id = dn.id
+      left join master_vendors mv on mv.id = dn.supplier or mv.name = dn.supplier
+      where lower(dn.dn_number) = lower($1)
+        and (dn.supplier_id = $2 or mv.id = $2)
+      limit 1
+      `,
+      [dnNumber, supplierId],
+    );
+    if (headerResult.rows.length === 0) {
+      res.status(404).json({ error: "DN tidak ditemukan." });
+      return;
+    }
+    const header = headerResult.rows[0];
+
+    const itemsResult = await pool.query(
+      `
+      with rn_union as (
+        select
+          rn.dn_id,
+          coalesce(rn.item_code, s.item_code, s.item) as item_code,
+          coalesce(rn.doc_qty, s.request_qty, rn.received_qty) as doc_qty,
+          rn.received_qty,
+          rn.qc_status
+        from receive_notes rn
+        left join schedules s on s.id = rn.schedule_id
+        where rn.dn_id = $1
+        union all
+        select
+          rni.origin_dn_id as dn_id,
+          rni.item_code,
+          rni.doc_qty,
+          rni.received_qty,
+          'ok'::text as qc_status
+        from receive_note_items rni
+        where rni.origin_dn_id = $1
+      ),
+      rn_group as (
+        select
+          dn_id,
+          item_code,
+          coalesce(sum(doc_qty), 0)::numeric as doc_qty,
+          coalesce(sum(received_qty), 0)::numeric as received_qty,
+          coalesce(sum(case when qc_status <> 'ok' then 1 else 0 end), 0)::int as qc_issue_count
+        from rn_union
+        group by dn_id, item_code
+      )
+      select
+        dni.item_code,
+        dni.item_name,
+        dni.part_no,
+        dni.unit,
+        dni.pack_qty,
+        dni.request_qty,
+        coalesce(rg.doc_qty, dni.request_qty, 0)::numeric as doc_qty,
+        coalesce(rg.received_qty, 0)::numeric as received_qty,
+        coalesce(rg.qc_issue_count, 0)::int as qc_issue_count,
+        case
+          when coalesce(rg.received_qty, 0) = 0 then 'Pending'
+          when coalesce(rg.qc_issue_count, 0) > 0
+            or coalesce(rg.doc_qty, dni.request_qty, 0) <> coalesce(rg.received_qty, 0)
+            then 'Selisih/Reject'
+          else 'Received'
+        end as item_status
+      from delivery_note_items dni
+      left join rn_group rg on rg.dn_id = dni.dn_id and rg.item_code = dni.item_code
+      where dni.dn_id = $1
+      order by dni.item_code asc
+      `,
+      [header.id],
+    );
+
+    res.json({ header, items: itemsResult.rows || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/schedules/check-sj", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  try {
+    const doNumber = normalizeDoNumber(req.body?.doNumber ?? req.body?.do_number);
+    if (!doNumber) {
+      res.json({ status: "ok", matches: [] });
+      return;
+    }
+    const ignoreIds = Array.isArray(req.body?.ignoreIds)
+      ? req.body.ignoreIds.map((value) => parsePositiveId(value)).filter(Boolean)
+      : [];
+    let items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) {
+      items = [{
+        poNumber: req.body?.poNumber ?? req.body?.po_number,
+        itemCode: req.body?.itemCode ?? req.body?.item_code ?? req.body?.item,
+        poLineId: req.body?.poLineId ?? req.body?.po_line_id,
+      }];
+    }
+    const normalizedItems = items
+      .map((entry) => ({
+        poNumber: normalizePoNumber(entry?.poNumber ?? entry?.po_number),
+        itemCode: normalizeItemCode(entry?.itemCode ?? entry?.item_code ?? entry?.item),
+        poLineId: parsePositiveId(entry?.poLineId ?? entry?.po_line_id),
+        supplier: String(entry?.supplier || entry?.supplier_id || req.body?.supplier || req.body?.supplier_id || "").trim(),
+      }))
+      .filter((entry) => entry.poNumber && entry.itemCode);
+    const headerParams = [doNumber, RECEIPT_HEADER_ACTIVE_STATUSES];
+    let headerQuery = `
+      select
+        h.id,
+        h.rn_number,
+        h.supplier,
+        h.po_number,
+        h.do_number,
+        h.status,
+        h.created_at,
+        count(rni.id)::int as line_count,
+        coalesce(sum(rni.received_qty), 0)::numeric as received_qty
+      from receive_note_headers h
+      left join receive_note_items rni on rni.rn_id = h.id
+      where lower(trim(h.do_number)) = lower(trim($1))
+        and h.status = any($2::text[])
+    `;
+    const supplierHints = Array.from(new Set([
+      ...normalizedItems.map((entry) => entry.supplier).filter(Boolean),
+      String(req.body?.supplier || req.body?.supplier_id || "").trim(),
+    ].filter(Boolean)));
+    if (supplierHints.length > 0) {
+      headerParams.push(supplierHints);
+      headerQuery += ` and lower(trim(h.supplier)) = any(select lower(trim(x)) from unnest($${headerParams.length}::text[]) as x)`;
+    }
+    if (ignoreIds.length > 0) {
+      headerParams.push(ignoreIds);
+      headerQuery += ` and not (h.id = any($${headerParams.length}))`;
+    }
+    headerQuery += `
+      group by h.id
+      order by h.created_at desc, h.id desc
+    `;
+    const headerResult = await pool.query(headerQuery, headerParams);
+    const headerMatches = headerResult.rows || [];
+    if (headerMatches.length > 0) {
+      res.json({
+        status: "block",
+        matches: headerMatches.map((row) => ({
+          id: row.id,
+          receiptType: "receipt_header",
+          poNumber: row.po_number,
+          itemCode: null,
+          itemName: null,
+          receivedQty: Number(row.received_qty || 0),
+          poLineId: null,
+          doNumber: row.do_number,
+          rnNumber: row.rn_number,
+          supplier: row.supplier,
+          lineCount: Number(row.line_count || 0),
+          receiptStatus: row.status,
+        })),
+      });
+      return;
+    }
+
+    const params = [doNumber];
+    let query = `
+      select
+        s.id,
+        s.po_number,
+        s.item,
+        s.item_code,
+        s.po_line_id,
+        s.received_qty,
+        s.do_number,
+        i.name as item_name
+      from schedules s
+      left join items i on lower(i.code) = lower(coalesce(s.item_code, s.item))
+      where lower(trim(s.do_number)) = lower(trim($1))
+    `;
+    if (ignoreIds.length > 0) {
+      params.push(ignoreIds);
+      query += ` and not (s.id = any($${params.length}))`;
+    }
+    const result = await pool.query(query, params);
+    const matches = result.rows || [];
+
+    let hardBlock = false;
+    if (normalizedItems.length > 0 && matches.length > 0) {
+      for (const item of normalizedItems) {
+        for (const match of matches) {
+          const matchItemCode = normalizeItemCode(match.item_code || match.item);
+          if (item.poLineId && Number(match.po_line_id || 0) === item.poLineId) {
+            hardBlock = true;
+            break;
+          }
+          if (item.poNumber === match.po_number && matchItemCode === item.itemCode) {
+            hardBlock = true;
+            break;
+          }
+        }
+        if (hardBlock) break;
+      }
+    }
+
+    res.json({
+      status: hardBlock ? "block" : (matches.length > 0 ? "warn" : "ok"),
+      matches: matches.map((row) => ({
+        id: row.id,
+        receiptType: "schedule_legacy",
+        poNumber: row.po_number,
+        itemCode: normalizeItemCode(row.item_code || row.item),
+        itemName: row.item_name || null,
+        receivedQty: row.received_qty,
+        poLineId: row.po_line_id,
+        doNumber: row.do_number,
+      })),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/search", authenticate, requireNotSupplier, async (req, res) => {
+  try {
+    const rawQuery = String(req.query?.q || "").trim();
+    if (!rawQuery) {
+      res.json({ query: "", groups: [] });
+      return;
+    }
+    const limitRaw = Number(req.query?.limit);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 20) : 8;
+    const query = rawQuery.toLowerCase();
+    const like = `%${query}%`;
+
+    const [poResult, vendorResult, itemResult, scheduleResult] = await Promise.all([
+      pool.query(
+        `
+        select
+          ph.po_number,
+          to_char(ph.po_date, 'YYYY-MM-DD') as po_date,
+          ph.status,
+          ph.supplier_id as supplier_code,
+          mv.name as supplier_name
+        from po_headers ph
+        left join master_vendors mv on mv.id = ph.supplier_id
+        where lower(ph.po_number) like $1
+           or lower(ph.supplier_id) like $1
+           or lower(coalesce(mv.name, '')) like $1
+        order by ph.po_date desc nulls last, ph.po_number asc
+        limit $2
+        `,
+        [like, limit],
+      ),
+      pool.query(
+        `
+        select id, name, type, email
+        from master_vendors
+        where lower(id) like $1
+           or lower(name) like $1
+        order by name asc
+        limit $2
+        `,
+        [like, limit],
+      ),
+      pool.query(
+        `
+        select code, name, part_no, vendor_id
+        from items
+        where lower(code) like $1
+           or lower(name) like $1
+           or lower(coalesce(part_no, '')) like $1
+        order by code asc
+        limit $2
+        `,
+        [like, limit],
+      ),
+      pool.query(
+        `
+        select s.id, s.po_number, coalesce(s.item_code, s.item) as item, s.supplier, s.request_date, s.status, mv.name as supplier_name
+        from schedules s
+        left join po_headers ph on ph.po_number = s.po_number
+        left join master_vendors mv on mv.id = ph.supplier_id
+           or mv.id = s.supplier
+           or mv.name = s.supplier
+        where lower(s.po_number) like $1
+           or lower(coalesce(s.item_code, s.item)) like $1
+           or lower(s.supplier) like $1
+           or lower(coalesce(mv.name, '')) like $1
+        order by s.request_date desc nulls last, s.id desc
+        limit $2
+        `,
+        [like, limit],
+      ),
+    ]);
+
+    const groups = [
+      { key: "po", label: "Master PO", items: poResult.rows || [] },
+      { key: "vendors", label: "Master Vendor", items: vendorResult.rows || [] },
+      { key: "items", label: "Master Item", items: itemResult.rows || [] },
+      { key: "schedules", label: "Jadwal Inbound", items: scheduleResult.rows || [] },
+    ].map((group) => ({ ...group, count: group.items.length, hasMore: group.items.length >= limit }));
+
+    res.json({ query: rawQuery, limit, groups });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/kanban/settings", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      select
+        ks.item_code,
+        ks.min_qty,
+        ks.max_qty,
+        ks.lot_qty,
+        ks.lead_time_days,
+        ks.default_supplier,
+        ks.drop_zone,
+        ks.active,
+        i.name as item_name,
+        i.unit as item_unit,
+        i.type as item_type
+      from kanban_settings ks
+      join items i on i.code = ks.item_code
+      order by ks.item_code asc
+      `,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/kanban/settings", authenticate, requireRole("admin"), async (req, res) => {
+  try {
+    const {
+      itemCode,
+      minQty,
+      maxQty,
+      lotQty,
+      leadTimeDays,
+      defaultSupplier,
+      dropZone,
+      lineCode,
+      drop_zone,
+      line_code,
+      active,
+    } = req.body || {};
+    if (!itemCode) {
+      res.status(400).json({ error: "itemCode wajib diisi" });
+      return;
+    }
+    const minValue = Number.isFinite(Number(minQty)) ? Number(minQty) : 0;
+    const maxValue = Number.isFinite(Number(maxQty)) ? Number(maxQty) : 0;
+    const lotValue = Number.isFinite(Number(lotQty)) ? Number(lotQty) : 0;
+    const leadTimeValue = Number.isFinite(Number(leadTimeDays)) ? Number(leadTimeDays) : 0;
+    const isActive = typeof active === "boolean" ? active : true;
+    const dropZoneValue = String(
+      dropZone ?? lineCode ?? drop_zone ?? line_code ?? "",
+    ).trim();
+    const result = await pool.query(
+      `
+      insert into kanban_settings
+        (item_code, min_qty, max_qty, lot_qty, lead_time_days, default_supplier, drop_zone, active, updated_at)
+      values ($1,$2,$3,$4,$5,$6,$7,$8, now())
+      on conflict (item_code) do update set
+        min_qty = excluded.min_qty,
+        max_qty = excluded.max_qty,
+        lot_qty = excluded.lot_qty,
+        lead_time_days = excluded.lead_time_days,
+        default_supplier = excluded.default_supplier,
+        drop_zone = excluded.drop_zone,
+        active = excluded.active,
+        updated_at = now()
+      returning *
+      `,
+      [
+        itemCode,
+        minValue,
+        maxValue,
+        lotValue,
+        leadTimeValue,
+        defaultSupplier || null,
+        dropZoneValue || null,
+        isActive,
+      ],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/kanban/requests", authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `
+      update kanban_requests kr
+      set dn_id = null,
+          status = 'approved',
+          updated_at = now()
+      where kr.dn_id is not null
+        and kr.status <> 'closed'
+        and not exists (
+          select 1 from delivery_notes dn where dn.id = kr.dn_id
+        )
+      `,
+    );
+    const { status, itemCode, dnId } = req.query;
+    const filters = [];
+    const values = [];
+    if (status) { values.push(status); filters.push(`kr.status = $${values.length}`); }
+    if (itemCode) { values.push(itemCode); filters.push(`kr.item_code = $${values.length}`); }
+    if (dnId) { values.push(Number(dnId)); filters.push(`kr.dn_id = $${values.length}`); }
+    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    let result = await client.query(
+      `
+      select
+        kr.*,
+        i.name as item_name,
+        i.unit as item_unit
+      from kanban_requests kr
+      join items i on i.code = kr.item_code
+      ${whereClause}
+      order by kr.created_at desc, kr.id desc
+      `,
+      values,
+    );
+    const healthIds = result.rows.map((row) => row.id);
+    if (healthIds.length > 0) {
+      await syncKanbanRequestHealthByIds(client, healthIds);
+      result = await client.query(
+        `
+        select
+          kr.*,
+          i.name as item_name,
+          i.unit as item_unit
+        from kanban_requests kr
+        join items i on i.code = kr.item_code
+        ${whereClause}
+        order by kr.created_at desc, kr.id desc
+        `,
+        values,
+      );
+    }
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/delivery-notes", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      select
+        dn.*,
+        count(kr.id) as request_count,
+        coalesce(sum(kr.request_qty), 0) as total_qty,
+        min(kr.item_code) as item_code,
+        min(i.name) as item_name,
+        min(i.unit) as item_unit,
+        max(kr.schedule_id) as schedule_id
+      from delivery_notes dn
+      left join kanban_requests kr on kr.dn_id = dn.id
+      left join items i on i.code = kr.item_code
+      group by dn.id
+      order by dn.created_at desc, dn.id desc
+      `,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/delivery-notes/open", authenticate, async (req, res) => {
+  try {
+    const supplierRaw = String(req.query?.supplier || "").trim();
+    if (!supplierRaw) {
+      res.status(400).json({ error: "supplier wajib diisi" });
+      return;
+    }
+    const vendorResult = await pool.query(
+      "select id, name from master_vendors where id = $1 or name = $1 limit 1",
+      [supplierRaw],
+    );
+    const matchValues = new Set([supplierRaw]);
+    if (vendorResult.rows[0]?.id) matchValues.add(vendorResult.rows[0].id);
+    if (vendorResult.rows[0]?.name) matchValues.add(vendorResult.rows[0].name);
+    const lowerValues = Array.from(matchValues).map((val) => String(val || "").toLowerCase());
+    const result = await pool.query(
+      `
+      select
+        dn.*,
+        coalesce(sum(dni.request_qty), 0) as total_qty
+      from delivery_notes dn
+      left join delivery_note_items dni on dni.dn_id = dn.id
+      where lower(dn.supplier) = any($1::text[])
+        and lower(dn.status) in ('open', 'partial', 'in_transit')
+      group by dn.id
+      order by dn.created_at desc, dn.id desc
+      `,
+      [lowerValues],
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/delivery-notes/items", authenticate, async (req, res) => {
+  try {
+    const dnIds = String(req.query?.dnIds || req.query?.dn_ids || "")
+      .split(",")
+      .map((val) => Number(val))
+      .filter((val) => Number.isFinite(val));
+    if (dnIds.length === 0) {
+      res.status(400).json({ error: "dnIds wajib diisi" });
+      return;
+    }
+    const result = await pool.query(
+      `
+      select
+        dni.*,
+        dn.dn_number,
+        dn.supplier,
+        mp.name as packing_name,
+        coalesce(rn.received_total, 0) as received_total
+      from delivery_note_items dni
+      join delivery_notes dn on dn.id = dni.dn_id
+      left join master_packings mp on mp.code = dni.type_pack
+      left join (
+        select origin_dn_id, item_code, sum(received_qty) as received_total
+        from receive_note_items
+        group by origin_dn_id, item_code
+      ) rn on rn.origin_dn_id = dni.dn_id and rn.item_code = dni.item_code
+      where dni.dn_id = any($1::int[])
+      order by dn.id asc, dni.id asc
+      `,
+      [dnIds],
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/delivery-notes/lookup", authenticate, async (req, res) => {
+  try {
+    const dnNumber = String(req.query?.dnNumber || req.query?.dn_number || "").trim();
+    if (!dnNumber) {
+      res.status(400).json({ error: "dnNumber wajib diisi" });
+      return;
+    }
+    const dnResult = await pool.query(
+      "select * from delivery_notes where dn_number = $1",
+      [dnNumber],
+    );
+    if (dnResult.rows.length === 0) {
+      res.status(404).json({ error: "DN tidak ditemukan" });
+      return;
+    }
+    const dn = dnResult.rows[0];
+    const itemsResult = await pool.query(
+      `
+      select
+        dni.*,
+        mp.name as packing_name
+      from delivery_note_items dni
+      left join master_packings mp on mp.code = dni.type_pack
+      where dni.dn_id = $1
+      order by dni.id asc
+      `,
+      [dn.id],
+    );
+    res.json({ dn, items: itemsResult.rows || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/delivery-notes/:id/items", authenticate, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const result = await pool.query(
+      `
+      select
+        dni.*,
+        mp.name as packing_name
+      from delivery_note_items dni
+      left join master_packings mp on mp.code = dni.type_pack
+      where dni.dn_id = $1
+      order by dni.id asc
+      `,
+      [id],
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/delivery-notes/:id/kanban-cards", authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const dnResult = await client.query(
+      "select * from delivery_notes where id = $1 for update",
+      [id],
+    );
+    if (dnResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "DN tidak ditemukan" });
+      return;
+    }
+    const dn = dnResult.rows[0];
+    const dnStatus = String(dn.status || "").toLowerCase();
+    if (dnStatus !== "open") {
+      await client.query("rollback");
+      res.status(409).json({ error: "DN belum OPEN." });
+      return;
+    }
+    const statusValue = String(dn.status || "").toLowerCase();
+    const allowedStatuses = new Set(["open", "in_transit", "partial", "published"]);
+    if (!allowedStatuses.has(statusValue)) {
+      await client.query("commit");
+      res.json([]);
+      return;
+    }
+
+    const itemsResult = await client.query(
+      `
+      select
+        dni.request_id,
+        dni.item_code,
+        dni.request_qty,
+        dni.pack_qty,
+        coalesce(kr.request_code, '') as request_code
+      from delivery_note_items dni
+      left join kanban_requests kr on kr.id = dni.request_id
+      where dni.dn_id = $1
+      order by dni.id asc
+      `,
+      [id],
+    );
+
+    const existingResult = await client.query(
+      "select * from kanban_cards where dn_id = $1",
+      [id],
+    );
+    const existingMap = new Map();
+    existingResult.rows.forEach((row) => {
+      existingMap.set(`${row.item_code}-${row.card_seq}`, row);
+    });
+
+    for (const item of itemsResult.rows) {
+      const itemCode = item.item_code;
+      const packQty = Number(item.pack_qty || 0);
+      const orderQty = Number(item.request_qty || 0);
+      if (!Number.isFinite(packQty) || packQty <= 0 || !Number.isFinite(orderQty) || orderQty <= 0) continue;
+      const totalCards = Math.max(1, Math.ceil(orderQty / packQty));
+      for (let seq = 1; seq <= totalCards; seq += 1) {
+        const key = `${itemCode}-${seq}`;
+        if (existingMap.has(key)) continue;
+        const remaining = orderQty - packQty * (seq - 1);
+        const cardQty = seq === totalCards ? Math.max(remaining, 0) : packQty;
+        const cardUid = crypto.randomUUID();
+        const lotBatch = String(item.request_code || "").trim() || null;
+        await client.query(
+          `
+          insert into kanban_cards
+            (dn_id, item_code, request_id, card_seq, total_cards, card_qty, card_uid, lot_batch)
+          values ($1,$2,$3,$4,$5,$6,$7,$8)
+          on conflict (dn_id, item_code, card_seq) do nothing
+          `,
+          [id, itemCode, item.request_id || null, seq, totalCards, cardQty, cardUid, lotBatch],
+        );
+      }
+    }
+
+    const cardResult = await client.query(
+      `
+      select *
+      from kanban_cards
+      where dn_id = $1
+      order by item_code asc, card_seq asc
+      `,
+      [id],
+    );
+    await client.query("commit");
+    res.json(cardResult.rows || []);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/delivery-notes/:id/receive", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const { items, scans } = req.body || {};
+    if (!Array.isArray(items) || items.length === 0) {
+      res.status(400).json({ error: "items wajib diisi" });
+      return;
+    }
+    await client.query("begin");
+    const dnResult = await client.query(
+      "select * from delivery_notes where id = $1 for update",
+      [id],
+    );
+    if (dnResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "DN tidak ditemukan" });
+      return;
+    }
+    const dn = dnResult.rows[0];
+    const providedDoNumber = normalizeDoNumber(req.body?.doNumber || req.body?.do_number);
+    const documentDate = String(req.body?.documentDate || req.body?.document_date || req.body?.arrivalDate || req.body?.arrival_date || "").trim();
+    const allowOverReceive = Boolean(req.body?.allowOverReceive) && req.user?.role === "admin";
+    const dnItemsResult = await client.query(
+      `
+      select item_code, request_qty, pack_qty
+      from delivery_note_items
+      where dn_id = $1
+      `,
+      [id],
+    );
+    const dnItemMap = new Map();
+    dnItemsResult.rows.forEach((row) => {
+      dnItemMap.set(row.item_code, {
+        docQty: Number(row.request_qty || 0),
+        packQty: Number(row.pack_qty || 0),
+      });
+    });
+
+    let hasOver = false;
+    const today = new Date().toISOString().slice(0, 10);
+    const supplierValue = dn.supplier || "SUPPLIER";
+    const payloadCodes = new Set();
+    const effectiveDoNumber = providedDoNumber || normalizeDoNumber(dn.dn_number) || `DN:${id}`;
+    const header = await createReceiptDraft(client, {
+      supplier: supplierValue,
+      doNumber: effectiveDoNumber,
+      documentDate: documentDate || today,
+      source: "DN_RECEIVE",
+      remarks: dn.dn_number ? `DN ${dn.dn_number}` : null,
+    }, req.user);
+    let nextLineNo = Number(
+      (
+        await client.query(
+          "select coalesce(max(line_no), 0) + 1 as next_line_no from receive_note_items where rn_id = $1",
+          [header.id],
+        )
+      ).rows[0]?.next_line_no || 1
+    );
+    let totalReceivedQty = 0;
+
+    for (const item of items) {
+      const itemCode = String(item?.itemCode || item?.item_code || "").trim();
+      if (!itemCode) continue;
+      payloadCodes.add(itemCode);
+      const meta = dnItemMap.get(itemCode);
+      if (!meta) {
+        await client.query("rollback");
+        res.status(409).json({ error: `Item ${itemCode} tidak ada di DN.` });
+        return;
+      }
+      const receivedQty = Number(item?.receivedQty || item?.received_qty || 0);
+      if (!Number.isFinite(receivedQty) || receivedQty < 0) {
+        await client.query("rollback");
+        res.status(400).json({ error: `Qty terima tidak valid untuk ${itemCode}.` });
+        return;
+      }
+      const docQty = Number.isFinite(Number(item?.docQty))
+        ? Number(item?.docQty)
+        : meta.docQty;
+      if (receivedQty > docQty) hasOver = true;
+      if (receivedQty <= 0) continue;
+      totalReceivedQty += receivedQty;
+      await upsertReceiptDraftLine(client, header.id, {
+        lineNo: nextLineNo,
+        originDnId: id,
+        itemCode,
+        packQty: meta.packQty,
+        docQty: Number.isFinite(docQty) ? docQty : receivedQty,
+        receivedQty,
+        qcStatus: "ok",
+        arrivalDate: documentDate || today,
+        notes: null,
+        matchBasis: "delivery_note",
+        overrideReason: receivedQty > docQty ? "dn_receive_over_receipt" : null,
+      }, req.user);
+      nextLineNo += 1;
+    }
+    if (!(totalReceivedQty > 0)) {
+      await client.query("rollback");
+      res.status(400).json({ error: "Qty terima masih 0." });
+      return;
+    }
+    const postResult = await postReceiptDraft(client, header.id, req.user, {
+      allowOverReceive,
+      allowPartial: false,
+    });
+
+    if (Array.isArray(scans) && scans.length > 0) {
+      for (const scan of scans) {
+        const qrValue = String(scan?.qrValue || scan?.qr_value || "").trim();
+        const itemCode = String(scan?.itemCode || scan?.item_code || "").trim();
+        const qtyValue = Number(scan?.qty || 0);
+        if (!qrValue || !itemCode || !dnItemMap.has(itemCode)) continue;
+        await client.query(
+          `
+          insert into dn_receive_scans (dn_id, item_code, qr_value, qty, scanned_by)
+          values ($1,$2,$3,$4,$5)
+          on conflict (dn_id, qr_value) do nothing
+          `,
+          [id, itemCode, qrValue, Number.isFinite(qtyValue) ? qtyValue : 0, req.user?.id || null],
+        );
+      }
+    }
+
+    const nextStatus = await recomputeDeliveryNoteStatus(client, id);
+
+    await client.query("commit");
+    const postedLines = await getReceiptLinesByHeader(client, header.id);
+    res.json({
+      ok: true,
+      status: nextStatus,
+      hasOver,
+      rnNumber: header.rn_number,
+      rnId: header.id,
+      receiptHeaderId: header.id,
+      doNumber: effectiveDoNumber,
+      notes: postedLines.filter((line) => Number(line.posted_qty || 0) > 0),
+      postResult,
+    });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({
+      error: error.message,
+      validation: error.validation || null,
+      receiptHeader: error.receiptHeader || null,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/delivery-notes/:id/force-close", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const dnResult = await pool.query(
+      "select * from delivery_notes where id = $1",
+      [id],
+    );
+    if (dnResult.rows.length === 0) {
+      res.status(404).json({ error: "DN tidak ditemukan" });
+      return;
+    }
+    const dn = dnResult.rows[0];
+    if (dn.status === "received" || dn.status === "closed") {
+      res.json(dn);
+      return;
+    }
+    const updated = await pool.query(
+      "update delivery_notes set status = $1 where id = $2 returning *",
+      ["closed", id],
+    );
+    res.json(updated.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/inbound/receipts/drafts", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const header = await createReceiptDraft(client, req.body || {}, req.user);
+    await client.query("commit");
+    res.json({
+      id: header.id,
+      rnNumber: header.rn_number,
+      doNumber: header.do_number,
+      supplier: header.supplier,
+      status: header.status,
+      source: header.source,
+      createdAt: header.created_at,
+      reused: Boolean(header.status && header.rn_number),
+    });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({
+      error: error.message,
+      receiptHeader: error.receiptHeader || null,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/inbound/receipts/drafts/:id/items", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const line = await upsertReceiptDraftLine(client, id, req.body || {}, req.user);
+    await client.query("commit");
+    res.json(line);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/inbound/receipts/drafts/:id/candidates", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    const lineNo = Number(req.query.lineNo ?? req.query.line_no);
+    if (!Number.isFinite(id) || !Number.isFinite(lineNo) || lineNo <= 0) {
+      res.status(400).json({ error: "id dan lineNo wajib valid" });
+      return;
+    }
+    const result = await recommendReceiptCandidates(client, id, lineNo, { limit: Number(req.query.limit || 10) });
+    res.json(result);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/inbound/receipts/drafts/:id/validate", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const allowOverReceive = Boolean(req.body?.allowOverReceive) && req.user?.role === "admin";
+    await client.query("begin");
+    const result = await validateReceiptDraft(client, id, req.user, {
+      persist: true,
+      allowOverReceive,
+    });
+    await client.query("commit");
+    res.json(result);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({
+      error: error.message,
+      validation: error.validation || null,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/inbound/receipts/drafts/:id/post", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const allowOverReceive = Boolean(req.body?.allowOverReceive) && req.user?.role === "admin";
+    const allowPartial = req.body?.allowPartial !== false;
+    await client.query("begin");
+    const result = await postReceiptDraft(client, id, req.user, {
+      allowOverReceive,
+      allowPartial,
+    });
+    await client.query("commit");
+    clearScheduleCache();
+    await autoTriggerKanbanRequests(pool, { note: "auto-trigger (inbound draft post)" });
+    res.json(result);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({
+      error: error.message,
+      validation: error.validation || null,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/inbound/receipts/:id/reverse", authenticate, requireRole("admin"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const result = await reverseReceipt(client, id, req.user, req.body || {});
+    await client.query("commit");
+    clearScheduleCache();
+    res.json(result);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/inbound/receipts", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  try {
+    const statusFilter = String(req.query.status || "").trim().toLowerCase();
+    const supplierFilter = String(req.query.supplier || "").trim();
+    const doFilter = String(req.query.doNumber || req.query.do_number || "").trim();
+    const where = [];
+    const values = [];
+    if (statusFilter) {
+      values.push(statusFilter);
+      where.push(`lower(h.status) = $${values.length}`);
+    }
+    if (supplierFilter) {
+      values.push(`%${supplierFilter.toLowerCase()}%`);
+      where.push(`lower(h.supplier) like $${values.length}`);
+    }
+    if (doFilter) {
+      values.push(`%${doFilter.toLowerCase()}%`);
+      where.push(`lower(coalesce(h.do_number, '')) like $${values.length}`);
+    }
+    const whereSql = where.length > 0 ? `where ${where.join(" and ")}` : "";
+    const result = await pool.query(
+      `
+      select
+        h.id,
+        h.rn_number,
+        h.supplier,
+        h.do_number,
+        h.po_number,
+        h.status,
+        h.source,
+        h.document_date,
+        h.created_at,
+        h.posted_at,
+        count(i.id)::int as line_count,
+        coalesce(sum(i.received_qty), 0)::numeric as total_received_qty,
+        coalesce(sum(case when i.line_status = 'posted' then i.posted_qty else 0 end), 0)::numeric as total_posted_qty
+      from receive_note_headers h
+      left join receive_note_items i on i.rn_id = h.id
+      ${whereSql}
+      group by h.id
+      order by coalesce(h.posted_at, h.created_at) desc, h.id desc
+      `
+      ,
+      values,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/inbound/receipts/:id", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const headerResult = await pool.query(
+      `
+      select *
+      from receive_note_headers
+      where id = $1
+      limit 1
+      `,
+      [id],
+    );
+    if (headerResult.rows.length === 0) {
+      res.status(404).json({ error: "receipt tidak ditemukan" });
+      return;
+    }
+    const itemsResult = await pool.query(
+      `
+      select
+        rni.*,
+        s.po_number as schedule_po_number,
+        s.request_date as schedule_request_date,
+        s.request_qty as schedule_request_qty,
+        pl.po_number as po_line_po_number,
+        pl.line_no as po_line_no
+      from receive_note_items rni
+      left join schedules s on s.id = rni.schedule_id
+      left join po_lines pl on pl.id = rni.po_line_id
+      where rni.rn_id = $1
+      order by rni.line_no asc, rni.id asc
+      `,
+      [id],
+    );
+    res.json({
+      header: headerResult.rows[0],
+      items: itemsResult.rows || [],
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/receive-notes", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      select * from (
+        select
+          rn.id,
+          rn.rn_number,
+          rn.dn_id,
+          rn.schedule_id,
+          coalesce(rn.item_code, kr.item_code, s.item_code, s.item) as item_code,
+          i.name as item_name,
+          coalesce(rn.doc_qty, s.request_qty) as expected_qty,
+          rn.received_qty,
+          rn.qc_status,
+          rn.status,
+          rn.received_at,
+          rn.notes,
+          rn.source,
+          null::text as truck_no,
+          null::text as driver_name,
+          dn.dn_number,
+          coalesce(dn.supplier, s.supplier) as supplier,
+          s.arrival_date,
+          s.do_number,
+          s.status as schedule_status,
+          sb.production_date,
+          sb.expired_date,
+          'legacy'::text as rn_type,
+          null::int as rn_header_id
+        from receive_notes rn
+        left join delivery_notes dn on dn.id = rn.dn_id
+        left join schedules s on s.id = rn.schedule_id
+        left join kanban_requests kr on kr.id = s.request_id
+        left join stock_batches sb on sb.schedule_id = rn.schedule_id
+        left join items i on i.code = coalesce(rn.item_code, kr.item_code, s.item_code, s.item)
+        union all
+        select
+          rni.id,
+          rnh.rn_number,
+          rni.origin_dn_id as dn_id,
+          rni.schedule_id,
+          rni.item_code,
+          i.name as item_name,
+          coalesce(rni.doc_qty, s.request_qty) as expected_qty,
+          rni.received_qty,
+          coalesce(rni.qc_status, 'ok') as qc_status,
+          case when rni.line_status = 'posted' then 'open' else rni.line_status end as status,
+          coalesce(rnh.posted_at, rnh.created_at) as received_at,
+          coalesce(rni.notes, rnh.remarks) as notes,
+          coalesce(rnh.source, 'DN_MERGE') as source,
+          rnh.truck_no,
+          rnh.driver_name,
+          dn.dn_number,
+          coalesce(dn.supplier, rnh.supplier, s.supplier) as supplier,
+          rni.arrival_date,
+          rnh.do_number,
+          s.status as schedule_status,
+          rni.production_date,
+          rni.expired_date,
+          'header'::text as rn_type,
+          rnh.id as rn_header_id
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        left join delivery_notes dn on dn.id = rni.origin_dn_id
+        left join schedules s on s.id = rni.schedule_id
+        left join items i on i.code = rni.item_code
+        where rni.line_status = 'posted'
+      ) rn_all
+      order by received_at desc, id desc
+      `,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/so-sessions", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      select
+        s.*,
+        coalesce(count(i.id), 0) as item_count,
+        coalesce(sum(case when i.difference is not null and i.difference <> 0 then 1 else 0 end), 0) as variance_count
+      from so_sessions s
+      left join so_items i on i.session_id = s.id
+      group by s.id
+      order by s.created_at desc, s.id desc
+      `,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/so-sessions/open", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "select * from so_sessions where status = 'OPEN' order by created_at desc limit 1",
+    );
+    res.json(result.rows[0] || null);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/so-sessions/start", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const period = String(req.body?.period || "").trim();
+    if (!period) {
+      res.status(400).json({ error: "period wajib diisi" });
+      return;
+    }
+    await client.query("begin");
+    const openCheck = await client.query("select id from so_sessions where status = 'OPEN' limit 1");
+    if (openCheck.rows.length > 0) {
+      await client.query("rollback");
+      res.status(409).json({ error: "Masih ada Stock Opname OPEN." });
+      return;
+    }
+    const sessionResult = await client.query(
+      `
+      insert into so_sessions (period, status, created_by)
+      values ($1, 'OPEN', $2)
+      returning *
+      `,
+      [period, req.user?.id || null],
+    );
+    const session = sessionResult.rows[0];
+    const itemsResult = await client.query(
+      `
+      select
+        i.code,
+        i.name,
+        i.part_no,
+        i.unit,
+        i.price,
+        i.qty_on_hand,
+        coalesce(i.pack_qty, ks.lot_qty, 0) as snp
+      from items i
+      left join kanban_settings ks on ks.item_code = i.code
+      order by i.code asc
+      `,
+    );
+    for (const row of itemsResult.rows) {
+      await client.query(
+        `
+        insert into so_items
+          (session_id, item_code, item_name, part_no, unit, snp, price, book_qty, input_box, input_loose)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,0,0)
+        `,
+        [
+          session.id,
+          row.code,
+          row.name || null,
+          row.part_no || null,
+          row.unit || null,
+          Number(row.snp || 0),
+          Number(row.price || 0),
+          Number(row.qty_on_hand || 0),
+        ],
+      );
+    }
+    await client.query("commit");
+    res.json(session);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/so-sessions/:id/items", authenticate, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+      const result = await pool.query(
+        `
+        select
+          si.*,
+          i.location_name,
+          i.location_id,
+          i.line_production
+        from so_items si
+        left join items i on i.code = si.item_code
+        where si.session_id = $1
+        order by si.item_code asc
+        `,
+        [id],
+      );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/so-sessions/:id/upload", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (items.length === 0) {
+      res.status(400).json({ error: "items wajib diisi" });
+      return;
+    }
+    await client.query("begin");
+    const sessionResult = await client.query("select * from so_sessions where id = $1 for update", [id]);
+    if (sessionResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "session tidak ditemukan" });
+      return;
+    }
+    const session = sessionResult.rows[0];
+    if (session.status === "POSTED") {
+      await client.query("rollback");
+      res.status(409).json({ error: "Session sudah POSTED." });
+      return;
+    }
+
+    for (const row of items) {
+      const itemCode = String(row.itemCode || row.item_code || "").trim();
+      if (!itemCode) continue;
+      const inputBox = Number(row.inputBox ?? row.input_box ?? 0);
+      const inputLoose = Number(row.inputLoose ?? row.input_loose ?? 0);
+      const snpInput = Number(row.snp ?? row.pack_qty ?? row.lot_qty ?? 0);
+      if (!Number.isFinite(inputBox) || inputBox < 0 || !Number.isFinite(inputLoose) || inputLoose < 0) {
+        await client.query("rollback");
+        res.status(400).json({ error: `Input tidak valid untuk ${itemCode}.` });
+        return;
+      }
+      const itemResult = await client.query(
+        "select book_qty, snp from so_items where session_id = $1 and item_code = $2 for update",
+        [id, itemCode],
+      );
+      if (itemResult.rows.length === 0) {
+        await client.query("rollback");
+        res.status(404).json({ error: `Item ${itemCode} tidak ada di session.` });
+        return;
+      }
+      const item = itemResult.rows[0];
+      const snpValue = Number.isFinite(snpInput) && snpInput > 0 ? snpInput : Number(item.snp || 0);
+      const actualQty = inputBox * snpValue + inputLoose;
+      const difference = actualQty - Number(item.book_qty || 0);
+      const reason = String(row.reason || "").trim();
+      if (difference !== 0 && !reason) {
+        await client.query("rollback");
+        res.status(400).json({ error: `Reason wajib diisi untuk ${itemCode}.` });
+        return;
+      }
+      await client.query(
+        `
+        update so_items
+        set input_box = $1,
+            input_loose = $2,
+            snp = $3,
+            actual_qty = $4,
+            difference = $5,
+            reason = $6,
+            updated_at = now()
+        where session_id = $7 and item_code = $8
+        `,
+        [inputBox, inputLoose, snpValue, actualQty, difference, reason || null, id, itemCode],
+      );
+    }
+    if (session.status === "OPEN") {
+      await client.query("update so_sessions set status = 'REVIEW' where id = $1", [id]);
+    }
+    await client.query("commit");
+    clearScheduleCache();
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/so-sessions/:id/review", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const result = await pool.query(
+      "update so_sessions set status = 'REVIEW' where id = $1 returning *",
+      [id],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "session tidak ditemukan" });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/so-sessions/:id/finalize", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const sessionResult = await client.query("select * from so_sessions where id = $1 for update", [id]);
+    if (sessionResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "session tidak ditemukan" });
+      return;
+    }
+    const session = sessionResult.rows[0];
+    if (session.status === "POSTED") {
+      await client.query("rollback");
+      res.status(409).json({ error: "Session sudah POSTED." });
+      return;
+    }
+    const itemsResult = await client.query(
+      "select * from so_items where session_id = $1 for update",
+      [id],
+    );
+    const referenceDoc = session.period ? `SO-${session.period}` : `SO-${id}`;
+    for (const row of itemsResult.rows) {
+      const actualQty = Number(row.actual_qty ?? row.book_qty ?? 0);
+      const bookQty = Number(row.book_qty || 0);
+      const difference = actualQty - bookQty;
+      if (difference !== 0 && !row.reason) {
+        await client.query("rollback");
+        res.status(400).json({ error: `Reason wajib diisi untuk ${row.item_code}.` });
+        return;
+      }
+      if (row.actual_qty === null || row.actual_qty === undefined) {
+        await client.query(
+          `update so_items set actual_qty = $1, difference = $2 where id = $3`,
+          [actualQty, difference, row.id],
+        );
+      }
+      await client.query(
+        "update items set qty_on_hand = $1 where code = $2",
+        [actualQty, row.item_code],
+      );
+      if (difference !== 0) {
+        await logStockMovement(client, {
+          itemCode: row.item_code,
+          batchId: null,
+          qty: Math.abs(difference),
+          direction: difference > 0 ? "in" : "out",
+          reason: "stock_opname",
+        });
+        await insertInventoryLedger(client, {
+          itemCode: row.item_code,
+          transactionType: "ADJUSTMENT_SO",
+          referenceDoc,
+          qtyIn: difference > 0 ? Math.abs(difference) : 0,
+          qtyOut: difference < 0 ? Math.abs(difference) : 0,
+          userId: req.user?.id || null,
+          remarks: row.reason || null,
+        });
+      }
+    }
+    await client.query("update so_sessions set status = 'POSTED' where id = $1", [id]);
+    await client.query("commit");
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/receive-notes/merge", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const body = req.body || {};
+    const supplier = String(body.supplier || "").trim();
+    const dnIdsRaw = Array.isArray(body.dnIds) ? body.dnIds : [];
+    const ids = Array.from(new Set(dnIdsRaw.map((val) => Number(val)).filter((val) => Number.isFinite(val))));
+    const itemsPayload = Array.isArray(body.items) ? body.items : [];
+    const scans = Array.isArray(body.scans) ? body.scans : [];
+    const remarks = String(body.remarks || "").trim();
+    const truckNo = String(body.truckNo || body.truck_no || "").trim();
+    const driverName = String(body.driverName || body.driver_name || "").trim();
+    const providedDoNumber = normalizeDoNumber(body.doNumber || body.do_number);
+    const documentDate = String(body.documentDate || body.document_date || body.arrivalDate || body.arrival_date || "").trim();
+    const allowOverReceive = Boolean(body.allowOverReceive) && req.user?.role === "admin";
+
+    if (!supplier) {
+      res.status(400).json({ error: "supplier wajib diisi" });
+      return;
+    }
+    if (ids.length === 0) {
+      res.status(400).json({ error: "dnIds wajib diisi" });
+      return;
+    }
+    if (!truckNo) {
+      res.status(400).json({ error: "truck_no wajib diisi" });
+      return;
+    }
+
+    await client.query("begin");
+    const dnResult = await client.query(
+      "select * from delivery_notes where id = any($1::int[]) for update",
+      [ids],
+    );
+    if (dnResult.rows.length !== ids.length) {
+      await client.query("rollback");
+      res.status(404).json({ error: "DN tidak ditemukan." });
+      return;
+    }
+    const vendorResult = await client.query(
+      "select id, name from master_vendors where id = $1 or name = $1 limit 1",
+      [supplier],
+    );
+    const supplierMatch = new Set([supplier]);
+    if (vendorResult.rows[0]?.id) supplierMatch.add(vendorResult.rows[0].id);
+    if (vendorResult.rows[0]?.name) supplierMatch.add(vendorResult.rows[0].name);
+    const supplierLower = new Set(Array.from(supplierMatch).map((val) => String(val || "").toLowerCase()));
+    for (const dn of dnResult.rows) {
+      if (!supplierLower.has(String(dn.supplier || "").toLowerCase())) {
+        await client.query("rollback");
+        res.status(409).json({ error: "Supplier DN tidak sesuai." });
+        return;
+      }
+    }
+
+    const dnItemsResult = await client.query(
+      `
+      select
+        dni.*,
+        dn.dn_number
+      from delivery_note_items dni
+      join delivery_notes dn on dn.id = dni.dn_id
+      where dni.dn_id = any($1::int[])
+      order by dn.id asc, dni.id asc
+      `,
+      [ids],
+    );
+    const dnItems = dnItemsResult.rows || [];
+    if (dnItems.length === 0) {
+      await client.query("rollback");
+      res.status(409).json({ error: "Item DN tidak ditemukan." });
+      return;
+    }
+    const validKeys = new Set(dnItems.map((row) => `${row.dn_id}:${row.item_code}`));
+    const receivedMap = new Map();
+    itemsPayload.forEach((row) => {
+      const dnId = Number(row.originDnId || row.origin_dn_id || row.dnId || row.dn_id);
+      const itemCode = String(row.itemCode || row.item_code || "").trim();
+      if (!Number.isFinite(dnId) || !itemCode) return;
+      receivedMap.set(`${dnId}:${itemCode}`, Number(row.receivedQty || row.received_qty || 0));
+    });
+    for (const key of receivedMap.keys()) {
+      if (!validKeys.has(key)) {
+        await client.query("rollback");
+        res.status(409).json({ error: `Item ${key} tidak ada di DN.` });
+        return;
+      }
+    }
+
+    const headerSupplier = dnResult.rows[0]?.supplier || supplier || "SUPPLIER";
+    const today = new Date().toISOString().slice(0, 10);
+    const fallbackDoNumber = (() => {
+      const dnNumbers = dnResult.rows
+        .map((row) => String(row.dn_number || "").trim())
+        .filter(Boolean);
+      if (dnNumbers.length === 0) return `MERGE:${ids.join("+")}`;
+      const merged = dnNumbers.join("+");
+      return merged.length > 120 ? `MERGE:${ids.join("+")}` : merged;
+    })();
+    const effectiveDoNumber = providedDoNumber || fallbackDoNumber;
+    const header = await createReceiptDraft(client, {
+      supplier: headerSupplier,
+      doNumber: effectiveDoNumber,
+      documentDate: documentDate || today,
+      remarks: remarks || null,
+      truckNo: truckNo || null,
+      driverName: driverName || null,
+      source: "LEGACY_DN_MERGE",
+    }, req.user);
+    let nextLineNo = Number(
+      (
+        await client.query(
+          "select coalesce(max(line_no), 0) + 1 as next_line_no from receive_note_items where rn_id = $1",
+          [header.id],
+        )
+      ).rows[0]?.next_line_no || 1
+    );
+    let totalReceivedQty = 0;
+    for (const row of dnItems) {
+      const key = `${row.dn_id}:${row.item_code}`;
+      const receivedValue = Number.isFinite(receivedMap.get(key)) ? receivedMap.get(key) : 0;
+      if (!Number.isFinite(receivedValue) || receivedValue < 0) {
+        await client.query("rollback");
+        res.status(400).json({ error: `Qty terima tidak valid untuk ${row.item_code}.` });
+        return;
+      }
+      const receivedQty = receivedValue;
+      const docQty = Number(row.request_qty || 0);
+      if (!(receivedQty > 0)) continue;
+      totalReceivedQty += receivedQty;
+      await upsertReceiptDraftLine(client, header.id, {
+        lineNo: nextLineNo,
+        originDnId: row.dn_id,
+        itemCode: row.item_code,
+        itemName: row.item_name || null,
+        partNo: row.part_no || null,
+        unit: row.unit || null,
+        packQty: Number.isFinite(Number(row.pack_qty)) ? Number(row.pack_qty) : null,
+        docQty: Number.isFinite(docQty) ? docQty : receivedQty,
+        receivedQty,
+        dropZone: row.drop_zone || null,
+        qcStatus: "ok",
+        arrivalDate: documentDate || today,
+        notes: remarks || null,
+        matchBasis: "delivery_note",
+        overrideReason: receivedQty > docQty ? "legacy_dn_merge_over_receipt" : null,
+      }, req.user);
+      nextLineNo += 1;
+    }
+    if (!(totalReceivedQty > 0)) {
+      await client.query("rollback");
+      res.status(400).json({ error: "Qty terima masih 0." });
+      return;
+    }
+    const postResult = await postReceiptDraft(client, header.id, req.user, {
+      allowOverReceive,
+      allowPartial: false,
+    });
+
+    if (scans.length > 0) {
+      const dnNumberMap = new Map(dnResult.rows.map((dn) => [dn.dn_number, dn.id]));
+      for (const scan of scans) {
+        const qrValue = String(scan?.qrValue || scan?.qr_value || "").trim();
+        const itemCode = String(scan?.itemCode || scan?.item_code || "").trim();
+        const dnId = Number(scan?.originDnId || scan?.origin_dn_id || scan?.dnId || scan?.dn_id)
+          || dnNumberMap.get(String(scan?.dnNumber || scan?.dn_number || "").trim());
+        const qtyValue = Number(scan?.qty || 0);
+        if (!qrValue || !itemCode || !Number.isFinite(dnId)) continue;
+        if (!validKeys.has(`${dnId}:${itemCode}`)) continue;
+        await client.query(
+          `
+          insert into dn_receive_scans (dn_id, item_code, qr_value, qty, scanned_by)
+          values ($1,$2,$3,$4,$5)
+          on conflict (dn_id, qr_value) do nothing
+          `,
+          [dnId, itemCode, qrValue, Number.isFinite(qtyValue) ? qtyValue : 0, req.user?.id || null],
+        );
+      }
+    }
+
+    for (const dn of dnResult.rows) {
+      await recomputeDeliveryNoteStatus(client, dn.id);
+    }
+
+    await client.query("commit");
+    res.json({
+      ok: true,
+      rnNumber: header.rn_number,
+      rnId: header.id,
+      receiptHeaderId: header.id,
+      doNumber: effectiveDoNumber,
+      postResult,
+    });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({
+      error: error.message,
+      validation: error.validation || null,
+      receiptHeader: error.receiptHeader || null,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/receive-note-headers/:id", authenticate, requireRole("admin"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const headerResult = await client.query(
+      "select * from receive_note_headers where id = $1 for update",
+      [id],
+    );
+    if (headerResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "RN tidak ditemukan" });
+      return;
+    }
+    const header = headerResult.rows[0];
+    const userLabel = getUserLabel(req.user);
+    const itemsResult = await client.query(
+      "select * from receive_note_items where rn_id = $1",
+      [id],
+    );
+    const items = itemsResult.rows || [];
+    const originDnIds = new Set();
+
+    for (const item of items) {
+      originDnIds.add(item.origin_dn_id);
+      const receivedQty = Number(item.received_qty || 0);
+      if (receivedQty <= 0) continue;
+      const batchResult = await client.query(
+        `
+        select * from stock_batches
+        where item_code = $1 and do_number = $2
+        order by id desc
+        limit 1
+        for update
+        `,
+        [item.item_code, header.do_number || header.rn_number || null],
+      );
+      const batch = batchResult.rows[0] || null;
+      if (batch) {
+        const qtyOut = Number(batch.qty_out || 0);
+        const qtyIn = Number(batch.qty_in || 0);
+        if (qtyOut > 0) {
+          await client.query("rollback");
+          res.status(409).json({ error: "Stok sudah terpakai. Tidak bisa hapus RN." });
+          return;
+        }
+        const nextQtyIn = qtyIn - receivedQty;
+        if (nextQtyIn < 0) {
+          await client.query("rollback");
+          res.status(409).json({ error: "Qty RN melebihi stok batch." });
+          return;
+        }
+        if (nextQtyIn <= 0) {
+          await client.query("delete from stock_batches where id = $1", [batch.id]);
+        } else {
+          await client.query("update stock_batches set qty_in = $1 where id = $2", [nextQtyIn, batch.id]);
+        }
+        await logStockMovement(client, {
+          itemCode: item.item_code,
+          batchId: batch.id,
+          qty: receivedQty,
+          direction: "out",
+          reason: "receive_delete",
+        });
+      }
+      await client.query(
+        "update items set qty_on_hand = greatest(qty_on_hand - $1, 0) where code = $2",
+        [receivedQty, item.item_code],
+      );
+      await insertInventoryLedger(client, {
+        itemCode: item.item_code,
+        transactionType: "REVERSAL",
+        referenceDoc: header.rn_number || null,
+        qtyIn: 0,
+        qtyOut: receivedQty,
+        userId: req.user?.id || null,
+        remarks: `Reversal of ${header.rn_number || "RN"} by ${userLabel}`,
+      });
+    }
+
+    await client.query("delete from receive_note_headers where id = $1", [id]);
+    if (originDnIds.size > 0) {
+      await client.query(
+        "delete from dn_receive_scans where dn_id = any($1::int[])",
+        [Array.from(originDnIds)],
+      );
+      for (const originDnId of originDnIds) {
+        if (!Number.isFinite(Number(originDnId))) continue;
+        await recomputeDeliveryNoteStatus(client, originDnId);
+      }
+    }
+    await client.query("commit");
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/receive-notes/:id", authenticate, requireRole("admin"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const rnResult = await client.query(
+      "select * from receive_notes where id = $1 for update",
+      [id],
+    );
+    if (rnResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "RN tidak ditemukan" });
+      return;
+    }
+    const rn = rnResult.rows[0];
+    const userLabel = getUserLabel(req.user);
+    let itemCode = rn.item_code || "";
+    let schedule = null;
+    if (rn.schedule_id) {
+      const scheduleResult = await client.query(
+        "select * from schedules where id = $1 for update",
+        [rn.schedule_id],
+      );
+      schedule = scheduleResult.rows[0] || null;
+      if (!itemCode) itemCode = schedule?.item || "";
+    }
+    if (!itemCode) {
+      await client.query("rollback");
+      res.status(409).json({ error: "Item RN tidak valid." });
+      return;
+    }
+
+    let batchRow = null;
+    if (rn.schedule_id) {
+      const batchResult = await client.query(
+        "select * from stock_batches where schedule_id = $1 for update",
+        [rn.schedule_id],
+      );
+      batchRow = batchResult.rows[0] || null;
+    } else if (rn.dn_id) {
+      const dnResult = await client.query("select dn_number from delivery_notes where id = $1", [rn.dn_id]);
+      const dnNumber = dnResult.rows[0]?.dn_number || "";
+      if (dnNumber) {
+        const batchResult = await client.query(
+          `
+          select * from stock_batches
+          where item_code = $1
+            and (batch_no = $2 or do_number = $2)
+          order by id desc
+          limit 1
+          for update
+          `,
+          [itemCode, dnNumber],
+        );
+        batchRow = batchResult.rows[0] || null;
+      }
+    }
+
+    const receivedQty = Number(rn.received_qty || 0);
+    if (batchRow) {
+      const qtyOut = Number(batchRow.qty_out || 0);
+      const qtyIn = Number(batchRow.qty_in || 0);
+      if (qtyOut > 0) {
+        await client.query("rollback");
+        res.status(409).json({ error: "Stok sudah terpakai. Tidak bisa hapus RN." });
+        return;
+      }
+      const nextQtyIn = qtyIn - receivedQty;
+      if (nextQtyIn < 0) {
+        await client.query("rollback");
+        res.status(409).json({ error: "Qty RN melebihi stok batch." });
+        return;
+      }
+      if (nextQtyIn <= 0) {
+        await client.query("delete from stock_batches where id = $1", [batchRow.id]);
+      } else {
+        await client.query("update stock_batches set qty_in = $1 where id = $2", [nextQtyIn, batchRow.id]);
+      }
+      await logStockMovement(client, {
+        itemCode,
+        batchId: batchRow.id,
+        qty: receivedQty,
+        direction: "out",
+        reason: "receive_delete",
+      });
+    }
+
+    if (receivedQty > 0) {
+      await client.query(
+        "update items set qty_on_hand = greatest(qty_on_hand - $1, 0) where code = $2",
+        [receivedQty, itemCode],
+      );
+      await insertInventoryLedger(client, {
+        itemCode,
+        transactionType: "REVERSAL",
+        referenceDoc: rn.rn_number || null,
+        qtyIn: 0,
+        qtyOut: receivedQty,
+        userId: req.user?.id || null,
+        remarks: `Reversal of ${rn.rn_number || "RN"} by ${userLabel}`,
+      });
+    }
+
+    if (schedule) {
+      const nextReceived = Math.max(0, Number(schedule.received_qty || 0) - receivedQty);
+      const nextStatus = getScheduleStatusFromActual({
+        requestDate: schedule.request_date,
+        arrivalDate: schedule.arrival_date,
+        requestQty: schedule.request_qty,
+        receivedQty: nextReceived,
+      });
+      await client.query(
+        `
+        update schedules
+        set received_qty = $1,
+            status = $2,
+            actual_locked = case when $1 <= 0 then false else actual_locked end,
+            updated_at = now()
+        where id = $3
+        `,
+        [nextReceived, nextStatus, schedule.id],
+      );
+    }
+
+    await client.query("delete from receive_notes where id = $1", [id]);
+    await client.query("commit");
+    clearScheduleCache();
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/schedules/reminder-email", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const supplier = String(req.body?.supplier || "").trim();
+    const requestDate = String(req.body?.requestDate || "").trim();
+    if (!supplier || !requestDate) {
+      res.status(400).json({ error: "supplier dan requestDate wajib diisi" });
+      return;
+    }
+    const schedulesResult = await client.query(
+      `
+      select
+        po_number,
+        item,
+        request_date,
+        request_qty,
+        received_qty,
+        status
+      from schedules
+      where supplier = $1
+        and request_date = $2
+        and coalesce(received_qty, 0) < coalesce(request_qty, 0)
+      order by po_number asc, item asc
+      `,
+      [supplier, requestDate],
+    );
+    if (schedulesResult.rows.length === 0) {
+      res.status(404).json({ error: "Tidak ada jadwal yang belum terpenuhi untuk supplier & tanggal ini." });
+      return;
+    }
+    const vendorResult = await client.query(
+      "select email from master_vendors where id = $1 or name = $1 limit 1",
+      [supplier],
+    );
+    const toEmail = String(vendorResult.rows[0]?.email || "").trim();
+    if (!toEmail) {
+      res.status(409).json({ error: "Email supplier belum diisi di Master Vendor." });
+      return;
+    }
+    const subject = `[URGENT] Inbound Schedule Reminder - ${supplier} - ${formatDateId(requestDate)}`;
+    const rowsHtml = schedulesResult.rows.map((row) => {
+      const planQty = Number(row.request_qty || 0);
+      const receivedQty = Number(row.received_qty || 0);
+      const remaining = Math.max(planQty - receivedQty, 0);
+      const isPending = receivedQty <= 0;
+      const statusLabel = isPending ? "BELUM DIKIRIM" : "PARTIAL (KURANG)";
+      const statusStyle = isPending
+        ? "background-color:#fff3cd;color:#856404;"
+        : "background-color:#d1ecf1;color:#0c5460;";
+      return `
+        <tr>
+          <td>${escapeHtml(row.po_number)}</td>
+          <td>${escapeHtml(row.item)}</td>
+          <td style="text-align:center;">${formatDateId(row.request_date)}</td>
+          <td style="text-align:center;">${formatNumberId(planQty)}</td>
+          <td style="text-align:center;font-weight:bold;color:#d9534f;">${formatNumberId(remaining)}</td>
+          <td style="text-align:center;">
+            <span style="${statusStyle} padding:4px 8px;border-radius:4px;font-size:12px;">
+              ${statusLabel}
+            </span>
+          </td>
+        </tr>
+      `;
+    }).join("");
+
+    const html = `
+      <p>Kepada Yth. <strong>${escapeHtml(supplier)}</strong>,</p>
+      <p>Berikut adalah pengingat jadwal kedatangan barang (Inbound Schedule) yang <strong>wajib dikirim</strong> sesuai tanggal di bawah ini:</p>
+      <table border="1" cellpadding="10" cellspacing="0" style="border-collapse: collapse; width: 100%; font-family: Arial, sans-serif;">
+        <thead>
+          <tr style="background-color: #f2f2f2;">
+            <th style="text-align: left;">No. PO</th>
+            <th style="text-align: left;">Nama Barang</th>
+            <th style="text-align: center;">Tgl Janji (Plan)</th>
+            <th style="text-align: center;">Total Order</th>
+            <th style="text-align: center; color: red;">SISA (Wajib Kirim)</th>
+            <th style="text-align: center;">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rowsHtml}
+        </tbody>
+      </table>
+      <p>Mohon konfirmasi kesanggupan pengiriman dengan membalas email ini.</p>
+      <p>Terima kasih,<br><strong>Procurement Team</strong></p>
+    `;
+
+    const smtpHost = String(process.env.SMTP_HOST || "").trim();
+    if (!smtpHost) {
+      res.json({ sent: false, to: toEmail, subject, html, notice: "SMTP belum dikonfigurasi." });
+      return;
+    }
+    let nodemailer;
+    try {
+      nodemailer = (await import("nodemailer")).default;
+    } catch {
+      res.status(500).json({ error: "Nodemailer belum terpasang. Jalankan npm install nodemailer di server." });
+      return;
+    }
+    const smtpPort = Number(process.env.SMTP_PORT || 587);
+    const smtpUser = String(process.env.SMTP_USER || "").trim();
+    const smtpPass = String(process.env.SMTP_PASS || "").trim();
+    const smtpSecure = String(process.env.SMTP_SECURE || "").toLowerCase() === "true";
+    const fromAddress = String(process.env.SMTP_FROM || smtpUser || "no-reply@example.com").trim();
+    const transporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpSecure,
+      auth: smtpUser ? { user: smtpUser, pass: smtpPass } : undefined,
+    });
+    await transporter.sendMail({
+      from: fromAddress,
+      to: toEmail,
+      subject,
+      html,
+    });
+    res.json({ sent: true, to: toEmail, subject });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/schedules/send-pdf-email", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const supplier = String(req.body?.supplier || "").trim();
+    const requestDate = String(req.body?.requestDate || "").trim();
+    const fileName = String(req.body?.fileName || "").trim() || `INBOUND_SCHEDULE_${Date.now()}.pdf`;
+    const pdfBase64 = String(req.body?.pdfBase64 || "").trim();
+    const summary = req.body?.summary || {};
+    if (!supplier || !requestDate) {
+      res.status(400).json({ error: "supplier dan requestDate wajib diisi" });
+      return;
+    }
+    if (!pdfBase64) {
+      res.status(400).json({ error: "Lampiran PDF wajib diisi" });
+      return;
+    }
+
+    const schedulesResult = await client.query(
+      `
+      select
+        po_number,
+        item,
+        delivery_time,
+        request_qty,
+        received_qty,
+        status,
+        notes
+      from schedules
+      where supplier = $1
+        and request_date = $2
+      order by po_number asc, item asc
+      `,
+      [supplier, requestDate],
+    );
+    if (schedulesResult.rows.length === 0) {
+      res.status(404).json({ error: "Jadwal tidak ditemukan untuk supplier & tanggal tersebut." });
+      return;
+    }
+
+    const vendorResult = await client.query(
+      "select email, name from master_vendors where id = $1 or name = $1 limit 1",
+      [supplier],
+    );
+    const toEmail = String(vendorResult.rows[0]?.email || "").trim();
+    const supplierLabel = String(vendorResult.rows[0]?.name || supplier).trim();
+    if (!toEmail) {
+      res.status(409).json({ error: "Email supplier belum diisi di Master Vendor." });
+      return;
+    }
+
+    const smtpHost = String(process.env.SMTP_HOST || "").trim();
+    if (!smtpHost) {
+      res.status(409).json({ error: "SMTP belum dikonfigurasi." });
+      return;
+    }
+
+    let nodemailer;
+    try {
+      nodemailer = (await import("nodemailer")).default;
+    } catch {
+      res.status(500).json({ error: "Nodemailer belum terpasang. Jalankan npm install nodemailer di server." });
+      return;
+    }
+
+    let pdfBuffer;
+    try {
+      pdfBuffer = Buffer.from(pdfBase64, "base64");
+    } catch {
+      res.status(400).json({ error: "Format PDF tidak valid." });
+      return;
+    }
+    if (!pdfBuffer || pdfBuffer.length === 0) {
+      res.status(400).json({ error: "Lampiran PDF kosong." });
+      return;
+    }
+
+    const smtpPort = Number(process.env.SMTP_PORT || 587);
+    const smtpUser = String(process.env.SMTP_USER || "").trim();
+    const smtpPass = String(process.env.SMTP_PASS || "").trim();
+    const smtpSecure = String(process.env.SMTP_SECURE || "").toLowerCase() === "true";
+    const fromAddress = String(process.env.SMTP_FROM || smtpUser || "no-reply@example.com").trim();
+    const transporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpSecure,
+      auth: smtpUser ? { user: smtpUser, pass: smtpPass } : undefined,
+    });
+
+    const totalRows = Number(summary.totalRows || schedulesResult.rows.length || 0);
+    const planQty = Number(summary.planQty || 0);
+    const actualQty = Number(summary.actualQty || 0);
+    const pendingCount = Number(summary.pendingCount || 0);
+    const partialCount = Number(summary.partialCount || 0);
+    const subject = `[PDF] Inbound Schedule - ${supplierLabel} - ${formatDateId(requestDate)}`;
+    const html = `
+      <p>Kepada Yth. <strong>${escapeHtml(supplierLabel)}</strong>,</p>
+      <p>Terlampir file PDF <strong>Inbound Schedule</strong> untuk jadwal pengiriman tanggal <strong>${formatDateId(requestDate)}</strong>.</p>
+      <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;">
+        <tr>
+          <th align="left" style="background:#f8fafc;">Total Baris</th>
+          <td>${formatNumberId(totalRows)}</td>
+        </tr>
+        <tr>
+          <th align="left" style="background:#f8fafc;">Qty Plan</th>
+          <td>${formatNumberId(planQty)}</td>
+        </tr>
+        <tr>
+          <th align="left" style="background:#f8fafc;">Qty Actual</th>
+          <td>${formatNumberId(actualQty)}</td>
+        </tr>
+        <tr>
+          <th align="left" style="background:#f8fafc;">Pending</th>
+          <td>${formatNumberId(pendingCount)}</td>
+        </tr>
+        <tr>
+          <th align="left" style="background:#f8fafc;">Partial</th>
+          <td>${formatNumberId(partialCount)}</td>
+        </tr>
+      </table>
+      <p>Mohon gunakan lampiran PDF sebagai acuan pengiriman dan konfirmasi bila ada perubahan.</p>
+      <p>Terima kasih,<br><strong>Procurement Team</strong></p>
+    `;
+
+    await transporter.sendMail({
+      from: fromAddress,
+      to: toEmail,
+      subject,
+      html,
+      attachments: [
+        {
+          filename: fileName,
+          content: pdfBuffer,
+          contentType: "application/pdf",
+        },
+      ],
+    });
+
+    res.json({ sent: true, to: toEmail, subject, rows: schedulesResult.rows.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/inbound-cards", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  try {
+    const { scheduleId, scheduleIds, status } = req.query || {};
+    const ids = String(scheduleIds || "")
+      .split(",")
+      .map((val) => Number(val))
+      .filter((val) => Number.isFinite(val));
+    if (scheduleId && ids.length === 0) {
+      const single = Number(scheduleId);
+      if (Number.isFinite(single)) ids.push(single);
+    }
+    const filters = [];
+    const values = [];
+    if (ids.length > 0) {
+      values.push(ids);
+      filters.push(`c.schedule_id = any($${values.length}::int[])`);
+    }
+    if (status) {
+      values.push(String(status));
+      filters.push(`c.status = $${values.length}`);
+    }
+    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    const result = await pool.query(
+      `
+      select
+        c.*,
+        s.po_number,
+        s.supplier,
+        s.request_date,
+        s.delivery_time,
+        s.request_qty,
+        coalesce(s.item_code, s.item) as schedule_item
+      from inbound_cards c
+      join schedules s on s.id = c.schedule_id
+      ${whereClause}
+      order by c.schedule_id asc, c.card_seq asc
+      `,
+      values,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/inbound-cards/adjust", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { scheduleId, targetQty } = req.body || {};
+    const id = Number(scheduleId);
+    let qtyValue = Number(targetQty);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "scheduleId tidak valid" });
+      return;
+    }
+    if (!Number.isFinite(qtyValue) || qtyValue <= 0) {
+      res.status(400).json({ error: "targetQty wajib diisi" });
+      return;
+    }
+    await client.query("begin");
+    const scheduleResult = await client.query(
+      "select * from schedules where id = $1 for update",
+      [id],
+    );
+    if (scheduleResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "schedule tidak ditemukan" });
+      return;
+    }
+    const scheduleRow = scheduleResult.rows[0];
+    const existingCards = await client.query(
+      "select * from inbound_cards where schedule_id = $1 order by card_seq asc",
+      [id],
+    );
+    const receivedCards = existingCards.rows.filter((row) => row.status === "received");
+    const receivedQty = receivedCards.reduce((sum, row) => sum + Number(row.card_qty || 0), 0);
+    if (qtyValue < receivedQty) {
+      await client.query("rollback");
+      res.status(409).json({ error: "targetQty lebih kecil dari qty yang sudah diterima" });
+      return;
+    }
+    const { itemCode, itemName, packQty } = await resolveInboundItemInfo(client, scheduleRow.item);
+    const packValue = Number.isFinite(packQty) && packQty > 0 ? packQty : 1;
+    const remainingQty = qtyValue - receivedQty;
+    const pendingCount = remainingQty > 0 ? Math.ceil(remainingQty / packValue) : 0;
+    const totalCards = receivedCards.length + pendingCount;
+    await client.query(
+      "update inbound_cards set status = 'void', updated_at = now() where schedule_id = $1 and status = 'pending'",
+      [id],
+    );
+    const batchNo = buildInboundBatchNo(scheduleRow.po_number, scheduleRow.request_date);
+    const created = [];
+    for (let idx = 0; idx < pendingCount; idx += 1) {
+      const remaining = remainingQty - packValue * idx;
+      const cardQty = idx === pendingCount - 1 ? (remaining > 0 ? remaining : packValue) : packValue;
+      const cardSeq = receivedCards.length + idx + 1;
+      const cardUid = `INB-${id}-${String(cardSeq).padStart(3, "0")}-${crypto.randomUUID().slice(0, 8)}`;
+      const result = await client.query(
+        `
+        insert into inbound_cards
+          (schedule_id, card_uid, item_code, item_name, pack_qty, card_qty, card_seq, total_cards, batch_no, status)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending')
+        returning *
+        `,
+        [id, cardUid, itemCode || scheduleRow.item, itemName || scheduleRow.item, packValue, cardQty, cardSeq, totalCards, batchNo],
+      );
+      created.push(result.rows[0]);
+    }
+    await client.query(
+      "update inbound_cards set total_cards = $2, updated_at = now() where schedule_id = $1 and status <> 'void'",
+      [id, totalCards],
+    );
+    await client.query("commit");
+    res.json({ ok: true, scheduleId: id, totalCards, created: created.length });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/inbound-cards/scan", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { cardUid, qcStatus, notes, arrivalDate, doNumber, docQty, productionDate, expiredDate } = req.body || {};
+    const cardKey = String(cardUid || "").trim();
+    if (!cardKey) {
+      res.status(400).json({ error: "cardUid wajib diisi" });
+      return;
+    }
+    const normalizedQc = String(qcStatus || "ok").toLowerCase();
+    const qcStatusList = await getQcStatusList(client);
+    const allowedQc = qcStatusList.length > 0 ? qcStatusList : ["ok", "hold", "reject"];
+    if (!allowedQc.includes(normalizedQc)) {
+      res.status(400).json({ error: "qcStatus tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const cardResult = await client.query(
+      "select * from inbound_cards where card_uid = $1 for update",
+      [cardKey],
+    );
+    if (cardResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "kartu tidak ditemukan" });
+      return;
+    }
+    const card = cardResult.rows[0];
+    if (card.status === "received") {
+      await client.query("rollback");
+      res.status(409).json({ error: "kartu sudah diterima" });
+      return;
+    }
+    if (card.status === "void") {
+      await client.query("rollback");
+      res.status(409).json({ error: "kartu sudah dibatalkan" });
+      return;
+    }
+    const scheduleResult = await client.query(
+      "select * from schedules where id = $1 for update",
+      [card.schedule_id],
+    );
+    if (scheduleResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "schedule tidak ditemukan" });
+      return;
+    }
+    const schedule = scheduleResult.rows[0];
+    if (!normalizePoNumber(schedule.po_number)) {
+      await client.query("rollback");
+      res.status(409).json({ error: "Nomor PO wajib diisi untuk menerima barang." });
+      return;
+    }
+    const qtyValue = Number(card.card_qty || 0);
+    if (!Number.isFinite(qtyValue) || qtyValue <= 0) {
+      await client.query("rollback");
+      res.status(409).json({ error: "qty kartu tidak valid" });
+      return;
+    }
+    const parsedDocQty = Number(docQty);
+    const docQtyValue = Number.isFinite(parsedDocQty) && parsedDocQty > 0 ? parsedDocQty : qtyValue;
+    const arrivalValue = arrivalDate || new Date().toISOString().slice(0, 10);
+    const allowOverReceive = Boolean(req.body?.allowOverReceive) && req.user?.role === "admin";
+    await assertArrivalDateAllowed(client, arrivalValue, req.user);
+    const scheduleSupplier = schedule.supplier || "SUPPLIER";
+    const effectiveDoNumber = normalizeDoNumber(doNumber || schedule.do_number || card.batch_no || card.card_uid || "") || `INB:${schedule.id}`;
+    let header = await findActiveReceiptHeaderBySupplierDoNumber(client, {
+      supplier: scheduleSupplier,
+      doNumber: effectiveDoNumber,
+      forUpdate: true,
+    });
+    if (header && normalizeReceiptStatus(header.status) === "posted") {
+      await client.query(
+        `
+        update receive_note_headers
+        set status = 'draft',
+            posting_error = null,
+            validated_at = null,
+            validated_by = null
+        where id = $1
+        `,
+        [header.id],
+      );
+      header = await getReceiptHeaderById(client, header.id, { forUpdate: true });
+    }
+    if (!header) {
+      header = await createReceiptDraft(client, {
+        supplier: scheduleSupplier,
+        doNumber: effectiveDoNumber,
+        documentDate: arrivalValue || null,
+        poNumber: schedule.po_number || null,
+        remarks: notes || null,
+        source: "INBOUND_SCAN",
+      }, req.user);
+    }
+    const nextLineNoResult = await client.query(
+      "select coalesce(max(line_no), 0) + 1 as next_line_no from receive_note_items where rn_id = $1",
+      [header.id],
+    );
+    const nextLineNo = Number(nextLineNoResult.rows[0]?.next_line_no || 1);
+    const line = await upsertReceiptDraftLine(client, header.id, {
+      lineNo: nextLineNo,
+      originDnId: schedule.dn_id || null,
+      scheduleId: schedule.id,
+      poLineId: schedule.po_line_id || null,
+      itemCode: schedule.item_code || schedule.item || null,
+      itemName: schedule.item_name || null,
+      partNo: schedule.part_no || null,
+      unit: schedule.unit || null,
+      packQty: card.pack_qty || null,
+      docQty: docQtyValue,
+      receivedQty: qtyValue,
+      qcStatus: normalizedQc,
+      arrivalDate: arrivalValue || null,
+      productionDate: productionDate || null,
+      expiredDate: expiredDate || null,
+      notes: notes || null,
+      matchBasis: "schedule",
+    }, req.user);
+    const postResult = await postReceiptDraft(client, header.id, req.user, {
+      allowOverReceive,
+      allowPartial: false,
+    });
+    const refreshedHeader = await getReceiptHeaderById(client, header.id);
+    const updatedSchedule = await client.query(
+      "select * from schedules where id = $1",
+      [schedule.id],
+    );
+    const postedLine = await getReceiptLineByHeaderLineNo(client, header.id, nextLineNo);
+    const updatedCard = await client.query(
+      "update inbound_cards set status = 'received', received_at = now(), updated_at = now() where id = $1 returning *",
+      [card.id],
+    );
+    await client.query("commit");
+    clearScheduleCache();
+    await autoTriggerKanbanRequests(pool, { note: "auto-trigger (inbound card scan via draft)" });
+    res.json({
+      ok: true,
+      receiveNote: {
+        id: postedLine?.id || line.id,
+        rn_number: refreshedHeader?.rn_number || header.rn_number || null,
+        dn_id: postedLine?.origin_dn_id ?? schedule.dn_id ?? null,
+        schedule_id: schedule.id,
+        item_code: postedLine?.item_code || schedule.item_code || schedule.item || null,
+        received_qty: Number(postedLine?.received_qty || qtyValue),
+        doc_qty: Number(postedLine?.doc_qty || docQtyValue),
+        qc_status: postedLine?.qc_status || normalizedQc,
+        status: "open",
+        notes: postedLine?.notes || notes || null,
+        received_at: refreshedHeader?.posted_at || refreshedHeader?.created_at || null,
+        received_by: req.user?.id || null,
+        source: refreshedHeader?.source || "INBOUND_SCAN",
+        po_line_id: postedLine?.po_line_id || schedule.po_line_id || null,
+        rn_header_id: refreshedHeader?.id || header.id,
+        line_no: postedLine?.line_no || nextLineNo,
+        do_number: refreshedHeader?.do_number || effectiveDoNumber,
+        arrival_date: postedLine?.arrival_date || arrivalValue || null,
+        production_date: postedLine?.production_date || productionDate || null,
+        expired_date: postedLine?.expired_date || expiredDate || null,
+      },
+      schedule: mapRowToSchedule(updatedSchedule.rows[0]),
+      card: updatedCard.rows[0],
+      receiptHeaderId: refreshedHeader?.id || header.id,
+      postResult,
+    });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({
+      error: error.message,
+      validation: error.validation || null,
+      receiptHeader: error.receiptHeader || null,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/kanban/requests", authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { itemCode, requestQty, triggerType, notes } = req.body || {};
+    if (!itemCode) {
+      res.status(400).json({ error: "itemCode wajib diisi" });
+      return;
+    }
+    await client.query("begin");
+    const vendorInfo = await getVendorRoleForItem(client, itemCode);
+    if (isScheduleVendor(vendorInfo.role)) {
+      await client.query("rollback");
+      res.status(409).json({ error: "Cek Inbound Schedule." });
+      return;
+    }
+    let qtyValue = Number(requestQty);
+    if (!Number.isFinite(qtyValue) || qtyValue <= 0) {
+      await client.query("rollback");
+      res.status(400).json({ error: "requestQty wajib diisi" });
+      return;
+    }
+    const packQty = await resolveItemPackQty(client, itemCode);
+    qtyValue = normalizeQtyByPack(qtyValue, packQty);
+    const activeCheck = await client.query(
+      "select id from kanban_requests where item_code = $1 and status not in ('closed','rejected')",
+      [itemCode],
+    );
+    if (activeCheck.rows.length > 0) {
+      await client.query("rollback");
+      res.status(409).json({ error: "Request kanban aktif sudah ada untuk item ini." });
+      return;
+    }
+    const normalizedTrigger = triggerType === "scan" ? "scan" : "manual";
+    const config = await getMasterConfigRow(client);
+    const requestIdFormat = requireFormat(config?.request_id_format, "Request ID format");
+    const requestCode = await buildRequestNumber(client, requestIdFormat, itemCode);
+    const limits = await resolveItemDeliveryLimits(client, itemCode);
+    const splitQtys = splitRequestQtyByMax(qtyValue, limits.maxDeliveryPerRit, packQty);
+    const splitTotal = splitQtys.length || 1;
+    const createdRows = [];
+    let splitIndex = 1;
+    for (const qtySplit of splitQtys) {
+      const splitCode = splitTotal > 1 && splitIndex > 1 ? `${requestCode}-${splitIndex}/${splitTotal}` : requestCode;
+      const result = await client.query(
+        `
+        insert into kanban_requests (item_code, request_code, request_group, split_index, split_total, request_qty, trigger_type, status, notes, created_by)
+        values ($1, $2, $3, $4, $5, $6, $7, 'requested', $8, $9)
+        returning *
+        `,
+        [itemCode, splitCode, requestCode, splitIndex, splitTotal, qtySplit, normalizedTrigger, notes || null, req.user?.id || null],
+      );
+      const request = result.rows[0];
+      await createKanbanEvent(client, request.id, "manual_request", req.user?.id || null, {
+        requestQty: qtySplit,
+        splitIndex,
+        splitTotal,
+        requestGroup: requestCode,
+        maxDeliveryPerRit: limits.maxDeliveryPerRit,
+      });
+      createdRows.push(request);
+      splitIndex += 1;
+    }
+    await syncKanbanRequestHealthByIds(client, createdRows.map((row) => row.id), { syncPrlDrafts: true });
+    await client.query("commit");
+    res.json(splitTotal > 1 ? { requests: createdRows, request: createdRows[0], splitTotal, requestGroup: requestCode } : createdRows[0]);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/kanban/requests/batch-dn", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { requestIds, remarks, remarksBySupplier } = req.body || {};
+    if (!Array.isArray(requestIds) || requestIds.length === 0) {
+      res.status(400).json({ error: "requestIds wajib diisi" });
+      return;
+    }
+    const ids = requestIds.map((val) => Number(val)).filter((val) => Number.isFinite(val));
+    if (ids.length === 0) {
+      res.status(400).json({ error: "requestIds tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const rowsResult = await client.query(
+      `
+      select id, item_code, status, dn_id
+      from kanban_requests
+      where id = any($1::int[])
+      for update
+      `,
+      [ids],
+    );
+    if (rowsResult.rows.length !== ids.length) {
+      res.status(404).json({ error: "sebagian request tidak ditemukan" });
+      await client.query("rollback");
+      return;
+    }
+    const normalizeStatus = (value) => String(value || "").trim().toLowerCase();
+    const allowedStatuses = ["triggered", "requested", "approved"];
+    const skipped = [];
+    const validRows = [];
+    rowsResult.rows.forEach((row) => {
+      const statusKey = normalizeStatus(row.status);
+      if (!allowedStatuses.includes(statusKey)) {
+        skipped.push({ id: row.id, reason: "status", status: row.status });
+        return;
+      }
+      if (row.dn_id) {
+        skipped.push({ id: row.id, reason: "dn_linked", status: row.status });
+        return;
+      }
+      validRows.push(row);
+    });
+    if (validRows.length === 0) {
+      res.status(409).json({ error: "tidak ada request valid untuk DN", skipped });
+      await client.query("rollback");
+      return;
+    }
+    const itemCodes = validRows.map((row) => row.item_code);
+    const supplierResult = await client.query(
+      "select item_code, default_supplier from kanban_settings where item_code = any($1::text[])",
+      [itemCodes],
+    );
+    const supplierByItem = new Map(
+      supplierResult.rows.map((row) => [row.item_code, row.default_supplier]),
+    );
+    const supplierGroups = new Map();
+    for (const row of validRows) {
+      const supplierValue = supplierByItem.get(row.item_code);
+      const supplierKey = String(supplierValue || "").trim();
+      if (!supplierKey) {
+        skipped.push({ id: row.id, reason: "missing_supplier" });
+        continue;
+      }
+      if (!supplierGroups.has(supplierKey)) {
+        supplierGroups.set(supplierKey, []);
+      }
+      supplierGroups.get(supplierKey).push(row);
+    }
+    if (supplierGroups.size === 0) {
+      res.status(409).json({ error: "tidak ada request valid untuk DN", skipped });
+      await client.query("rollback");
+      return;
+    }
+    const supplierKeys = Array.from(supplierGroups.keys());
+    const roleResult = await client.query(
+      "select id, name, role from master_vendors where id = any($1::text[]) or name = any($1::text[])",
+      [supplierKeys],
+    );
+    const roleMap = new Map();
+    roleResult.rows.forEach((row) => {
+      if (row.id) roleMap.set(row.id, row.role);
+      if (row.name) roleMap.set(row.name, row.role);
+    });
+    for (const supplierKey of supplierKeys) {
+      const role = roleMap.get(supplierKey);
+      const roleKey = String(role || "").trim().toLowerCase();
+      if (roleKey && roleKey !== "delivery note") {
+        const group = supplierGroups.get(supplierKey) || [];
+        group.forEach((row) => {
+          skipped.push({ id: row.id, reason: "invalid_role" });
+        });
+        supplierGroups.delete(supplierKey);
+      }
+    }
+    if (supplierGroups.size === 0) {
+      res.status(409).json({ error: "tidak ada request valid untuk DN", skipped });
+      await client.query("rollback");
+      return;
+    }
+    const numbering = await getDocumentNumberingConfig(client);
+    const plannedDate = new Date().toISOString().slice(0, 10);
+    const dns = [];
+    const resolveRemarksForSupplier = (supplierKey) => {
+      if (!remarksBySupplier || typeof remarksBySupplier !== "object") {
+        return String(remarks || "").trim();
+      }
+      const direct = remarksBySupplier[supplierKey];
+      if (direct) return String(direct || "").trim();
+      const lowerKey = String(supplierKey || "").toLowerCase();
+      const matchKey = Object.keys(remarksBySupplier).find((key) => String(key || "").toLowerCase() === lowerKey);
+      if (matchKey) return String(remarksBySupplier[matchKey] || "").trim();
+      return String(remarks || "").trim();
+    };
+    for (const [supplier, rows] of supplierGroups.entries()) {
+      const supplierCodeRaw = await resolveSupplierCode(client, supplier);
+      const supplierCode = supplierCodeRaw || supplier || "SUPPLIER";
+      const supplierId = await resolveSupplierCode(client, supplier, { strict: true });
+      const remarksValue = resolveRemarksForSupplier(supplier);
+      const scheduleRows = await resolveVendorSchedule(client, supplier);
+      const schedulePick = scheduleRows[0] || {};
+      const cycleValue = schedulePick.cycle ? String(schedulePick.cycle).trim() : null;
+      const ritValue = schedulePick.rit !== undefined && schedulePick.rit !== null && String(schedulePick.rit).trim() !== ""
+        ? String(schedulePick.rit).trim()
+        : null;
+      const timeValue = schedulePick.time ? String(schedulePick.time).trim() : null;
+      const dnFormat = requireFormat(numbering.dnFormat, "DN format");
+      const dnNumber = await buildDocumentNumber(client, "delivery_notes", "dn_number", dnFormat, {
+        dept: numbering.dept,
+        supplier,
+        supplierCode,
+        prefix: "DN",
+      });
+      const primaryRequest = rows[0];
+      const dnResult = await client.query(
+        `
+        insert into delivery_notes (dn_number, request_id, supplier, supplier_id, planned_date, status, remarks, cycle, rit, delivery_time)
+        values ($1, $2, $3, $4, 'draft', $5, $6, $7, $8, $9)
+        returning *
+        `,
+        [dnNumber, primaryRequest.id, supplier, supplierId || null, plannedDate, remarksValue || null, cycleValue, ritValue, timeValue],
+      );
+      const dn = dnResult.rows[0];
+      dns.push(dn);
+      const groupIds = rows.map((row) => row.id);
+      await client.query(
+        `
+        update kanban_requests
+        set status = 'dn_created', dn_id = $1, updated_at = now()
+        where id = any($2::int[])
+        `,
+        [dn.id, groupIds],
+      );
+      await insertDeliveryNoteItems(client, dn.id, groupIds);
+      for (const row of rows) {
+        await createKanbanEvent(client, row.id, "dn_created", req.user?.id || null, { dnId: dn.id });
+      }
+    }
+    await syncKanbanRequestHealthByIds(client, validRows.map((row) => row.id), { syncPrlDrafts: true });
+    await client.query("commit");
+    res.json({ dns, dn: dns[0] || null, requestIds: ids, skipped });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+const handleKanbanEmptyScan = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const body = req.body || {};
+    const rawKanbanId = body.kanbanId || body.kanban_uuid || body.kanban_id || null;
+    let itemCode = body.itemCode || "";
+    if (!itemCode && rawKanbanId) {
+      itemCode = await resolveKanbanItemCode(client, rawKanbanId);
+    }
+    if (!itemCode) {
+      res.status(400).json({ error: "itemCode atau kanban_uuid wajib diisi" });
+      return;
+    }
+
+    let qtyValue = Number(body.requestQty);
+    if (!Number.isFinite(qtyValue) || qtyValue <= 0) {
+      qtyValue = await resolveItemPackQty(client, itemCode);
+    }
+    if (!Number.isFinite(qtyValue) || qtyValue <= 0) {
+      res.status(400).json({ error: "requestQty atau SNP item tidak valid" });
+      return;
+    }
+    const packQty = await resolveItemPackQty(client, itemCode);
+    qtyValue = normalizeQtyByPack(qtyValue, packQty);
+
+    const itemInfoResult = await client.query(
+      "select name, part_no, vendor_id, supplier_name from items where code = $1",
+      [itemCode],
+    );
+    if (itemInfoResult.rows.length === 0) {
+      res.status(404).json({ error: "Item tidak ditemukan" });
+      return;
+    }
+    const itemName = itemInfoResult.rows[0]?.name || null;
+    const partNo = itemInfoResult.rows[0]?.part_no || null;
+    const supplierHint = itemInfoResult.rows[0]?.vendor_id || itemInfoResult.rows[0]?.supplier_name || "";
+
+    const isScan = Boolean(rawKanbanId) || String(req.originalUrl || "").includes("/api/kanban/scan");
+    if (isScan && !rawKanbanId) {
+      res.status(400).json({ error: "kanban_uuid wajib diisi" });
+      return;
+    }
+    await client.query("begin");
+    if (isScan && rawKanbanId) {
+      const dupResult = await client.query(
+        `
+        select id from production_orders
+        where kanban_id = $1
+          and source = 'SCAN_APP'
+          and coalesce(scanned_at, created_at) >= (now() - interval '5 minutes')
+        limit 1
+        `,
+        [rawKanbanId],
+      );
+      if (dupResult.rows.length > 0) {
+        await client.query("rollback");
+        res.status(409).json({ error: "Kanban sudah discan dalam 5 menit terakhir." });
+        return;
+      }
+    }
+
+    let consumed = [];
+    let warnings = [];
+    try {
+      ({ consumed, warnings } = await consumeStockFifo(client, itemCode, qtyValue, "kanban_empty"));
+    } catch (error) {
+      error.statusCode = error.statusCode || 409;
+      throw error;
+    }
+    const consumedQty = consumed.reduce((sum, row) => sum + Number(row.qty || 0), 0);
+    const consumedBatches = consumed.length;
+
+    const vendorInfo = await getVendorRoleForItem(client, itemCode);
+    const supplierRaw = vendorInfo.supplier || supplierHint;
+    const supplierCode = supplierRaw ? await resolveSupplierCode(client, supplierRaw) : "";
+    let productionId = null;
+    const operatorId = req.user?.id || null;
+    const scanTimestamp = new Date();
+    if (isScan) {
+      const productionDate = scanTimestamp.toISOString().slice(0, 10);
+      const prodResult = await client.query(
+        `
+        insert into production_orders (product_code, supplier, qty, source, kanban_id, part_no, created_by, scanned_at, production_date)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        returning id
+        `,
+        [itemCode, supplierCode || null, qtyValue, "SCAN_APP", rawKanbanId || null, partNo, operatorId, scanTimestamp, productionDate],
+      );
+      productionId = prodResult.rows[0]?.id || null;
+    }
+
+    await insertInventoryLedger(client, {
+      itemCode,
+      transactionType: "PRODUCTION",
+      referenceDoc: productionId ? `PROD-${productionId}` : `KANBAN-${formatDateStamp()}`,
+      qtyIn: 0,
+      qtyOut: qtyValue,
+      userId: operatorId,
+      remarks: isScan ? "kanban_scan" : "kanban_empty",
+      kanbanId: rawKanbanId || null,
+    });
+
+    if (isScheduleVendor(vendorInfo.role)) {
+      await client.query("commit");
+      const responsePayload = {
+        ok: true,
+        updatedLots: consumedBatches,
+        consumedBatches,
+        consumedQty,
+        requestCreated: false,
+        requestId: null,
+        productionId,
+        notice: "Cek Inbound Schedule.",
+        warnings,
+      };
+      if (isScan) {
+        responsePayload.status = "success";
+        responsePayload.message = "Consumption Recorded";
+        responsePayload.data = {
+          part_name: itemName || "-",
+          qty: qtyValue,
+          scan_time: scanTimestamp.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }),
+          supplier: supplierCode || supplierRaw || "-",
+        };
+      }
+      res.json(responsePayload);
+      return;
+    }
+    const config = await getMasterConfigRow(client);
+    const requestIdFormat = requireFormat(config?.request_id_format, "Request ID format");
+    const requestCode = await buildRequestNumber(client, requestIdFormat, itemCode);
+    const noteParts = [];
+    if (body.area) noteParts.push(`area:${body.area}`);
+    if (rawKanbanId) noteParts.push(`kanban:${rawKanbanId}`);
+    const limits = await resolveItemDeliveryLimits(client, itemCode);
+    const splitQtys = splitRequestQtyByMax(qtyValue, limits.maxDeliveryPerRit, packQty);
+    const splitTotal = splitQtys.length || 1;
+    const createdRequests = [];
+    let splitIndex = 1;
+    for (const qtySplit of splitQtys) {
+      const splitCode = splitTotal > 1 && splitIndex > 1 ? `${requestCode}-${splitIndex}/${splitTotal}` : requestCode;
+      const result = await client.query(
+        `
+        insert into kanban_requests (item_code, request_code, request_group, split_index, split_total, request_qty, trigger_type, status, notes, created_by)
+        values ($1, $2, $3, $4, $5, $6, 'scan', 'requested', $7, $8)
+        returning *
+        `,
+        [itemCode, splitCode, requestCode, splitIndex, splitTotal, qtySplit, noteParts.length ? noteParts.join(" | ") : null, req.user?.id || null],
+      );
+      const request = result.rows[0];
+      await createKanbanEvent(client, request.id, "empty_kanban", req.user?.id || null, {
+        requestQty: qtySplit,
+        splitIndex,
+        splitTotal,
+        requestGroup: requestCode,
+        maxDeliveryPerRit: limits.maxDeliveryPerRit,
+      });
+      createdRequests.push(request);
+      splitIndex += 1;
+    }
+    await syncKanbanRequestHealthByIds(client, createdRequests.map((row) => row.id), { syncPrlDrafts: true });
+    const requestId = createdRequests[0]?.id || null;
+    const requestCreated = createdRequests.length > 0;
+    await client.query("commit");
+    const responsePayload = {
+      ok: true,
+      updatedLots: consumedBatches,
+      consumedBatches,
+      consumedQty,
+      requestCreated,
+      requestId,
+      requestIds: createdRequests.map((row) => row.id),
+      requestGroup: requestCode,
+      splitTotal,
+      productionId,
+      warnings,
+    };
+    if (isScan) {
+      responsePayload.status = "success";
+      responsePayload.message = "Consumption Recorded";
+      responsePayload.data = {
+        part_name: itemName || "-",
+        qty: qtyValue,
+        scan_time: scanTimestamp.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }),
+        supplier: supplierCode || supplierRaw || "-",
+      };
+    }
+    res.json(responsePayload);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+};
+
+app.post("/api/kanban/empty", authenticate, requirePermission("editSchedules"), (req, res) => {
+  handleKanbanEmptyScan(req, res);
+});
+
+app.post("/api/kanban/scan", authenticate, requirePermission("editSchedules"), (req, res) => {
+  if (!req.body) req.body = {};
+  req.body.kanbanId = req.body.kanbanId || req.body.kanban_uuid || req.body.kanban_id || null;
+  handleKanbanEmptyScan(req, res);
+});
+
+app.post("/api/stock/consume", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { itemCode, qty } = req.body || {};
+    const qtyNumber = Number(qty);
+    if (!itemCode || !Number.isFinite(qtyNumber) || qtyNumber <= 0) {
+      res.status(400).json({ error: "itemCode dan qty wajib diisi" });
+      return;
+    }
+    await client.query("begin");
+    const { consumed, warnings } = await consumeStockFifo(client, itemCode, qtyNumber, "manual_consume");
+    await insertInventoryLedger(client, {
+      itemCode,
+      transactionType: "PRODUCTION",
+      referenceDoc: `CONSUME-${formatDateStamp()}`,
+      qtyIn: 0,
+      qtyOut: qtyNumber,
+      userId: req.user?.id || null,
+      remarks: "manual_consume",
+    });
+    await client.query("commit");
+    await autoTriggerKanbanRequests(pool, { note: "auto-trigger (consume)" });
+    res.json({ ok: true, itemCode, qty: qtyNumber, consumed, warnings });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/kanban/requests/auto-trigger", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  try {
+    const created = await autoTriggerKanbanRequests(pool, { userId: req.user?.id });
+    res.json({ created: created.length, rows: created });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/kanban/requests/:id/approve", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const requestResult = await client.query(
+      "select * from kanban_requests where id = $1 for update",
+      [id],
+    );
+    if (requestResult.rows.length === 0) {
+      res.status(404).json({ error: "request tidak ditemukan" });
+      await client.query("rollback");
+      return;
+    }
+    const requestRow = requestResult.rows[0];
+    if (!["triggered", "requested"].includes(requestRow.status)) {
+      res.status(409).json({ error: "request tidak dalam status yang bisa di-approve" });
+      await client.query("rollback");
+      return;
+    }
+    if (requestRow.trigger_type === "manual") {
+      const role = String(req.user?.role || "").toLowerCase();
+      if (!["supervisor", "admin"].includes(role)) {
+        res.status(403).json({ error: "approval manual request hanya untuk supervisor" });
+        await client.query("rollback");
+        return;
+      }
+    }
+    const result = await client.query(
+      `
+      update kanban_requests
+      set status = 'approved', approved_by = $1, updated_at = now()
+      where id = $2
+      returning *
+      `,
+      [req.user?.id || null, id],
+    );
+    await syncKanbanRequestHealthByIds(client, [id], { syncPrlDrafts: true });
+    await createKanbanEvent(client, id, "approved", req.user?.id || null, null);
+    await client.query("commit");
+    res.json(result.rows[0]);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/kanban/requests/:id/approve-dn", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const { supplier, plannedDate, status, remarks, cycle, rit, deliveryTime, deliveryScheduleIndex } = req.body || {};
+    await client.query("begin");
+    const requestResult = await client.query(
+      "select * from kanban_requests where id = $1 for update",
+      [id],
+    );
+    if (requestResult.rows.length === 0) {
+      res.status(404).json({ error: "request tidak ditemukan" });
+      await client.query("rollback");
+      return;
+    }
+    const requestRow = requestResult.rows[0];
+    if (!["triggered", "requested", "approved"].includes(requestRow.status)) {
+      res.status(409).json({ error: "request tidak dalam status yang bisa diproses" });
+      await client.query("rollback");
+      return;
+    }
+    if (requestRow.trigger_type === "manual") {
+      const role = String(req.user?.role || "").toLowerCase();
+      if (!["supervisor", "admin"].includes(role)) {
+        res.status(403).json({ error: "approval manual request hanya untuk supervisor" });
+        await client.query("rollback");
+        return;
+      }
+    }
+    let supplierValue = supplier ? String(supplier).trim() : "";
+    if (!supplierValue) {
+      const supplierResult = await client.query(
+        "select default_supplier from kanban_settings where item_code = $1",
+        [requestRow.item_code],
+      );
+      supplierValue = supplierResult.rows[0]?.default_supplier || "";
+    }
+    if (!supplierValue) {
+      res.status(400).json({ error: "supplier wajib diisi" });
+      await client.query("rollback");
+      return;
+    }
+    const roleResult = await client.query(
+      "select role from master_vendors where id = $1 or name = $1 limit 1",
+      [supplierValue],
+    );
+    if (roleResult.rows.length && roleResult.rows[0].role !== "Delivery Note") {
+      res.status(409).json({ error: "vendor tidak berperan sebagai Delivery Note" });
+      await client.query("rollback");
+      return;
+    }
+
+    if (requestRow.status !== "approved") {
+      await client.query(
+        `
+        update kanban_requests
+        set status = 'approved', approved_by = $1, updated_at = now()
+        where id = $2
+        `,
+        [req.user?.id || null, id],
+      );
+      await createKanbanEvent(client, id, "approved", req.user?.id || null, null);
+    }
+
+    const remarksValue = String(remarks || "").trim();
+    if (requestRow.dn_id) {
+      let dnExisting = await client.query("select * from delivery_notes where id = $1", [requestRow.dn_id]);
+      if (remarksValue) {
+        const updatedDn = await client.query(
+          "update delivery_notes set remarks = $1 where id = $2 returning *",
+          [remarksValue, requestRow.dn_id],
+        );
+        if (updatedDn.rows[0]) dnExisting = updatedDn;
+      }
+      await insertDeliveryNoteItems(client, requestRow.dn_id, [id]);
+      await syncKanbanRequestHealthByIds(client, [id], { syncPrlDrafts: true });
+      await client.query("commit");
+      res.json(dnExisting.rows[0] || { id: requestRow.dn_id });
+      return;
+    }
+
+    const dnStatus = status || "draft";
+    const scheduleRows = await resolveVendorSchedule(client, supplier);
+    const scheduleIndex = Number.isFinite(Number(deliveryScheduleIndex))
+      ? Number(deliveryScheduleIndex)
+      : 0;
+    const schedulePick = scheduleRows[scheduleIndex] || scheduleRows[0] || {};
+    const cycleValue = String(cycle || schedulePick.cycle || "").trim() || null;
+    const ritRaw = rit ?? schedulePick.rit ?? "";
+    const ritValue = ritRaw !== null && ritRaw !== undefined && String(ritRaw).trim() !== ""
+      ? String(ritRaw).trim()
+      : null;
+    const timeValue = String(deliveryTime || schedulePick.time || "").trim() || null;
+    const planned = plannedDate || new Date().toISOString().slice(0, 10);
+    const dnExistingResult = await client.query(
+      `
+      select * from delivery_notes
+      where supplier = $1 and status in ('draft')
+      order by created_at desc, id desc
+      limit 1
+      `,
+      [supplierValue],
+    );
+    let dn = dnExistingResult.rows[0];
+    if (!dn) {
+      const numbering = await getDocumentNumberingConfig(client);
+      const supplierCodeRaw = await resolveSupplierCode(client, supplierValue);
+      const supplierCode = supplierCodeRaw || supplierValue || "SUPPLIER";
+      const supplierId = await resolveSupplierCode(client, supplierValue, { strict: true });
+      const resolvedDnNumber = await buildDocumentNumber(client, "delivery_notes", "dn_number", requireFormat(numbering.dnFormat, "DN format"), {
+        dept: numbering.dept,
+        supplier: supplierValue,
+        supplierCode,
+        prefix: "DN",
+      });
+      const dnResult = await client.query(
+        `
+        insert into delivery_notes (dn_number, request_id, supplier, supplier_id, planned_date, status, remarks, cycle, rit, delivery_time)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        returning *
+        `,
+        [resolvedDnNumber, id, supplierValue, supplierId || null, planned, dnStatus, remarksValue || null, cycleValue, ritValue, timeValue],
+      );
+      dn = dnResult.rows[0];
+    } else if (remarksValue) {
+      const updatedDn = await client.query(
+        "update delivery_notes set remarks = $1 where id = $2 returning *",
+        [remarksValue, dn.id],
+      );
+      if (updatedDn.rows[0]) dn = updatedDn.rows[0];
+    }
+
+    await client.query(
+      "update kanban_requests set status = 'dn_created', dn_id = $1, updated_at = now() where id = $2",
+      [dn.id, id],
+    );
+    await insertDeliveryNoteItems(client, dn.id, [id]);
+    await syncKanbanRequestHealthByIds(client, [id], { syncPrlDrafts: true });
+    await createKanbanEvent(client, id, "dn_created", req.user?.id || null, { dnId: dn.id });
+    await client.query("commit");
+    res.json(dn);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/kanban/requests/:id/reject", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const result = await client.query(
+      `
+      update kanban_requests
+      set status = 'rejected', approved_by = $1, updated_at = now()
+      where id = $2 and status in ('triggered','requested','approved')
+      returning *
+      `,
+      [req.user?.id || null, id],
+    );
+    if (result.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "request tidak ditemukan atau status tidak valid" });
+      return;
+    }
+    await syncKanbanRequestHealthByIds(client, [id], { syncPrlDrafts: true });
+    await createKanbanEvent(client, id, "rejected", req.user?.id || null, null);
+    await client.query("commit");
+    res.json(result.rows[0]);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/kanban/requests/:id", authenticate, requirePermission("deleteRecords"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const requestResult = await client.query(
+      "select * from kanban_requests where id = $1 for update",
+      [id],
+    );
+    if (requestResult.rows.length === 0) {
+      res.status(404).json({ error: "request tidak ditemukan" });
+      await client.query("rollback");
+      return;
+    }
+    const requestRow = requestResult.rows[0];
+    if (!["triggered", "requested"].includes(requestRow.status)) {
+      res.status(409).json({ error: "request tidak bisa dihapus setelah approve" });
+      await client.query("rollback");
+      return;
+    }
+    await client.query("delete from kanban_events where request_id = $1", [id]);
+    await client.query("delete from kanban_requests where id = $1", [id]);
+    await syncKanbanShortagePrlDraftsByItemCodes(client, [requestRow.item_code]);
+    await client.query("commit");
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/kanban/requests/:id/close", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const result = await client.query(
+      `
+      update kanban_requests
+      set status = 'closed', updated_at = now()
+      where id = $1 and status not in ('closed','rejected')
+      returning *
+      `,
+      [id],
+    );
+    if (result.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "request tidak ditemukan atau status tidak valid" });
+      return;
+    }
+    await syncKanbanRequestHealthByIds(client, [id], { syncPrlDrafts: true });
+    await createKanbanEvent(client, id, "closed", req.user?.id || null, null);
+    await client.query("commit");
+    res.json(result.rows[0]);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/api/kanban/requests/:id/status", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const { status } = req.body || {};
+    const allowed = new Set([
+      "triggered",
+      "requested",
+      "approved",
+      "rejected",
+      "dn_created",
+      "scheduled",
+      "in_transit",
+      "receiving",
+      "fifo",
+      "closed",
+    ]);
+    if (!status || !allowed.has(status)) {
+      res.status(400).json({ error: "status tidak valid" });
+      return;
+    }
+
+    await client.query("begin");
+    const existingResult = await client.query("select * from kanban_requests where id = $1 for update", [id]);
+    if (existingResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "request tidak ditemukan" });
+      return;
+    }
+    const current = existingResult.rows[0];
+    const transitions = {
+      triggered: ["requested", "approved", "rejected"],
+      requested: ["approved", "rejected"],
+      approved: ["dn_created", "rejected"],
+      dn_created: ["scheduled", "in_transit"],
+      scheduled: ["in_transit", "receiving"],
+      in_transit: ["receiving"],
+      receiving: ["fifo", "closed"],
+      fifo: ["closed"],
+      rejected: [],
+      closed: [],
+    };
+    const nextList = transitions[current.status] || [];
+    if (!nextList.includes(status)) {
+      await client.query("rollback");
+      res.status(409).json({ error: "transisi status tidak valid" });
+      return;
+    }
+    if (status === "dn_created" && !current.dn_id) {
+      await client.query("rollback");
+      res.status(409).json({ error: "DN belum dibuat" });
+      return;
+    }
+    if (["scheduled", "in_transit", "receiving", "fifo"].includes(status) && !current.schedule_id) {
+      await client.query("rollback");
+      res.status(409).json({ error: "schedule belum dibuat" });
+      return;
+    }
+
+    const result = await client.query(
+      "update kanban_requests set status = $1, updated_at = now() where id = $2 returning *",
+      [status, id],
+    );
+    await syncKanbanRequestHealthByIds(client, [id], { syncPrlDrafts: true });
+    await createKanbanEvent(client, id, "status_changed", req.user?.id || null, { from: current.status, to: status });
+    await client.query("commit");
+    res.json(result.rows[0]);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/api/kanban/requests/:id/qty", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    let qtyValue = Number(req.body?.requestQty);
+    if (!Number.isFinite(qtyValue) || qtyValue <= 0) {
+      res.status(400).json({ error: "requestQty wajib diisi" });
+      return;
+    }
+    await client.query("begin");
+    const requestResult = await client.query(
+      `
+      select kr.*, dn.status as dn_status
+      from kanban_requests kr
+      left join delivery_notes dn on dn.id = kr.dn_id
+      where kr.id = $1
+      for update
+      `,
+      [id],
+    );
+    if (requestResult.rows.length === 0) {
+      res.status(404).json({ error: "request tidak ditemukan" });
+      await client.query("rollback");
+      return;
+    }
+    const requestRow = requestResult.rows[0];
+    if (requestRow.dn_id && requestRow.dn_status && requestRow.dn_status !== "draft") {
+      res.status(409).json({ error: "DN sudah diproses, qty tidak bisa diubah." });
+      await client.query("rollback");
+      return;
+    }
+    const packQty = await resolveItemPackQty(client, requestRow.item_code);
+    qtyValue = normalizeQtyByPack(qtyValue, packQty);
+    const updated = await client.query(
+      `
+      update kanban_requests
+      set request_qty = $1, updated_at = now()
+      where id = $2
+      returning *
+      `,
+      [qtyValue, id],
+    );
+    await syncKanbanRequestHealthByIds(client, [id], { syncPrlDrafts: true });
+    await createKanbanEvent(client, id, "qty_updated", req.user?.id || null, { from: requestRow.request_qty, to: qtyValue });
+    await client.query("commit");
+    res.json(updated.rows[0]);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/kanban/requests/:id/create-dn", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const { supplier, plannedDate, status, remarks, cycle, rit, deliveryTime, deliveryScheduleIndex } = req.body || {};
+    if (!supplier || !plannedDate) {
+      res.status(400).json({ error: "supplier, plannedDate wajib diisi" });
+      return;
+    }
+    const dnStatus = status || "draft";
+    const scheduleRows = await resolveVendorSchedule(client, supplier);
+    const scheduleIndex = Number.isFinite(Number(deliveryScheduleIndex))
+      ? Number(deliveryScheduleIndex)
+      : 0;
+    const schedulePick = scheduleRows[scheduleIndex] || scheduleRows[0] || {};
+    const cycleValue = String(cycle || schedulePick.cycle || "").trim() || null;
+    const ritRaw = rit ?? schedulePick.rit ?? "";
+    const ritValue = ritRaw !== null && ritRaw !== undefined && String(ritRaw).trim() !== ""
+      ? String(ritRaw).trim()
+      : null;
+    const timeValue = String(deliveryTime || schedulePick.time || "").trim() || null;
+    const remarksValue = String(remarks || "").trim();
+    await client.query("begin");
+    const numbering = await getDocumentNumberingConfig(client);
+    const supplierCodeRaw = await resolveSupplierCode(client, supplier);
+    const supplierCode = supplierCodeRaw || supplier || "SUPPLIER";
+    const supplierId = await resolveSupplierCode(client, supplier, { strict: true });
+    const resolvedDnNumber = await buildDocumentNumber(client, "delivery_notes", "dn_number", requireFormat(numbering.dnFormat, "DN format"), {
+      dept: numbering.dept,
+      supplier,
+      supplierCode,
+      prefix: "DN",
+    });
+    const requestResult = await client.query(
+      "select * from kanban_requests where id = $1 for update",
+      [id],
+    );
+    if (requestResult.rows.length === 0) {
+      res.status(404).json({ error: "request tidak ditemukan" });
+      await client.query("rollback");
+      return;
+    }
+    const requestRow = requestResult.rows[0];
+    if (requestRow.status !== "approved") {
+      res.status(409).json({ error: "request belum approved" });
+      await client.query("rollback");
+      return;
+    }
+    const roleResult = await client.query(
+      "select role from master_vendors where id = $1 or name = $1 limit 1",
+      [supplier],
+    );
+    if (roleResult.rows.length && roleResult.rows[0].role !== "Delivery Note") {
+      res.status(409).json({ error: "vendor tidak berperan sebagai Delivery Note" });
+      await client.query("rollback");
+      return;
+    }
+    const existingDnResult = await client.query(
+      `
+      select * from delivery_notes
+      where supplier = $1 and status in ('draft')
+      order by created_at desc, id desc
+      limit 1
+      `,
+      [supplier],
+    );
+    let dn = existingDnResult.rows[0];
+    if (!dn) {
+      const dnResult = await client.query(
+        `
+        insert into delivery_notes (dn_number, request_id, supplier, supplier_id, planned_date, status, remarks, cycle, rit, delivery_time)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        returning *
+        `,
+        [resolvedDnNumber, id, supplier, supplierId || null, plannedDate, dnStatus, remarksValue || null, cycleValue, ritValue, timeValue],
+      );
+      dn = dnResult.rows[0];
+    } else if (remarksValue) {
+      const updatedDn = await client.query(
+        "update delivery_notes set remarks = $1 where id = $2 returning *",
+        [remarksValue, dn.id],
+      );
+      if (updatedDn.rows[0]) dn = updatedDn.rows[0];
+    }
+    await client.query(
+      "update kanban_requests set status = 'dn_created', dn_id = $1, updated_at = now() where id = $2",
+      [dn.id, id],
+    );
+    await insertDeliveryNoteItems(client, dn.id, [id]);
+    await syncKanbanRequestHealthByIds(client, [id], { syncPrlDrafts: true });
+    await createKanbanEvent(client, id, "dn_created", req.user?.id || null, { dnId: dn.id });
+    await client.query("commit");
+    res.json(dn);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/prl", authenticate, requirePermission("viewPrl"), async (req, res) => {
+  try {
+    const year = Number(req.query.year) || new Date().getFullYear();
+    const result = await pool.query(
+      `
+      select *
+      from prl_records
+      where year = $1
+      order by item_code
+      `,
+      [year],
+    );
+    const itemCodes = result.rows.map((row) => row.item_code);
+    if (itemCodes.length === 0) {
+      res.json([]);
+      return;
+    }
+    const itemResult = await pool.query(
+      `
+      select code, type, type_pack
+      from items
+      where code = any($1)
+      `,
+      [itemCodes],
+    );
+    const approverIds = result.rows
+      .map((row) => Number(row.approved_by))
+      .filter((value) => Number.isFinite(value));
+    let approverById = new Map();
+    if (approverIds.length > 0) {
+      const userResult = await pool.query(
+        `
+        select id, username, role
+        from users
+        where id = any($1::int[])
+        `,
+        [[...new Set(approverIds)]],
+      );
+      approverById = new Map(
+        userResult.rows.map((row) => [
+          row.id,
+          {
+            username: row.username,
+            role: row.role,
+          },
+        ]),
+      );
+    }
+    const typeByCode = new Map(itemResult.rows.map((row) => [row.code, row.type]));
+    const typePackByCode = new Map(itemResult.rows.map((row) => [row.code, row.type_pack]));
+    const enriched = result.rows.map((row) => ({
+      ...row,
+      category: typeByCode.get(row.item_code) || null,
+      item_type_pack: typePackByCode.get(row.item_code) || null,
+      approved_by_name: approverById.get(Number(row.approved_by))?.username || null,
+      approved_by_role: approverById.get(Number(row.approved_by))?.role || null,
+    }));
+    res.json(enriched);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/prl/import", authenticate, requirePermission("prlImport"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { year, rows } = req.body || {};
+    const targetYear = Number(year) || new Date().getFullYear();
+    if (!Array.isArray(rows) || rows.length === 0) {
+      res.status(400).json({ error: "rows wajib diisi" });
+      return;
+    }
+
+    let saved = 0;
+    let skipped = 0;
+    await client.query("begin");
+    for (const row of rows) {
+      const uniq = String(row?.uniq || "").trim();
+      if (!uniq) {
+        skipped += 1;
+        continue;
+      }
+      const itemResult = await client.query(
+        "select code, name, model, unit, pack_qty from items where code = $1",
+        [uniq],
+      );
+      if (itemResult.rows.length === 0) {
+        skipped += 1;
+        continue;
+      }
+      const item = itemResult.rows[0];
+      const ksResult = await client.query(
+        "select lot_qty from kanban_settings where item_code = $1",
+        [uniq],
+      );
+      const lotQty = ksResult.rows[0]?.lot_qty ?? null;
+      const packQty = Number(item.pack_qty || lotQty || 0);
+      const rawMonths = row?.months && typeof row.months === "object" ? row.months : {};
+      const months = {};
+      Object.entries(rawMonths).forEach(([key, value]) => {
+        const num = Number(value);
+        if (Number.isFinite(num) && num > 0) {
+          months[key] = normalizeQtyByPack(num, packQty);
+        } else if (Number.isFinite(num)) {
+          months[key] = num;
+        } else {
+          months[key] = 0;
+        }
+      });
+      const existingPrlResult = await client.query(
+        "select id, status from prl_records where item_code = $1 and year = $2",
+        [uniq, targetYear],
+      );
+      const existingPrl = existingPrlResult.rows[0] || null;
+      const nextStatus = toPlainObject(existingPrl?.status);
+      PRL_MONTH_KEYS.forEach((monthKey) => {
+        const monthQty = Number(months?.[monthKey] || 0);
+        if (monthQty <= 0) return;
+        nextStatus[monthKey] = getPrlMonthStatus(nextStatus, monthKey) === "active"
+          ? "active"
+          : "manual";
+      });
+
+      await client.query(
+        `
+        insert into prl_records
+          (
+            item_code,
+            year,
+            part_no,
+            description,
+            model,
+            qty_per_kanban,
+            uom,
+            type_pack,
+            volume,
+            months,
+            status,
+            source_type,
+            source_ref,
+            suggested_qty,
+            due_date,
+            priority_score,
+            updated_at
+          )
+        values
+          ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'manual', null, 0, null, 0, now())
+        on conflict (item_code, year)
+        do update set
+          part_no = excluded.part_no,
+          description = excluded.description,
+          model = excluded.model,
+          qty_per_kanban = excluded.qty_per_kanban,
+          uom = excluded.uom,
+          type_pack = excluded.type_pack,
+          volume = excluded.volume,
+          months = excluded.months,
+          status = excluded.status,
+          source_type = 'manual',
+          source_ref = null,
+          suggested_qty = 0,
+          due_date = null,
+          priority_score = 0,
+          updated_at = now()
+        `,
+        [
+          uniq,
+          targetYear,
+          item.code,
+          item.name,
+          item.model,
+          packQty || lotQty,
+          item.unit,
+          null,
+          null,
+          months,
+          nextStatus,
+        ],
+      );
+      saved += 1;
+    }
+    await client.query("commit");
+    res.json({ saved, skipped });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/prl/release", authenticate, requirePermission("prlProcess"), async (req, res) => {
+  const client = await pool.connect();
+  let transactionStarted = false;
+  try {
+    const { year, month } = req.body || {};
+    const targetYear = Number(year) || new Date().getFullYear();
+    const monthKey = String(month || "").toLowerCase();
+    const allowedMonths = new Set([
+      "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ]);
+    if (!allowedMonths.has(monthKey)) {
+      res.status(400).json({ error: "month tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    transactionStarted = true;
+    const eligibleResult = await client.query(
+      `
+      select
+        id,
+        source_type,
+        source_ref,
+        suggested_qty,
+        status,
+        case
+          when (months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+            then (months ->> $2)::numeric
+          else 0
+        end as month_qty
+      from prl_records
+      where year = $1
+        and (
+          case
+            when (months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+              then (months ->> $2)::numeric
+            else 0
+          end
+        ) > 0
+      `,
+      [targetYear, monthKey],
+    );
+    const eligibleRows = eligibleResult.rows || [];
+    const alreadyActive = eligibleRows.filter((row) => getPrlMonthStatus(row.status, monthKey) === "active").length;
+    const releasableRows = eligibleRows.filter((row) => getPrlMonthStatus(row.status, monthKey) !== "active");
+    const autoDraftReleased = releasableRows.filter((row) => (
+      Number(row.suggested_qty || 0) > 0
+      && (
+        String(row.source_type || "").trim().toLowerCase() === "kanban_request"
+        || String(row.source_ref || "").trim().startsWith(KANBAN_PRL_SOURCE_PREFIX)
+      )
+    )).length;
+    let updated = 0;
+    if (releasableRows.length > 0) {
+      const ids = releasableRows.map((row) => row.id);
+      const result = await client.query(
+        `
+        update prl_records
+        set
+          status = jsonb_set(status, $2, '"active"', true),
+          approved_qty = case
+            when (months ->> $3) ~ '^[0-9]+(\\.[0-9]+)?$'
+              then (months ->> $3)::numeric
+            else approved_qty
+          end,
+          approved_by = $4,
+          approved_at = now(),
+          source_type = case
+            when source_type = 'kanban_request' then 'prl'
+            else source_type
+          end,
+          suggested_qty = case
+            when suggested_qty > 0 then 0
+            else suggested_qty
+          end,
+          due_date = case
+            when suggested_qty > 0 then null
+            else due_date
+          end,
+          priority_score = case
+            when suggested_qty > 0 then 0
+            else priority_score
+          end,
+          updated_at = now()
+        where id = any($1::int[])
+        `,
+        [ids, `{${monthKey}}`, monthKey, req.user?.id || null],
+      );
+      updated = result.rowCount;
+    }
+    await client.query("commit");
+    transactionStarted = false;
+    res.json({
+      updated,
+      alreadyActive,
+      autoDraftReleased,
+      eligible: eligibleRows.length,
+    });
+  } catch (error) {
+    if (transactionStarted) {
+      await client.query("rollback");
+    }
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/master/plants", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const result = await pool.query("select * from master_plants order by id");
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/master/plants", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { id, name, site } = req.body || {};
+    if (!id || !name || !site) {
+      res.status(400).json({ error: "id, name, site wajib diisi" });
+      return;
+    }
+    const result = await pool.query(
+      "insert into master_plants (id, name, site) values ($1, $2, $3) returning *",
+      [id, name, site],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/master/plants/:id", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { name, site } = req.body || {};
+    const id = req.params.id;
+    if (!id || !name || !site) {
+      res.status(400).json({ error: "id, name, site wajib diisi" });
+      return;
+    }
+    const result = await pool.query(
+      "update master_plants set name = $1, site = $2 where id = $3 returning *",
+      [name, site, id],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "plant tidak ditemukan" });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/master/plants/:id", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const result = await pool.query("delete from master_plants where id = $1 returning *", [req.params.id]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "plant tidak ditemukan" });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/master/areas", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const result = await pool.query("select * from master_areas order by id");
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Failed to load master areas:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/master/areas", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { id, name, plantId, warehouseId } = req.body || {};
+    const resolvedWarehouseId = warehouseId || plantId;
+    if (!id || !name || !resolvedWarehouseId) {
+      res.status(400).json({ error: "id, name, warehouseId wajib diisi" });
+      return;
+    }
+    const warehouseRow = await pool.query("select * from master_warehouses where id = $1", [resolvedWarehouseId]);
+    if (warehouseRow.rows.length > 0) {
+      const wh = warehouseRow.rows[0];
+      await pool.query(
+        "insert into master_plants (id, name, site) values ($1, $2, $3) on conflict (id) do update set name = excluded.name, site = excluded.site",
+        [wh.id, wh.name, wh.site],
+      );
+    }
+    const result = await pool.query(
+      "insert into master_areas (id, name, plant_id) values ($1, $2, $3) returning *",
+      [id, name, resolvedWarehouseId],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/master/areas/:id", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { name, plantId, warehouseId } = req.body || {};
+    const id = req.params.id;
+    const resolvedWarehouseId = warehouseId || plantId;
+    if (!id || !name || !resolvedWarehouseId) {
+      res.status(400).json({ error: "id, name, warehouseId wajib diisi" });
+      return;
+    }
+    const warehouseRow = await pool.query("select * from master_warehouses where id = $1", [resolvedWarehouseId]);
+    if (warehouseRow.rows.length > 0) {
+      const wh = warehouseRow.rows[0];
+      await pool.query(
+        "insert into master_plants (id, name, site) values ($1, $2, $3) on conflict (id) do update set name = excluded.name, site = excluded.site",
+        [wh.id, wh.name, wh.site],
+      );
+    }
+    const result = await pool.query(
+      "update master_areas set name = $1, plant_id = $2 where id = $3 returning *",
+      [name, resolvedWarehouseId, id],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "area tidak ditemukan" });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/master/areas/:id", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const result = await pool.query("delete from master_areas where id = $1 returning *", [req.params.id]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "area tidak ditemukan" });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/master/deliveries", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const result = await pool.query("select * from master_deliveries order by id");
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/master/deliveries", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { id, areaId, address } = req.body || {};
+    if (!id || !areaId || !address) {
+      res.status(400).json({ error: "id, areaId, address wajib diisi" });
+      return;
+    }
+    const result = await pool.query(
+      "insert into master_deliveries (id, area_id, address) values ($1, $2, $3) returning *",
+      [id, areaId, address],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/master/deliveries/:id", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { areaId, address } = req.body || {};
+    const id = req.params.id;
+    if (!id || !areaId || !address) {
+      res.status(400).json({ error: "id, areaId, address wajib diisi" });
+      return;
+    }
+    const result = await pool.query(
+      "update master_deliveries set area_id = $1, address = $2 where id = $3 returning *",
+      [areaId, address, id],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "delivery tidak ditemukan" });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/master/deliveries/:id", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const result = await pool.query("delete from master_deliveries where id = $1 returning *", [req.params.id]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "delivery tidak ditemukan" });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/master/warehouses", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const result = await pool.query("select * from master_warehouses order by id");
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/master/warehouses", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { id, name, site, type } = req.body || {};
+    if (!id || !name || !site) {
+      res.status(400).json({ error: "id, name, site wajib diisi" });
+      return;
+    }
+    const typeValue = String(type || "MAIN").trim() || "MAIN";
+    const result = await pool.query(
+      "insert into master_warehouses (id, name, site, type) values ($1, $2, $3, $4) returning *",
+      [id, name, site, typeValue],
+    );
+    await pool.query(
+      "insert into master_plants (id, name, site) values ($1, $2, $3) on conflict (id) do update set name = excluded.name, site = excluded.site",
+      [id, name, site],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/master/warehouses/:id", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { name, site, type } = req.body || {};
+    const id = req.params.id;
+    if (!id || !name || !site) {
+      res.status(400).json({ error: "id, name, site wajib diisi" });
+      return;
+    }
+    const typeValue = String(type || "MAIN").trim() || "MAIN";
+    const result = await pool.query(
+      "update master_warehouses set name = $1, site = $2, type = $3 where id = $4 returning *",
+      [name, site, typeValue, id],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "warehouse tidak ditemukan" });
+      return;
+    }
+    await pool.query(
+      "insert into master_plants (id, name, site) values ($1, $2, $3) on conflict (id) do update set name = excluded.name, site = excluded.site",
+      [id, name, site],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/master/warehouses/:id", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const result = await pool.query("delete from master_warehouses where id = $1 returning *", [req.params.id]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "warehouse tidak ditemukan" });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/master/vendors", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const result = await pool.query("select * from master_vendors order by id");
+    const rows = result.rows.map((row) => ({
+      ...row,
+      delivery_schedule: normalizeDeliverySchedule(row.delivery_schedule),
+    }));
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/master/customers", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const result = await pool.query("select * from master_customers order by id");
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/master/customers", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { id, name, email, leadTimeDays } = req.body || {};
+    if (!id || !name) {
+      res.status(400).json({ error: "id dan name wajib diisi" });
+      return;
+    }
+    const leadTimeValue = Number(leadTimeDays) || 0;
+    const result = await pool.query(
+      "insert into master_customers (id, name, email, lead_time_days) values ($1, $2, $3, $4) returning *",
+      [id, name, email || null, Math.max(0, Math.round(leadTimeValue))],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/master/customers/:id", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { name, email, leadTimeDays } = req.body || {};
+    const id = req.params.id;
+    if (!id || !name) {
+      res.status(400).json({ error: "id dan name wajib diisi" });
+      return;
+    }
+    const leadTimeValue = Number(leadTimeDays) || 0;
+    const result = await pool.query(
+      "update master_customers set name = $1, email = $2, lead_time_days = $3 where id = $4 returning *",
+      [name, email || null, Math.max(0, Math.round(leadTimeValue)), id],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "customer tidak ditemukan" });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/master/customers/:id", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const result = await pool.query("delete from master_customers where id = $1 returning *", [req.params.id]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "customer tidak ditemukan" });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/master/categories", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const result = await pool.query("select * from master_categories order by code");
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/master/categories", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { code, name } = req.body || {};
+    if (!code || !name) {
+      res.status(400).json({ error: "code dan name wajib diisi" });
+      return;
+    }
+    const result = await pool.query(
+      "insert into master_categories (code, name) values ($1, $2) returning *",
+      [code, name],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/master/categories/:code", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { name } = req.body || {};
+    const code = req.params.code;
+    if (!code || !name) {
+      res.status(400).json({ error: "code dan name wajib diisi" });
+      return;
+    }
+    const result = await pool.query(
+      "update master_categories set name = $1 where code = $2 returning *",
+      [name, code],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "kategori tidak ditemukan" });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/master/categories/:code", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const result = await pool.query("delete from master_categories where code = $1 returning *", [req.params.code]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "kategori tidak ditemukan" });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/master/vendors", authenticate, requireManageVendors, async (req, res) => {
+  try {
+    const { id, name, type, role, email, leadTimeDays, dailyCapacityQty, daily_capacity_qty, cycle, rit, deliveryTime, deliverySchedule, delivery_schedule } = req.body || {};
+    if (!id || !name || !type || !role) {
+      res.status(400).json({ error: "id, name, type, role wajib diisi" });
+      return;
+    }
+    const scheduleRows = normalizeDeliverySchedule(deliverySchedule || delivery_schedule);
+    const schedulePayload = scheduleRows.length > 0 ? JSON.stringify(scheduleRows) : null;
+    const firstSchedule = scheduleRows[0] || {};
+    const cycleValue = String(cycle || firstSchedule.cycle || "").trim() || null;
+    const ritRaw = rit ?? firstSchedule.rit ?? "";
+    const ritValue = ritRaw !== null && ritRaw !== undefined && String(ritRaw).trim() !== "" ? String(ritRaw).trim() : null;
+    const deliveryTimeValue = String(deliveryTime || firstSchedule.time || "").trim() || null;
+    const dailyCapacityValue = Number(dailyCapacityQty ?? daily_capacity_qty ?? 0) || 0;
+    const result = await pool.query(
+      "insert into master_vendors (id, name, type, role, email, lead_time_days, daily_capacity_qty, cycle, rit, delivery_time, delivery_schedule) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) returning *",
+      [id, name, type, role, email || null, Number(leadTimeDays) || 0, dailyCapacityValue, cycleValue, ritValue, deliveryTimeValue, schedulePayload],
+    );
+    const row = result.rows[0];
+    res.json({ ...row, delivery_schedule: normalizeDeliverySchedule(row?.delivery_schedule) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/master/vendors/:id", authenticate, requireManageVendors, async (req, res) => {
+  try {
+    const { name, type, role, email, leadTimeDays, dailyCapacityQty, daily_capacity_qty, cycle, rit, deliveryTime, deliverySchedule, delivery_schedule } = req.body || {};
+    const id = req.params.id;
+    if (!id || !name || !type || !role) {
+      res.status(400).json({ error: "id, name, type, role wajib diisi" });
+      return;
+    }
+    const scheduleRows = normalizeDeliverySchedule(deliverySchedule || delivery_schedule);
+    const schedulePayload = scheduleRows.length > 0 ? JSON.stringify(scheduleRows) : null;
+    const firstSchedule = scheduleRows[0] || {};
+    const cycleValue = String(cycle || firstSchedule.cycle || "").trim() || null;
+    const ritRaw = rit ?? firstSchedule.rit ?? "";
+    const ritValue = ritRaw !== null && ritRaw !== undefined && String(ritRaw).trim() !== "" ? String(ritRaw).trim() : null;
+    const deliveryTimeValue = String(deliveryTime || firstSchedule.time || "").trim() || null;
+    const dailyCapacityValue = Number(dailyCapacityQty ?? daily_capacity_qty ?? 0) || 0;
+    const result = await pool.query(
+      "update master_vendors set name = $1, type = $2, role = $3, email = $4, lead_time_days = $5, daily_capacity_qty = $6, cycle = $7, rit = $8, delivery_time = $9, delivery_schedule = $10 where id = $11 returning *",
+      [name, type, role, email || null, Number(leadTimeDays) || 0, dailyCapacityValue, cycleValue, ritValue, deliveryTimeValue, schedulePayload, id],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "vendor tidak ditemukan" });
+      return;
+    }
+    const row = result.rows[0];
+    res.json({ ...row, delivery_schedule: normalizeDeliverySchedule(row?.delivery_schedule) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/master/vendors/:id", authenticate, requireManageVendors, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const subconUsage = await pool.query(
+      `
+      select
+        (select count(*) from subcon_deliveries where vendor_id = $1) as delivery_count,
+        (select count(*) from subcon_receipts where vendor_id = $1) as receipt_count,
+        (select count(*) from subcon_stock_movements where vendor_id = $1) as movement_count,
+        (select count(*) from subcon_stock_opname where vendor_id = $1) as opname_count
+      `,
+      [id],
+    );
+    const usageRow = subconUsage.rows[0] || {};
+    const hasUsage =
+      Number(usageRow.delivery_count || 0) > 0 ||
+      Number(usageRow.receipt_count || 0) > 0 ||
+      Number(usageRow.movement_count || 0) > 0 ||
+      Number(usageRow.opname_count || 0) > 0;
+    if (hasUsage) {
+      res.status(400).json({ error: "Vendor masih dipakai di transaksi Subcon. Tidak bisa dihapus." });
+      return;
+    }
+    const result = await pool.query("delete from master_vendors where id = $1 returning *", [id]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "vendor tidak ditemukan" });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/master/items", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const result = await pool.query("select * from items where code not ilike 'TEST-%' order by code");
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/master/items/:code/image", authenticate, requireManageItems, upload.single("image"), async (req, res) => {
+  try {
+    const code = String(req.params.code || "").trim();
+    if (!code) {
+      res.status(400).json({ error: "code wajib diisi" });
+      return;
+    }
+    if (!req.file?.buffer) {
+      res.status(400).json({ error: "File gambar wajib diunggah." });
+      return;
+    }
+    const existing = await pool.query(
+      "select code, image_url, image_thumb_url from items where code = $1",
+      [code],
+    );
+    if (existing.rows.length === 0) {
+      res.status(404).json({ error: "item tidak ditemukan" });
+      return;
+    }
+
+    const originalBuffer = await buildOriginalWebp(req.file.buffer);
+    const thumbBuffer = await buildThumbWebp(req.file.buffer);
+    if (!originalBuffer || !thumbBuffer) {
+      res.status(500).json({ error: "Gagal memproses gambar." });
+      return;
+    }
+
+    const safeCode = sanitizeFileToken(code) || "item";
+    const stamp = Date.now();
+    const fileName = `${safeCode}_${stamp}.webp`;
+    const originalPath = path.join(itemsUploadDir, fileName);
+    const thumbPath = path.join(itemsThumbDir, fileName);
+
+    await fs.writeFile(originalPath, originalBuffer);
+    await fs.writeFile(thumbPath, thumbBuffer);
+
+    const imageUrl = `/uploads/items/${fileName}`;
+    const imageThumbUrl = `/uploads/items/thumbs/${fileName}`;
+
+    await pool.query(
+      "update items set image_url = $1, image_thumb_url = $2 where code = $3",
+      [imageUrl, imageThumbUrl, code],
+    );
+
+    const previous = existing.rows[0];
+    await removeLocalUploadFile(previous?.image_url);
+    await removeLocalUploadFile(previous?.image_thumb_url);
+
+    res.json({
+      imageUrl,
+      imageThumbUrl,
+      originalBytes: originalBuffer.length,
+      thumbBytes: thumbBuffer.length,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/master/items", authenticate, requireManageItems, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { code, name, partNo, type, unit, model, weight, price, vendorId, locationId, supplierName, locationName, packingName, lineProduction, imageUrl, imageThumbUrl, shelfLifeDays, shelfLifeMonths, movingStatus, isSeasonal, typePack, packQty, leadTimeDays, cycleTimeSeconds, processFlow, suppliers, customers, orderLotSize, maxDeliveryPerRit } = req.body || {};
+    if (!code || !name || !type || !unit) {
+      res.status(400).json({ error: "code, name, type, unit wajib diisi" });
+      return;
+    }
+    await client.query("begin");
+    const shelfLifeValue = Number(shelfLifeDays);
+    const packQtyValue = Number(packQty);
+    const orderLotValue = Number(orderLotSize);
+    const maxDeliveryValue = Number(maxDeliveryPerRit);
+    const movingStatusRaw = movingStatus === undefined ? null : String(movingStatus || "").trim().toUpperCase();
+    const movingStatusValue = ['FAST', 'SLOW', 'DEAD', 'SEASONAL'].includes(movingStatusRaw) ? movingStatusRaw : null;
+    const isSeasonalValue = typeof isSeasonal === "boolean" ? isSeasonal : null;
+    const shelfLifeMonthsValue = Number(shelfLifeMonths);
+    const movingStatusInsert = isSeasonalValue ? "SEASONAL" : (movingStatusValue || "SLOW");
+    const leadTimeValue = Number.isFinite(Number(leadTimeDays))
+      ? Math.max(0, Math.round(Number(leadTimeDays)))
+      : 0;
+    const cycleTimeValue = Number.isFinite(Number(cycleTimeSeconds))
+      ? Math.max(0, Number(cycleTimeSeconds))
+      : 0;
+    const processFlowValue = Array.isArray(processFlow)
+      ? processFlow.filter((step) => String(step || "").trim())
+      : [];
+    const result = await client.query(
+      `
+      insert into items (code, name, part_no, type, unit, model, weight, price, vendor_id, location_id, supplier_name, location_name, packing_name, line_production, image_url, image_thumb_url, shelf_life_days, shelf_life_months, moving_status, is_seasonal, type_pack, pack_qty, lead_time_days, cycle_time_seconds, order_lot_size, max_delivery_per_rit, process_flow)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+      on conflict (code) do update set
+        name = excluded.name,
+        part_no = excluded.part_no,
+        type = excluded.type,
+        unit = excluded.unit,
+        model = excluded.model,
+        weight = excluded.weight,
+        price = excluded.price,
+        vendor_id = excluded.vendor_id,
+        location_id = excluded.location_id,
+        supplier_name = excluded.supplier_name,
+        location_name = excluded.location_name,
+        packing_name = excluded.packing_name,
+        line_production = excluded.line_production,
+        image_url = excluded.image_url,
+        image_thumb_url = excluded.image_thumb_url,
+        shelf_life_days = excluded.shelf_life_days,
+        shelf_life_months = excluded.shelf_life_months,
+        moving_status = excluded.moving_status,
+        is_seasonal = excluded.is_seasonal,
+        type_pack = excluded.type_pack,
+        pack_qty = excluded.pack_qty,
+        lead_time_days = excluded.lead_time_days,
+        cycle_time_seconds = excluded.cycle_time_seconds,
+        order_lot_size = excluded.order_lot_size,
+        max_delivery_per_rit = excluded.max_delivery_per_rit,
+        process_flow = excluded.process_flow
+      returning *
+      `,
+      [
+        code,
+        name,
+        partNo || null,
+        type,
+        unit,
+        model || null,
+        Number(weight) || null,
+        Number(price) || null,
+        vendorId || null,
+        locationId || null,
+        supplierName || null,
+        locationName || null,
+        packingName || null,
+        lineProduction || null,
+        imageUrl || null,
+        imageThumbUrl || null,
+        Number.isFinite(shelfLifeValue) ? shelfLifeValue : null,
+        Number.isFinite(shelfLifeMonthsValue) ? shelfLifeMonthsValue : null,
+        movingStatusInsert,
+        isSeasonalValue,
+        typePack || null,
+        Number.isFinite(packQtyValue) ? packQtyValue : 0,
+        leadTimeValue,
+        cycleTimeValue,
+        Number.isFinite(orderLotValue) ? Math.max(0, orderLotValue) : 0,
+        Number.isFinite(maxDeliveryValue) ? Math.max(0, maxDeliveryValue) : 0,
+        processFlowValue,
+      ],
+    );
+    await client.query("delete from item_suppliers where item_code = $1", [code]);
+    await client.query("delete from item_customers where item_code = $1", [code]);
+    if (Array.isArray(suppliers)) {
+      for (const supplier of suppliers) {
+        if (!supplier?.vendorId) continue;
+        const share = Number(supplier.sharePercent || 0);
+        await client.query(
+          "insert into item_suppliers (item_code, vendor_id, share_percent) values ($1, $2, $3)",
+          [code, supplier.vendorId, Number.isFinite(share) ? share : 0],
+        );
+      }
+    }
+    if (Array.isArray(customers)) {
+      for (const customer of customers) {
+        if (!customer?.customerId) continue;
+        const share = Number(customer.sharePercent || 0);
+        await client.query(
+          "insert into item_customers (item_code, customer_id, share_percent) values ($1, $2, $3)",
+          [code, customer.customerId, Number.isFinite(share) ? share : 0],
+        );
+      }
+    }
+    await client.query("commit");
+    res.json(result.rows[0]);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/api/master/items/bulk-update", authenticate, requireManageItems, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { itemCodes, updates } = req.body || {};
+    if (!Array.isArray(itemCodes) || itemCodes.length === 0) {
+      res.status(400).json({ error: "itemCodes wajib diisi" });
+      return;
+    }
+    if (!updates || typeof updates !== "object") {
+      res.status(400).json({ error: "updates wajib diisi" });
+      return;
+    }
+    await client.query("begin");
+    const fields = [];
+    const values = [];
+    let idx = 1;
+    if (updates.type) {
+      fields.push(`type = $${idx}`);
+      values.push(updates.type);
+      idx += 1;
+    }
+    if (updates.typePack) {
+      fields.push(`type_pack = $${idx}`);
+      values.push(updates.typePack);
+      idx += 1;
+    }
+    if (Number.isFinite(Number(updates.shelfLifeDays))) {
+      fields.push(`shelf_life_days = $${idx}`);
+      values.push(Math.max(0, Math.round(Number(updates.shelfLifeDays))));
+      idx += 1;
+    }
+    if (Number.isFinite(Number(updates.packQty))) {
+      fields.push(`pack_qty = $${idx}`);
+      values.push(Math.max(0, Number(updates.packQty)));
+      idx += 1;
+    }
+    if (updates.vendorId) {
+      fields.push(`vendor_id = $${idx}`);
+      values.push(updates.vendorId);
+      idx += 1;
+    }
+    if (fields.length === 0) {
+      await client.query("rollback");
+      res.status(400).json({ error: "tidak ada field yang diupdate" });
+      return;
+    }
+    values.push(itemCodes);
+    const result = await client.query(
+      `update items set ${fields.join(", ")} where code = any($${idx}::text[])`,
+      values,
+    );
+    if (updates.vendorId) {
+      await client.query("delete from item_suppliers where item_code = any($1::text[])", [itemCodes]);
+      await client.query(
+        `insert into item_suppliers (item_code, vendor_id, share_percent)
+         select unnest($1::text[]), $2, 100`,
+        [itemCodes, updates.vendorId],
+      );
+    }
+    if (updates.customerId) {
+      await client.query("delete from item_customers where item_code = any($1::text[])", [itemCodes]);
+      await client.query(
+        `insert into item_customers (item_code, customer_id, share_percent)
+         select unnest($1::text[]), $2, 100`,
+        [itemCodes, updates.customerId],
+      );
+    }
+    await client.query("commit");
+    res.json({ updated: result.rowCount });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/api/master/items/:code", authenticate, requireManageItems, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { name, partNo, type, unit, model, weight, price, vendorId, locationId, supplierName, locationName, packingName, lineProduction, imageUrl, imageThumbUrl, shelfLifeDays, shelfLifeMonths, movingStatus, isSeasonal, typePack, packQty, leadTimeDays, cycleTimeSeconds, processFlow, suppliers, customers, orderLotSize, maxDeliveryPerRit } = req.body || {};
+    const code = req.params.code;
+    if (!code || !name || !type || !unit) {
+      res.status(400).json({ error: "code, name, type, unit wajib diisi" });
+      return;
+    }
+    await client.query("begin");
+    const shelfLifeValue = Number(shelfLifeDays);
+    const packQtyValue = Number(packQty);
+    const orderLotValue = Number(orderLotSize);
+    const maxDeliveryValue = Number(maxDeliveryPerRit);
+    const movingStatusRaw = movingStatus === undefined ? null : String(movingStatus || "").trim().toUpperCase();
+    const movingStatusValue = ['FAST', 'SLOW', 'DEAD', 'SEASONAL'].includes(movingStatusRaw) ? movingStatusRaw : null;
+    const isSeasonalValue = Boolean(isSeasonal);
+    const shelfLifeMonthsValue = Number(shelfLifeMonths);
+    const movingStatusResolved = isSeasonalValue ? "SEASONAL" : movingStatusValue;
+    const supplierNameValue = supplierName === undefined ? null : String(supplierName || "").trim();
+    const locationNameValue = locationName === undefined ? null : String(locationName || "").trim();
+    const packingNameValue = packingName === undefined ? null : String(packingName || "").trim();
+    const lineProductionValue = lineProduction === undefined ? null : String(lineProduction || "").trim();
+    const leadTimeValue = Number.isFinite(Number(leadTimeDays)) ? Math.max(0, Math.round(Number(leadTimeDays))) : 0;
+    const cycleTimeValue = Number.isFinite(Number(cycleTimeSeconds)) ? Math.max(0, Number(cycleTimeSeconds)) : 0;
+    const processFlowValue = Array.isArray(processFlow)
+      ? processFlow.filter((step) => String(step || "").trim())
+      : [];
+    const result = await client.query(
+      "update items set name = $1, part_no = $2, type = $3, unit = $4, model = $5, weight = $6, price = $7, vendor_id = $8, location_id = $9, supplier_name = coalesce($10, supplier_name), location_name = coalesce($11, location_name), packing_name = coalesce($12, packing_name), line_production = coalesce($13, line_production), image_url = $14, image_thumb_url = $15, shelf_life_days = $16, shelf_life_months = $17, moving_status = coalesce($18, moving_status), is_seasonal = coalesce($19, is_seasonal), type_pack = $20, pack_qty = $21, lead_time_days = coalesce($22, lead_time_days), cycle_time_seconds = coalesce($23, cycle_time_seconds), order_lot_size = $24, max_delivery_per_rit = $25, process_flow = coalesce($26, process_flow) where code = $27 returning *",
+      [
+        name,
+        partNo || null,
+        type,
+        unit,
+        model || null,
+        Number(weight) || null,
+        Number(price) || null,
+        vendorId || null,
+        locationId || null,
+        supplierNameValue,
+        locationNameValue,
+        packingNameValue,
+        lineProductionValue,
+        imageUrl || null,
+        imageThumbUrl || null,
+        Number.isFinite(shelfLifeValue) ? shelfLifeValue : null,
+        Number.isFinite(shelfLifeMonthsValue) ? shelfLifeMonthsValue : null,
+        movingStatusResolved,
+        isSeasonalValue,
+        typePack || null,
+        Number.isFinite(packQtyValue) ? packQtyValue : 0,
+        leadTimeValue,
+        cycleTimeValue,
+        Number.isFinite(orderLotValue) ? Math.max(0, orderLotValue) : 0,
+        Number.isFinite(maxDeliveryValue) ? Math.max(0, maxDeliveryValue) : 0,
+        processFlowValue,
+        code,
+      ],
+    );
+    if (result.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "item tidak ditemukan" });
+      return;
+    }
+    await client.query("delete from item_suppliers where item_code = $1", [code]);
+    await client.query("delete from item_customers where item_code = $1", [code]);
+    if (Array.isArray(suppliers)) {
+      for (const supplier of suppliers) {
+        if (!supplier?.vendorId) continue;
+        const share = Number(supplier.sharePercent || 0);
+        await client.query(
+          "insert into item_suppliers (item_code, vendor_id, share_percent) values ($1, $2, $3)",
+          [code, supplier.vendorId, Number.isFinite(share) ? share : 0],
+        );
+      }
+    }
+    if (Array.isArray(customers)) {
+      for (const customer of customers) {
+        if (!customer?.customerId) continue;
+        const share = Number(customer.sharePercent || 0);
+        await client.query(
+          "insert into item_customers (item_code, customer_id, share_percent) values ($1, $2, $3)",
+          [code, customer.customerId, Number.isFinite(share) ? share : 0],
+        );
+      }
+    }
+    await client.query("commit");
+    res.json(result.rows[0]);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/master/items/:code", authenticate, requireManageItems, async (req, res) => {
+  try {
+    const result = await pool.query("delete from items where code = $1 returning *", [req.params.code]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "item tidak ditemukan" });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/master/item-relations", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const [supplierRows, customerRows] = await Promise.all([
+      pool.query(
+        `select isup.item_code, isup.vendor_id, isup.share_percent, mv.name as vendor_name
+         from item_suppliers isup
+         left join master_vendors mv on mv.id = isup.vendor_id
+         order by isup.item_code, isup.vendor_id`,
+      ),
+      pool.query(
+        `select ic.item_code, ic.customer_id, ic.share_percent, mc.name as customer_name
+         from item_customers ic
+         left join master_customers mc on mc.id = ic.customer_id
+         order by ic.item_code, ic.customer_id`,
+      ),
+    ]);
+    res.json({ suppliers: supplierRows.rows || [], customers: customerRows.rows || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+app.get("/api/master/locations", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const result = await pool.query("select * from master_locations order by id");
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Failed to load master locations:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/master/locations", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { id, warehouseId, areaId, category, fifoLane, lineDescription, description, machineNote, machine_note, note } = req.body || {};
+    const descValue = String(lineDescription || description || "").trim();
+    let resolvedWarehouseId = warehouseId;
+    if (areaId) {
+      const areaResult = await pool.query("select * from master_areas where id = $1", [areaId]);
+      if (areaResult.rows.length === 0) {
+        res.status(400).json({ error: "areaId tidak ditemukan" });
+        return;
+      }
+      resolvedWarehouseId = areaResult.rows[0].plant_id;
+    }
+    if (!id || !resolvedWarehouseId || !category || !descValue) {
+      res.status(400).json({ error: "id, areaId/warehouseId, category, lineDescription wajib diisi" });
+      return;
+    }
+    const machineNoteValue = String(machineNote || machine_note || note || '').trim() || null;
+    const result = await pool.query(
+      "insert into master_locations (id, warehouse_id, area_id, category, line_description, fifo_lane, machine_note) values ($1, $2, $3, $4, $5, $6, $7) returning *",
+      [id, resolvedWarehouseId, areaId || null, category, descValue, fifoLane || null, machineNoteValue],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/master/locations/:id", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { warehouseId, areaId, category, fifoLane, lineDescription, description, machineNote, machine_note, note } = req.body || {};
+    const id = req.params.id;
+    const descValue = String(lineDescription || description || "").trim();
+    let resolvedWarehouseId = warehouseId;
+    if (areaId) {
+      const areaResult = await pool.query("select * from master_areas where id = $1", [areaId]);
+      if (areaResult.rows.length === 0) {
+        res.status(400).json({ error: "areaId tidak ditemukan" });
+        return;
+      }
+      resolvedWarehouseId = areaResult.rows[0].plant_id;
+    }
+    if (!id || !resolvedWarehouseId || !category || !descValue) {
+      res.status(400).json({ error: "id, areaId/warehouseId, category, lineDescription wajib diisi" });
+      return;
+    }
+    const machineNoteValue = String(machineNote || machine_note || note || '').trim() || null;
+    const result = await pool.query(
+      "update master_locations set warehouse_id = $1, area_id = $2, category = $3, line_description = $4, fifo_lane = $5, machine_note = $6 where id = $7 returning *",
+      [resolvedWarehouseId, areaId || null, category, descValue, fifoLane || null, machineNoteValue, id],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "location tidak ditemukan" });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/master/locations/:id", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const result = await pool.query("delete from master_locations where id = $1 returning *", [req.params.id]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "location tidak ditemukan" });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/master/packings", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const result = await pool.query("select * from master_packings order by code");
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/master/packings", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { code, name } = req.body || {};
+    if (!code || !name) {
+      res.status(400).json({ error: "code dan name wajib diisi" });
+      return;
+    }
+    const result = await pool.query(
+      "insert into master_packings (code, name) values ($1, $2) returning *",
+      [code, name],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/master/packings/:code", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { name } = req.body || {};
+    const code = req.params.code;
+    if (!code || !name) {
+      res.status(400).json({ error: "code dan name wajib diisi" });
+      return;
+    }
+    const result = await pool.query(
+      "update master_packings set name = $1 where code = $2 returning *",
+      [name, code],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "packing tidak ditemukan" });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+  app.delete("/api/master/packings/:code", authenticate, requireManageMaster, async (req, res) => {
+    try {
+      const result = await pool.query("delete from master_packings where code = $1 returning *", [req.params.code]);
+      if (result.rows.length === 0) {
+        res.status(404).json({ error: "packing tidak ditemukan" });
+        return;
+      }
+      res.json({ ok: true });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get("/api/master/models", authenticate, requireMasterRead, async (req, res) => {
+    try {
+      const result = await pool.query("select * from master_models order by code");
+      res.json(result.rows);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/master/models", authenticate, requireManageMaster, async (req, res) => {
+    try {
+      const { code, name } = req.body || {};
+      if (!code || !name) {
+        res.status(400).json({ error: "code dan name wajib diisi" });
+        return;
+      }
+      const normalizedCode = String(code).trim();
+      const payloadName = String(name).trim();
+      const result = await pool.query(
+        "insert into master_models (code, name) values ($1, $2) returning *",
+        [normalizedCode, payloadName],
+      );
+      res.json(result.rows[0]);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.put("/api/master/models/:code", authenticate, requireManageMaster, async (req, res) => {
+    try {
+      const code = req.params.code;
+      const { name } = req.body || {};
+      if (!code || !name) {
+        res.status(400).json({ error: "code dan name wajib diisi" });
+        return;
+      }
+      const result = await pool.query(
+        "update master_models set name = $1 where code = $2 returning *",
+        [name, code],
+      );
+      if (result.rows.length === 0) {
+        res.status(404).json({ error: "model tidak ditemukan" });
+        return;
+      }
+      res.json(result.rows[0]);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.delete("/api/master/models/:code", authenticate, requireManageMaster, async (req, res) => {
+    try {
+      const result = await pool.query("delete from master_models where code = $1 returning *", [req.params.code]);
+      if (result.rows.length === 0) {
+        res.status(404).json({ error: "model tidak ditemukan" });
+        return;
+      }
+      res.json({ ok: true });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get("/api/master/processes", authenticate, requireMasterRead, async (req, res) => {
+    try {
+      const result = await pool.query("select * from master_processes order by code");
+      res.json(result.rows);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/master/processes", authenticate, requireManageMaster, async (req, res) => {
+    try {
+      const { code, name } = req.body || {};
+      if (!code || !name) {
+        res.status(400).json({ error: "code dan name wajib diisi" });
+        return;
+      }
+      const normalizedCode = String(code).trim();
+      const payloadName = String(name).trim();
+      const result = await pool.query(
+        "insert into master_processes (code, name) values ($1, $2) returning *",
+        [normalizedCode, payloadName],
+      );
+      res.json(result.rows[0]);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.put("/api/master/processes/:code", authenticate, requireManageMaster, async (req, res) => {
+    try {
+      const code = req.params.code;
+      const { name } = req.body || {};
+      if (!code || !name) {
+        res.status(400).json({ error: "code dan name wajib diisi" });
+        return;
+      }
+      const result = await pool.query(
+        "update master_processes set name = $1 where code = $2 returning *",
+        [name, code],
+      );
+      if (result.rows.length === 0) {
+        res.status(404).json({ error: "process tidak ditemukan" });
+        return;
+      }
+      res.json(result.rows[0]);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.delete("/api/master/processes/:code", authenticate, requireManageMaster, async (req, res) => {
+    try {
+      const result = await pool.query("delete from master_processes where code = $1 returning *", [req.params.code]);
+      if (result.rows.length === 0) {
+        res.status(404).json({ error: "process tidak ditemukan" });
+        return;
+      }
+      res.json({ ok: true });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+app.get("/api/master/config", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const result = await pool.query("select * from master_config where id = 1");
+    if (result.rows.length === 0) {
+      res.json({ id: 1, fifo_method: {}, document_numbering: {}, qc_status: [], hold_location: null, working_days: {}, kanban_id_format: null, request_id_format: null });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/master/config", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const { fifoMethod, documentNumbering, qcStatus, holdLocation, workingDays, kanbanIdFormat, requestIdFormat } = req.body || {};
+    if (!fifoMethod || typeof fifoMethod !== "object") {
+      res.status(400).json({ error: "fifoMethod wajib diisi" });
+      return;
+    }
+    if (!documentNumbering || typeof documentNumbering !== "object") {
+      res.status(400).json({ error: "documentNumbering wajib diisi" });
+      return;
+    }
+    const result = await pool.query(
+      `
+      insert into master_config (id, fifo_method, document_numbering, qc_status, hold_location, working_days, kanban_id_format, request_id_format)
+      values (1, $1, $2, $3, $4, $5, $6, $7)
+      on conflict (id)
+      do update set
+        fifo_method = excluded.fifo_method,
+        document_numbering = excluded.document_numbering,
+        qc_status = excluded.qc_status,
+        hold_location = excluded.hold_location,
+        working_days = excluded.working_days,
+        kanban_id_format = excluded.kanban_id_format,
+        request_id_format = excluded.request_id_format
+      returning *
+      `,
+      [fifoMethod, documentNumbering, Array.isArray(qcStatus) ? qcStatus : [], holdLocation || null, workingDays || {}, kanbanIdFormat || null, requestIdFormat || null],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/settings/ai", authenticate, requireRole("admin"), async (req, res) => {
+  try {
+    const value = await getSettingValue(pool, SETTINGS_KEYS.GEMINI_API_KEY);
+    const modelValue = await ensureGeminiModel(pool);
+    res.json({ geminiApiKey: value || "", geminiModel: modelValue || "" });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal memuat pengaturan AI." });
+  }
+});
+
+app.put("/api/settings/ai", authenticate, requireRole("admin"), async (req, res) => {
+  try {
+    const { geminiApiKey, geminiModel } = req.body || {};
+    let savedKey = null;
+    let savedModel = null;
+    if (geminiApiKey !== undefined) {
+      savedKey = await setSettingValue(pool, SETTINGS_KEYS.GEMINI_API_KEY, geminiApiKey);
+    } else {
+      savedKey = await getSettingValue(pool, SETTINGS_KEYS.GEMINI_API_KEY);
+    }
+    if (geminiModel !== undefined) {
+      savedModel = await setSettingValue(pool, SETTINGS_KEYS.GEMINI_MODEL, geminiModel);
+    } else {
+      savedModel = await ensureGeminiModel(pool);
+    }
+    res.json({ geminiApiKey: savedKey || "", geminiModel: savedModel || "" });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal menyimpan pengaturan AI." });
+  }
+});
+
+app.get("/api/settings/ai/status", authenticate, requirePermission("useAI"), async (req, res) => {
+  try {
+    const value = await getSettingValue(pool, SETTINGS_KEYS.GEMINI_API_KEY);
+    res.json({ configured: Boolean(String(value || "").trim()) });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal memuat status AI." });
+  }
+});
+
+app.get("/api/settings/ai/models", authenticate, requireRole("admin"), async (req, res) => {
+  try {
+    const apiKey = await getSettingValue(pool, SETTINGS_KEYS.GEMINI_API_KEY);
+    if (!String(apiKey || "").trim()) {
+      res.status(400).json({ error: "GEMINI API Key belum dikonfigurasi." });
+      return;
+    }
+    const aiResponse = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`,
+    );
+    const text = await aiResponse.text();
+    let data = null;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+    if (!aiResponse.ok) {
+      const message = data?.error?.message || text || `Model list failed (${aiResponse.status})`;
+      res.status(aiResponse.status).json({ error: message });
+      return;
+    }
+    const models = Array.isArray(data?.models) ? data.models : [];
+    const filtered = models
+      .filter((model) => Array.isArray(model.supportedGenerationMethods)
+        && model.supportedGenerationMethods.includes("generateContent"))
+      .map((model) => {
+        const rawName = String(model.name || "");
+        const cleanedName = rawName.replace(/^models\//, "");
+        return {
+          name: cleanedName,
+          displayName: model.displayName || cleanedName,
+          description: model.description || "",
+          inputTokenLimit: model.inputTokenLimit || null,
+          outputTokenLimit: model.outputTokenLimit || null,
+        };
+      });
+    res.json({ models: filtered });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal memuat daftar model AI." });
+  }
+});
+
+app.post("/api/ai/analyze", authenticate, requirePermission("useAI"), async (req, res) => {
+  try {
+    const { pageKey, title, filters, columns, rows } = req.body || {};
+    const key = String(pageKey || "").trim();
+    if (!key) {
+      res.status(400).json({ error: "pageKey wajib diisi." });
+      return;
+    }
+    if (!Array.isArray(rows) || rows.length === 0) {
+      res.status(400).json({ error: "rows kosong." });
+      return;
+    }
+
+    const normalizedRows = rows.map((row) => {
+      if (row && typeof row === "object" && !Array.isArray(row)) return row;
+      if (Array.isArray(row)) {
+        const columnDefs = normalizeAnalysisColumns(columns, []);
+        return columnDefs.reduce((acc, col, index) => {
+          acc[col.key] = row[index];
+          return acc;
+        }, {});
+      }
+      return {};
+    });
+
+    let analysisRows = normalizedRows;
+    let contextNote = "";
+
+    if (key === "stock_opname_variance") {
+      analysisRows = normalizedRows.map((row) => {
+        const diffRaw = row.difference ?? row.selisih ?? row.variance ?? row.diff ?? row.Diff;
+        const actualRaw = row.actualQty ?? row.totalFisik ?? row.actual ?? row.Total;
+        const bookRaw = row.bookQty ?? row.stokSistem ?? row.systemQty ?? row.System;
+        const diffNumber = Number(diffRaw);
+        const actualNumber = Number(actualRaw);
+        const bookNumber = Number(bookRaw);
+        const computedDiff = Number.isFinite(diffNumber)
+          ? diffNumber
+          : (Number.isFinite(actualNumber) && Number.isFinite(bookNumber) ? actualNumber - bookNumber : 0);
+        return {
+          ...row,
+          difference: Number.isFinite(computedDiff) ? computedDiff : 0,
+          _absVariance: Math.abs(Number.isFinite(computedDiff) ? computedDiff : 0),
+        };
+      });
+      analysisRows = analysisRows
+        .filter((row) => Number(row._absVariance || 0) !== 0)
+        .sort((a, b) => Number(b._absVariance || 0) - Number(a._absVariance || 0))
+        .slice(0, AI_ANALYSIS_ROW_LIMIT);
+      contextNote = `Data merupakan top ${analysisRows.length} item berdasarkan selisih terbesar.`;
+    }
+
+    if (!analysisRows.length) {
+      res.json({
+        anomalies: [],
+        insights: ["Tidak ada selisih pada data yang dianalisis."],
+        actions: [],
+      });
+      return;
+    }
+
+    const columnDefs = normalizeAnalysisColumns(columns, analysisRows);
+    let csvPayload = rowsToCsv(columnDefs, analysisRows);
+    if (csvPayload.length > AI_ANALYSIS_CHAR_LIMIT && analysisRows.length > 1) {
+      const reducedRows = analysisRows.slice(0, Math.max(10, Math.floor(analysisRows.length * 0.6)));
+      csvPayload = rowsToCsv(columnDefs, reducedRows);
+      contextNote = `${contextNote} Data dipotong menjadi ${reducedRows.length} baris karena ukuran terlalu besar.`;
+    }
+
+    const apiKey = await getSettingValue(pool, SETTINGS_KEYS.GEMINI_API_KEY);
+    if (!String(apiKey || "").trim()) {
+      res.status(400).json({ error: "GEMINI API Key belum dikonfigurasi." });
+      return;
+    }
+
+    const modelName = await ensureGeminiModel(pool);
+    const systemPrompt = {
+      stock_opname_variance: [
+        "Anda adalah analis stock opname gudang.",
+        "Fokus pada selisih (variance) dan anomali.",
+        "Keluarkan output JSON murni dengan struktur:",
+        '{"anomalies":["..."],"insights":["..."],"actions":["..."]}',
+        "Setiap item berupa bullet ringkas (1 kalimat), bahasa Indonesia, tanpa paragraf panjang.",
+      ].join(" "),
+    }[key] || "Berikan analisis data dalam JSON murni.";
+
+    const userPrompt = [
+      title ? `Judul: ${title}` : "",
+      filters ? `Filter: ${JSON.stringify(filters)}` : "",
+      contextNote ? `Catatan: ${contextNote}` : "",
+      "Berikut data dalam format CSV:",
+      csvPayload,
+      "Keluarkan JSON murni sesuai format yang diminta.",
+    ].filter(Boolean).join("\n\n");
+
+    const payload = {
+      contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+      generationConfig: { responseMimeType: "application/json" },
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+    };
+
+    const aiResponse = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) },
+    );
+    const text = await aiResponse.text();
+    let data = null;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+    if (!aiResponse.ok) {
+      const message = data?.error?.message || text || `AI request failed (${aiResponse.status})`;
+      res.status(aiResponse.status).json({ error: message });
+      return;
+    }
+    const contentText = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    let parsed = null;
+    try {
+      parsed = JSON.parse(contentText);
+    } catch {
+      parsed = null;
+    }
+    if (!parsed) {
+      res.status(500).json({ error: "AI tidak mengembalikan JSON yang valid." });
+      return;
+    }
+    res.json({
+      anomalies: Array.isArray(parsed.anomalies) ? parsed.anomalies : [],
+      insights: Array.isArray(parsed.insights) ? parsed.insights : [],
+      actions: Array.isArray(parsed.actions) ? parsed.actions : [],
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal melakukan analisis AI." });
+  }
+});
+
+app.post("/api/ai/generate", authenticate, requirePermission("useAI"), async (req, res) => {
+    try {
+      const { contents, responseMimeType, model } = req.body || {};
+      if (!Array.isArray(contents) || contents.length === 0) {
+        res.status(400).json({ error: "Konten AI kosong." });
+        return;
+      }
+      const apiKey = await getSettingValue(pool, SETTINGS_KEYS.GEMINI_API_KEY);
+      if (!String(apiKey || "").trim()) {
+        res.status(400).json({ error: "GEMINI API Key belum dikonfigurasi." });
+        return;
+      }
+      const storedModel = await ensureGeminiModel(pool);
+      const modelName = String(model || storedModel || "gemini-2.5-flash").trim();
+      const payload = {
+        contents,
+        ...(responseMimeType ? { generationConfig: { responseMimeType } } : {}),
+      };
+    const aiResponse = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) },
+    );
+    const text = await aiResponse.text();
+    let data = null;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+    if (!aiResponse.ok) {
+      const message = data?.error?.message || text || `AI request failed (${aiResponse.status})`;
+      res.status(aiResponse.status).json({ error: message });
+      return;
+    }
+    if (!data) {
+      res.status(502).json({ error: "Respons AI tidak valid." });
+      return;
+    }
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal memanggil AI." });
+  }
+});
+
+app.put("/api/dn/:id/status", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const { status } = req.body || {};
+    const allowed = new Set(["draft", "open", "sent", "in_transit", "closed", "cancelled"]);
+    if (!status || !allowed.has(status)) {
+      res.status(400).json({ error: "status tidak valid" });
+      return;
+    }
+    const result = await pool.query(
+      "update delivery_notes set status = $1 where id = $2 returning *",
+      [status, id],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "DN tidak ditemukan" });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/dn/:id", authenticate, requirePermission("deleteRecords"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const dnResult = await client.query(
+      "select * from delivery_notes where id = $1 for update",
+      [id],
+    );
+    if (dnResult.rows.length === 0) {
+      res.status(404).json({ error: "DN tidak ditemukan" });
+      await client.query("rollback");
+      return;
+    }
+    const dn = dnResult.rows[0];
+    if (dn.status !== "draft") {
+      res.status(409).json({ error: "DN sudah diproses dan tidak bisa dihapus." });
+      await client.query("rollback");
+      return;
+    }
+    const requestRows = await client.query(
+      "select id from kanban_requests where dn_id = $1",
+      [id],
+    );
+    await client.query(
+      "update kanban_requests set dn_id = null, status = 'approved', updated_at = now() where dn_id = $1",
+      [id],
+    );
+    await syncKanbanRequestHealthByIds(client, requestRows.rows.map((row) => row.id), { syncPrlDrafts: true });
+    await client.query("delete from delivery_notes where id = $1", [id]);
+    for (const row of requestRows.rows) {
+      await createKanbanEvent(client, row.id, "dn_deleted", req.user?.id || null, { dnId: id });
+    }
+    await client.query("commit");
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/dn/:id/create-schedule", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const dnId = Number(req.params.id);
+    if (!Number.isFinite(dnId)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const { poNumber, requestDate, deliveryTime, requestQty, requestId } = req.body || {};
+    await client.query("begin");
+    const dnResult = await client.query(
+      "select * from delivery_notes where id = $1 for update",
+      [dnId],
+    );
+    if (dnResult.rows.length === 0) {
+      res.status(404).json({ error: "DN tidak ditemukan" });
+      await client.query("rollback");
+      return;
+    }
+    const dn = dnResult.rows[0];
+    let requestRow = null;
+    if (Number.isFinite(Number(requestId))) {
+      const requestResult = await client.query(
+        `
+        select kr.* from kanban_requests kr
+        where kr.id = $1 and kr.dn_id = $2
+        for update
+        `,
+        [Number(requestId), dnId],
+      );
+      if (requestResult.rows.length === 0) {
+        res.status(404).json({ error: "request tidak ditemukan untuk DN ini" });
+        await client.query("rollback");
+        return;
+      }
+      requestRow = requestResult.rows[0];
+      if (requestRow.schedule_id) {
+        res.status(409).json({ error: "schedule sudah dibuat untuk request ini" });
+        await client.query("rollback");
+        return;
+      }
+    } else {
+      const requestResult = await client.query(
+        "select * from kanban_requests where id = $1 for update",
+        [dn.request_id],
+      );
+      if (requestResult.rows.length === 0) {
+        res.status(404).json({ error: "request tidak ditemukan" });
+        await client.query("rollback");
+        return;
+      }
+      requestRow = requestResult.rows[0];
+      if (requestRow.schedule_id) {
+        res.status(409).json({ error: "schedule sudah dibuat untuk DN ini" });
+        await client.query("rollback");
+        return;
+      }
+    }
+    const poNumberValue = normalizePoNumber(poNumber);
+    if (!poNumberValue) {
+      res.status(400).json({ error: "Nomor PO wajib diisi." });
+      await client.query("rollback");
+      return;
+    }
+    const poHeader = await resolvePoHeader(client, poNumberValue);
+    if (!poHeader) {
+      res.status(404).json({ error: "PO tidak ditemukan." });
+      await client.query("rollback");
+      return;
+    }
+    const poLine = await resolvePoLineForPayload(client, {
+      poNumber: poNumberValue,
+      item: requestRow.item_code,
+    });
+    const { remaining } = await resolvePoLineScheduleRemaining(client, poLine);
+    const rawQty = Number.isFinite(Number(requestQty)) ? Number(requestQty) : Number(requestRow.request_qty);
+    const packQty = await resolveItemPackQty(client, requestRow.item_code);
+    const normalizedQty = normalizeQtyByPack(rawQty, packQty);
+    if (normalizedQty > remaining) {
+      res.status(409).json({
+        error: buildScheduleQtyConflictMessage({
+          poNumber: poNumberValue,
+          itemCode: requestRow.item_code,
+          requestQty: normalizedQty,
+          remaining,
+          requestDate: requestDate || dn.planned_date,
+        }),
+      });
+      await client.query("rollback");
+      return;
+    }
+    const supplierValue = poHeader.supplier_id || dn.supplier;
+    const scheduleResult = await client.query(
+      `
+      insert into schedules
+        (po_number, supplier, supplier_id, item, item_code, request_date, delivery_time, request_qty, status, dn_id, request_id, po_line_id)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      returning *
+      `,
+      [
+        poNumberValue,
+        supplierValue,
+        supplierValue,
+        requestRow.item_code,
+        requestRow.item_code,
+        requestDate || dn.planned_date,
+        deliveryTime || null,
+        normalizedQty,
+        "Planned",
+        dn.id,
+        requestRow.id,
+        poLine.id,
+      ],
+    );
+    const schedule = scheduleResult.rows[0];
+    await createInboundCardsForSchedule(client, schedule);
+    await client.query(
+      "update kanban_requests set status = 'scheduled', schedule_id = $1, updated_at = now() where id = $2",
+      [schedule.id, requestRow.id],
+    );
+    await syncKanbanRequestHealthByIds(client, [requestRow.id], { syncPrlDrafts: true });
+    await createKanbanEvent(client, requestRow.id, "scheduled", req.user?.id || null, { scheduleId: schedule.id });
+    await client.query("commit");
+    clearScheduleCache();
+    res.json(mapRowToSchedule(schedule));
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/schedules/:id/receive", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const { rnNumber, receivedQty, qcStatus, notes, arrivalDate, doNumber, docQty, productionDate, expiredDate } = req.body || {};
+    let qtyValue = Number(receivedQty);
+    if (!Number.isFinite(qtyValue) || qtyValue <= 0 || !qcStatus) {
+      res.status(400).json({ error: "receivedQty, qcStatus wajib diisi" });
+      return;
+    }
+    const parsedDocQty = Number(docQty);
+    let docQtyValue = Number.isFinite(parsedDocQty) && parsedDocQty > 0 ? parsedDocQty : qtyValue;
+    const allowOverReceive = Boolean(req.body?.allowOverReceive) && req.user?.role === "admin";
+    const qcStatusList = await getQcStatusList(client);
+    const allowedQc = qcStatusList.length > 0 ? qcStatusList : ["ok", "hold", "reject"];
+    const normalizedQc = String(qcStatus).toLowerCase();
+    const normalizedDoNumber = normalizeDoNumber(doNumber);
+    if (!normalizedDoNumber) {
+      res.status(400).json({ error: "doNumber wajib diisi" });
+      return;
+    }
+    if (!allowedQc.includes(normalizedQc)) {
+      res.status(400).json({ error: "qcStatus tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const scheduleResult = await client.query(
+      "select * from schedules where id = $1 for update",
+      [id],
+    );
+    if (scheduleResult.rows.length === 0) {
+      res.status(404).json({ error: "schedule tidak ditemukan" });
+      await client.query("rollback");
+      return;
+    }
+    const schedule = scheduleResult.rows[0];
+    if (arrivalDate) {
+      await assertArrivalDateAllowed(client, arrivalDate, req.user);
+    }
+    const scheduleSupplier = String(schedule.supplier || "").trim();
+    if (!scheduleSupplier) {
+      res.status(409).json({ error: "supplier schedule tidak valid" });
+      await client.query("rollback");
+      return;
+    }
+    let header = await findActiveReceiptHeaderBySupplierDoNumber(client, {
+      supplier: scheduleSupplier,
+      doNumber: normalizedDoNumber,
+      forUpdate: true,
+    });
+    if (header) {
+      const existingScheduleLineResult = await client.query(
+        `
+        select id, line_no, line_status
+        from receive_note_items
+        where rn_id = $1 and schedule_id = $2
+        order by id asc
+        limit 1
+        `,
+        [header.id, schedule.id],
+      );
+      if (existingScheduleLineResult.rows.length > 0) {
+        await client.query("rollback");
+        res.status(409).json({ error: "Nomor surat jalan ini sudah pernah diinput untuk schedule tersebut." });
+        return;
+      }
+      if (normalizeReceiptStatus(header.status) === "posted") {
+        await client.query(
+          `
+          update receive_note_headers
+          set status = 'draft',
+              posting_error = null,
+              validated_at = null,
+              validated_by = null
+          where id = $1
+          `,
+          [header.id],
+        );
+        header = await getReceiptHeaderById(client, header.id, { forUpdate: true });
+      }
+    } else {
+      header = await createReceiptDraft(client, {
+        supplier: scheduleSupplier,
+        doNumber: normalizedDoNumber,
+        documentDate: arrivalDate || null,
+        poNumber: schedule.po_number || null,
+        remarks: notes || null,
+        source: "LEGACY_SCHEDULE",
+      }, req.user);
+    }
+    const nextLineNoResult = await client.query(
+      "select coalesce(max(line_no), 0) + 1 as next_line_no from receive_note_items where rn_id = $1",
+      [header.id],
+    );
+    const nextLineNo = Number(nextLineNoResult.rows[0]?.next_line_no || 1);
+    const line = await upsertReceiptDraftLine(client, header.id, {
+      lineNo: nextLineNo,
+      originDnId: schedule.dn_id || null,
+      scheduleId: schedule.id,
+      poLineId: schedule.po_line_id || null,
+      itemCode: schedule.item_code || schedule.item || null,
+      itemName: schedule.item_name || null,
+      partNo: schedule.part_no || null,
+      unit: schedule.unit || null,
+      packQty: schedule.pack_qty || null,
+      docQty: docQtyValue,
+      receivedQty: qtyValue,
+      qcStatus: normalizedQc,
+      arrivalDate: arrivalDate || null,
+      productionDate: productionDate || null,
+      expiredDate: expiredDate || null,
+      notes: notes || null,
+      matchBasis: "schedule",
+    }, req.user);
+    const postResult = await postReceiptDraft(client, header.id, req.user, {
+      allowOverReceive,
+      allowPartial: false,
+    });
+    const refreshedHeader = await getReceiptHeaderById(client, header.id);
+    const updatedScheduleResult = await client.query(
+      "select * from schedules where id = $1",
+      [schedule.id],
+    );
+    const postedLine = await getReceiptLineByHeaderLineNo(client, header.id, nextLineNo);
+    await client.query("commit");
+    clearScheduleCache();
+    await autoTriggerKanbanRequests(pool, { note: "auto-trigger (schedule receive via draft)" });
+    res.json({
+      schedule: mapRowToSchedule(updatedScheduleResult.rows[0]),
+      receiveNote: {
+        id: postedLine?.id || line.id,
+        rn_number: refreshedHeader?.rn_number || header.rn_number || rnNumber || null,
+        dn_id: postedLine?.origin_dn_id ?? schedule.dn_id ?? null,
+        schedule_id: schedule.id,
+        item_code: postedLine?.item_code || schedule.item_code || schedule.item || null,
+        received_qty: Number(postedLine?.received_qty || qtyValue),
+        doc_qty: Number(postedLine?.doc_qty || docQtyValue),
+        qc_status: postedLine?.qc_status || normalizedQc,
+        status: "open",
+        notes: postedLine?.notes || notes || null,
+        received_at: refreshedHeader?.posted_at || refreshedHeader?.created_at || null,
+        received_by: req.user?.id || null,
+        source: refreshedHeader?.source || "LEGACY_SCHEDULE",
+        po_line_id: postedLine?.po_line_id || schedule.po_line_id || null,
+        rn_header_id: refreshedHeader?.id || header.id,
+        line_no: postedLine?.line_no || nextLineNo,
+        do_number: refreshedHeader?.do_number || normalizedDoNumber,
+        arrival_date: postedLine?.arrival_date || arrivalDate || null,
+        production_date: postedLine?.production_date || productionDate || null,
+        expired_date: postedLine?.expired_date || expiredDate || null,
+      },
+      receiptHeaderId: refreshedHeader?.id || header.id,
+      postResult,
+    });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({
+      error: error.message,
+      validation: error.validation || null,
+      receiptHeader: error.receiptHeader || null,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/items", authenticate, requireNotSupplier, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      with stock_main as (
+        select item_code, sum(qty_in - qty_out)::numeric as stock_qty
+        from stock_batches
+        group by item_code
+      ),
+      stock_subcon as (
+        select item_code, sum(case when direction = 'in' then qty else -qty end)::numeric as stock_qty
+        from subcon_stock_movements
+        group by item_code
+      ),
+      stock as (
+        select
+          coalesce(m.item_code, s.item_code) as item_code,
+          (coalesce(m.stock_qty, 0) + coalesce(s.stock_qty, 0))::numeric as stock_qty
+        from stock_main m
+        full join stock_subcon s on s.item_code = m.item_code
+      )
+      select
+        i.code,
+        i.name,
+        i.part_no,
+        i.type,
+        i.unit,
+        i.model,
+        i.weight,
+        i.cycle,
+        i.safety_stock,
+        i.pack_qty,
+        i.supplier_name,
+        i.location_name,
+        i.packing_name,
+        i.line_production,
+        i.lead_time_days,
+        i.cycle_time_seconds,
+        i.process_flow,
+        i.created_at,
+        coalesce(s.stock_qty, 0) as stock_qty
+      from items i
+      left join stock s on s.item_code = i.code
+      where i.code not ilike 'TEST-%'
+      order by i.code asc
+      `,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/stock-card", authenticate, requireNotSupplier, async (req, res) => {
+  try {
+    const itemCode = String(req.query.itemCode || "").trim();
+    if (!itemCode) {
+      res.status(400).json({ error: "itemCode wajib diisi" });
+      return;
+    }
+    const headerResult = await pool.query(
+      `
+      select
+        i.code,
+        i.name,
+        i.part_no,
+        i.unit,
+        coalesce(k.min_qty, 0) as min_qty,
+        coalesce(k.max_qty, 0) as max_qty
+      from items i
+      left join kanban_settings k on k.item_code = i.code
+      where i.code = $1
+      `,
+      [itemCode],
+    );
+    if (headerResult.rows.length === 0) {
+      res.status(404).json({ error: "Item tidak ditemukan" });
+      return;
+    }
+    const start = typeof req.query.start === "string" ? req.query.start.trim() : "";
+    const end = typeof req.query.end === "string" ? req.query.end.trim() : "";
+    const filters = [];
+    const values = [itemCode];
+    if (start) {
+      values.push(start);
+      filters.push(`l.date::date >= $${values.length}`);
+    }
+    if (end) {
+      values.push(end);
+      filters.push(`l.date::date <= $${values.length}`);
+    }
+    const whereClause = filters.length ? `and ${filters.join(" and ")}` : "";
+    const rowsResult = await pool.query(
+      `
+      select
+        l.id,
+        l.date,
+        l.reference_doc,
+        l.transaction_type,
+        l.qty_in,
+        l.qty_out,
+        l.balance,
+        l.remarks,
+        u.username
+      from inventory_ledgers l
+      left join users u on u.id = l.user_id
+      where l.item_id = $1
+      ${whereClause}
+      order by l.date asc, l.id asc
+      `,
+      values,
+    );
+    res.json({ header: headerResult.rows[0], rows: rowsResult.rows || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/stock-card/lot", authenticate, requireNotSupplier, async (req, res) => {
+  try {
+    const batchId = Number(req.query.batchId);
+    if (!Number.isFinite(batchId)) {
+      res.status(400).json({ error: "batchId wajib diisi" });
+      return;
+    }
+    const headerResult = await pool.query(
+      `
+      select
+        b.id,
+        b.batch_no,
+        b.item_code,
+        i.name as item_name,
+        i.unit,
+        b.arrival_date,
+        b.do_number,
+        b.production_date,
+        b.expired_date,
+        b.qty_in,
+        b.qty_out,
+        (b.qty_in - b.qty_out)::numeric as balance
+      from stock_batches b
+      join items i on i.code = b.item_code
+      where b.id = $1
+      `,
+      [batchId],
+    );
+    if (headerResult.rows.length === 0) {
+      res.status(404).json({ error: "Batch tidak ditemukan" });
+      return;
+    }
+    const start = typeof req.query.start === "string" ? req.query.start.trim() : "";
+    const end = typeof req.query.end === "string" ? req.query.end.trim() : "";
+    const filters = [];
+    const values = [batchId];
+    if (start) {
+      values.push(start);
+      filters.push(`created_at::date >= $${values.length}`);
+    }
+    if (end) {
+      values.push(end);
+      filters.push(`created_at::date <= $${values.length}`);
+    }
+    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    const rowsResult = await pool.query(
+      `
+      with base as (
+        select
+          m.id,
+          m.created_at,
+          m.qty,
+          m.direction,
+          m.reason,
+          sum(case when m.direction = 'in' then m.qty else -m.qty end)
+            over (order by m.created_at asc, m.id asc) as balance
+        from stock_movements m
+        where m.batch_id = $1
+      )
+      select
+        id,
+        created_at as date,
+        direction,
+        qty,
+        case when direction = 'in' then qty else 0 end as qty_in,
+        case when direction = 'out' then qty else 0 end as qty_out,
+        balance,
+        reason
+      from base
+      ${whereClause}
+      order by date asc, id asc
+      `,
+      values,
+    );
+    res.json({ header: headerResult.rows[0], rows: rowsResult.rows || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/items/:code", authenticate, requireNotSupplier, async (req, res) => {
+  try {
+    const code = String(req.params.code || "").trim();
+    if (!code) {
+      res.status(400).json({ error: "code wajib diisi" });
+      return;
+    }
+    const result = await pool.query(
+      `
+      with stock_main as (
+        select item_code, sum(qty_in - qty_out)::numeric as stock_qty
+        from stock_batches
+        group by item_code
+      ),
+      stock_subcon as (
+        select item_code, sum(case when direction = 'in' then qty else -qty end)::numeric as stock_qty
+        from subcon_stock_movements
+        group by item_code
+      ),
+      stock as (
+        select
+          coalesce(m.item_code, s.item_code) as item_code,
+          (coalesce(m.stock_qty, 0) + coalesce(s.stock_qty, 0))::numeric as stock_qty
+        from stock_main m
+        full join stock_subcon s on s.item_code = m.item_code
+      )
+      select
+        i.code,
+        i.name,
+        i.type,
+        i.unit,
+        i.model,
+        i.weight,
+        i.cycle,
+        i.safety_stock,
+        i.pack_qty,
+        i.supplier_name,
+        i.location_name,
+        i.packing_name,
+        i.line_production,
+        i.lead_time_days,
+        i.cycle_time_seconds,
+        i.process_flow,
+        i.created_at,
+        coalesce(s.stock_qty, 0) as stock_qty
+      from items i
+      left join stock s on s.item_code = i.code
+      where i.code = $1
+        and i.code not ilike 'TEST-%'
+      `,
+      [code],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "item tidak ditemukan" });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/items", authenticate, requireManageItems, async (req, res) => {
+  try {
+    const { code, name, partNo, type, unit, model, weight, cycle, safetyStock, packQty, orderLotSize, maxDeliveryPerRit } = req.body || {};
+    if (!code || !name || !type || !unit) {
+      res.status(400).json({ error: "code, name, type, unit wajib diisi" });
+      return;
+    }
+    const safetyValue = Number.isFinite(Number(safetyStock)) ? Number(safetyStock) : 0;
+    const packQtyValue = Number.isFinite(Number(packQty)) ? Number(packQty) : 0;
+    const orderLotValue = Number(orderLotSize);
+    const maxDeliveryValue = Number(maxDeliveryPerRit);
+    const result = await pool.query(
+      `insert into items (code, name, part_no, type, unit, model, weight, cycle, safety_stock, pack_qty, order_lot_size, max_delivery_per_rit)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       on conflict (code) do update set
+         name = excluded.name,
+         part_no = excluded.part_no,
+         type = excluded.type,
+         unit = excluded.unit,
+         model = excluded.model,
+         weight = excluded.weight,
+         cycle = excluded.cycle,
+         safety_stock = excluded.safety_stock,
+         pack_qty = excluded.pack_qty,
+         order_lot_size = excluded.order_lot_size,
+         max_delivery_per_rit = excluded.max_delivery_per_rit
+       returning *`,
+      [
+        code,
+        name,
+        partNo || null,
+        type,
+        unit,
+        model || null,
+        weight || null,
+        cycle || null,
+        safetyValue,
+        packQtyValue,
+        Number.isFinite(orderLotValue) ? Math.max(0, orderLotValue) : 0,
+        Number.isFinite(maxDeliveryValue) ? Math.max(0, maxDeliveryValue) : 0,
+      ],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/items/:code", authenticate, requireManageItems, async (req, res) => {
+  try {
+    const code = req.params.code;
+    if (!code) {
+      res.status(400).json({ error: "code wajib diisi" });
+      return;
+    }
+    const usage = await pool.query(
+      `
+      select
+        (select count(*) from stock_batches where item_code = $1) as stock_count,
+        (select count(*) from production_orders where product_code = $1) as product_count,
+        (select count(*) from production_consumption where item_code = $1) as consumption_count,
+        (select count(*) from subcon_deliveries where item_code = $1) as subcon_delivery_count,
+        (select count(*) from subcon_receipts where product_code = $1) as subcon_receipt_count,
+        (select count(*) from subcon_backflush_lines where item_code = $1) as subcon_backflush_count,
+        (select count(*) from subcon_stock_movements where item_code = $1) as subcon_movement_count,
+        (select count(*) from subcon_stock_opname where item_code = $1) as subcon_opname_count
+      `,
+      [code],
+    );
+    const row = usage.rows[0];
+    const hasUsage =
+      Number(row.stock_count) > 0 ||
+      Number(row.product_count) > 0 ||
+      Number(row.consumption_count) > 0 ||
+      Number(row.subcon_delivery_count) > 0 ||
+      Number(row.subcon_receipt_count) > 0 ||
+      Number(row.subcon_backflush_count) > 0 ||
+      Number(row.subcon_movement_count) > 0 ||
+      Number(row.subcon_opname_count) > 0;
+    if (hasUsage) {
+      res.status(400).json({ error: "Item masih dipakai di stok/produksi. Tidak bisa dihapus." });
+      return;
+    }
+    await pool.query("delete from items where code = $1", [code]);
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/bom/headers", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      select
+        h.id,
+        h.parent_code,
+        h.bom_version,
+        h.effective_date,
+        h.reference,
+        h.created_at,
+        pi.name as parent_name,
+        count(b.id) as line_count
+      from master_bom_headers h
+      join items pi on pi.code = h.parent_code
+      left join master_bom b on b.header_id = h.id
+      group by h.id, pi.name
+      order by h.created_at desc
+      `,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/bom/headers/:id", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const headerResult = await pool.query(
+      `
+      select
+        h.id,
+        h.parent_code,
+        h.bom_version,
+        h.effective_date,
+        h.reference,
+        h.created_at,
+        pi.name as parent_name
+      from master_bom_headers h
+      join items pi on pi.code = h.parent_code
+      where h.id = $1
+      `,
+      [id],
+    );
+    if (headerResult.rows.length === 0) {
+      res.status(404).json({ error: "BOM header tidak ditemukan" });
+      return;
+    }
+    const linesResult = await pool.query(
+      `
+      select
+        b.id,
+        b.header_id,
+        b.parent_code,
+        b.child_code,
+        b.quantity,
+        b.component_description,
+        ci.name as child_name,
+        ci.type as child_type,
+        ci.unit as child_unit
+      from master_bom b
+      join items ci on ci.code = b.child_code
+      where b.header_id = $1
+      order by b.id asc
+      `,
+      [id],
+    );
+    res.json({ header: headerResult.rows[0], lines: linesResult.rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/bom/headers", authenticate, requireManageMaster, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { parentCode, bomVersion = "", effectiveDate, reference = "", lines = [] } = req.body || {};
+    const parentCodeValue = String(parentCode || "").trim();
+    if (!parentCodeValue) {
+      res.status(400).json({ error: "parentCode wajib diisi" });
+      return;
+    }
+    if (!Array.isArray(lines) || lines.length === 0) {
+      res.status(400).json({ error: "lines minimal 1 komponen" });
+      return;
+    }
+    const cleanedLines = lines
+      .map((line) => ({
+        childCode: String(line?.childCode || "").trim(),
+        description: String(line?.description || "").trim(),
+      }))
+      .filter((line) => line.childCode);
+    if (cleanedLines.length === 0) {
+      res.status(400).json({ error: "lines minimal 1 komponen" });
+      return;
+    }
+    const seen = new Set();
+    for (const line of cleanedLines) {
+      if (line.childCode === parentCodeValue) {
+        res.status(400).json({ error: "Child tidak boleh sama dengan parent" });
+        return;
+      }
+      if (seen.has(line.childCode)) {
+        res.status(400).json({ error: `Komponen duplikat: ${line.childCode}` });
+        return;
+      }
+      seen.add(line.childCode);
+    }
+
+    await client.query("BEGIN");
+    const headerResult = await client.query(
+      `
+      insert into master_bom_headers (parent_code, bom_version, effective_date, reference)
+      values ($1,$2,$3,$4)
+      returning *
+      `,
+      [
+        parentCodeValue,
+        String(bomVersion || "").trim() || null,
+        effectiveDate ? String(effectiveDate).trim() : null,
+        String(reference || "").trim() || null,
+      ],
+    );
+    const header = headerResult.rows[0];
+    const childCodes = cleanedLines.map((line) => line.childCode);
+    const itemResult = await client.query(
+      `select code, name from items where code = any($1::text[])`,
+      [childCodes],
+    );
+    const itemMap = new Map(itemResult.rows.map((row) => [row.code, row.name]));
+    for (const line of cleanedLines) {
+      const description = line.description || itemMap.get(line.childCode) || "";
+      await client.query(
+        `
+        insert into master_bom (
+          header_id,
+          parent_code,
+          child_code,
+          quantity,
+          component_description
+        ) values ($1,$2,$3,$4,$5)
+        `,
+        [header.id, parentCodeValue, line.childCode, 1, description],
+      );
+    }
+    await client.query("COMMIT");
+    res.json({ header, lineCount: cleanedLines.length });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/bom", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const filters = [];
+    const values = [];
+    if (req.query.parentCode) {
+      values.push(String(req.query.parentCode).trim());
+      filters.push(`b.parent_code = $${values.length}`);
+    }
+    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    const result = await pool.query(
+      `
+      select
+        b.id,
+        b.parent_code,
+        b.child_code,
+        b.quantity,
+        b.scrap_factor,
+        b.component_type,
+        b.component_description,
+        b.model_spec,
+        b.line_production,
+        b.supplier_name,
+        b.packing,
+        b.cycle_time_seconds,
+        b.process_flow,
+        b.cost_rp,
+        b.lead_time_days,
+        b.assembly_note,
+        pi.name as parent_name,
+        pi.type as parent_type,
+        ci.name as child_name,
+        ci.type as child_type,
+        ci.unit as child_unit,
+        ci.weight as child_weight,
+        ci.model as child_model
+      from master_bom b
+      join items pi on pi.code = b.parent_code
+      join items ci on ci.code = b.child_code
+      ${whereClause}
+      order by pi.code asc, b.id asc
+      `,
+      values,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/bom/:parentCode", authenticate, requireMasterRead, async (req, res) => {
+  try {
+    const { parentCode } = req.params;
+    const result = await pool.query(
+      `select
+        b.id,
+        b.parent_code,
+        b.child_code,
+        b.quantity,
+        b.scrap_factor,
+        b.component_type,
+        b.component_description,
+        b.model_spec,
+        b.line_production,
+        b.supplier_name,
+        b.packing,
+        b.cycle_time_seconds,
+        b.process_flow,
+        b.cost_rp,
+        b.lead_time_days,
+        b.assembly_note,
+        i.name as child_name,
+        i.type as child_type,
+        i.unit as child_unit,
+        i.weight as child_weight,
+        i.model as child_model
+       from master_bom b
+       join items i on i.code = b.child_code
+       where b.parent_code = $1
+       order by b.id asc`,
+      [parentCode],
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/bom", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const {
+      parentCode,
+      childCode,
+      componentType = "",
+      componentDescription = "",
+      modelSpec = "",
+      lineProduction = "",
+      supplierName = "",
+      packing = "",
+      assemblyNote = "",
+      cycleTimeSeconds = null,
+      processFlow = [],
+      costRp = null,
+      leadTimeDays = null,
+    } = req.body || {};
+    if (!parentCode || !childCode) {
+      res.status(400).json({ error: "parentCode dan childCode wajib diisi" });
+      return;
+    }
+    if (parentCode === childCode) {
+      res.status(400).json({ error: "Parent dan child tidak boleh sama" });
+      return;
+    }
+    const quantity =
+      Number.isFinite(Number(req.body?.quantity))
+        ? Number(req.body?.quantity)
+        : Number(req.body?.ratioQty);
+    const scrapFactor = Number.isFinite(Number(req.body?.scrapFactor))
+      ? Number(req.body?.scrapFactor)
+      : 0;
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      res.status(400).json({ error: "quantity harus bernilai numerik lebih dari 0" });
+      return;
+    }
+    const cycleSeconds =
+      Number.isFinite(Number(cycleTimeSeconds)) && Number(cycleTimeSeconds) >= 0
+        ? Number(cycleTimeSeconds)
+        : null;
+    const processedFlow = Array.isArray(processFlow)
+      ? processFlow.filter((step) => String(step || "").trim())
+      : [];
+    const costValue = Number.isFinite(Number(costRp)) ? Number(costRp) : 0;
+    const leadTimeValue = Number.isFinite(Number(leadTimeDays)) ? Number(leadTimeDays) : 0;
+    const headerResult = await pool.query(
+      `
+      insert into master_bom_headers (parent_code, bom_version, reference)
+      values ($1,'Legacy','Auto from legacy BOM')
+      on conflict (parent_code, bom_version)
+      do update set parent_code = excluded.parent_code
+      returning id
+      `,
+      [parentCode],
+    );
+    const headerId = headerResult.rows[0]?.id || null;
+    const result = await pool.query(
+      `
+      insert into master_bom (
+        header_id,
+        parent_code,
+        child_code,
+        quantity,
+        scrap_factor,
+        component_type,
+        component_description,
+        model_spec,
+        line_production,
+        supplier_name,
+        packing,
+        cycle_time_seconds,
+        process_flow,
+        cost_rp,
+        lead_time_days,
+        assembly_note
+      ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+      returning *
+      `,
+      [
+        headerId,
+        parentCode,
+        childCode,
+        quantity,
+        scrapFactor,
+        componentType,
+        componentDescription,
+        modelSpec,
+        lineProduction,
+        supplierName,
+        packing,
+        cycleSeconds,
+        processedFlow,
+        costValue,
+        leadTimeValue,
+        String(assemblyNote || "").trim() || null,
+      ],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/bom/:id", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const {
+      childCode,
+      componentType = "",
+      componentDescription = "",
+      modelSpec = "",
+      lineProduction = "",
+      supplierName = "",
+      packing = "",
+      assemblyNote = "",
+      cycleTimeSeconds = null,
+      processFlow = [],
+      costRp = null,
+      leadTimeDays = null,
+    } = req.body || {};
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    if (!childCode) {
+      res.status(400).json({ error: "childCode wajib diisi" });
+      return;
+    }
+    const quantity =
+      Number.isFinite(Number(req.body?.quantity))
+        ? Number(req.body?.quantity)
+        : Number(req.body?.ratioQty);
+    const scrapFactor = Number.isFinite(Number(req.body?.scrapFactor))
+      ? Number(req.body?.scrapFactor)
+      : 0;
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      res.status(400).json({ error: "quantity harus bernilai numerik lebih dari 0" });
+      return;
+    }
+    const cycleSeconds =
+      Number.isFinite(Number(cycleTimeSeconds)) && Number(cycleTimeSeconds) >= 0
+        ? Number(cycleTimeSeconds)
+        : null;
+    const processedFlow = Array.isArray(processFlow)
+      ? processFlow.filter((step) => String(step || "").trim())
+      : [];
+    const costValue = Number.isFinite(Number(costRp)) ? Number(costRp) : 0;
+    const leadTimeValue = Number.isFinite(Number(leadTimeDays)) ? Number(leadTimeDays) : 0;
+    const result = await pool.query(
+      `
+      update master_bom set
+        child_code = $1,
+        quantity = $2,
+        scrap_factor = $3,
+        component_type = $4,
+        component_description = $5,
+        model_spec = $6,
+        line_production = $7,
+        supplier_name = $8,
+        packing = $9,
+        cycle_time_seconds = $10,
+        process_flow = $11,
+        cost_rp = $12,
+        lead_time_days = $13,
+        assembly_note = $14
+      where id = $15
+      returning *
+      `,
+      [
+        childCode,
+        quantity,
+        scrapFactor,
+        componentType,
+        componentDescription,
+        modelSpec,
+        lineProduction,
+        supplierName,
+        packing,
+        cycleSeconds,
+        processedFlow,
+        costValue,
+        leadTimeValue,
+        String(assemblyNote || "").trim() || null,
+        id,
+      ],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "BOM tidak ditemukan" });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/bom/:id", authenticate, requireManageMaster, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await pool.query("delete from master_bom where id = $1", [id]);
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/production/requirements", authenticate, requirePermission("production"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { productCode, qty, supplier } = req.query;
+    const qtyNumber = Number(qty);
+    if (!productCode || !Number.isFinite(qtyNumber) || qtyNumber <= 0) {
+      res.status(400).json({ error: "productCode dan qty wajib diisi" });
+      return;
+    }
+    const requirements = {};
+    await explodeBom(client, productCode, qtyNumber, requirements);
+    const itemCodes = Object.keys(requirements);
+    if (itemCodes.length === 0) {
+      res.status(400).json({ error: "BOM kosong untuk item ini" });
+      return;
+    }
+
+    const supplierFilter = typeof supplier === "string" ? supplier.trim() : "";
+    const stockResult = supplierFilter
+      ? await client.query(
+          `
+          select
+            i.code,
+            i.name,
+            i.unit,
+            i.type,
+            i.safety_stock,
+            coalesce(s.stock_qty, 0) as available_qty
+          from items i
+          left join (
+            select b.item_code, sum(b.qty_in - b.qty_out)::numeric as stock_qty
+            from stock_batches b
+            join schedules s on s.id = b.schedule_id
+            where s.supplier = $2
+            group by b.item_code
+          ) s on s.item_code = i.code
+          where i.code = any($1)
+          order by i.code asc
+          `,
+          [itemCodes, supplierFilter],
+        )
+      : await client.query(
+          `
+          select
+            i.code,
+            i.name,
+            i.unit,
+            i.type,
+            i.safety_stock,
+            coalesce(s.stock_qty, 0) as available_qty
+          from items i
+          left join (
+            select item_code, sum(qty_in - qty_out)::numeric as stock_qty
+            from stock_batches
+            group by item_code
+          ) s on s.item_code = i.code
+          where i.code = any($1)
+          order by i.code asc
+          `,
+          [itemCodes],
+        );
+
+    const rows = stockResult.rows.map((row) => {
+      const requiredQty = Number(requirements[row.code] || 0);
+      const availableQty = Number(row.available_qty || 0);
+      return {
+        itemCode: row.code,
+        itemName: row.name,
+        itemUnit: row.unit,
+        itemType: row.type,
+        requiredQty,
+        availableQty,
+        safetyStock: Number(row.safety_stock || 0),
+        shortage: Math.max(requiredQty - availableQty, 0),
+      };
+    });
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/production/orders", authenticate, requirePermission("production"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      select
+        po.id,
+        po.product_code,
+        po.supplier,
+        po.qty,
+        po.created_at,
+        po.production_date,
+        po.source,
+        po.created_by,
+        u.username as created_by_name,
+        i.name as product_name,
+        i.unit as product_unit
+      from production_orders po
+      join items i on i.code = po.product_code
+      left join users u on u.id = po.created_by
+      where i.code not ilike 'TEST-%'
+      order by po.created_at desc, po.id desc
+      `,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/stock/batches", authenticate, requirePermission("production"), async (req, res) => {
+  try {
+    const itemCodesParam = req.query.itemCodes;
+    const supplierParam = req.query.supplier;
+    const itemCodes = typeof itemCodesParam === "string"
+      ? itemCodesParam.split(",").map((val) => val.trim()).filter(Boolean)
+      : [];
+    if (itemCodes.length === 0) {
+      res.json([]);
+      return;
+    }
+    const supplierFilter = typeof supplierParam === "string" ? supplierParam.trim() : "";
+    const baseQuery = `
+      select
+        b.id,
+        b.item_code,
+        b.arrival_date,
+        b.do_number,
+        b.schedule_id,
+        (b.qty_in - b.qty_out)::numeric as available_qty,
+        s.supplier,
+        s.po_number
+      from stock_batches b
+      left join schedules s on s.id = b.schedule_id
+      where b.item_code = any($1)
+        and b.qty_in > b.qty_out
+    `;
+    const orderBy = " order by b.arrival_date asc nulls last, b.id asc";
+    const result = supplierFilter
+      ? await pool.query(
+          `${baseQuery} and s.supplier = $2${orderBy}`,
+          [itemCodes, supplierFilter],
+        )
+      : await pool.query(
+          `${baseQuery}${orderBy}`,
+          [itemCodes],
+        );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/stock/batches/list", authenticate, async (req, res) => {
+  try {
+    const itemCode = String(req.query.itemCode || "").trim();
+    if (!itemCode) {
+      res.status(400).json({ error: "itemCode wajib diisi" });
+      return;
+    }
+    const result = await pool.query(
+      `
+      select
+        b.id,
+        b.batch_no,
+        b.do_number,
+        b.arrival_date,
+        b.production_date,
+        b.expired_date,
+        (b.qty_in - b.qty_out)::numeric as available_qty
+      from stock_batches b
+      where b.item_code = $1
+      order by b.arrival_date asc nulls last, b.id asc
+      `,
+      [itemCode],
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/production/import", authenticate, requirePermission("production"), async (req, res) => {
+  const client = await pool.connect();
+  let batchId = null;
+  try {
+    const rowsInput = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (rowsInput.length === 0) {
+      res.status(400).json({ error: "Data produksi kosong." });
+      return;
+    }
+
+    const fileName = String(req.body?.fileName || "").trim() || null;
+    const normalizedRows = rowsInput.map((row, index) => {
+      const rawDate = row?.date ?? row?.tanggal ?? row?.Tanggal ?? row?.Date ?? row?.DATE;
+      const rawCode = row?.uniq ?? row?.Uniq ?? row?.UNIQ ?? row?.itemCode ?? row?.item_code ?? row?.code ?? row?.Code;
+      const rawQty = row?.qty ?? row?.Qty ?? row?.QTY ?? row?.quantity ?? row?.Quantity;
+      const productionDate = normalizeDateOnly(rawDate);
+      const itemCode = String(rawCode || "").trim();
+      const qtyValue = Number(rawQty);
+      return {
+        index,
+        productionDate,
+        itemCode,
+        qtyValue,
+      };
+    });
+
+    const batchResult = await client.query(
+      `
+      insert into production_import_batches (file_name, total_rows, status, created_by)
+      values ($1, $2, 'processing', $3)
+      returning *
+      `,
+      [fileName, normalizedRows.length, req.user?.id || null],
+    );
+    batchId = batchResult.rows[0]?.id || null;
+
+    const invalidDateRow = normalizedRows.find((row) => !row.productionDate);
+    if (invalidDateRow) {
+      if (batchId) {
+        await client.query(
+          "update production_import_batches set status = 'failed', error_message = $1, finished_at = now() where id = $2",
+          [`Tanggal tidak valid di baris ${invalidDateRow.index + 1}.`, batchId],
+        );
+      }
+      res.status(400).json({ error: `Tanggal tidak valid di baris ${invalidDateRow.index + 1}.` });
+      return;
+    }
+    const invalidCodeRow = normalizedRows.find((row) => !row.itemCode);
+    if (invalidCodeRow) {
+      if (batchId) {
+        await client.query(
+          "update production_import_batches set status = 'failed', error_message = $1, finished_at = now() where id = $2",
+          [`Uniq wajib diisi di baris ${invalidCodeRow.index + 1}.`, batchId],
+        );
+      }
+      res.status(400).json({ error: `Uniq wajib diisi di baris ${invalidCodeRow.index + 1}.` });
+      return;
+    }
+    const invalidQtyRow = normalizedRows.find((row) => !Number.isFinite(row.qtyValue) || row.qtyValue <= 0);
+    if (invalidQtyRow) {
+      if (batchId) {
+        await client.query(
+          "update production_import_batches set status = 'failed', error_message = $1, finished_at = now() where id = $2",
+          [`Qty wajib > 0 di baris ${invalidQtyRow.index + 1}.`, batchId],
+        );
+      }
+      res.status(400).json({ error: `Qty wajib > 0 di baris ${invalidQtyRow.index + 1}.` });
+      return;
+    }
+
+    const itemCodes = Array.from(new Set(normalizedRows.map((row) => row.itemCode)));
+    const itemResult = await client.query(
+      "select code, type from items where code = any($1)",
+      [itemCodes],
+    );
+    const typeByCode = new Map(itemResult.rows.map((row) => [row.code, row.type]));
+    const missingCodes = itemCodes.filter((code) => !typeByCode.has(code));
+    if (missingCodes.length > 0) {
+      if (batchId) {
+        await client.query(
+          "update production_import_batches set status = 'failed', error_message = $1, finished_at = now() where id = $2",
+          [`Kode item tidak ditemukan: ${missingCodes.join(", ")}`, batchId],
+        );
+      }
+      res.status(400).json({ error: `Kode item tidak ditemukan: ${missingCodes.join(", ")}` });
+      return;
+    }
+    const invalidTypes = itemCodes.filter((code) => !isAllowedProductionOutputType(typeByCode.get(code)));
+    if (invalidTypes.length > 0) {
+      if (batchId) {
+        await client.query(
+          "update production_import_batches set status = 'failed', error_message = $1, finished_at = now() where id = $2",
+          ["Hanya FG/Childpart yang bisa diinput sebagai hasil produksi", batchId],
+        );
+      }
+      res.status(400).json({ error: "Hanya FG/Childpart yang bisa diinput sebagai hasil produksi", items: invalidTypes });
+      return;
+    }
+
+    await client.query("begin");
+    const results = [];
+    const allWarnings = [];
+    for (const row of normalizedRows) {
+      const orderResult = await client.query(
+        `
+        insert into production_orders (product_code, supplier, qty, source, created_by, production_date)
+        values ($1, $2, $3, $4, $5, $6)
+        returning *
+        `,
+        [row.itemCode, null, row.qtyValue, "IMPORT", req.user?.id || null, row.productionDate],
+      );
+      const productionId = orderResult.rows[0]?.id;
+      const { requirements, warnings } = await applyProductionConsumption(
+        client,
+        row.itemCode,
+        row.qtyValue,
+        productionId,
+        "",
+        req.user?.id || null,
+      );
+      if (Array.isArray(warnings) && warnings.length > 0) {
+        allWarnings.push(...warnings);
+      }
+      results.push({
+        productionId,
+        itemCode: row.itemCode,
+        qty: row.qtyValue,
+        productionDate: row.productionDate,
+        requirements,
+      });
+    }
+    const autoCreated = await autoTriggerKanbanRequests(client, { note: "auto-trigger (production import)", userId: req.user?.id || null });
+    if (batchId) {
+      await client.query(
+        "update production_import_batches set status = 'success', success_rows = $1, finished_at = now() where id = $2",
+        [results.length, batchId],
+      );
+    }
+    await client.query("commit");
+    res.json({
+      ok: true,
+      batchId,
+      fileName,
+      totalRows: normalizedRows.length,
+      created: results.length,
+      autoTriggered: autoCreated.length,
+      warnings: allWarnings,
+      rows: results,
+    });
+  } catch (error) {
+    await client.query("rollback");
+    if (batchId) {
+      try {
+        const message = String(error?.message || "Import gagal").slice(0, 300);
+        await pool.query(
+          "update production_import_batches set status = 'failed', error_message = $1, finished_at = now() where id = $2",
+          [message, batchId],
+        );
+      } catch {
+        // ignore batch update failure
+      }
+    }
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/wip/import", authenticate, requirePermission("production"), async (req, res) => {
+  const client = await pool.connect();
+  let batchId = null;
+  let inTransaction = false;
+  try {
+    const rowsInput = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (rowsInput.length === 0) {
+      res.status(400).json({ error: "Data mutasi WIP kosong." });
+      return;
+    }
+
+    const fileName = String(req.body?.fileName || "").trim() || null;
+    const normalizedRows = rowsInput.map((row, index) => {
+      const rawDate = row?.date ?? row?.tanggal ?? row?.Tanggal ?? row?.["Tanggal Produksi"] ?? row?.TanggalProduksi ?? row?.Date ?? row?.DATE;
+      const rawCode = row?.itemCode ?? row?.item_code ?? row?.code ?? row?.Kode ?? row?.["Kode Barang"] ?? row?.Item ?? row?.["Item Code"];
+      const rawFrom = row?.fromLocation ?? row?.from ?? row?.asal ?? row?.["Lokasi Asal"] ?? row?.ProcessFrom ?? row?.["Process From"];
+      const rawTo = row?.toLocation ?? row?.to ?? row?.tujuan ?? row?.["Lokasi Tujuan"] ?? row?.ProcessTo ?? row?.["Process To"];
+      const rawGood = row?.qtyGood ?? row?.qty_good ?? row?.qty ?? row?.Qty ?? row?.QTY ?? row?.["Qty Lulus"] ?? row?.["Qty Good"];
+      const rawReject = row?.qtyReject ?? row?.qty_reject ?? row?.["Qty Reject"] ?? row?.Reject ?? row?.["Qty NG"];
+      const rawDoc = row?.documentNo ?? row?.document_no ?? row?.["No. Dokumen"] ?? row?.["No Dokumen"] ?? row?.DocumentNo ?? row?.Document;
+      const rawShift = row?.shift ?? row?.Shift ?? row?.shiftLabel ?? row?.shift_label ?? row?.["Shift"];
+      const rawOperator = row?.operatorName ?? row?.operator_name ?? row?.["PIC / Operator"] ?? row?.["PIC"] ?? row?.Operator;
+      const productionDate = normalizeDateOnly(rawDate);
+      const itemCode = String(rawCode || "").trim();
+      const fromLocation = String(rawFrom || "").trim();
+      const toLocation = String(rawTo || "").trim();
+      const qtyGood = Number(rawGood);
+      const qtyReject = rawReject === undefined || rawReject === null || rawReject === "" ? 0 : Number(rawReject);
+      const documentNo = String(rawDoc || "").trim();
+      const shiftLabel = String(rawShift || "").trim();
+      const operatorName = String(rawOperator || "").trim();
+      const rowNumberRaw = row?.rowNumber ?? row?.row ?? row?.no ?? row?.No ?? null;
+      const rowNumber = Number.isFinite(Number(rowNumberRaw)) ? Number(rowNumberRaw) : index + 2;
+      return {
+        index,
+        rowNumber,
+        productionDate,
+        itemCode,
+        fromLocation,
+        toLocation,
+        qtyGood,
+        qtyReject,
+        documentNo,
+        shiftLabel,
+        operatorName,
+      };
+    });
+
+    const batchResult = await client.query(
+      `
+      insert into wip_import_batches (file_name, total_rows, status, created_by)
+      values ($1, $2, 'processing', $3)
+      returning *
+      `,
+      [fileName, normalizedRows.length, req.user?.id || null],
+    );
+    batchId = batchResult.rows[0]?.id || null;
+
+    const itemCodes = Array.from(new Set(normalizedRows.map((row) => row.itemCode).filter(Boolean)));
+    const itemSet = new Set();
+    if (itemCodes.length > 0) {
+      const itemResult = await client.query(
+        "select code from items where code = any($1)",
+        [itemCodes],
+      );
+      itemResult.rows.forEach((row) => itemSet.add(row.code));
+    }
+
+    const buildImportError = (row, reason) => {
+      const message = `Import dibatalkan. Gagal di baris ${row.rowNumber}: ${reason}`;
+      const err = new Error(message);
+      err.status = 400;
+      err.detail = {
+        row: row.rowNumber,
+        productionDate: row.productionDate,
+        itemCode: row.itemCode,
+        fromLocation: row.fromLocation,
+        toLocation: row.toLocation,
+        qtyGood: row.qtyGood,
+        qtyReject: row.qtyReject,
+        documentNo: row.documentNo,
+        shiftLabel: row.shiftLabel,
+        operatorName: row.operatorName,
+      };
+      return err;
+    };
+
+    await client.query("begin");
+    inTransaction = true;
+    const stockMap = await buildWipStockMap(client, itemCodes);
+    let totalQty = 0;
+
+    for (const row of normalizedRows) {
+      if (!row.productionDate) throw buildImportError(row, "Tanggal tidak valid.");
+      if (!row.itemCode) throw buildImportError(row, "Kode barang kosong.");
+      if (row.itemCode && !itemSet.has(row.itemCode)) throw buildImportError(row, `Kode barang ${row.itemCode} tidak ditemukan.`);
+      if (!row.fromLocation) throw buildImportError(row, "Lokasi asal kosong.");
+      if (!row.toLocation) throw buildImportError(row, "Lokasi tujuan kosong.");
+      if (!Number.isFinite(row.qtyGood) || row.qtyGood <= 0) throw buildImportError(row, "Qty lulus tidak valid.");
+      if (!Number.isFinite(row.qtyReject) || row.qtyReject < 0) throw buildImportError(row, "Qty reject tidak valid.");
+
+      const requiredQty = Number(row.qtyGood) + Number(row.qtyReject || 0);
+      const fromKey = normalizeLocationKey(row.fromLocation);
+      const stockKey = `${row.itemCode}||${fromKey}`;
+      const available = Number(stockMap.get(stockKey) || 0);
+      if (available < requiredQty) {
+        throw buildImportError(
+          row,
+          `Stok di ${row.fromLocation} tidak cukup (Sisa: ${available}, Butuh: ${requiredQty}).`,
+        );
+      }
+      stockMap.set(stockKey, available - requiredQty);
+      const toKey = normalizeLocationKey(row.toLocation);
+      const toStockKey = `${row.itemCode}||${toKey}`;
+      const toPrev = Number(stockMap.get(toStockKey) || 0);
+      stockMap.set(toStockKey, toPrev + Number(row.qtyGood));
+      totalQty += Number(row.qtyGood || 0);
+    }
+
+    for (const row of normalizedRows) {
+      await client.query(
+        `
+        insert into wip_stock_movements
+          (production_date, item_code, from_location, to_location, qty_good, qty_reject, document_no, shift_label, operator_name, import_batch_id, created_by)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        `,
+        [
+          row.productionDate,
+          row.itemCode,
+          row.fromLocation,
+          row.toLocation,
+          row.qtyGood,
+          row.qtyReject || 0,
+          row.documentNo || null,
+          row.shiftLabel || null,
+          row.operatorName || null,
+          batchId,
+          req.user?.id || null,
+        ],
+      );
+    }
+
+    await client.query("commit");
+    inTransaction = false;
+    if (batchId) {
+      await client.query(
+        "update wip_import_batches set status = 'success', success_rows = $1, total_qty = $2, finished_at = now() where id = $3",
+        [normalizedRows.length, totalQty, batchId],
+      );
+    }
+
+    res.json({
+      ok: true,
+      batchId,
+      fileName,
+      totalRows: normalizedRows.length,
+      successRows: normalizedRows.length,
+      failedRows: 0,
+      totalQty,
+    });
+  } catch (error) {
+    if (inTransaction) {
+      await client.query("rollback");
+      inTransaction = false;
+    }
+    if (batchId) {
+      const message = String(error?.message || "Import gagal").slice(0, 300);
+      try {
+        await client.query(
+          "update wip_import_batches set status = 'failed', error_message = $1, finished_at = now() where id = $2",
+          [message, batchId],
+        );
+      } catch {
+        // ignore batch update failure
+      }
+    }
+    const status = error?.status && Number.isFinite(Number(error.status)) ? Number(error.status) : 500;
+    res.status(status).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/production/imports", authenticate, requirePermission("production"), async (req, res) => {
+  try {
+    const { start, end, limit } = req.query;
+    const filters = ["1=1"];
+    const values = [];
+    if (start) { values.push(start); filters.push(`b.created_at::date >= $${values.length}`); }
+    if (end) { values.push(end); filters.push(`b.created_at::date <= $${values.length}`); }
+    const limitValue = Number(limit);
+    const resolvedLimit = Number.isFinite(limitValue) && limitValue > 0 ? Math.min(limitValue, 500) : 200;
+    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    const result = await pool.query(
+      `
+      select
+        b.id,
+        b.file_name,
+        b.total_rows,
+        b.success_rows,
+        b.status,
+        b.error_message,
+        b.created_at,
+        b.finished_at,
+        b.created_by,
+        u.username as created_by_name
+      from production_import_batches b
+      left join users u on u.id = b.created_by
+      ${whereClause}
+      order by b.created_at desc, b.id desc
+      limit ${resolvedLimit}
+      `,
+      values,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/wip/imports", authenticate, requirePermission("production"), async (req, res) => {
+  try {
+    const { limit } = req.query;
+    const limitValue = Number(limit);
+    const resolvedLimit = Number.isFinite(limitValue) && limitValue > 0 ? Math.min(limitValue, 300) : 100;
+    const result = await pool.query(
+      `
+      select
+        b.id,
+        b.file_name,
+        b.total_rows,
+        b.success_rows,
+        b.total_qty,
+        b.status,
+        b.error_message,
+        b.created_at,
+        b.finished_at,
+        b.created_by,
+        u.username as created_by_name
+      from wip_import_batches b
+      left join users u on u.id = b.created_by
+      order by b.created_at desc, b.id desc
+      limit ${resolvedLimit}
+      `,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/production/compare", authenticate, requirePermission("production"), async (req, res) => {
+  try {
+    const { start, end, code } = req.query;
+    const filters = [];
+    const values = [];
+    if (start) { values.push(start); filters.push(`prod_date >= $${values.length}`); }
+    if (end) { values.push(end); filters.push(`prod_date <= $${values.length}`); }
+    if (code) {
+      values.push(`%${String(code).trim()}%`);
+      filters.push(`(i.code ilike $${values.length} or i.part_no ilike $${values.length})`);
+    }
+    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    const result = await pool.query(
+      `
+      with prod_out as (
+        select
+          po.product_code as item_code,
+          coalesce(po.production_date, po.created_at::date) as prod_date,
+          sum(po.qty)::numeric as production_qty
+        from production_orders po
+        where po.source = 'IMPORT'
+        group by po.product_code, coalesce(po.production_date, po.created_at::date)
+      ),
+      kanban_out as (
+        select
+          item_code,
+          created_at::date as prod_date,
+          sum(qty)::numeric as kanban_qty
+        from stock_movements
+        where direction = 'out'
+          and reason = 'kanban_empty'
+        group by item_code, created_at::date
+      )
+      select
+        p.prod_date as production_date,
+        i.code as item_code,
+        i.part_no,
+        i.name as item_name,
+        coalesce(p.production_qty, 0) as production_qty,
+        coalesce(k.kanban_qty, 0) as kanban_qty,
+        (coalesce(p.production_qty, 0) - coalesce(k.kanban_qty, 0))::numeric as diff_qty
+      from prod_out p
+      join items i on i.code = p.item_code
+      left join kanban_out k on k.item_code = p.item_code and k.prod_date = p.prod_date
+      ${whereClause}
+      order by p.prod_date desc, i.code asc
+      `,
+      values,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/production/consume", authenticate, requirePermission("production"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { productCode, qty, supplier, productionDate, source } = req.body || {};
+    const qtyNumber = Number(qty);
+    if (!productCode || !Number.isFinite(qtyNumber) || qtyNumber <= 0) {
+      res.status(400).json({ error: "productCode dan qty wajib diisi" });
+      return;
+    }
+    const productionDateValue = productionDate ? normalizeDateOnly(productionDate) : null;
+    if (productionDate && !productionDateValue) {
+      res.status(400).json({ error: "productionDate tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const orderResult = await client.query(
+      `
+      insert into production_orders (product_code, supplier, qty, source, created_by, production_date)
+      values ($1, $2, $3, $4, $5, $6)
+      returning *
+      `,
+      [productCode, supplier || null, qtyNumber, source || "MANUAL", req.user?.id || null, productionDateValue],
+    );
+    const orderId = orderResult.rows[0].id;
+    const { requirements, warnings } = await applyProductionConsumption(
+      client,
+      productCode,
+      qtyNumber,
+      orderId,
+      supplier || "",
+      req.user?.id || null,
+    );
+
+    const autoCreated = await autoTriggerKanbanRequests(client, { note: "auto-trigger (production)", userId: req.user?.id || null });
+    await client.query("commit");
+    res.json({ ok: true, productionId: orderId, requirements, warnings, autoTriggered: autoCreated.length });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/api/production/orders/:id", authenticate, requirePermission("production"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    const qtyNumber = Number(req.body?.qty);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    if (!Number.isFinite(qtyNumber) || qtyNumber <= 0) {
+      res.status(400).json({ error: "qty wajib diisi" });
+      return;
+    }
+    await client.query("begin");
+    const orderResult = await client.query("select * from production_orders where id = $1 for update", [id]);
+    if (orderResult.rows.length === 0) {
+      res.status(404).json({ error: "Produksi tidak ditemukan" });
+      await client.query("rollback");
+      return;
+    }
+    const order = orderResult.rows[0];
+    const reversedItems = await rollbackProduction(client, id);
+    const userLabel = getUserLabel(req.user);
+    for (const row of reversedItems) {
+      if (!row.itemCode || !row.qty) continue;
+      await insertInventoryLedger(client, {
+        itemCode: row.itemCode,
+        transactionType: "REVERSAL",
+        referenceDoc: `PROD-${id}`,
+        qtyIn: Number(row.qty || 0),
+        qtyOut: 0,
+        userId: req.user?.id || null,
+        remarks: `Reversal of PROD-${id} by ${userLabel}`,
+      });
+    }
+    await client.query("update production_orders set qty = $1 where id = $2", [qtyNumber, id]);
+    const { requirements, warnings } = await applyProductionConsumption(
+      client,
+      order.product_code,
+      qtyNumber,
+      id,
+      order.supplier || "",
+      req.user?.id || null,
+    );
+    const autoCreated = await autoTriggerKanbanRequests(client, { note: "auto-trigger (production update)", userId: req.user?.id || null });
+    await client.query("commit");
+    res.json({ ok: true, productionId: id, requirements, warnings, autoTriggered: autoCreated.length });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/production/orders/:id", authenticate, requirePermission("production"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const existing = await client.query("select id from production_orders where id = $1", [id]);
+    if (existing.rows.length === 0) {
+      res.status(404).json({ error: "Produksi tidak ditemukan" });
+      await client.query("rollback");
+      return;
+    }
+    const reversedItems = await rollbackProduction(client, id);
+    const userLabel = getUserLabel(req.user);
+    for (const row of reversedItems) {
+      if (!row.itemCode || !row.qty) continue;
+      await insertInventoryLedger(client, {
+        itemCode: row.itemCode,
+        transactionType: "REVERSAL",
+        referenceDoc: `PROD-${id}`,
+        qtyIn: Number(row.qty || 0),
+        qtyOut: 0,
+        userId: req.user?.id || null,
+        remarks: `Reversal of PROD-${id} by ${userLabel}`,
+      });
+    }
+    await client.query("delete from production_orders where id = $1", [id]);
+    await client.query("commit");
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/production/report", authenticate, requirePermission("production"), async (req, res) => {
+  try {
+    const { start, end } = req.query;
+    const filters = [];
+    const values = [];
+    filters.push("i.code not ilike 'TEST-%'");
+    if (start) { values.push(start); filters.push(`coalesce(po.production_date, po.created_at::date) >= $${values.length}`); }
+    if (end) { values.push(end); filters.push(`coalesce(po.production_date, po.created_at::date) <= $${values.length}`); }
+    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    const result = await pool.query(
+      `
+      select
+        pc.item_code,
+        i.name as item_name,
+        i.unit as item_unit,
+        sum(pc.qty)::numeric as total_qty
+      from production_consumption pc
+      join production_orders po on po.id = pc.production_id
+      join items i on i.code = pc.item_code
+      ${whereClause}
+      group by pc.item_code, i.name, i.unit
+      order by pc.item_code asc
+      `,
+      values,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/schedules/:id", authenticate, requirePermission("deleteRecords"), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await pool.query("delete from schedules where id = $1", [id]);
+    clearScheduleCache();
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/schedules", authenticate, requirePermission("resetAll"), async (req, res) => {
+  try {
+    await pool.query("delete from schedules");
+    clearScheduleCache();
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/subcon/deliveries", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  try {
+    const { vendor, start, end } = req.query;
+    const filters = [];
+    const values = [];
+    if (vendor) {
+      const vendorRow = await resolveVendorRow(pool, vendor);
+      const vendorId = vendorRow?.id || String(vendor || "").trim();
+      if (vendorId) {
+        values.push(vendorId);
+        filters.push(`d.vendor_id = $${values.length}`);
+      }
+    }
+    if (start) { values.push(start); filters.push(`d.delivery_date >= $${values.length}`); }
+    if (end) { values.push(end); filters.push(`d.delivery_date <= $${values.length}`); }
+    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    const result = await pool.query(
+      `
+      with usage as (
+        select delivery_id, sum(qty)::numeric as used_qty
+        from subcon_backflush_lines
+        where delivery_id is not null
+        group by delivery_id
+      )
+      select
+        d.*,
+        v.name as vendor_name,
+        i.name as item_name,
+        i.unit as item_unit,
+        coalesce(u.used_qty, 0) as used_qty,
+        (d.qty - coalesce(u.used_qty, 0))::numeric as remaining_qty
+      from subcon_deliveries d
+      left join usage u on u.delivery_id = d.id
+      left join master_vendors v on v.id = d.vendor_id
+      left join items i on i.code = d.item_code
+      ${whereClause}
+      order by d.delivery_date desc, d.id desc
+      `,
+      values,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/subcon/deliveries/next-number", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { date, vendor } = req.query || {};
+    const numbering = await getDocumentNumberingConfig(client);
+    const sjFormat = requireFormat(numbering.sjSubFormat, "SJ Subcon format");
+    let vendorId = "";
+    if (vendor) {
+      const vendorRow = await resolveVendorRow(client, vendor);
+      vendorId = vendorRow?.id || String(vendor || "").trim();
+    }
+    const sjNumber = await buildDocumentNumber(client, "subcon_deliveries", "sj_number", sjFormat, {
+      prefix: "SJ-SUB",
+      vendor: vendorId,
+      supplier: vendorId,
+      supplierCode: vendorId,
+      date,
+    });
+    res.json({ sjNumber });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/subcon/deliveries/open", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  try {
+    const { vendor } = req.query;
+    const filters = [];
+    const values = [];
+    if (vendor) {
+      const vendorRow = await resolveVendorRow(pool, vendor);
+      const vendorId = vendorRow?.id || String(vendor || "").trim();
+      if (vendorId) {
+        values.push(vendorId);
+        filters.push(`d.vendor_id = $${values.length}`);
+      }
+    }
+    const whereClause = filters.length ? `and ${filters.join(" and ")}` : "";
+    const result = await pool.query(
+      `
+      with usage as (
+        select delivery_id, sum(qty)::numeric as used_qty
+        from subcon_backflush_lines
+        where delivery_id is not null
+        group by delivery_id
+      ),
+      virtual_stock as (
+        select vendor_id, item_code, sum(case when direction = 'in' then qty else -qty end)::numeric as stock_qty
+        from subcon_stock_movements
+        group by vendor_id, item_code
+      )
+      select
+        d.*,
+        v.name as vendor_name,
+        i.name as item_name,
+        i.unit as item_unit,
+        coalesce(u.used_qty, 0) as used_qty,
+        (d.qty - coalesce(u.used_qty, 0))::numeric as remaining_qty,
+        coalesce(vs.stock_qty, 0) as virtual_stock
+      from subcon_deliveries d
+      left join usage u on u.delivery_id = d.id
+      left join master_vendors v on v.id = d.vendor_id
+      left join items i on i.code = d.item_code
+      left join virtual_stock vs on vs.vendor_id = d.vendor_id and vs.item_code = d.item_code
+      where (d.status is distinct from 'CLOSED')
+        and (d.qty - coalesce(u.used_qty, 0)) > 0
+      ${whereClause}
+      order by d.delivery_date desc, d.id desc
+      `,
+      values,
+    );
+    const rows = [];
+    for (const row of result.rows) {
+      const bomParents = await getBomParentsForRm(pool, row.item_code);
+      const finishedFirst = bomParents.sort((a, b) => {
+        const aFinished = String(a.parentType || "").toLowerCase().includes("finished") ? 0 : 1;
+        const bFinished = String(b.parentType || "").toLowerCase().includes("finished") ? 0 : 1;
+        if (aFinished !== bFinished) return aFinished - bFinished;
+        return String(a.parentCode || "").localeCompare(String(b.parentCode || ""));
+      });
+      const suggestion = finishedFirst[0] || null;
+      const rawMaxFg = suggestion && suggestion.usagePerUnit > 0
+        ? Number(row.remaining_qty || 0) / suggestion.usagePerUnit
+        : 0;
+      const maxFgQty = Number.isFinite(rawMaxFg) ? Math.floor(rawMaxFg) : 0;
+      rows.push({
+        ...row,
+        suggested_product_code: suggestion?.parentCode || null,
+        suggested_product_name: suggestion?.parentName || null,
+        suggested_product_unit: suggestion?.parentUnit || null,
+        suggested_product_type: suggestion?.parentType || null,
+        usage_per_unit: suggestion?.usagePerUnit || null,
+        max_fg_qty: maxFgQty,
+        alternatives: finishedFirst.slice(1, 4),
+      });
+    }
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/subcon/deliveries", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { vendorId, itemCode, qty, deliveryDate, notes } = req.body || {};
+    const qtyNumber = Number(qty);
+    if (!vendorId || !itemCode || !Number.isFinite(qtyNumber) || qtyNumber <= 0) {
+      res.status(400).json({ error: "vendorId, itemCode, qty wajib diisi" });
+      return;
+    }
+    const vendorRow = await resolveVendorRow(client, vendorId);
+    if (!vendorRow) {
+      res.status(404).json({ error: "vendor tidak ditemukan" });
+      return;
+    }
+    const vendorType = String(vendorRow.type || "").toLowerCase();
+    if (!vendorType.includes("subcon")) {
+      res.status(409).json({ error: "vendor bukan tipe Subcon" });
+      return;
+    }
+    const itemRow = await resolveItemRow(client, itemCode);
+    if (!itemRow) {
+      res.status(404).json({ error: "item tidak ditemukan" });
+      return;
+    }
+    const deliveryDateValue = deliveryDate || new Date().toISOString().slice(0, 10);
+    const numbering = await getDocumentNumberingConfig(client);
+    const sjFormat = requireFormat(numbering.sjSubFormat, "SJ Subcon format");
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await client.query("begin");
+        const warehouseId = await ensureSubconWarehouse(client, vendorRow);
+        const { consumed, warnings } = await consumeStockFifo(client, itemRow.code, qtyNumber, "subcon_delivery");
+        const sjNumber = await buildDocumentNumber(client, "subcon_deliveries", "sj_number", sjFormat, {
+          prefix: "SJ-SUB",
+          vendor: vendorRow.id,
+          date: deliveryDateValue,
+        });
+        const referenceValue = sjNumber;
+        const deliveryResult = await client.query(
+          `
+          insert into subcon_deliveries
+            (sj_number, vendor_id, warehouse_id, item_code, qty, delivery_date, reference, notes, status, created_by)
+          values ($1,$2,$3,$4,$5,$6,$7,$8,'OPEN',$9)
+          returning *
+          `,
+          [
+            sjNumber,
+            vendorRow.id,
+            warehouseId,
+            itemRow.code,
+            qtyNumber,
+            deliveryDateValue,
+            referenceValue,
+            notes ? String(notes).trim() : null,
+            req.user?.id || null,
+          ],
+        );
+        const delivery = deliveryResult.rows[0];
+        await client.query(
+          `
+          insert into subcon_stock_movements
+            (vendor_id, warehouse_id, item_code, qty, direction, reason, ref_type, ref_id, created_by)
+          values ($1,$2,$3,$4,'in','delivery','delivery',$5,$6)
+          `,
+          [
+            vendorRow.id,
+            warehouseId,
+            itemRow.code,
+            qtyNumber,
+            delivery.id,
+            req.user?.id || null,
+          ],
+        );
+        await client.query("commit");
+        res.json({ delivery, consumed, warnings });
+        return;
+      } catch (error) {
+        await client.query("rollback");
+        const isDuplicate = error?.code === "23505";
+        if (isDuplicate && attempt < maxAttempts) {
+          continue;
+        }
+        throw error;
+      }
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/subcon/receipts", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  try {
+    const { vendor, start, end } = req.query;
+    const filters = [];
+    const values = [];
+    if (vendor) {
+      const vendorRow = await resolveVendorRow(pool, vendor);
+      const vendorId = vendorRow?.id || String(vendor || "").trim();
+      if (vendorId) {
+        values.push(vendorId);
+        filters.push(`r.vendor_id = $${values.length}`);
+      }
+    }
+    if (start) { values.push(start); filters.push(`r.receipt_date >= $${values.length}`); }
+    if (end) { values.push(end); filters.push(`r.receipt_date <= $${values.length}`); }
+    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    const result = await pool.query(
+      `
+      with backflush as (
+        select receipt_id, sum(qty)::numeric as total_backflush
+        from subcon_backflush_lines
+        group by receipt_id
+      )
+      select
+        r.*,
+        v.name as vendor_name,
+        i.name as product_name,
+        i.unit as product_unit,
+        coalesce(b.total_backflush, 0) as total_backflush
+      from subcon_receipts r
+      left join master_vendors v on v.id = r.vendor_id
+      left join items i on i.code = r.product_code
+      left join backflush b on b.receipt_id = r.id
+      ${whereClause}
+      order by r.receipt_date desc, r.id desc
+      `,
+      values,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/subcon/receipts", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { vendorId, productCode, qty, receiptDate, reference, notes, deliveryId } = req.body || {};
+    const qtyNumber = Number(qty);
+    if (!vendorId || !productCode || !Number.isFinite(qtyNumber) || qtyNumber <= 0) {
+      res.status(400).json({ error: "vendorId, productCode, qty wajib diisi" });
+      return;
+    }
+    const vendorRow = await resolveVendorRow(client, vendorId);
+    if (!vendorRow) {
+      res.status(404).json({ error: "vendor tidak ditemukan" });
+      return;
+    }
+    const vendorType = String(vendorRow.type || "").toLowerCase();
+    if (!vendorType.includes("subcon")) {
+      res.status(409).json({ error: "vendor bukan tipe Subcon" });
+      return;
+    }
+    const productRow = await resolveItemRow(client, productCode);
+    if (!productRow) {
+      res.status(404).json({ error: "produk tidak ditemukan" });
+      return;
+    }
+    const receiptDateValue = receiptDate || new Date().toISOString().slice(0, 10);
+    let linkedDelivery = null;
+    let deliveryRemaining = null;
+    await client.query("begin");
+    const warehouseId = await ensureSubconWarehouse(client, vendorRow);
+
+    const requirements = {};
+    await explodeBom(client, productRow.code, qtyNumber, requirements);
+    const itemCodes = Object.keys(requirements);
+    if (itemCodes.length === 0) {
+      throw new Error("BOM kosong untuk item ini");
+    }
+
+    let deliveryRemainingRm = null;
+    if (deliveryId) {
+      const deliveryResult = await client.query(
+        "select * from subcon_deliveries where id = $1 for update",
+        [Number(deliveryId)],
+      );
+      if (deliveryResult.rows.length === 0) {
+        res.status(404).json({ error: "DO Subcon tidak ditemukan" });
+        await client.query("rollback");
+        return;
+      }
+      linkedDelivery = deliveryResult.rows[0];
+      if (linkedDelivery.vendor_id !== vendorRow.id) {
+        res.status(409).json({ error: "Vendor DO tidak sesuai dengan receipt" });
+        await client.query("rollback");
+        return;
+      }
+      const usageResult = await client.query(
+        `select coalesce(sum(qty), 0)::numeric as used_qty
+         from subcon_backflush_lines
+         where delivery_id = $1`,
+        [linkedDelivery.id],
+      );
+      const usedQty = Number(usageResult.rows[0]?.used_qty || 0);
+      deliveryRemaining = Math.max(0, Number(linkedDelivery.qty || 0) - usedQty);
+      deliveryRemainingRm = deliveryRemaining;
+      const requiredRm = Number(requirements[linkedDelivery.item_code] || 0);
+      if (!requiredRm || requiredRm <= 0) {
+        res.status(409).json({ error: "BOM FG tidak menggunakan RM dari DO ini" });
+        await client.query("rollback");
+        return;
+      }
+    }
+
+    const receiptResult = await client.query(
+      `
+      insert into subcon_receipts
+        (vendor_id, delivery_id, warehouse_id, product_code, qty, receipt_date, reference, notes, created_by)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      returning *
+      `,
+      [
+        vendorRow.id,
+        linkedDelivery?.id || null,
+        warehouseId,
+        productRow.code,
+        qtyNumber,
+        receiptDateValue,
+        reference ? String(reference).trim() : null,
+        notes ? String(notes).trim() : null,
+        req.user?.id || null,
+      ],
+    );
+    const receipt = receiptResult.rows[0];
+
+    const stockMap = await getSubconStockMap(client, vendorRow.id, itemCodes);
+    const backflushLines = [];
+    const shortages = [];
+
+    for (const [itemCode, requiredQtyRaw] of Object.entries(requirements)) {
+      const requiredQty = Number(requiredQtyRaw || 0);
+      if (!Number.isFinite(requiredQty) || requiredQty <= 0) continue;
+      if (linkedDelivery?.item_code === itemCode && deliveryRemainingRm !== null) {
+        const allocQty = Math.min(requiredQty, deliveryRemainingRm);
+        if (allocQty > 0) {
+          await client.query(
+            "insert into subcon_backflush_lines (receipt_id, delivery_id, item_code, qty) values ($1,$2,$3,$4)",
+            [receipt.id, linkedDelivery.id, itemCode, allocQty],
+          );
+        }
+        const remainder = requiredQty - allocQty;
+        if (remainder > 0) {
+          await client.query(
+            "insert into subcon_backflush_lines (receipt_id, delivery_id, item_code, qty) values ($1,$2,$3,$4)",
+            [receipt.id, null, itemCode, remainder],
+          );
+        }
+        deliveryRemainingRm = Math.max(0, deliveryRemainingRm - allocQty);
+      } else {
+        await client.query(
+          "insert into subcon_backflush_lines (receipt_id, delivery_id, item_code, qty) values ($1,$2,$3,$4)",
+          [receipt.id, null, itemCode, requiredQty],
+        );
+      }
+      await client.query(
+        `
+        insert into subcon_stock_movements
+          (vendor_id, warehouse_id, item_code, qty, direction, reason, ref_type, ref_id, created_by)
+        values ($1,$2,$3,$4,'out','backflush','receipt',$5,$6)
+        `,
+        [
+          vendorRow.id,
+          warehouseId,
+          itemCode,
+          requiredQty,
+          receipt.id,
+          req.user?.id || null,
+        ],
+      );
+      const availableQty = stockMap.get(itemCode) || 0;
+      const shortage = Math.max(requiredQty - availableQty, 0);
+      if (shortage > 0) {
+        shortages.push({ itemCode, requiredQty, availableQty, shortage });
+      }
+      backflushLines.push({ itemCode, qty: requiredQty });
+    }
+
+    if (linkedDelivery) {
+      const usageResult = await client.query(
+        `select coalesce(sum(qty), 0)::numeric as used_qty
+         from subcon_backflush_lines
+         where delivery_id = $1`,
+        [linkedDelivery.id],
+      );
+      const usedQty = Number(usageResult.rows[0]?.used_qty || 0);
+      const remainingQty = Math.max(0, Number(linkedDelivery.qty || 0) - usedQty);
+      if (remainingQty <= 1e-6) {
+        await client.query(
+          "update subcon_deliveries set status = 'CLOSED', closed_at = now(), updated_at = now() where id = $1",
+          [linkedDelivery.id],
+        );
+      } else if (usedQty > 1e-6) {
+        await client.query(
+          "update subcon_deliveries set status = 'PARTIAL', updated_at = now() where id = $1",
+          [linkedDelivery.id],
+        );
+      } else {
+        await client.query(
+          "update subcon_deliveries set status = 'OPEN', updated_at = now() where id = $1",
+          [linkedDelivery.id],
+        );
+      }
+    }
+
+    const batchNo = `SUBCON-${receipt.id}-${formatDateStampValue(receiptDateValue)}`;
+    const batchResult = await client.query(
+      `
+      insert into stock_batches (item_code, qty_in, arrival_date, do_number, batch_no, is_loose)
+      values ($1,$2,$3,$4,$5,false)
+      returning id
+      `,
+      [
+        productRow.code,
+        qtyNumber,
+        receiptDateValue,
+        reference ? String(reference).trim() : null,
+        batchNo,
+      ],
+    );
+    const batchId = batchResult.rows[0]?.id || null;
+    await logStockMovement(client, {
+      itemCode: productRow.code,
+      batchId,
+      qty: qtyNumber,
+      direction: "in",
+      reason: "subcon_receipt",
+    });
+
+    await client.query("commit");
+    res.json({ receipt, backflush: backflushLines, shortages });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/subcon/stock-card", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const { vendor } = req.query;
+    let vendorId = null;
+    if (vendor) {
+      const vendorRow = await resolveVendorRow(pool, vendor);
+      if (!vendorRow) {
+        res.status(404).json({ error: "vendor tidak ditemukan" });
+        return;
+      }
+      vendorId = vendorRow.id;
+    }
+    const values = [];
+    const vendorFilter = vendorId ? "and vendor_id = $1" : "";
+    const vendorWhere = vendorId ? "where vendor_id = $1" : "";
+    if (vendorId) values.push(vendorId);
+    const result = await pool.query(
+      `
+      with delivered as (
+        select vendor_id, item_code, sum(qty)::numeric as delivered_qty
+        from subcon_stock_movements
+        where direction = 'in'
+        ${vendorFilter}
+        group by vendor_id, item_code
+      ),
+      backflush as (
+        select vendor_id, item_code, sum(qty)::numeric as backflush_qty
+        from subcon_stock_movements
+        where direction = 'out'
+        ${vendorFilter}
+        group by vendor_id, item_code
+      ),
+      opname as (
+        select distinct on (vendor_id, item_code)
+          vendor_id,
+          item_code,
+          actual_qty,
+          opname_date
+        from subcon_stock_opname
+        ${vendorWhere}
+        order by vendor_id, item_code, opname_date desc, id desc
+      ),
+      combined as (
+        select
+          coalesce(d.vendor_id, b.vendor_id, o.vendor_id) as vendor_id,
+          coalesce(d.item_code, b.item_code, o.item_code) as item_code,
+          coalesce(d.delivered_qty, 0) as delivered_qty,
+          coalesce(b.backflush_qty, 0) as backflush_qty,
+          coalesce(o.actual_qty, 0) as actual_qty,
+          o.opname_date
+        from delivered d
+        full join backflush b on b.vendor_id = d.vendor_id and b.item_code = d.item_code
+        full join opname o on o.vendor_id = coalesce(d.vendor_id, b.vendor_id)
+          and o.item_code = coalesce(d.item_code, b.item_code)
+      )
+      select
+        c.vendor_id,
+        v.name as vendor_name,
+        c.item_code,
+        i.name as item_name,
+        i.unit as item_unit,
+        c.delivered_qty,
+        c.backflush_qty,
+        (c.delivered_qty - c.backflush_qty)::numeric as book_qty,
+        c.actual_qty,
+        c.opname_date
+      from combined c
+      left join master_vendors v on v.id = c.vendor_id
+      left join items i on i.code = c.item_code
+      order by c.vendor_id asc, c.item_code asc
+      `,
+      values,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/subcon/stock-ledger", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const vendorValue = String(req.query.vendor || "").trim();
+    const itemValue = String(req.query.itemCode || "").trim();
+    if (!vendorValue || !itemValue) {
+      res.status(400).json({ error: "vendor dan itemCode wajib diisi" });
+      return;
+    }
+    const vendorRow = await resolveVendorRow(pool, vendorValue);
+    if (!vendorRow) {
+      res.status(404).json({ error: "vendor tidak ditemukan" });
+      return;
+    }
+    const itemRow = await resolveItemRow(pool, itemValue);
+    if (!itemRow) {
+      res.status(404).json({ error: "item tidak ditemukan" });
+      return;
+    }
+    const start = typeof req.query.start === "string" ? req.query.start.trim() : "";
+    const end = typeof req.query.end === "string" ? req.query.end.trim() : "";
+    const filters = [];
+    const values = [vendorRow.id, itemRow.code];
+    if (start) {
+      values.push(start);
+      filters.push(`created_at::date >= $${values.length}`);
+    }
+    if (end) {
+      values.push(end);
+      filters.push(`created_at::date <= $${values.length}`);
+    }
+    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    const rowsResult = await pool.query(
+      `
+      with base as (
+        select
+          m.id,
+          m.vendor_id,
+          m.item_code,
+          m.qty,
+          m.direction,
+          m.reason,
+          m.ref_type,
+          m.ref_id,
+          m.created_at,
+          m.created_by,
+          sum(case when m.direction = 'in' then m.qty else -m.qty end)
+            over (partition by m.vendor_id, m.item_code order by m.created_at asc, m.id asc) as balance
+        from subcon_stock_movements m
+        where m.vendor_id = $1 and m.item_code = $2
+      ),
+      joined as (
+        select
+          b.*,
+          case
+            when b.ref_type = 'delivery' then d.sj_number
+            when b.ref_type = 'receipt' then r.reference
+            else null
+          end as reference_doc
+        from base b
+        left join subcon_deliveries d on b.ref_type = 'delivery' and b.ref_id = d.id
+        left join subcon_receipts r on b.ref_type = 'receipt' and b.ref_id = r.id
+      )
+      select
+        j.id,
+        j.created_at as date,
+        j.direction,
+        j.reason,
+        j.reference_doc,
+        case when j.direction = 'in' then j.qty else 0 end as qty_in,
+        case when j.direction = 'out' then j.qty else 0 end as qty_out,
+        j.balance,
+        u.username
+      from joined j
+      left join users u on u.id = j.created_by
+      ${whereClause}
+      order by date asc, id asc
+      `,
+      values,
+    );
+    res.json({
+      header: {
+        vendor_id: vendorRow.id,
+        vendor_name: vendorRow.name || vendorRow.id,
+        item_code: itemRow.code,
+        item_name: itemRow.name,
+        unit: itemRow.unit,
+      },
+      rows: rowsResult.rows || [],
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/subcon/opname", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  try {
+    const { vendorId, itemCode, actualQty, opnameDate, notes } = req.body || {};
+    const qtyNumber = Number(actualQty);
+    if (!vendorId || !itemCode || !Number.isFinite(qtyNumber)) {
+      res.status(400).json({ error: "vendorId, itemCode, actualQty wajib diisi" });
+      return;
+    }
+    const vendorRow = await resolveVendorRow(pool, vendorId);
+    if (!vendorRow) {
+      res.status(404).json({ error: "vendor tidak ditemukan" });
+      return;
+    }
+    const itemRow = await resolveItemRow(pool, itemCode);
+    if (!itemRow) {
+      res.status(404).json({ error: "item tidak ditemukan" });
+      return;
+    }
+    const opnameDateValue = opnameDate || new Date().toISOString().slice(0, 10);
+    const result = await pool.query(
+      `
+      insert into subcon_stock_opname
+        (vendor_id, item_code, actual_qty, opname_date, notes, created_by)
+      values ($1,$2,$3,$4,$5,$6)
+      returning *
+      `,
+      [
+        vendorRow.id,
+        itemRow.code,
+        qtyNumber,
+        opnameDateValue,
+        notes ? String(notes).trim() : null,
+        req.user?.id || null,
+      ],
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/reports/summary", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const { start, end, supplier } = req.query;
+    const filters = [];
+    const values = [];
+    filters.push("item not ilike 'TEST-%'");
+    if (start) { values.push(start); filters.push(`request_date >= $${values.length}`); }
+    if (end) { values.push(end); filters.push(`request_date <= $${values.length}`); }
+    if (supplier) { values.push(supplier); filters.push(`supplier = $${values.length}`); }
+    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    const result = await pool.query(
+      `
+      select
+        count(*)::int as total_rows,
+        coalesce(sum(request_qty), 0)::int as total_requested,
+        coalesce(sum(received_qty), 0)::int as total_received,
+        sum(case when arrival_date = request_date then 1 else 0 end)::int as total_on_time,
+        sum(case when arrival_date > request_date then 1 else 0 end)::int as total_late,
+        sum(case when arrival_date < request_date then 1 else 0 end)::int as total_too_early,
+        sum(case when arrival_date is null then 1 else 0 end)::int as total_pending
+      from schedules
+      ${whereClause}
+      `,
+      values,
+    );
+    const row = result.rows[0];
+    res.json({
+      totalRows: row.total_rows,
+      totalRequested: row.total_requested,
+      totalReceived: row.total_received,
+      totalOnTime: row.total_on_time,
+      totalLate: row.total_late,
+      totalTooEarly: row.total_too_early,
+      totalPending: row.total_pending,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/reports/by-supplier", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const { start, end } = req.query;
+    const filters = [];
+    const values = [];
+    filters.push("item not ilike 'TEST-%'");
+    if (start) { values.push(start); filters.push(`request_date >= $${values.length}`); }
+    if (end) { values.push(end); filters.push(`request_date <= $${values.length}`); }
+    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    const result = await pool.query(
+      `
+      select
+        supplier,
+        count(*)::int as total_rows,
+        coalesce(sum(request_qty), 0)::int as total_requested,
+        coalesce(sum(received_qty), 0)::int as total_received
+      from schedules
+      ${whereClause}
+      group by supplier
+      order by supplier asc
+      `,
+      values,
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/reports/by-supplier-po", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const { start, end, supplier } = req.query;
+    const filters = [];
+    const values = [];
+    filters.push("coalesce(s.item_code, s.item) not ilike 'TEST-%'");
+    if (start) { values.push(start); filters.push(`s.request_date >= $${values.length}`); }
+    if (end) { values.push(end); filters.push(`s.request_date <= $${values.length}`); }
+    if (supplier) { values.push(supplier); filters.push(`s.supplier = $${values.length}`); }
+    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    const result = await pool.query(
+      `
+      with schedule_group as (
+        select
+          s.supplier,
+          s.po_number,
+          coalesce(sum(s.request_qty), 0)::int as total_requested,
+          coalesce(sum(s.received_qty), 0)::int as total_received,
+          sum(case when s.arrival_date = s.request_date then 1 else 0 end)::int as on_time_count,
+          sum(case when s.arrival_date > s.request_date then 1 else 0 end)::int as late_count,
+          sum(case when s.arrival_date < s.request_date then 1 else 0 end)::int as too_early_count,
+          sum(case when s.arrival_date is null then 1 else 0 end)::int as pending_count
+        from schedules s
+        ${whereClause}
+        group by s.supplier, s.po_number
+      ),
+      rn_group as (
+        select
+          s.supplier,
+          s.po_number,
+          count(rn.id)::int as rn_count,
+          coalesce(sum(
+            case
+              when rn.id is null then 0
+              when rn.is_loose is true then 1
+              when coalesce(i.pack_qty, 0) > 0 and mod(rn.received_qty, i.pack_qty) <> 0 then 1
+              else 0
+            end
+          ), 0)::int as loose_count
+        from schedules s
+        left join receive_notes rn on rn.schedule_id = s.id
+        left join items i on i.code = coalesce(s.item_code, s.item)
+        ${whereClause}
+        group by s.supplier, s.po_number
+      )
+      select
+        sg.*,
+        coalesce(rg.rn_count, 0)::int as rn_count,
+        coalesce(rg.loose_count, 0)::int as loose_count
+      from schedule_group sg
+      left join rn_group rg
+        on rg.supplier = sg.supplier
+        and rg.po_number = sg.po_number
+      order by sg.supplier asc, sg.po_number asc
+      `,
+      values,
+    );
+    const mapped = result.rows.map((row) => ({
+      supplier: row.supplier,
+      poNumber: row.po_number,
+      totalRequested: row.total_requested,
+      totalReceived: row.total_received,
+      onTimeCount: row.on_time_count,
+      lateCount: row.late_count,
+      tooEarlyCount: row.too_early_count,
+      pendingCount: row.pending_count,
+      rnCount: row.rn_count,
+      looseCount: row.loose_count,
+    }));
+    res.json(mapped);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const monthKeyByIndex = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+app.get("/api/reports/stock-coverage", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const daysParam = Number(req.query.days || 30);
+    const days = Number.isFinite(daysParam) && daysParam > 0 ? Math.min(Math.max(Math.floor(daysParam), 1), 365) : 30;
+    const result = await pool.query(
+      `
+      with stock as (
+        select item_code, sum(qty_in - qty_out)::numeric as stock_qty
+        from stock_batches
+        group by item_code
+      ),
+      consumption as (
+        select item_code, sum(qty)::numeric as out_qty
+        from stock_movements
+        where direction = 'out'
+          and created_at >= now() - ($1 * interval '1 day')
+        group by item_code
+      )
+      select
+        i.code,
+        i.name,
+        i.type,
+        i.unit,
+        i.safety_stock,
+        coalesce(s.stock_qty, 0) as stock_qty,
+        coalesce(c.out_qty, 0) as out_qty
+      from items i
+      left join stock s on s.item_code = i.code
+      left join consumption c on c.item_code = i.code
+      where i.code not ilike 'TEST-%'
+      order by i.code asc
+      `,
+      [days],
+    );
+    const mapped = result.rows.map((row) => {
+      const stockQty = Number(row.stock_qty || 0);
+      const outQty = Number(row.out_qty || 0);
+      const avgDaily = days > 0 ? outQty / days : 0;
+      const coverageDays = avgDaily > 0 ? stockQty / avgDaily : null;
+      return {
+        itemCode: row.code,
+        itemName: row.name,
+        category: row.type,
+        unit: row.unit,
+        stockQty,
+        avgDailyConsumption: avgDaily,
+        coverageDays,
+        safetyStock: Number(row.safety_stock || 0),
+      };
+    });
+    res.json({ days, rows: mapped });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/reports/slow-moving", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      with stock as (
+        select item_code, sum(qty_in - qty_out)::numeric as stock_qty
+        from stock_batches
+        group by item_code
+      ),
+      last_out as (
+        select item_code, max(created_at) as last_out_at
+        from stock_movements
+        where direction = 'out'
+        group by item_code
+      )
+      select
+        i.code,
+        i.name,
+        i.type,
+        i.unit,
+        coalesce(s.stock_qty, 0) as stock_qty,
+        lo.last_out_at
+      from items i
+      left join stock s on s.item_code = i.code
+      left join last_out lo on lo.item_code = i.code
+      where i.code not ilike 'TEST-%'
+        and coalesce(s.stock_qty, 0) > 0
+        and (lo.last_out_at is null or lo.last_out_at < now() - interval '90 days')
+      order by lo.last_out_at nulls first, i.code asc
+      `,
+    );
+    const now = new Date();
+    const mapped = result.rows.map((row) => {
+      const lastOut = row.last_out_at ? new Date(row.last_out_at) : null;
+      const daysSince = lastOut ? Math.floor((now.getTime() - lastOut.getTime()) / 86400000) : null;
+      const category = daysSince === null ? "Dead" : daysSince >= 180 ? "Dead" : "Slow";
+      return {
+        itemCode: row.code,
+        itemName: row.name,
+        category: row.type,
+        unit: row.unit,
+        stockQty: Number(row.stock_qty || 0),
+        lastOutAt: row.last_out_at,
+        daysSinceLastOut: daysSince,
+        status: category,
+      };
+    });
+    res.json(mapped);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/reports/inbound-performance", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const { start, end, supplier } = req.query;
+    const filters = [];
+    const values = [];
+    filters.push("item not ilike 'TEST-%'");
+    if (start) { values.push(start); filters.push(`request_date >= $${values.length}`); }
+    if (end) { values.push(end); filters.push(`request_date <= $${values.length}`); }
+    if (supplier) { values.push(supplier); filters.push(`supplier = $${values.length}`); }
+    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    const result = await pool.query(
+      `
+      select
+        id,
+        supplier,
+        po_number,
+        item,
+        request_date,
+        arrival_date,
+        request_qty,
+        received_qty,
+        status
+      from schedules
+      ${whereClause}
+      order by request_date desc, supplier asc, po_number asc
+      `,
+      values,
+    );
+    const mapped = result.rows.map((row) => {
+      const reqDate = row.request_date ? new Date(row.request_date) : null;
+      const arrDate = row.arrival_date ? new Date(row.arrival_date) : null;
+      const dayDiff =
+        reqDate && arrDate ? Math.round((arrDate.getTime() - reqDate.getTime()) / 86400000) : null;
+      return {
+        id: row.id,
+        supplier: row.supplier,
+        poNumber: row.po_number,
+        item: row.item,
+        requestDate: row.request_date,
+        arrivalDate: row.arrival_date,
+        requestQty: Number(row.request_qty || 0),
+        receivedQty: Number(row.received_qty || 0),
+        status: getScheduleStatusFromActual({
+          requestDate: row.request_date,
+          arrivalDate: row.arrival_date,
+        }),
+        dayDiff,
+      };
+    });
+    res.json(mapped);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/reports/fifo-violations", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const limitParam = Number(req.query.limit || 200);
+    const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(Math.floor(limitParam), 1000) : 200;
+    const result = await pool.query(
+      `
+      select
+        v.id,
+        v.item_code,
+        i.name as item_name,
+        v.batch_id,
+        v.chosen_batch_no,
+        v.oldest_batch_no,
+        v.reason,
+        v.created_at
+      from fifo_violations v
+      left join items i on i.code = v.item_code
+      where v.item_code not ilike 'TEST-%'
+      order by v.created_at desc
+      limit $1
+      `,
+      [limit],
+    );
+    const mapped = result.rows.map((row) => ({
+      id: row.id,
+      itemCode: row.item_code,
+      itemName: row.item_name,
+      batchId: row.batch_id,
+      chosenBatchNo: row.chosen_batch_no,
+      oldestBatchNo: row.oldest_batch_no,
+      reason: row.reason,
+      createdAt: row.created_at,
+    }));
+    res.json(mapped);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/reports/inventory-value", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      with stock_main as (
+        select item_code, sum(qty_in - qty_out)::numeric as stock_qty
+        from stock_batches
+        group by item_code
+      ),
+      stock_subcon as (
+        select item_code, sum(case when direction = 'in' then qty else -qty end)::numeric as stock_qty
+        from subcon_stock_movements
+        group by item_code
+      ),
+      stock as (
+        select
+          coalesce(m.item_code, s.item_code) as item_code,
+          (coalesce(m.stock_qty, 0) + coalesce(s.stock_qty, 0))::numeric as stock_qty
+        from stock_main m
+        full join stock_subcon s on s.item_code = m.item_code
+      )
+      select
+        i.code,
+        i.name,
+        i.unit,
+        coalesce(i.price, 0) as price,
+        coalesce(s.stock_qty, 0) as stock_qty,
+        (coalesce(s.stock_qty, 0) * coalesce(i.price, 0))::numeric as value
+      from items i
+      left join stock s on s.item_code = i.code
+      where i.code not ilike 'TEST-%'
+      order by value desc, i.code asc
+      `,
+    );
+    const rows = result.rows.map((row) => ({
+      itemCode: row.code,
+      itemName: row.name,
+      unit: row.unit,
+      price: Number(row.price || 0),
+      stockQty: Number(row.stock_qty || 0),
+      value: Number(row.value || 0),
+    }));
+    const totalValue = rows.reduce((sum, row) => sum + Number(row.value || 0), 0);
+    res.json({ totalValue, rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/reports/supplier-shortage", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const now = new Date();
+    const fallbackMonth = monthKeyByIndex[now.getMonth()];
+    const rawMonth = String(req.query.month || fallbackMonth).toLowerCase();
+    const allowedMonths = new Set(monthKeyByIndex);
+    const monthKey = allowedMonths.has(rawMonth) ? rawMonth : fallbackMonth;
+    const year = Number(req.query.year) || now.getFullYear();
+    const isSupplierRole = String(req.user?.role || "").toLowerCase() === "supplier";
+    const requesterSupplierId = String(req.user?.supplierId || "").trim();
+    const supplierFilter = String(req.query.supplier || "").trim().toLowerCase();
+    const values = [year, monthKey];
+    let supplierClause = "";
+    if (isSupplierRole) {
+      if (!requesterSupplierId) {
+        res.status(403).json({ error: "Akun supplier belum terhubung ke Supplier ID." });
+        return;
+      }
+      values.push(requesterSupplierId);
+      supplierClause = `and coalesce(r.supplier_id, '') = $${values.length}`;
+    } else if (supplierFilter) {
+      values.push(`%${supplierFilter}%`);
+      supplierClause = `and lower(coalesce(r.supplier_name, r.supplier_id, '')) like $${values.length}`;
+    }
+    const result = await pool.query(
+      `
+      with stock_main as (
+        select item_code, sum(qty_in - qty_out)::numeric as stock_qty
+        from stock_batches
+        group by item_code
+      ),
+      stock_subcon as (
+        select item_code, sum(case when direction = 'in' then qty else -qty end)::numeric as stock_qty
+        from subcon_stock_movements
+        group by item_code
+      ),
+      stock as (
+        select
+          coalesce(m.item_code, s.item_code) as item_code,
+          (coalesce(m.stock_qty, 0) + coalesce(s.stock_qty, 0))::numeric as stock_qty
+        from stock_main m
+        full join stock_subcon s on s.item_code = m.item_code
+      ),
+      supplier_weights as (
+        select
+          item_code,
+          vendor_id,
+          greatest(coalesce(share_percent, 0), 0)::numeric as share_percent,
+          count(*) over (partition by item_code) as supplier_count,
+          sum(greatest(coalesce(share_percent, 0), 0)::numeric) over (partition by item_code) as total_share
+        from item_suppliers
+      ),
+      prl_base as (
+        select
+          pr.item_code,
+          coalesce(i.name, pr.description, pr.item_code) as item_name,
+          coalesce(i.part_no, pr.part_no, pr.item_code) as part_no,
+          coalesce(i.unit, pr.uom, '-') as unit,
+          coalesce(i.type_pack, pr.type_pack, '-') as type_pack,
+          coalesce(i.safety_stock, 0)::numeric as safety_stock,
+          coalesce(i.lead_time_days, 0)::numeric as item_lead_time_days,
+          coalesce(du.daily_usage_qty, 0)::numeric as daily_usage_qty,
+          coalesce(s.stock_qty, 0)::numeric as stock_qty,
+          nullif(trim(i.vendor_id), '') as default_supplier_id,
+          nullif(trim(i.supplier_name), '') as default_supplier_name,
+          case
+            when (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+              then (pr.months ->> $2)::numeric
+            else 0
+          end as plan_qty
+        from prl_records pr
+        left join items i on i.code = pr.item_code
+        left join stock s on s.item_code = pr.item_code
+        left join item_daily_usage du on du.item_code = pr.item_code
+        where pr.year = $1
+          and pr.item_code not ilike 'TEST-%'
+      ),
+      resolved as (
+        select
+          b.item_code,
+          b.item_name,
+          b.part_no,
+          b.unit,
+          b.type_pack,
+          coalesce(sw.vendor_id, b.default_supplier_id, mv_by_name.id, null) as supplier_id,
+          coalesce(mv_share.name, mv_default.name, mv_by_name.name, b.default_supplier_name, b.default_supplier_id, '-') as supplier_name,
+          case
+            when coalesce(sw.supplier_count, 0) > 0 and coalesce(sw.total_share, 0) > 0
+              then sw.share_percent / nullif(sw.total_share, 0)
+            when coalesce(sw.supplier_count, 0) > 0
+              then 1::numeric / sw.supplier_count
+            else 1::numeric
+          end as share_ratio,
+          coalesce(sls.avg_lead_time_days, mv_share.lead_time_days, mv_default.lead_time_days, mv_by_name.lead_time_days, b.item_lead_time_days, 0)::numeric as lead_time_days,
+          b.stock_qty,
+          b.safety_stock,
+          b.daily_usage_qty,
+          b.plan_qty
+        from prl_base b
+        left join supplier_weights sw on sw.item_code = b.item_code
+        left join master_vendors mv_share on mv_share.id = sw.vendor_id
+        left join master_vendors mv_default on mv_default.id = b.default_supplier_id
+        left join master_vendors mv_by_name on lower(mv_by_name.name) = lower(b.default_supplier_name)
+        left join supplier_lead_time_stats sls on sls.supplier_id = coalesce(sw.vendor_id, b.default_supplier_id, mv_by_name.id)
+        where b.plan_qty > 0
+      )
+      select
+        r.item_code,
+        r.item_name,
+        r.part_no,
+        r.unit,
+        r.type_pack,
+        r.supplier_id,
+        r.supplier_name,
+        round(r.stock_qty, 2) as stock_qty,
+        round(r.safety_stock, 2) as safety_stock,
+        round(r.plan_qty, 2) as plan_qty,
+        round(r.daily_usage_qty, 2) as daily_usage_qty,
+        round(r.lead_time_days, 2) as lead_time_days,
+        round(greatest((r.plan_qty + r.safety_stock) - r.stock_qty, 0), 2) as total_shortage,
+        round(greatest(((r.plan_qty + r.safety_stock) - r.stock_qty) * r.share_ratio, 0), 2) as supplier_shortage,
+        case
+          when r.daily_usage_qty > 0
+            then round(r.stock_qty / nullif(r.daily_usage_qty, 0), 2)
+          else null
+        end as coverage_days
+      from resolved r
+      where greatest(((r.plan_qty + r.safety_stock) - r.stock_qty) * r.share_ratio, 0) > 0
+        ${supplierClause}
+      order by r.supplier_name asc, supplier_shortage desc, r.item_code asc
+      `,
+      values,
+    );
+    const rows = result.rows.map((row) => {
+      const stockQty = Number(row.stock_qty || 0);
+      const safetyStock = Number(row.safety_stock || 0);
+      const planQty = Number(row.plan_qty || 0);
+      const dailyUsageQty = Number(row.daily_usage_qty || 0);
+      const leadTimeDays = Number(row.lead_time_days || 0);
+      const shortageQty = Number(row.supplier_shortage || 0);
+      const coverageDays = row.coverage_days == null ? null : Number(row.coverage_days);
+      let status = "SHORTAGE";
+      if (coverageDays != null && leadTimeDays > 0 && coverageDays <= leadTimeDays) {
+        status = "URGENT";
+      } else if (stockQty <= safetyStock) {
+        status = "LOW STOCK";
+      }
+      return {
+        supplierId: row.supplier_id || null,
+        supplierName: row.supplier_name || "-",
+        itemCode: row.item_code,
+        itemName: row.item_name,
+        partNo: row.part_no,
+        unit: row.unit,
+        typePack: row.type_pack,
+        stockQty,
+        safetyStock,
+        planQty,
+        dailyUsageQty,
+        leadTimeDays,
+        totalShortage: Number(row.total_shortage || 0),
+        shortageQty,
+        coverageDays,
+        status,
+      };
+    });
+    const supplierMap = new Map();
+    rows.forEach((row) => {
+      const key = row.supplierId || row.supplierName || "-";
+      const current = supplierMap.get(key) || {
+        supplierId: row.supplierId || null,
+        supplierName: row.supplierName || "-",
+        itemCount: 0,
+        urgentCount: 0,
+        shortageQty: 0,
+      };
+      current.itemCount += 1;
+      current.shortageQty += Number(row.shortageQty || 0);
+      if (row.status === "URGENT") current.urgentCount += 1;
+      supplierMap.set(key, current);
+    });
+    const suppliers = Array.from(supplierMap.values())
+      .map((row) => ({
+        ...row,
+        shortageQty: Math.round((Number(row.shortageQty || 0) + Number.EPSILON) * 100) / 100,
+      }))
+      .sort((a, b) => b.shortageQty - a.shortageQty || a.supplierName.localeCompare(b.supplierName));
+    const summary = {
+      totalItems: rows.length,
+      totalSuppliers: suppliers.length,
+      urgentItems: rows.filter((row) => row.status === "URGENT").length,
+      totalShortageQty: Math.round((rows.reduce((sum, row) => sum + Number(row.shortageQty || 0), 0) + Number.EPSILON) * 100) / 100,
+    };
+    res.json({ monthKey, year, summary, suppliers, rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/reports/raw-material-ledger", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const periodValue = String(req.query.period || "").toLowerCase();
+    const yearValue = Number(req.query.year || 0);
+    const monthValue = Number(req.query.month || 0);
+    const categoryInput = String(req.query.category || "raw").toLowerCase().trim();
+    const locationFilter = String(req.query.location || "").trim();
+    const normalizeCategory = (value) => {
+      if (!value) return "raw";
+      if (["raw", "rm", "raw material"].includes(value)) return "raw";
+      if (["wip", "work in progress", "work-in-progress"].includes(value)) return "wip";
+      if (["fg", "finish good", "finished good", "finished goods", "finish goods"].includes(value)) return "fg";
+      if (value === "all") return "all";
+      return "";
+    };
+    const category = normalizeCategory(categoryInput);
+    if (!category) {
+      return res.status(400).json({ error: "Kategori item tidak valid." });
+    }
+    if (!["monthly", "yearly"].includes(periodValue)) {
+      return res.status(400).json({ error: "Periode laporan tidak valid." });
+    }
+    if (!Number.isFinite(yearValue) || yearValue < 2000) {
+      return res.status(400).json({ error: "Tahun laporan tidak valid." });
+    }
+    if (periodValue === "monthly" && (!Number.isFinite(monthValue) || monthValue < 1 || monthValue > 12)) {
+      return res.status(400).json({ error: "Bulan laporan tidak valid." });
+    }
+    const startDate = periodValue === "yearly"
+      ? new Date(yearValue, 0, 1)
+      : new Date(yearValue, monthValue - 1, 1);
+    const endDate = periodValue === "yearly"
+      ? new Date(yearValue, 11, 31)
+      : new Date(yearValue, monthValue, 0);
+    const startLabel = startDate.toISOString().slice(0, 10);
+    const endLabel = endDate.toISOString().slice(0, 10);
+    let rows = [];
+    if (category === "raw") {
+      const result = await pool.query(
+        `
+        with raw_items as (
+          select code, part_no, name, unit
+          from items
+          where lower(trim(type)) = 'raw material'
+            and code not ilike 'TEST-%'
+        ),
+        opening as (
+          select i.code,
+            coalesce((
+              select sum(case when m.direction = 'in' then m.qty else -m.qty end)
+              from stock_movements m
+              where m.item_code = i.code
+                and m.created_at::date < $1::date
+            ), 0) as opening_balance
+          from raw_items i
+        ),
+        movements as (
+          select item_code,
+            sum(case when direction = 'in' then qty else 0 end) as total_in,
+            sum(case when direction = 'out' then qty else 0 end) as total_out
+          from stock_movements
+          where created_at::date >= $1::date
+            and created_at::date <= $2::date
+          group by item_code
+        )
+        select
+          i.code,
+          i.part_no,
+          i.name,
+          i.unit,
+          coalesce(o.opening_balance, 0) as opening_balance,
+          coalesce(m.total_in, 0) as total_in,
+          coalesce(m.total_out, 0) as total_out
+        from raw_items i
+        left join opening o on o.code = i.code
+        left join movements m on m.item_code = i.code
+        order by i.code asc
+        `,
+        [startLabel, endLabel],
+      );
+      rows = result.rows.map((row) => {
+        const opening = Number(row.opening_balance || 0);
+        const totalIn = Number(row.total_in || 0);
+        const totalOut = Number(row.total_out || 0);
+        return {
+          itemCode: row.code,
+          partNo: row.part_no,
+          itemName: row.name,
+          unit: row.unit,
+          openingBalance: opening,
+          totalIn,
+          totalOut,
+          closingBalance: opening + totalIn - totalOut,
+        };
+      });
+    } else {
+      const locationValue = locationFilter ? locationFilter.toLowerCase() : "";
+      const hasLocation = Boolean(locationValue);
+      const itemTypeFilter = category === "wip"
+        ? "(lower(trim(type)) like '%wip%' or lower(trim(type)) like '%work in progress%')"
+        : category === "fg"
+          ? "(lower(trim(type)) = 'fg' or lower(trim(type)) like '%finish%' or lower(trim(type)) like '%finished%')"
+          : "1=1";
+      const openingExpr = hasLocation
+        ? `case
+             when lower(trim(m.to_location)) = $3 then m.qty_good
+             when lower(trim(m.from_location)) = $3 then -(m.qty_good + m.qty_reject)
+             else 0
+           end`
+        : `m.qty_good - (m.qty_good + m.qty_reject)`;
+      const totalInExpr = hasLocation
+        ? `case when lower(trim(to_location)) = $3 then qty_good else 0 end`
+        : `qty_good`;
+      const totalOutExpr = hasLocation
+        ? `case when lower(trim(from_location)) = $3 then (qty_good + qty_reject) else 0 end`
+        : `(qty_good + qty_reject)`;
+      const values = hasLocation ? [startLabel, endLabel, locationValue] : [startLabel, endLabel];
+      const result = await pool.query(
+        `
+        with target_items as (
+          select code, part_no, name, unit
+          from items
+          where ${itemTypeFilter}
+            and code not ilike 'TEST-%'
+        ),
+        opening as (
+          select i.code,
+            coalesce((
+              select sum(${openingExpr})
+              from wip_stock_movements m
+              where m.item_code = i.code
+                and m.production_date < $1::date
+            ), 0) as opening_balance
+          from target_items i
+        ),
+        movements as (
+          select item_code,
+            sum(${totalInExpr}) as total_in,
+            sum(${totalOutExpr}) as total_out
+          from wip_stock_movements
+          where production_date >= $1::date
+            and production_date <= $2::date
+          group by item_code
+        )
+        select
+          i.code,
+          i.part_no,
+          i.name,
+          i.unit,
+          coalesce(o.opening_balance, 0) as opening_balance,
+          coalesce(m.total_in, 0) as total_in,
+          coalesce(m.total_out, 0) as total_out
+        from target_items i
+        left join opening o on o.code = i.code
+        left join movements m on m.item_code = i.code
+        order by i.code asc
+        `,
+        values,
+      );
+      rows = result.rows.map((row) => {
+        const opening = Number(row.opening_balance || 0);
+        const totalIn = Number(row.total_in || 0);
+        const totalOut = Number(row.total_out || 0);
+        return {
+          itemCode: row.code,
+          partNo: row.part_no,
+          itemName: row.name,
+          unit: row.unit,
+          openingBalance: opening,
+          totalIn,
+          totalOut,
+          closingBalance: opening + totalIn - totalOut,
+        };
+      });
+    }
+    res.json({
+      period: periodValue,
+      year: yearValue,
+      month: periodValue === "monthly" ? monthValue : null,
+      start: startLabel,
+      end: endLabel,
+      category,
+      location: locationFilter || null,
+      rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+  });
+
+app.get("/api/reports/all-mutations", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const startDate = String(req.query.start || "").trim();
+    const endDate = String(req.query.end || "").trim();
+    const categoryInputRaw = String(req.query.category || "").trim();
+    const categoryInput = String(categoryInputRaw).toLowerCase().trim();
+    const locationFilter = String(req.query.location || "").trim();
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: "Tanggal mulai dan akhir wajib diisi." });
+    }
+    if (Number.isNaN(new Date(startDate).getTime()) || Number.isNaN(new Date(endDate).getTime())) {
+      return res.status(400).json({ error: "Format tanggal tidak valid." });
+    }
+
+    const normalizeValue = (value) => String(value || "").toLowerCase().trim();
+    const rawAliases = new Set(["raw", "rm", "raw material"]);
+    const wipAliases = new Set(["wip", "work in progress", "work-in-progress"]);
+    const fgAliases = new Set(["fg", "finish good", "finished good", "finished goods", "finish goods"]);
+    const allAliases = new Set(["all", "semua", "all categories"]);
+
+    let categoryMode = "all";
+    let categoryLabel = "all";
+    let stockTypeFilters = [];
+
+    if (categoryInput && !allAliases.has(categoryInput)) {
+      if (rawAliases.has(categoryInput)) {
+        categoryMode = "raw";
+        categoryLabel = "raw";
+        stockTypeFilters = ["raw material"];
+      } else if (wipAliases.has(categoryInput)) {
+        categoryMode = "wip";
+        categoryLabel = "wip";
+      } else if (fgAliases.has(categoryInput)) {
+        categoryMode = "fg";
+        categoryLabel = "fg";
+      } else {
+        const categoryResult = await pool.query("select code, name from master_categories");
+        const map = new Map();
+        categoryResult.rows.forEach((row) => {
+          const codeKey = normalizeValue(row.code);
+          const nameKey = normalizeValue(row.name);
+          if (codeKey) map.set(codeKey, row);
+          if (nameKey) map.set(nameKey, row);
+        });
+        const matched = map.get(categoryInput);
+        if (!matched) {
+          return res.status(400).json({ error: "Kategori item tidak valid." });
+        }
+        const codeNorm = normalizeValue(matched.code);
+        const nameNorm = normalizeValue(matched.name);
+        stockTypeFilters = Array.from(new Set([codeNorm, nameNorm].filter(Boolean)));
+        if (stockTypeFilters.length === 0) {
+          stockTypeFilters = [categoryInput];
+        }
+        categoryMode = "custom";
+        categoryLabel = matched.name || matched.code || categoryInputRaw;
+      }
+    }
+
+    const locationValue = locationFilter ? locationFilter.toLowerCase() : "";
+    const hasLocation = Boolean(locationValue);
+    const rows = [];
+
+    const getCategoryLabel = (type) => {
+      const text = String(type || "").toLowerCase();
+      if (text.includes("raw")) return "Raw Material";
+      if (text.includes("wip") || text.includes("work in progress")) return "WIP";
+      if (text === "fg" || text.includes("finish")) return "Finish Good";
+      return type || "-";
+    };
+
+    const includeStock = ["all", "raw", "custom"].includes(categoryMode);
+    const buildStockClauses = (params) => {
+      let clause = "";
+      if (stockTypeFilters.length > 0) {
+        const placeholders = stockTypeFilters.map((_, idx) => `$${params.length + idx + 1}`).join(", ");
+        clause += ` and lower(trim(i.type)) in (${placeholders})`;
+        params.push(...stockTypeFilters);
+      }
+      if (hasLocation) {
+        const idx = params.length + 1;
+        clause += ` and (lower(trim(i.location_name)) = $${idx} or lower(trim(i.location_id)) = $${idx})`;
+        params.push(locationValue);
+      }
+      return clause;
+    };
+
+    if (includeStock) {
+      const rawOpeningParams = [startDate];
+      const rawLocationClause = buildStockClauses(rawOpeningParams);
+      const openingResult = await pool.query(
+        `
+        select m.item_code,
+          coalesce(sum(case when m.direction = 'in' then m.qty else -m.qty end), 0) as opening_balance
+        from stock_movements m
+        join items i on i.code = m.item_code
+        where m.created_at::date < $1::date
+          and m.item_code not ilike 'TEST-%'
+          ${rawLocationClause}
+        group by m.item_code
+        `,
+        rawOpeningParams,
+      );
+      const openingMap = new Map(openingResult.rows.map((row) => [
+        row.item_code,
+        Number(row.opening_balance || 0),
+      ]));
+
+      const rawMovementParams = [startDate, endDate];
+      const rawMovementLocationClause = buildStockClauses(rawMovementParams);
+      const movementResult = await pool.query(
+        `
+        select m.id,
+          m.created_at::date as date,
+          m.item_code,
+          m.qty,
+          m.direction,
+          i.name,
+          i.type,
+          i.location_name,
+          i.location_id
+        from stock_movements m
+        join items i on i.code = m.item_code
+        where m.created_at::date >= $1::date
+          and m.created_at::date <= $2::date
+          and m.item_code not ilike 'TEST-%'
+          ${rawMovementLocationClause}
+        order by m.created_at::date asc, m.item_code asc, m.id asc
+        `,
+        rawMovementParams,
+      );
+
+      const balanceMap = new Map();
+      movementResult.rows.forEach((row) => {
+        const itemCode = row.item_code;
+        const locationLabel = row.location_name || row.location_id || "-";
+        const balanceKey = `${itemCode}|${locationLabel}`;
+        if (!balanceMap.has(balanceKey)) {
+          balanceMap.set(balanceKey, openingMap.get(itemCode) ?? 0);
+        }
+        const opening = balanceMap.get(balanceKey) ?? 0;
+        const qtyIn = row.direction === "in" ? Number(row.qty || 0) : 0;
+        const qtyOut = row.direction === "out" ? Number(row.qty || 0) : 0;
+        if (!qtyIn && !qtyOut) return;
+        const closing = opening + qtyIn - qtyOut;
+        balanceMap.set(balanceKey, closing);
+        rows.push({
+          date: row.date,
+          itemCode,
+          itemName: row.name,
+          category: getCategoryLabel(row.type),
+          location: locationLabel,
+          openingBalance: opening,
+          qtyIn,
+          qtyOut,
+          closingBalance: closing,
+        });
+      });
+    }
+
+    const includeWip = categoryMode === "wip" || categoryMode === "all";
+    const includeFg = categoryMode === "fg" || categoryMode === "all";
+    if (includeWip || includeFg) {
+      const wipCondition = "(lower(trim(i.type)) like '%wip%' or lower(trim(i.type)) like '%work in progress%')";
+      const fgCondition = "(lower(trim(i.type)) = 'fg' or lower(trim(i.type)) like '%finish%' or lower(trim(i.type)) like '%finished%')";
+      const itemTypeFilter = categoryMode === "wip"
+        ? wipCondition
+        : categoryMode === "fg"
+          ? fgCondition
+          : `(${wipCondition} or ${fgCondition})`;
+      const openingExpr = hasLocation
+        ? `case
+             when lower(trim(m.to_location)) = $2 then m.qty_good
+             when lower(trim(m.from_location)) = $2 then -(m.qty_good + m.qty_reject)
+             else 0
+           end`
+        : `m.qty_good - (m.qty_good + m.qty_reject)`;
+      const locationClauseOpen = hasLocation
+        ? "and (lower(trim(m.to_location)) = $2 or lower(trim(m.from_location)) = $2)"
+        : "";
+      const locationClause = hasLocation
+        ? "and (lower(trim(m.to_location)) = $3 or lower(trim(m.from_location)) = $3)"
+        : "";
+
+      const openingResult = await pool.query(
+        `
+        select m.item_code,
+          coalesce(sum(${openingExpr}), 0) as opening_balance
+        from wip_stock_movements m
+        join items i on i.code = m.item_code
+        where m.production_date < $1::date
+          and ${itemTypeFilter}
+          and m.item_code not ilike 'TEST-%'
+          ${locationClauseOpen}
+        group by m.item_code
+        `,
+        hasLocation ? [startDate, locationValue] : [startDate],
+      );
+      const openingMap = new Map(openingResult.rows.map((row) => [
+        row.item_code,
+        Number(row.opening_balance || 0),
+      ]));
+
+      const movementParams = hasLocation ? [startDate, endDate, locationValue] : [startDate, endDate];
+      const movementResult = await pool.query(
+        `
+        select m.id,
+          m.production_date as date,
+          m.item_code,
+          m.from_location,
+          m.to_location,
+          m.qty_good,
+          m.qty_reject,
+          i.name,
+          i.type
+        from wip_stock_movements m
+        join items i on i.code = m.item_code
+        where m.production_date >= $1::date
+          and m.production_date <= $2::date
+          and ${itemTypeFilter}
+          and m.item_code not ilike 'TEST-%'
+          ${locationClause}
+        order by m.production_date asc, m.item_code asc, m.id asc
+        `,
+        movementParams,
+      );
+
+      const balanceMap = new Map();
+      movementResult.rows.forEach((row) => {
+        const itemCode = row.item_code;
+        const balanceKey = hasLocation ? `${itemCode}|${locationValue}` : itemCode;
+        if (!balanceMap.has(balanceKey)) {
+          balanceMap.set(balanceKey, openingMap.get(itemCode) ?? 0);
+        }
+        const opening = balanceMap.get(balanceKey) ?? 0;
+        const toLocation = String(row.to_location || "").toLowerCase();
+        const fromLocation = String(row.from_location || "").toLowerCase();
+        const qtyGood = Number(row.qty_good || 0);
+        const qtyReject = Number(row.qty_reject || 0);
+        const qtyIn = hasLocation ? (toLocation === locationValue ? qtyGood : 0) : qtyGood;
+        const qtyOut = hasLocation
+          ? (fromLocation === locationValue ? qtyGood + qtyReject : 0)
+          : qtyGood + qtyReject;
+        if (!qtyIn && !qtyOut) return;
+        const closing = opening + qtyIn - qtyOut;
+        balanceMap.set(balanceKey, closing);
+        rows.push({
+          date: row.date,
+          itemCode,
+          itemName: row.name,
+          category: getCategoryLabel(row.type),
+          location: hasLocation ? locationFilter : `${row.from_location} → ${row.to_location}`,
+          openingBalance: opening,
+          qtyIn,
+          qtyOut,
+          closingBalance: closing,
+        });
+      });
+    }
+
+    rows.sort((a, b) => {
+      const dateCompare = String(a.date).localeCompare(String(b.date));
+      if (dateCompare !== 0) return dateCompare;
+      return String(a.itemCode || "").localeCompare(String(b.itemCode || ""));
+    });
+
+    res.json({
+      start: startDate,
+      end: endDate,
+      category: categoryLabel,
+      location: locationFilter || null,
+      rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal memuat laporan mutasi." });
+  }
+});
+
+app.get("/api/reports/outstanding-prl", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const now = new Date();
+    const fallbackMonth = monthKeyByIndex[now.getMonth()];
+    const rawMonth = String(req.query.month || fallbackMonth).toLowerCase();
+    const allowedMonths = new Set(monthKeyByIndex);
+    const monthKey = allowedMonths.has(rawMonth) ? rawMonth : fallbackMonth;
+    const year = Number(req.query.year) || now.getFullYear();
+    const result = await pool.query(
+      `
+      select
+        pr.item_code,
+        coalesce(i.name, pr.description, pr.item_code) as item_name,
+        pr.model,
+        pr.uom,
+        pr.type_pack,
+        case
+          when (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+            then (pr.months ->> $2)::numeric
+          else 0
+        end as plan_qty,
+        pr.status ->> $2 as prl_status
+      from prl_records pr
+      left join items i on i.code = pr.item_code
+      where pr.year = $1
+        and pr.item_code not ilike 'TEST-%'
+        and (
+          case
+            when (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+              then (pr.months ->> $2)::numeric
+            else 0
+          end
+        ) > 0
+        and (pr.status ->> $2) is distinct from 'active'
+      order by pr.item_code asc
+      `,
+      [year, monthKey],
+    );
+    const rows = result.rows.map((row) => ({
+      itemCode: row.item_code,
+      itemName: row.item_name,
+      model: row.model,
+      uom: row.uom,
+      typePack: row.type_pack,
+      planQty: Number(row.plan_qty || 0),
+      status: row.prl_status || 'pending',
+    }));
+    const totalOutstanding = rows.reduce((sum, row) => sum + Number(row.planQty || 0), 0);
+    res.json({ monthKey, year, totalOutstanding, rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/reports/quality-objectives", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const now = new Date();
+    let rawMonth = req.query.month;
+    let rawYear = req.query.year;
+    if (typeof rawMonth === "string" && rawMonth.includes("-") && !rawYear) {
+      const [yearPart, monthPart] = rawMonth.split("-");
+      rawYear = yearPart;
+      rawMonth = monthPart;
+    }
+    const monthNum = Math.min(Math.max(Number(rawMonth || now.getMonth() + 1), 1), 12);
+    const yearNum = Number(rawYear) || now.getFullYear();
+    const startDate = formatDateOnly(new Date(yearNum, monthNum - 1, 1));
+    const endDate = formatDateOnly(new Date(yearNum, monthNum, 1));
+    const monthLabel = monthKeyByIndex[monthNum - 1] || String(monthNum);
+    const periodLabel = `${monthLabel.toUpperCase()} ${yearNum}`;
+
+    const inboundResult = await pool.query(
+      `
+      select
+        supplier,
+        coalesce(sum(request_qty), 0)::numeric as plan_qty,
+        coalesce(sum(received_qty), 0)::numeric as actual_qty
+      from schedules
+      where request_date >= $1 and request_date < $2
+        and item not ilike 'TEST-%'
+      group by supplier
+      order by supplier asc
+      `,
+      [startDate, endDate],
+    );
+    const inboundRows = inboundResult.rows.map((row) => {
+      const planQty = Number(row.plan_qty || 0);
+      const actualQty = Number(row.actual_qty || 0);
+      const percent = planQty > 0 ? (actualQty / planQty) * 100 : 0;
+      const percentRounded = Math.round(percent * 100) / 100;
+      return {
+        name: row.supplier || "-",
+        period: periodLabel,
+        planQty,
+        actualQty,
+        percent: percentRounded,
+        status: percentRounded >= 95 ? "TERCAPAI" : "TIDAK TERCAPAI",
+      };
+    });
+
+    const dnResult = await pool.query(
+      `
+      with rn_union as (
+        select
+          rn.dn_id,
+          rn.schedule_id,
+          rn.item_code,
+          rn.received_qty,
+          rn.doc_qty,
+          rn.is_loose,
+          rn.received_at
+        from receive_notes rn
+        where rn.item_code is null or rn.item_code not ilike 'TEST-%'
+        union all
+        select
+          rni.origin_dn_id as dn_id,
+          null::int as schedule_id,
+          rni.item_code,
+          rni.received_qty,
+          rni.doc_qty,
+          false as is_loose,
+          rnh.created_at as received_at
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        where rni.item_code not ilike 'TEST-%'
+      )
+      select
+        coalesce(dn.supplier, s.supplier, '-') as supplier,
+        coalesce(sum(coalesce(rn_union.doc_qty, s.request_qty, rn_union.received_qty)), 0)::numeric as doc_qty,
+        coalesce(sum(rn_union.received_qty), 0)::numeric as received_qty,
+        coalesce(sum(case when rn_union.is_loose then 1 else 0 end), 0)::int as loose_count
+      from rn_union
+      left join delivery_notes dn on dn.id = rn_union.dn_id
+      left join schedules s on s.id = rn_union.schedule_id
+      where rn_union.received_at >= $1 and rn_union.received_at < $2
+        and (coalesce(s.item_code, s.item) is null or coalesce(s.item_code, s.item) not ilike 'TEST-%')
+      group by coalesce(dn.supplier, s.supplier, '-')
+      order by coalesce(dn.supplier, s.supplier, '-') asc
+      `,
+      [startDate, endDate],
+    );
+    const dnRows = dnResult.rows.map((row) => {
+      const docQty = Number(row.doc_qty || 0);
+      const actualQty = Number(row.received_qty || 0);
+      const looseCount = Number(row.loose_count || 0);
+      const percent = docQty > 0 ? (actualQty / docQty) * 100 : 0;
+      const percentRounded = Math.round(percent * 100) / 100;
+      const isExact = Math.abs(percentRounded - 100) < 0.0001;
+      return {
+        name: row.supplier || "-",
+        period: periodLabel,
+        planQty: docQty,
+        actualQty,
+        percent: percentRounded,
+        looseCount,
+        status: isExact && looseCount === 0 ? "TERCAPAI" : "TIDAK TERCAPAI",
+      };
+    });
+
+    const monthKey = monthKeyByIndex[monthNum - 1] || "jan";
+    const deliveryResult = await pool.query(
+      `
+      with prl as (
+        select
+          item_code,
+          case
+            when (months ->> $3) ~ '^[0-9]+(\\.[0-9]+)?$'
+              then (months ->> $3)::numeric
+            else 0
+          end as plan_qty
+        from prl_records
+        where year = $1
+          and item_code not ilike 'TEST-%'
+      ),
+      plan_customer as (
+        select
+          coalesce(mc.name, ic.customer_id, 'Unassigned') as customer,
+          sum(pr.plan_qty * (coalesce(ic.share_percent, 0) / 100.0))::numeric as plan_qty
+        from prl pr
+        join item_customers ic on ic.item_code = pr.item_code
+        left join master_customers mc on mc.id = ic.customer_id
+        group by customer
+      ),
+      plan_unassigned as (
+        select
+          'Unassigned' as customer,
+          coalesce(sum(pr.plan_qty), 0)::numeric as plan_qty
+        from prl pr
+        where not exists (
+          select 1 from item_customers ic where ic.item_code = pr.item_code
+        )
+      ),
+      plan as (
+        select customer, plan_qty from plan_customer
+        union all
+        select customer, plan_qty from plan_unassigned
+      ),
+      plan_grouped as (
+        select customer, sum(plan_qty)::numeric as plan_qty
+        from plan
+        group by customer
+      ),
+      actual as (
+        select
+          coalesce(po.supplier, 'Unassigned') as customer,
+          sum(po.qty)::numeric as actual_qty
+        from production_orders po
+        where po.created_at >= $2 and po.created_at < $4
+          and po.product_code not ilike 'TEST-%'
+        group by customer
+      )
+      select
+        coalesce(pg.customer, a.customer) as customer,
+        coalesce(pg.plan_qty, 0)::numeric as plan_qty,
+        coalesce(a.actual_qty, 0)::numeric as actual_qty
+      from plan_grouped pg
+      full join actual a on a.customer = pg.customer
+      order by customer asc
+      `,
+      [yearNum, startDate, monthKey, endDate],
+    );
+    const deliveryRows = deliveryResult.rows
+      .map((row) => {
+        const planQty = Number(row.plan_qty || 0);
+        const actualQty = Number(row.actual_qty || 0);
+        const percent = planQty > 0 ? (actualQty / planQty) * 100 : 0;
+        const percentRounded = Math.round(percent * 100) / 100;
+        const inRange = percentRounded >= 80 && percentRounded <= 120;
+        return {
+          name: row.customer || "-",
+          period: periodLabel,
+          planQty,
+          actualQty,
+          percent: percentRounded,
+          status: inRange ? "TERCAPAI" : "TIDAK TERCAPAI",
+        };
+      })
+      .filter((row) => row.planQty > 0 || row.actualQty > 0);
+
+    res.json({
+      period: { month: monthNum, year: yearNum, label: periodLabel },
+      inboundSchedule: inboundRows,
+      dnVsRn: dnRows,
+      deliveryVsPrl: deliveryRows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/kpi/summary", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const today = new Date();
+    const monthKey = monthKeyByIndex[today.getMonth()];
+    const year = today.getFullYear();
+    const [inventoryValueResult, stockAlertResult, pendingInboundResult, outstandingPrResult] = await Promise.all([
+      pool.query(
+        `
+        with stock_main as (
+          select item_code, sum(qty_in - qty_out)::numeric as stock_qty
+          from stock_batches
+          group by item_code
+        ),
+        stock_subcon as (
+          select item_code, sum(case when direction = 'in' then qty else -qty end)::numeric as stock_qty
+          from subcon_stock_movements
+          group by item_code
+        ),
+        stock as (
+          select
+            coalesce(m.item_code, s.item_code) as item_code,
+            (coalesce(m.stock_qty, 0) + coalesce(s.stock_qty, 0))::numeric as stock_qty
+          from stock_main m
+          full join stock_subcon s on s.item_code = m.item_code
+        )
+        select coalesce(sum(coalesce(s.stock_qty, 0) * coalesce(i.price, 0)), 0)::numeric as inventory_value
+        from items i
+        left join stock s on s.item_code = i.code
+        where i.code not ilike 'TEST-%'
+        `,
+      ),
+      pool.query(
+        `
+        with stock as (
+          select item_code, sum(qty_in - qty_out)::numeric as stock_qty
+          from stock_batches
+          group by item_code
+        )
+        select count(*)::int as alert_count
+        from items i
+        left join stock s on s.item_code = i.code
+        where coalesce(i.safety_stock, 0) > 0
+          and coalesce(s.stock_qty, 0) < coalesce(i.safety_stock, 0)
+          and i.code not ilike 'TEST-%'
+        `,
+      ),
+      pool.query(
+        `
+        select count(*)::int as pending_count
+        from schedules
+        where request_date = current_date
+          and arrival_date is null
+          and item not ilike 'TEST-%'
+        `,
+      ),
+      pool.query(
+        `
+        select count(*)::int as outstanding_count
+        from prl_records
+        where year = $1
+          and item_code not ilike 'TEST-%'
+          and (
+            case
+              when (months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+                then (months ->> $2)::numeric
+              else 0
+            end
+          ) > 0
+          and (status ->> $2) is distinct from 'active'
+        `,
+        [year, monthKey],
+      ),
+    ]);
+    const inventoryValue = Number(inventoryValueResult.rows[0]?.inventory_value || 0);
+    const stockAlert = Number(stockAlertResult.rows[0]?.alert_count || 0);
+    const pendingInbound = Number(pendingInboundResult.rows[0]?.pending_count || 0);
+    const outstandingPr = Number(outstandingPrResult.rows[0]?.outstanding_count || 0);
+    res.json({
+      inventoryValue,
+      stockAlert,
+      pendingInbound,
+      outstandingPr,
+      monthKey,
+      year,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const refreshMovingStatus = async (poolInstance) => {
+  const client = await poolInstance.connect();
+  try {
+    await client.query(
+      `
+      with outgoing as (
+        select item_code, count(*)::int as frequency
+        from stock_movements
+        where direction = 'out'
+          and created_at >= now() - interval '90 days'
+        group by item_code
+      ),
+      freqs as (
+        select
+          i.code,
+          coalesce(o.frequency, 0) as frequency,
+          coalesce(i.qty_on_hand, 0) as stock_on_hand,
+          coalesce(i.is_seasonal, false) as is_seasonal
+        from items i
+        left join outgoing o on o.item_code = i.code
+      )
+      update items i
+      set moving_status = (
+        case
+          when f.is_seasonal then 'SEASONAL'
+          when f.stock_on_hand > 0 and f.frequency = 0 then 'DEAD'
+          when f.frequency >= 15 then 'FAST'
+          else 'SLOW'
+        end
+      )::moving_status_enum
+      from freqs f
+      where i.code = f.code
+      `,
+    );
+  } finally {
+    client.release();
+  }
+};
+
+const scheduleMovingStatusJob = (poolInstance) => {
+  const scheduleNextRun = () => {
+    const now = new Date();
+    const next = new Date(now);
+    next.setHours(1, 0, 0, 0);
+    if (next <= now) next.setDate(next.getDate() + 1);
+    const delay = Math.max(0, next.getTime() - now.getTime());
+    setTimeout(async () => {
+      try {
+        await refreshMovingStatus(poolInstance);
+        console.log("Moving status updated.");
+      } catch (error) {
+        console.error("Failed to update moving status:", error);
+      } finally {
+        scheduleNextRun();
+      }
+    }, delay);
+  };
+  refreshMovingStatus(poolInstance).catch((error) => {
+    console.error("Failed to update moving status:", error);
+  });
+  scheduleNextRun();
+};
+
+const DAILY_USAGE_EXCLUDED_REASONS = new Set(["receive_delete", "stock_opname"]);
+
+const addDays = (date, days) => {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+};
+
+const resolveWindowRange = (windowDays) => {
+  const safeDays = Number.isFinite(windowDays) ? Math.max(1, Math.floor(windowDays)) : 1;
+  const endDate = addDays(new Date(), -1);
+  const startDate = addDays(endDate, -(safeDays - 1));
+  return {
+    windowDays: safeDays,
+    startDate: formatDateOnly(startDate),
+    endDate: formatDateOnly(endDate),
+  };
+};
+
+const refreshItemDailyUsage = async (client, windowDays) => {
+  const { startDate, endDate, windowDays: days } = resolveWindowRange(windowDays);
+  const excludedReasons = Array.from(DAILY_USAGE_EXCLUDED_REASONS);
+  await client.query(
+    `
+    with usage as (
+      select i.code as item_code,
+        i.unit as uom,
+        coalesce(sum(m.qty), 0)::numeric as total_usage
+      from items i
+      left join stock_movements m
+        on m.item_code = i.code
+        and m.direction = 'out'
+        and m.created_at::date between $1::date and $2::date
+        and (
+          m.reason is null
+          or m.reason not in (${excludedReasons.map((_, idx) => `$${idx + 3}`).join(", ")})
+        )
+      where i.code not ilike 'TEST-%'
+      group by i.code
+    )
+    insert into item_daily_usage
+      (item_code, daily_usage_qty, window_days, window_start, window_end, total_usage, uom, source, effective_date, updated_at)
+    select
+      u.item_code,
+      (u.total_usage / $${excludedReasons.length + 3}::numeric),
+      $${excludedReasons.length + 3},
+      $1::date,
+      $2::date,
+      u.total_usage,
+      u.uom,
+      'auto',
+      $2::date,
+      now()
+    from usage u
+    on conflict (item_code) do update set
+      daily_usage_qty = excluded.daily_usage_qty,
+      window_days = excluded.window_days,
+      window_start = excluded.window_start,
+      window_end = excluded.window_end,
+      total_usage = excluded.total_usage,
+      uom = excluded.uom,
+      source = excluded.source,
+      effective_date = excluded.effective_date,
+      updated_at = excluded.updated_at
+    `,
+    [startDate, endDate, ...excludedReasons, days],
+  );
+
+  await client.query(
+    `
+    with usage as (
+      select i.code as item_code,
+        i.unit as uom,
+        coalesce(sum(m.qty), 0)::numeric as total_usage
+      from items i
+      left join stock_movements m
+        on m.item_code = i.code
+        and m.direction = 'out'
+        and m.created_at::date between $1::date and $2::date
+        and (
+          m.reason is null
+          or m.reason not in (${excludedReasons.map((_, idx) => `$${idx + 3}`).join(", ")})
+        )
+      where i.code not ilike 'TEST-%'
+      group by i.code
+    )
+    insert into item_daily_usage_history
+      (item_code, daily_usage_qty, window_days, window_start, window_end, total_usage, uom, source, effective_date)
+    select
+      u.item_code,
+      (u.total_usage / $${excludedReasons.length + 3}::numeric),
+      $${excludedReasons.length + 3},
+      $1::date,
+      $2::date,
+      u.total_usage,
+      u.uom,
+      'auto',
+      $2::date
+    from usage u
+    `,
+    [startDate, endDate, ...excludedReasons, days],
+  );
+};
+
+const syncSupplierLeadTimeHistory = async (client) => {
+  await client.query(
+    `
+    insert into supplier_lead_time_history
+      (supplier_id, po_number, po_date, schedule_id, item_code, received_qty, received_date, lead_time_days)
+    select
+      ph.supplier_id,
+      s.po_number,
+      ph.po_date,
+      rn.schedule_id,
+      coalesce(s.item_code, s.item, rn.item_code),
+      rn.received_qty,
+      coalesce(s.arrival_date, rn.received_at::date),
+      (coalesce(s.arrival_date, rn.received_at::date) - ph.po_date)
+    from receive_notes rn
+    join schedules s on s.id = rn.schedule_id
+    join po_headers ph on ph.po_number = s.po_number
+    left join supplier_lead_time_history h on h.schedule_id = rn.schedule_id
+    where h.id is null
+      and ph.supplier_id is not null
+      and ph.po_date is not null
+      and coalesce(s.arrival_date, rn.received_at::date) is not null
+      and coalesce(s.item_code, s.item, rn.item_code) not ilike 'TEST-%'
+      and (coalesce(s.arrival_date, rn.received_at::date) - ph.po_date) >= 0
+    `,
+  );
+};
+
+const refreshSupplierLeadTimeStats = async (client, windowDays, iqrMultiplier) => {
+  const { startDate, endDate } = resolveWindowRange(windowDays);
+  const safeMultiplier = Number.isFinite(iqrMultiplier) ? Math.max(0, iqrMultiplier) : 1.5;
+  await client.query(
+    `
+    with base as (
+      select supplier_id, lead_time_days
+      from supplier_lead_time_history
+      where received_date between $1::date and $2::date
+        and lead_time_days is not null
+        and lead_time_days >= 0
+    ),
+    stats as (
+      select supplier_id,
+        count(*)::int as n,
+        percentile_cont(0.25) within group (order by lead_time_days) as p25,
+        percentile_cont(0.5) within group (order by lead_time_days) as p50,
+        percentile_cont(0.75) within group (order by lead_time_days) as p75
+      from base
+      group by supplier_id
+    ),
+    filtered as (
+      select b.supplier_id, b.lead_time_days, s.n, s.p25, s.p75
+      from base b
+      join stats s on s.supplier_id = b.supplier_id
+      where s.n < 4
+        or (
+          b.lead_time_days >= (s.p25 - $3 * (s.p75 - s.p25))
+          and b.lead_time_days <= (s.p75 + $3 * (s.p75 - s.p25))
+        )
+    ),
+    agg as (
+      select supplier_id,
+        avg(lead_time_days)::numeric as avg_lead_time_days,
+        count(*)::int as sample_size
+      from filtered
+      group by supplier_id
+    )
+    insert into supplier_lead_time_stats
+      (supplier_id, avg_lead_time_days, sample_size, window_start, window_end, updated_at)
+    select supplier_id, avg_lead_time_days, sample_size, $1::date, $2::date, now()
+    from agg
+    on conflict (supplier_id) do update set
+      avg_lead_time_days = excluded.avg_lead_time_days,
+      sample_size = excluded.sample_size,
+      window_start = excluded.window_start,
+      window_end = excluded.window_end,
+      updated_at = excluded.updated_at
+    `,
+    [startDate, endDate, safeMultiplier],
+  );
+
+  await client.query(
+    `
+    update master_vendors v
+    set actual_lead_time_days = s.avg_lead_time_days,
+        actual_lead_time_updated_at = now()
+    from supplier_lead_time_stats s
+    where s.supplier_id = v.id
+    `,
+  );
+};
+
+let analyticsJobRunning = false;
+const runAnalyticsJobs = async (poolInstance) => {
+  if (analyticsJobRunning) return;
+  analyticsJobRunning = true;
+  const client = await poolInstance.connect();
+  try {
+    const dailyUsageWindowDays = await getNumberSetting(client, SETTINGS_KEYS.DAILY_USAGE_WINDOW_DAYS, 90);
+    const leadTimeWindowDays = await getNumberSetting(client, SETTINGS_KEYS.LEAD_TIME_WINDOW_DAYS, 180);
+    const leadTimeIqrMultiplier = await getNumberSetting(client, SETTINGS_KEYS.LEAD_TIME_OUTLIER_IQR_MULT, 1.5);
+
+    await refreshItemDailyUsage(client, dailyUsageWindowDays);
+    await syncSupplierLeadTimeHistory(client);
+    await refreshSupplierLeadTimeStats(client, leadTimeWindowDays, leadTimeIqrMultiplier);
+
+    console.log("Analytics jobs completed.");
+  } catch (error) {
+    console.error("Analytics jobs failed:", error);
+  } finally {
+    analyticsJobRunning = false;
+    client.release();
+  }
+};
+
+const scheduleAnalyticsJobs = (poolInstance) => {
+  const scheduleNextRun = () => {
+    const now = new Date();
+    const next = new Date(now);
+    next.setHours(2, 15, 0, 0);
+    if (next <= now) next.setDate(next.getDate() + 1);
+    const delay = Math.max(0, next.getTime() - now.getTime());
+    setTimeout(async () => {
+      await runAnalyticsJobs(poolInstance);
+      scheduleNextRun();
+    }, delay);
+  };
+  runAnalyticsJobs(poolInstance).catch((error) => {
+    console.error("Initial analytics jobs failed:", error);
+  });
+  scheduleNextRun();
+};
+
+const reconcileKanbanShortagePrlDrafts = async (poolInstance) => {
+  const client = await poolInstance.connect();
+  try {
+    await client.query("begin");
+    const activeResult = await client.query(
+      `
+      select id
+      from kanban_requests
+      where status not in ('closed', 'rejected')
+      `,
+    );
+    const activeIds = (activeResult.rows || [])
+      .map((row) => Number(row.id))
+      .filter((value) => Number.isFinite(value));
+    if (activeIds.length > 0) {
+      await syncKanbanRequestHealthByIds(client, activeIds, { syncPrlDrafts: true });
+    }
+    await client.query("commit");
+    console.log(`Kanban PRL shortage reconcile completed. Active requests: ${activeIds.length}`);
+  } catch (error) {
+    await client.query("rollback");
+    console.error("Kanban PRL shortage reconcile failed:", error);
+  } finally {
+    client.release();
+  }
+};
+
+const startServer = async () => {
+  try {
+    await ensureSchema();
+    await ensureUploadDirs();
+    await ensureAdminUser();
+    await reconcileKanbanShortagePrlDrafts(pool);
+    scheduleMovingStatusJob(pool);
+    scheduleAnalyticsJobs(pool);
+    app.listen(port, "0.0.0.0", () => {
+      console.log(`API listening on http://0.0.0.0:${port}`);
+    });
+  } catch (error) {
+    console.error("Failed to start server:", error);
+    process.exit(1);
+  }
+};
+
+startServer();

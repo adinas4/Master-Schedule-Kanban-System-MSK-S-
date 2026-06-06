@@ -1,0 +1,264 @@
+erDiagram
+  master_bom {
+    integer id PK
+    text parent_code FK
+    text child_code FK
+    numeric quantity
+    numeric scrap_factor
+    timestamp_with_time_zone created_at
+    text component_type
+    text component_description
+    text model_spec
+    text line_production
+    text supplier_name
+    text packing
+    numeric cycle_time_seconds
+    jsonb process_flow
+    numeric cost_rp
+    integer lead_time_days
+  }
+  delivery_notes {
+    integer id PK
+    text dn_number
+    integer request_id FK
+    text supplier
+    date planned_date
+    text status
+    timestamp_with_time_zone created_at
+  }
+  item_customers {
+    text item_code PK FK
+    text customer_id PK FK
+    numeric share_percent
+  }
+  item_suppliers {
+    text item_code PK FK
+    text vendor_id PK FK
+    numeric share_percent
+  }
+  items {
+    text code PK
+    text name
+    text part_no
+    text type
+    text unit
+    text model
+    numeric weight
+    numeric price
+    text vendor_id
+    text location_id
+    text image_url
+    text cycle
+    integer shelf_life_days
+    numeric safety_stock
+    numeric qty_on_hand
+    text type_pack
+    timestamp_with_time_zone created_at
+  }
+  kanban_events {
+    integer id PK
+    integer request_id FK
+    text event
+    integer by_user FK
+    jsonb meta
+    timestamp_with_time_zone created_at
+  }
+  kanban_requests {
+    integer id PK
+    text item_code FK
+    text request_code
+    numeric request_qty
+    text trigger_type
+    text status
+    integer created_by FK
+    integer approved_by FK
+    integer dn_id
+    integer schedule_id
+    text notes
+    timestamp_with_time_zone created_at
+    timestamp_with_time_zone updated_at
+  }
+  kanban_settings {
+    text item_code PK FK
+    numeric min_qty
+    numeric max_qty
+    numeric lot_qty
+    integer lead_time_days
+    text default_supplier
+    boolean active
+    timestamp_with_time_zone created_at
+    timestamp_with_time_zone updated_at
+  }
+  master_areas {
+    text id PK
+    text name
+    text plant_id FK
+  }
+  master_categories {
+    text code PK
+    text name
+  }
+  master_config {
+    integer id PK
+    jsonb fifo_method
+    jsonb document_numbering
+    ARRAY qc_status
+    text hold_location
+    jsonb working_days
+    text kanban_id_format
+    text request_id_format
+  }
+  master_customers {
+    text id PK
+    text name
+    text email
+    integer lead_time_days
+  }
+  master_deliveries {
+    text id PK
+    text area_id FK
+    text address
+  }
+  master_locations {
+    text id PK
+    text warehouse_id FK
+    text category
+    text fifo_lane
+  }
+  master_models {
+    text code PK
+    text name
+    timestamp_with_time_zone created_at
+  }
+  master_packings {
+    text code PK
+    text name
+  }
+  master_plants {
+    text id PK
+    text name
+    text site
+  }
+  master_vendors {
+    text id PK
+    text name
+    text type
+    text role
+    text email
+    integer lead_time_days
+  }
+  master_warehouses {
+    text id PK
+    text name
+    text site
+  }
+  prl_records {
+    integer id PK
+    text item_code FK
+    integer year
+    text part_no
+    text description
+    text model
+    numeric qty_per_kanban
+    text uom
+    text type_pack
+    text volume
+    jsonb months
+    jsonb status
+    timestamp_with_time_zone created_at
+    timestamp_with_time_zone updated_at
+  }
+  production_consumption {
+    integer id PK
+    integer production_id FK
+    text item_code FK
+    integer batch_id FK
+    numeric qty
+  }
+  production_orders {
+    integer id PK
+    text product_code FK
+    text supplier
+    numeric qty
+    timestamp_with_time_zone created_at
+  }
+  receive_notes {
+    integer id PK
+    text rn_number
+    integer dn_id FK
+    integer schedule_id FK
+    numeric received_qty
+    text qc_status
+    text status
+    timestamp_with_time_zone received_at
+    text notes
+  }
+  schedules {
+    integer id PK
+    text po_number
+    text supplier
+    text item
+    date request_date
+    text delivery_time
+    integer request_qty
+    date arrival_date
+    integer received_qty
+    text do_number
+    text status
+    text notes
+    boolean has_split
+    boolean is_split_result
+    boolean actual_locked
+    timestamp_with_time_zone created_at
+    timestamp_with_time_zone updated_at
+    integer dn_id FK
+    integer request_id FK
+  }
+  stock_batches {
+    integer id PK
+    text item_code FK
+    numeric qty_in
+    numeric qty_out
+    date arrival_date
+    text do_number
+    text batch_no
+    integer schedule_id FK
+    timestamp_with_time_zone created_at
+  }
+  users {
+    integer id PK
+    text username
+    text password_hash
+    text role
+    timestamp_with_time_zone created_at
+    timestamp_with_time_zone updated_at
+    jsonb permissions
+  }
+
+  schedules ||--o{ stock_batches : "schedule_id->id"
+  items ||--o{ item_customers : "item_code->code"
+  items ||--o{ production_consumption : "item_code->code"
+  items ||--o{ master_bom : "child_code->code"
+  master_customers ||--o{ item_customers : "customer_id->id"
+  kanban_requests ||--o{ kanban_events : "request_id->id"
+  users ||--o{ kanban_events : "by_user->id"
+  items ||--o{ master_bom : "parent_code->code"
+  stock_batches ||--o{ production_consumption : "batch_id->id"
+  items ||--o{ prl_records : "item_code->code"
+  items ||--o{ stock_batches : "item_code->code"
+  items ||--o{ production_orders : "product_code->code"
+  items ||--o{ item_suppliers : "item_code->code"
+  master_areas ||--o{ master_deliveries : "area_id->id"
+  delivery_notes ||--o{ schedules : "dn_id->id"
+  master_warehouses ||--o{ master_locations : "warehouse_id->id"
+  master_vendors ||--o{ item_suppliers : "vendor_id->id"
+  kanban_requests ||--o{ delivery_notes : "request_id->id"
+  items ||--o{ kanban_requests : "item_code->code"
+  kanban_requests ||--o{ schedules : "request_id->id"
+  users ||--o{ kanban_requests : "created_by->id"
+  delivery_notes ||--o{ receive_notes : "dn_id->id"
+  schedules ||--o{ receive_notes : "schedule_id->id"
+  production_orders ||--o{ production_consumption : "production_id->id"
+  items ||--o{ kanban_settings : "item_code->code"
+  master_plants ||--o{ master_areas : "plant_id->id"
+  users ||--o{ kanban_requests : "approved_by->id"

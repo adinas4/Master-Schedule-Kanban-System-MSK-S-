@@ -12,6 +12,20 @@ dist
 dist-ssr
 *.local
 
+# Environment variables (SENSITIVE - DO NOT COMMIT)
+.env
+.env.local
+.env.*.local
+server/.env
+server/.env.local
+
+# Temp files
+tmp-downloads/*
+*.tmp
+*.bak
+dev.log
+consoleCapture.cjs
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

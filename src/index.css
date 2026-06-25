@@ -251,6 +251,10 @@
   margin-top: 16px;
 }
 
+.rn-footer-section {
+  margin-top: 16px;
+}
+
 .rn-signature-card {
   border: 1px solid #0f172a;
   padding: 8px;
@@ -274,6 +278,10 @@
   font-size: 9px;
   text-align: center;
   color: #64748b;
+}
+
+.rn-page-footer {
+  display: none;
 }
 
 .print-only {
@@ -656,6 +664,58 @@
     page-break-inside: avoid;
   }
 
+  body.stockopname-print-active #root {
+    position: relative;
+    overflow: visible;
+  }
+
+  body.stockopname-print-active #root > * {
+    visibility: hidden !important;
+  }
+
+  body.stockopname-print-active .stockopname-print-scope {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    visibility: visible !important;
+  }
+
+  body.stockopname-print-active .stockopname-print-scope * {
+    visibility: visible !important;
+  }
+
+  body.stockopname-print-active .stockopname-print-scope {
+    background: #fff !important;
+    padding: 0 !important;
+  }
+
+  body.stockopname-print-active .stockopname-print-scope > div {
+    width: 100% !important;
+    max-width: none !important;
+    max-height: none !important;
+    overflow: visible !important;
+    border: none !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+  }
+
+  body.stockopname-print-active .stockopname-print-sheet {
+    padding: 0 !important;
+    padding-bottom: 42mm !important;
+    box-sizing: border-box;
+    min-height: calc(297mm - 30mm);
+  }
+
+  body.stockopname-print-active .stockopname-signature-bar {
+    position: fixed;
+    left: 15mm;
+    right: 15mm;
+    bottom: 12mm;
+    margin: 0 !important;
+    padding-top: 4mm;
+    background: #fff;
+  }
+
   .report-print-scope table {
     width: 100%;
     border-collapse: collapse;
@@ -894,6 +954,47 @@
 
   .print-body {
     padding-bottom: 24mm;
+  }
+
+  .rn-print-page {
+    min-height: calc(297mm - 25mm);
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
+  }
+
+  .rn-print-page.print-body {
+    padding-bottom: 0;
+  }
+
+  .rn-footer-section {
+    margin-top: auto;
+    padding-top: 6mm;
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  .rn-signature-grid {
+    margin-top: 0;
+    padding-top: 0;
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  .rn-signature-card {
+    min-height: 58px;
+  }
+
+  .rn-page-footer {
+    display: block;
+    margin-top: 3mm;
+    font-size: 9px;
+    text-align: right;
+    color: #111827;
+  }
+
+  .rn-page-footer::after {
+    content: "Page " counter(page);
   }
 
   .page-footer {

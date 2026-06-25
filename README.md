@@ -41,9 +41,11 @@ Frontend (`.env` di root):
 
 ```
 VITE_API_BASE=
+VITE_ADMIN_WHATSAPP_NUMBER=6285183220938
 ```
 
 Kosongkan `VITE_API_BASE` untuk auto-detect host browser saat backend ada di port `4000` pada mesin/LAN yang sama. Jika ingin override manual, isi dengan URL penuh seperti `http://192.168.1.194:4000`.
+Isi `VITE_ADMIN_WHATSAPP_NUMBER` dengan nomor Admin/IT format digit tanpa spasi atau simbol, misalnya `6285183220938`.
 
 ### 3) Run Local
 
@@ -190,6 +192,12 @@ graph TD
 - Input notes di‑commit saat blur untuk mengurangi lag ketik.
 - Lazy load library berat (`xlsx`, `qr-scanner`).
 - Memoisasi filter jadwal untuk mengurangi render.
+
+## Dokumen Praktis AI
+
+- [AI Praktis untuk Perancangan Modul](docs/ai-praktis-perancangan-modul.md)
+- [Task breakdown backend/frontend/database](docs/task-breakdown-backend-frontend-database.md)
+- [Schema lock 4 modules](docs/schema-lock-4-modules-2026-03.md)
 
 ## Business Logic (Penting)
 

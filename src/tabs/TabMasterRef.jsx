@@ -48,7 +48,6 @@ const TabMasterRef = (props) => {
     handleEditModel,
     handleEditProcess,
     handleExportItemsXls,
-    handleItemModelEntryKey,
     handleSaveArea,
     handleSaveCategory,
     handleSaveConfig,
@@ -184,6 +183,63 @@ const TabMasterRef = (props) => {
     && String(a?.customer ?? '') === String(b?.customer ?? '')
     && String(a?.model ?? '') === String(b?.model ?? '')
   );
+  const locationTypeOptions = ['Production Line', 'Work Center', 'Warehouse'];
+  const getStandardLocationType = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    if (/production\s*line/i.test(raw)) return 'Production Line';
+    if (/work\s*center/i.test(raw)) return 'Work Center';
+    if (/warehouse/i.test(raw)) return 'Warehouse';
+    return '';
+  };
+  const isProcessLocationType = (value) => {
+    const normalized = getStandardLocationType(value);
+    return normalized === 'Production Line' || normalized === 'Work Center';
+  };
+
+  const processTypeOptions = useMemo(() => {
+    const defaults = ['Subcon', 'Assembly', 'Machining', 'Welding', 'Painting', 'Inspection', 'Packing', 'Other'];
+    const dynamic = (masterProcesses || [])
+      .map((process) => String(process.process_type || process.processType || '').trim())
+      .filter(Boolean);
+    return Array.from(new Set([...defaults, ...dynamic])).filter(Boolean);
+  }, [masterProcesses]);
+  const processWorkCenterOptions = useMemo(() => {
+    const seen = new Set();
+    return (masterLocations || [])
+      .map((location) => {
+        const locationId = String(location.id || '').trim();
+        const lineDescription = getStandardLocationType(location.line_description || location.lineDescription);
+        const inferredType = lineDescription || String(location.category || location.type || '').trim();
+        const fifoLane = String(location.fifo_lane || location.fifoLane || '').trim();
+        const labelParts = [locationId, inferredType, fifoLane].filter(Boolean);
+        return {
+          value: locationId,
+          label: labelParts.join(' • '),
+          isProcessType: isProcessLocationType(lineDescription),
+        };
+      })
+      .filter((option) => {
+        if (!option.value || seen.has(option.value)) return false;
+        seen.add(option.value);
+        return true;
+      });
+  }, [masterLocations]);
+  const getProcessWorkCenterLabel = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '-';
+    const matched = processWorkCenterOptions.find(
+      (option) => option.value === raw || String(option.label || '').toLowerCase() === raw.toLowerCase(),
+    );
+    return matched?.label || raw;
+  };
+  const masterFormHelperText = {
+    warehouse: 'Gedung fisik atau fungsi utama secara keseluruhan. Contoh: Gudang Material (RM), Gudang Barang Jadi (FG).',
+    area: 'Pembagian zona atau blok di dalam Gudang. Contoh: Area Karantina, Area Rak Besi.',
+    location: 'Titik koordinat paling spesifik untuk meletakkan barang fisik. Contoh: Rak A-01, Bin B-05, Palet 12.',
+    productionLine: 'Jalur produksi atau area perakitan secara keseluruhan. Contoh: Line Perakitan Rangka, Line Pengecatan.',
+    workCenter: 'Titik mesin atau stasiun kerja spesifik di dalam Line. Contoh: Mesin Las 01, Meja Inspeksi 02.',
+  };
 
   useEffect(() => {
     setLocalItemFilters(itemTableFilters || {});
@@ -255,6 +311,19 @@ const TabMasterRef = (props) => {
     }
   };
 
+  const handleQuickSaveModelForItem = async () => {
+    const savedModel = await handleSaveModel?.();
+    if (!savedModel?.code) return;
+    const savedCode = String(savedModel.code || '').trim();
+    if (!savedCode) return;
+    setItemModelEntry(savedCode);
+    setItemMasterForm((prev) => {
+      const existing = prev.modelCodes || [];
+      if (existing.includes(savedCode)) return prev;
+      return { ...prev, modelCodes: [...existing, savedCode] };
+    });
+  };
+
   const allowMasterEdit = !!canManageMaster;
   const allowVendorEdit = !!canManageVendors;
   const [vendorSearch, setVendorSearch] = useState('');
@@ -295,20 +364,13 @@ const TabMasterRef = (props) => {
     const area = areaById.get(areaId);
     return area ? `${area.id} - ${area.name}` : areaId;
   };
-  const locationTypeOptions = ['Production Line', 'Work Center', 'Warehouse'];
-  const getStandardLocationType = (value) => {
-    const raw = String(value || '').trim();
-    if (!raw) return '';
-    if (/production\s*line/i.test(raw)) return 'Production Line';
-    if (/work\s*center/i.test(raw)) return 'Work Center';
-    if (/warehouse/i.test(raw)) return 'Warehouse';
-    return '';
-  };
-  const isProcessLocationType = (value) => {
-    const normalized = getStandardLocationType(value);
-    return normalized === 'Production Line' || normalized === 'Work Center';
-  };
   const isLocationProcessEnabled = isProcessLocationType(locationForm?.lineDescription);
+  const getProcessScopeLabel = (value) => {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === 'single') return 'Single-Level';
+    if (normalized === 'multi') return 'Multi-Level';
+    return 'All';
+  };
   const isCreatingLocation = !editingLocationId;
   const normalizePrefix = (value, fallback) => {
     const trimmed = String(value || '').trim();
@@ -536,6 +598,9 @@ const TabMasterRef = (props) => {
                           ))}
                         </select>
                       </div>
+                      <div className="mb-3 text-[11px] text-slate-500 leading-relaxed">
+                        {masterFormHelperText.warehouse}
+                      </div>
                       <div className="flex gap-2 mb-4 text-xs">
                         <button onClick={handleSaveWarehouse} className="px-3 py-1.5 rounded bg-slate-900 text-white inline-flex items-center gap-1">
                           <Save size={14} />
@@ -626,6 +691,9 @@ const TabMasterRef = (props) => {
                             <option key={wh.id} value={wh.id}>{wh.id} - {wh.name}</option>
                           ))}
                         </select>
+                      </div>
+                      <div className="mb-3 text-[11px] text-slate-500 leading-relaxed">
+                        {masterFormHelperText.area}
                       </div>
                       <div className="flex gap-2 mb-4 text-xs">
                         <button onClick={handleSaveArea} className="px-3 py-1.5 rounded bg-slate-900 text-white inline-flex items-center gap-1">
@@ -738,12 +806,19 @@ const TabMasterRef = (props) => {
                             }));
                           }}
                           required
-                        >
-                          <option value="">Pilih Tipe Lokasi</option>
-                          {locationTypeOptions.map((type) => (
-                            <option key={type} value={type}>{type}</option>
-                          ))}
-                        </select>
+                          >
+                            <option value="">Pilih Tipe Lokasi</option>
+                            {locationTypeOptions.map((type) => (
+                              <option key={type} value={type}>{type}</option>
+                            ))}
+                          </select>
+                      </div>
+                      <div className="mb-3 text-[11px] text-slate-500 leading-relaxed">
+                        {locationForm.lineDescription === 'Production Line'
+                          ? masterFormHelperText.productionLine
+                          : locationForm.lineDescription === 'Work Center'
+                            ? masterFormHelperText.workCenter
+                            : masterFormHelperText.location}
                       </div>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs mb-3 items-stretch">
                         <select
@@ -797,6 +872,11 @@ const TabMasterRef = (props) => {
                   <datalist id="bom-process-options">
                     {bomProcessOptions.map((proc, idx) => (
                       <option key={`proc-${idx}`} value={proc} />
+                    ))}
+                  </datalist>
+                  <datalist id="master-process-type-options">
+                    {processTypeOptions.map((type) => (
+                      <option key={type} value={type} />
                     ))}
                   </datalist>
                   <table className="min-w-full text-xs">
@@ -1386,7 +1466,15 @@ const TabMasterRef = (props) => {
                   {allowMasterEdit && (
                     <button
                       onClick={() => {
-                        setProcessCatalogForm({ code: '', name: '' });
+                        setProcessCatalogForm({
+                          code: '',
+                          name: '',
+                          processType: '',
+                          appliesToLevel: 'All',
+                          workCenter: '',
+                          sequence: '',
+                          standardTime: '',
+                        });
                         setEditingProcessCode(null);
                         setProcessFormVisible(true);
                       }}
@@ -1399,7 +1487,7 @@ const TabMasterRef = (props) => {
                 </div>
                 {processFormVisible && allowMasterEdit && (
                   <div className="space-y-3 border-b pb-3 mb-4">
-                    <div className="grid gap-2 text-xs">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
                       <input
                         className="border rounded px-3 py-2"
                         placeholder="Kode Process"
@@ -1411,6 +1499,50 @@ const TabMasterRef = (props) => {
                         placeholder="Nama Process"
                         value={processCatalogForm.name}
                         onChange={(e) => setProcessCatalogForm({ ...processCatalogForm, name: e.target.value })}
+                      />
+                      <input
+                        className="border rounded px-3 py-2"
+                        list="master-process-type-options"
+                        placeholder="Process Type (contoh: Subcon)"
+                        value={processCatalogForm.processType}
+                        onChange={(e) => setProcessCatalogForm({ ...processCatalogForm, processType: e.target.value })}
+                      />
+                      <select
+                        className="border rounded px-3 py-2 bg-white"
+                        value={processCatalogForm.appliesToLevel}
+                        onChange={(e) => setProcessCatalogForm({ ...processCatalogForm, appliesToLevel: e.target.value })}
+                      >
+                        <option value="All">All</option>
+                        <option value="Single">Single-Level</option>
+                        <option value="Multi">Multi-Level</option>
+                      </select>
+                        <select
+                          className="border rounded px-3 py-2 bg-white"
+                          value={processCatalogForm.workCenter}
+                          onChange={(e) => setProcessCatalogForm({ ...processCatalogForm, workCenter: e.target.value })}
+                          required
+                        >
+                          <option value="">- Pilih Work Center / Production Line -</option>
+                          {processWorkCenterOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      <input
+                        type="number"
+                        className="border rounded px-3 py-2"
+                        placeholder="Sequence"
+                        value={processCatalogForm.sequence}
+                        onChange={(e) => setProcessCatalogForm({ ...processCatalogForm, sequence: e.target.value })}
+                      />
+                      <input
+                        type="number"
+                        step="0.01"
+                        className="border rounded px-3 py-2"
+                        placeholder="Standard Time (detik)"
+                        value={processCatalogForm.standardTime}
+                        onChange={(e) => setProcessCatalogForm({ ...processCatalogForm, standardTime: e.target.value })}
                       />
                     </div>
                     <div className="flex flex-wrap gap-2">
@@ -1431,6 +1563,11 @@ const TabMasterRef = (props) => {
                       <tr>
                         <th className="text-left p-2">Kode Process</th>
                         <th className="text-left p-2">Nama Process</th>
+                        <th className="text-left p-2">Tipe</th>
+                        <th className="text-left p-2">Scope</th>
+                        <th className="text-left p-2">Work Center</th>
+                        <th className="text-right p-2">Seq</th>
+                        <th className="text-right p-2">Std Time</th>
                         <th className="text-left p-2">Actions</th>
                       </tr>
                     </thead>
@@ -1439,6 +1576,11 @@ const TabMasterRef = (props) => {
                         <tr key={process.code} className="border-t">
                           <td className="p-2">{process.code}</td>
                           <td className="p-2">{process.name}</td>
+                          <td className="p-2">{process.process_type || process.processType || '-'}</td>
+                          <td className="p-2">{getProcessScopeLabel(process.applies_to_level || process.appliesToLevel || 'All')}</td>
+                          <td className="p-2">{getProcessWorkCenterLabel(process.work_center || process.workCenter || '')}</td>
+                          <td className="p-2 text-right">{process.sequence ?? 0}</td>
+                          <td className="p-2 text-right">{process.standard_time ?? 0}</td>
                           <td className="p-2 flex gap-2 text-xs">
                             {allowMasterEdit ? (
                               <>
@@ -1469,7 +1611,7 @@ const TabMasterRef = (props) => {
                       ))}
                       {masterProcesses.length === 0 && (
                         <tr>
-                          <td colSpan={3} className="p-4 text-center text-gray-500">Belum ada process.</td>
+                          <td colSpan={8} className="p-4 text-center text-gray-500">Belum ada process.</td>
                         </tr>
                       )}
                     </tbody>
@@ -1703,10 +1845,7 @@ const TabMasterRef = (props) => {
                             {itemMasterForm.modelCodes?.length ? (
                               itemMasterForm.modelCodes.map((code) => (
                               <span key={`model-chip-${code}`} className="text-[10px] flex items-center gap-1 bg-slate-100 px-2 py-0.5 rounded-full border border-slate-200">
-                                <span>
-                                  {code}
-                                  {masterModelsMap.get(code) ? ` (${masterModelsMap.get(code).name})` : ''}
-                                </span>
+                                <span>{code}</span>
                                   <button
                                     type="button"
                                     onClick={() => removeModelCodeFromItemForm(code)}
@@ -1722,14 +1861,18 @@ const TabMasterRef = (props) => {
                             )}
                           </div>
                           <div className="flex gap-2 mt-2">
-                            <input
-                              list="item-model-options"
-                              className="border rounded px-3 py-2 flex-1 text-xs"
-                              placeholder="Pilih atau tulis kode model..."
+                            <select
+                              className="border rounded px-3 py-2 flex-1 text-xs bg-white"
                               value={itemModelEntry}
                               onChange={(e) => setItemModelEntry(e.target.value)}
-                              onKeyDown={handleItemModelEntryKey}
-                            />
+                            >
+                              <option value="">Pilih kode model</option>
+                              {masterModels.map((model) => (
+                                <option key={`item-model-opt-${model.code}`} value={model.code}>
+                                  {model.code}
+                                </option>
+                              ))}
+                            </select>
                             <button
                               type="button"
                               onClick={() => addModelCodeToItemForm(itemModelEntry)}
@@ -1739,11 +1882,60 @@ const TabMasterRef = (props) => {
                               <span>Tambah</span>
                             </button>
                           </div>
-                          <datalist id="item-model-options">
-                            {masterModels.map((model) => (
-                              <option key={`item-model-opt-${model.code}`} value={model.code} label={model.name} />
-                            ))}
-                          </datalist>
+                          <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px]">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setModelCatalogForm({ code: '', name: '' });
+                                setEditingModelCode(null);
+                                setModelFormVisible(true);
+                              }}
+                              className="inline-flex items-center gap-1 rounded border border-dashed border-slate-300 px-2 py-1 text-slate-600 hover:bg-slate-50"
+                            >
+                              <Plus size={12} />
+                              <span>Model belum ada? Tambah di sini</span>
+                            </button>
+                          </div>
+                          {modelFormVisible && allowMasterEdit && (
+                            <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-3">
+                              <div className="text-[11px] font-semibold text-slate-700">Tambah Model Baru</div>
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+                                <input
+                                  className="border rounded px-3 py-2"
+                                  placeholder="Kode Model"
+                                  value={modelCatalogForm.code}
+                                  onChange={(e) => setModelCatalogForm({ ...modelCatalogForm, code: e.target.value })}
+                                />
+                                <input
+                                  className="border rounded px-3 py-2"
+                                  placeholder="Nama Model"
+                                  value={modelCatalogForm.name}
+                                  onChange={(e) => setModelCatalogForm({ ...modelCatalogForm, name: e.target.value })}
+                                />
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                <button
+                                  type="button"
+                                  onClick={handleQuickSaveModelForItem}
+                                  className="px-3 py-1.5 rounded bg-slate-900 text-white text-xs inline-flex items-center gap-1"
+                                >
+                                  <Save size={14} />
+                                  <span>Simpan &amp; Pakai</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setModelFormVisible(false);
+                                    setModelCatalogForm({ code: '', name: '' });
+                                  }}
+                                  className="px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1"
+                                >
+                                  <XIcon size={14} />
+                                  <span>Batal</span>
+                                </button>
+                              </div>
+                            </div>
+                          )}
                         </div>
                       <input
                         type="number"

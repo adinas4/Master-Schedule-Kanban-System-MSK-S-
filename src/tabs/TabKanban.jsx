@@ -104,9 +104,13 @@ const TabKanban = (props) => {
     handleRejectKanban,
     handleRequestDnBatch,
     handleSaveKanbanSetting,
+    handleGenerateKanbanFromMasterItems,
+    handleKanbanProcessStart,
+    handleKanbanProcessFinish,
     items,
     kanbanCategory,
     kanbanCategoryFilter,
+    kanbanDashboardCategoryFilter,
     kanbanDnPaginationMeta,
     kanbanEditMode,
     kanbanEmptyPaginationMeta,
@@ -130,6 +134,7 @@ const TabKanban = (props) => {
     manualRequestForm,
     masterAreas,
     masterDeliveries,
+    masterCategories,
     masterItemsByCode,
     masterLocationsById,
     masterPlants,
@@ -161,6 +166,8 @@ const TabKanban = (props) => {
     scheduleForm,
     selectedDnDetail,
     selectedRequestIds,
+    setMainTab,
+    setMasterRefTab,
     setBatchForm,
     setConsumeQty,
     setDnDetailEdits,
@@ -168,6 +175,7 @@ const TabKanban = (props) => {
     setEmptyKanbanForm,
     setKanbanCategory,
     setKanbanCategoryFilter,
+    setKanbanDashboardCategoryFilter,
     setKanbanEditMode,
     setKanbanRequestStatusFilter,
     setKanbanRequestQuickFilter,
@@ -243,10 +251,163 @@ const TabKanban = (props) => {
   ]), []);
   const [localKanbanSearch, setLocalKanbanSearch] = useState(kanbanSearch || '');
   const [localRnSearch, setLocalRnSearch] = useState(rnSearch || '');
-  const formatRequestAging = (ageHours) => {
+  const kanbanActiveStatusMeta = useMemo(() => ([
+    {
+      key: 'triggered',
+      label: 'Triggered',
+      tone: 'border-amber-200 bg-amber-50 text-amber-700',
+      shortLabel: 'Menunggu action',
+      nextAction: 'Review request',
+    },
+    {
+      key: 'requested',
+      label: 'Requested',
+      tone: 'border-indigo-200 bg-indigo-50 text-indigo-700',
+      shortLabel: 'Antrian request',
+      nextAction: 'Approve / reject',
+    },
+    {
+      key: 'approved',
+      label: 'Approved',
+      tone: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+      shortLabel: 'Siap DN',
+      nextAction: 'Create DN',
+    },
+    {
+      key: 'dn_created',
+      label: 'DN Issued',
+      tone: 'border-blue-200 bg-blue-50 text-blue-700',
+      shortLabel: 'DN terbit',
+      nextAction: 'Create schedule',
+    },
+    {
+      key: 'scheduled',
+      label: 'Scheduled',
+      tone: 'border-sky-200 bg-sky-50 text-sky-700',
+      shortLabel: 'Jadwal jalan',
+      nextAction: 'Monitor dispatch',
+    },
+    {
+      key: 'in_transit',
+      label: 'In Transit',
+      tone: 'border-violet-200 bg-violet-50 text-violet-700',
+      shortLabel: 'Sedang perjalanan',
+      nextAction: 'Prepare receiving',
+    },
+    {
+      key: 'receiving',
+      label: 'Receiving/QC',
+      tone: 'border-orange-200 bg-orange-50 text-orange-700',
+      shortLabel: 'Proses inbound',
+      nextAction: 'Finalize receiving',
+    },
+  ]), []);
+  const kanbanActiveStatusSet = useMemo(() => new Set(kanbanActiveStatusMeta.map((meta) => meta.key)), [kanbanActiveStatusMeta]);
+  const kanbanActiveRows = useMemo(
+    () => kanbanRequests.filter((row) => kanbanActiveStatusSet.has(String(row?.status || '').trim().toLowerCase())),
+    [kanbanRequests, kanbanActiveStatusSet],
+  );
+  const resolveKanbanDashboardCategory = (row) => {
+    const masterItem = masterItemsByCode.get(row?.item_code);
+    const rawValue = String(row?.item_type || masterItem?.type || masterItem?.category || '').trim().toLowerCase();
+    if (!rawValue) return 'unknown';
+    if (rawValue.includes('raw')) return 'raw';
+    if (rawValue.includes('indirect')) return 'indirect';
+    if (rawValue.includes('consum')) return 'consumable';
+    if (rawValue.includes('subcon')) return 'subcon';
+    if (rawValue.includes('sub assy') || rawValue.includes('subassy') || rawValue === 'sa') return 'subassy';
+    if (rawValue.includes('child part') || rawValue === 'cp' || rawValue.startsWith('cp')) return 'cp';
+    if (rawValue.includes('fg') || rawValue.includes('finish')) return 'fg';
+    return rawValue;
+  };
+  const kanbanDashboardCategoryOptions = useMemo(() => ([
+    { value: 'all', label: 'Semua Kategori' },
+    { value: 'fg', label: 'FG / Finished Goods' },
+    { value: 'subassy', label: 'Sub-Assy' },
+    { value: 'cp', label: 'Child Part' },
+    { value: 'raw', label: 'Raw Material' },
+    { value: 'indirect', label: 'Indirect Material' },
+    { value: 'consumable', label: 'Consumable' },
+    { value: 'subcon', label: 'Subcon' },
+  ]), []);
+  const kanbanDashboardCategoryCounts = useMemo(() => (
+    kanbanActiveRows.reduce((acc, row) => {
+      const key = resolveKanbanDashboardCategory(row);
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {})
+  ), [kanbanActiveRows, masterItemsByCode]);
+  const kanbanDashboardRows = useMemo(() => {
+    const filterKey = String(kanbanDashboardCategoryFilter || 'all').trim().toLowerCase();
+    if (filterKey === 'all') return kanbanActiveRows;
+    return kanbanActiveRows.filter((row) => resolveKanbanDashboardCategory(row) === filterKey);
+  }, [kanbanActiveRows, kanbanDashboardCategoryFilter, masterItemsByCode]);
+  const kanbanOperationalSummary = useMemo(() => {
+    const summary = {
+      active: 0,
+      pending: 0,
+      approved: 0,
+      inFlow: 0,
+      receiving: 0,
+      blocked: 0,
+      overdue: 0,
+      oldestAge: 0,
+      oldestLabel: '-',
+    };
+    kanbanDashboardRows.forEach((row) => {
+      const health = getKanbanRequestHealth(row);
+      const statusKey = String(row?.status || '').trim().toLowerCase();
+      summary.active += 1;
+      if (['triggered', 'requested'].includes(statusKey)) summary.pending += 1;
+      if (statusKey === 'approved') summary.approved += 1;
+      if (['dn_created', 'scheduled', 'in_transit'].includes(statusKey)) summary.inFlow += 1;
+      if (statusKey === 'receiving') summary.receiving += 1;
+      if (health.isBlocked) summary.blocked += 1;
+      if (health.isOverdue) summary.overdue += 1;
+      if (health.ageHours >= summary.oldestAge) {
+        summary.oldestAge = health.ageHours;
+        summary.oldestLabel = `${row.item_code || '-'} • ${getRequestIdLabel(row)}`;
+      }
+    });
+    return summary;
+  }, [kanbanDashboardRows, getKanbanRequestHealth, getRequestIdLabel]);
+  const kanbanStatusCards = useMemo(() => kanbanActiveStatusMeta.map((meta) => {
+    const rows = kanbanDashboardRows.filter((row) => String(row?.status || '').trim().toLowerCase() === meta.key);
+    const enrichedRows = rows
+      .map((row) => ({ row, health: getKanbanRequestHealth(row) }))
+      .sort((a, b) => b.health.ageHours - a.health.ageHours || new Date(b.row.created_at || 0) - new Date(a.row.created_at || 0));
+    const oldest = enrichedRows[0];
+    return {
+      ...meta,
+      count: rows.length,
+      blocked: enrichedRows.filter((entry) => entry.health.isBlocked).length,
+      overdue: enrichedRows.filter((entry) => entry.health.isOverdue).length,
+      topRows: enrichedRows.slice(0, 3),
+      oldestLabel: oldest ? `${getRequestIdLabel(oldest.row)} • ${formatRequestAging(oldest.health.ageHours)}` : '-',
+    };
+  }), [kanbanDashboardRows, kanbanActiveStatusMeta, getKanbanRequestHealth, getRequestIdLabel]);
+  const kanbanActiveQueue = useMemo(() => (
+    [...kanbanDashboardRows]
+      .map((row) => ({ row, health: getKanbanRequestHealth(row) }))
+      .sort((a, b) => b.health.ageHours - a.health.ageHours || new Date(a.row.created_at || 0) - new Date(b.row.created_at || 0))
+  ), [kanbanDashboardRows, getKanbanRequestHealth]);
+  function formatRequestAging(ageHours) {
     const safeHours = Number(ageHours || 0);
     if (safeHours >= 24) return `${Math.floor(safeHours / 24)}d ${safeHours % 24}h`;
     return `${safeHours}h`;
+  }
+  const getKanbanNextAction = (row) => {
+    const statusKey = String(row?.status || '').trim().toLowerCase();
+    if (statusKey === 'triggered' || statusKey === 'requested') return 'Approve / reject';
+    if (statusKey === 'approved') return row?.dn_id ? 'Create schedule' : 'Create DN';
+    if (statusKey === 'dn_created') return row?.schedule_id ? 'Monitor schedule' : 'Create schedule';
+    if (statusKey === 'scheduled') return 'Monitor dispatch';
+    if (statusKey === 'in_transit') return 'Receiving / check-in';
+    if (statusKey === 'receiving') return 'Finalize QC / close';
+    if (statusKey === 'fifo') return 'Consume from FIFO';
+    if (statusKey === 'closed') return 'Closed';
+    if (statusKey === 'rejected') return 'Rejected';
+    return '-';
   };
   const kanbanRequestHealthSummary = useMemo(() => (
     kanbanRequests.reduce((acc, row) => {
@@ -699,7 +860,7 @@ const TabKanban = (props) => {
       @media print {
         @page {
           size: A4;
-          margin: 15mm;
+          margin: 10mm 15mm 15mm 15mm;
         }
       }
     `;
@@ -889,11 +1050,11 @@ const TabKanban = (props) => {
           .filter((item) => item.poNumber && item.itemCode);
         const result = await apiFetch('/api/schedules/check-sj', {
           method: 'POST',
-          body: {
+          body: JSON.stringify({
             doNumber: normalizedDoNumber,
             supplier: receiveSupplier,
             items: payloadItems,
-          },
+          }),
         });
         if (receiveDoCheckSeqRef.current !== seq) return;
         const matches = Array.isArray(result?.matches) ? result.matches : [];
@@ -1666,13 +1827,36 @@ const TabKanban = (props) => {
     const receivedDate = rn.received_at ? new Date(rn.received_at) : null;
     const items = (rn.items || []).filter((row) => Number(row.received_qty ?? 0) > 0);
     const dnReference = rn.dn_reference || rn.dn_number || rn.dnNumber || '-';
+    const poNumbers = Array.from(new Set(
+      items
+        .map((row) => String(row.po_number || row.schedule_po_number || row.po_line_po_number || '').trim())
+        .filter(Boolean),
+    ));
+    const totalDocQty = items.reduce((sum, row) => sum + Number(row.expected_qty ?? row.doc_qty ?? 0), 0);
+    const totalActualQty = items.reduce((sum, row) => sum + Number(row.received_qty ?? row.actual_qty ?? 0), 0);
+    const receivedByName = rn.received_by_name || items.find((row) => row.received_by_name)?.received_by_name || '-';
+    const remarks = rn.notes || items.find((row) => row.notes)?.notes || '-';
+    const doNumber = rn.do_number || items.find((row) => row.do_number)?.do_number || '-';
+    const statusLabel = totalActualQty > totalDocQty ? 'OVER'
+      : totalActualQty < totalDocQty ? 'SHORT'
+      : 'COMPLETE';
     return {
       rnNumber: rn.rn_number || '-',
       receivedDateLabel: receivedDate ? receivedDate.toLocaleDateString('id-ID') : '-',
+      receivedTimeLabel: receivedDate ? receivedDate.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }) : '-',
       supplierName: rn.supplier || '-',
       truckPlate: rn.truck_no || rn.truck_plate || rn.plate_no || '-',
       driverName: rn.driver_name || '-',
+      poNumberLabel: poNumbers.length > 1 ? `${poNumbers[0]} +${poNumbers.length - 1}` : (poNumbers[0] || '-'),
+      doNumber,
       dnReference,
+      receivedByName,
+      remarks,
+      totalDocQty,
+      totalActualQty,
+      totalVarianceQty: totalActualQty - totalDocQty,
+      itemCount: items.length,
+      statusLabel,
       items,
     };
   };
@@ -1716,6 +1900,16 @@ const TabKanban = (props) => {
               <div className="rn-info-value">{rnPrintPayload.supplierName}</div>
             </div>
             <div className="rn-info-row">
+              <div className="rn-info-label">NO PO</div>
+              <div className="rn-info-sep">:</div>
+              <div className="rn-info-value">{rnPrintPayload.poNumberLabel}</div>
+            </div>
+            <div className="rn-info-row">
+              <div className="rn-info-label">NO SJ / DO</div>
+              <div className="rn-info-sep">:</div>
+              <div className="rn-info-value">{rnPrintPayload.doNumber || '-'}</div>
+            </div>
+            <div className="rn-info-row">
               <div className="rn-info-label">NO POLISI</div>
               <div className="rn-info-sep">:</div>
               <div className="rn-info-value">{rnPrintPayload.truckPlate}</div>
@@ -1738,20 +1932,55 @@ const TabKanban = (props) => {
               <div className="rn-info-value">{rnPrintPayload.receivedDateLabel}</div>
             </div>
             <div className="rn-info-row">
+              <div className="rn-info-label">JAM TERIMA</div>
+              <div className="rn-info-sep">:</div>
+              <div className="rn-info-value">{rnPrintPayload.receivedTimeLabel}</div>
+            </div>
+            <div className="rn-info-row">
               <div className="rn-info-label">DN REFERENCE</div>
               <div className="rn-info-sep">:</div>
               <div className="rn-info-value">{rnPrintPayload.dnReference || '-'}</div>
             </div>
+            <div className="rn-info-row">
+              <div className="rn-info-label">DITERIMA OLEH</div>
+              <div className="rn-info-sep">:</div>
+              <div className="rn-info-value">{rnPrintPayload.receivedByName}</div>
+            </div>
           </div>
+        </div>
+
+        <div className="mt-3 grid grid-cols-4 gap-2 text-[11px]">
+          <div className="rounded border border-slate-300 px-3 py-2">
+            <div className="text-slate-500">Total Line</div>
+            <div className="font-semibold">{rnPrintPayload.itemCount}</div>
+          </div>
+          <div className="rounded border border-slate-300 px-3 py-2">
+            <div className="text-slate-500">Qty Dokumen</div>
+            <div className="font-semibold">{formatDnQty0(rnPrintPayload.totalDocQty)}</div>
+          </div>
+          <div className="rounded border border-slate-300 px-3 py-2">
+            <div className="text-slate-500">Qty Aktual</div>
+            <div className="font-semibold">{formatDnQty0(rnPrintPayload.totalActualQty)}</div>
+          </div>
+          <div className="rounded border border-slate-300 px-3 py-2">
+            <div className="text-slate-500">Status Receipt</div>
+            <div className="font-semibold">{rnPrintPayload.statusLabel}</div>
+          </div>
+        </div>
+
+        <div className="mt-2 rounded border border-slate-300 px-3 py-2 text-[11px]">
+          <span className="font-semibold">Remarks:</span> {rnPrintPayload.remarks || '-'}
         </div>
 
         <table className="w-full rn-print-table">
           <colgroup>
             <col style={{ width: '5%' }} />
             <col style={{ width: '10%' }} />
-            <col style={{ width: '50%' }} />
-            <col style={{ width: '10%' }} />
-            <col style={{ width: '15%' }} />
+            <col style={{ width: '36%' }} />
+            <col style={{ width: '8%' }} />
+            <col style={{ width: '11%' }} />
+            <col style={{ width: '11%' }} />
+            <col style={{ width: '9%' }} />
             <col style={{ width: '10%' }} />
           </colgroup>
           <thead>
@@ -1760,17 +1989,24 @@ const TabKanban = (props) => {
               <th>UNIQ</th>
               <th>PART NUMBER /<br />PART NAME</th>
               <th>Unit</th>
+              <th>Doc Qty</th>
               <th>Actual Qty</th>
-              <th>Check</th>
+              <th>Selisih</th>
+              <th>QC Status</th>
             </tr>
           </thead>
           <tbody>
             {rnPrintPayload.items.map((row, index) => {
-              const partNo = row.part_no || row.item_code || row.partNo || '-';
-              const partName = row.part_name || row.item_name || row.partName || '-';
+              const itemCode = String(row.item_code || row.uniq || '').trim();
+              const masterItem = itemCode ? masterItemsByCode?.get(itemCode) : null;
+              const partNo = row.part_no || row.partNo || masterItem?.part_no || masterItem?.partNo || itemCode || '-';
+              const partName = row.part_name || row.item_name || row.partName || row.itemName || masterItem?.name || partNo || '-';
               const unitLabel = row.unit || row.item_unit || row.uom || '-';
+              const docQtyValue = Number(row.expected_qty ?? row.doc_qty ?? 0);
               const qtyValue = row.received_qty ?? row.actual_qty ?? 0;
-              const uniqValue = row.item_code || row.uniq || partNo || '-';
+              const varianceValue = Number(qtyValue || 0) - docQtyValue;
+              const uniqValue = row.uniq || itemCode || masterItem?.code || partNo || '-';
+              const qcStatusLabel = String(row.qc_status || 'OK').toUpperCase();
               return (
                 <tr key={`${row.id}-${index}`}>
                   <td className="text-center">{index + 1}</td>
@@ -1778,39 +2014,46 @@ const TabKanban = (props) => {
                   <td className="rn-part-cell">
                     <div className="rn-part-no">{partNo}</div>
                     <div className="rn-part-name">{partName}</div>
+                    <div className="mt-1 text-[10px] text-slate-500">
+                      Prod: {row.production_date ? new Date(row.production_date).toLocaleDateString('id-ID') : '-'} | Exp: {row.expired_date ? new Date(row.expired_date).toLocaleDateString('id-ID') : '-'}
+                    </div>
                   </td>
                   <td className="text-center">{unitLabel}</td>
+                  <td className="text-right">{formatDnQty0(docQtyValue)}</td>
                   <td className="text-right">{formatDnQty0(qtyValue)}</td>
-                  <td />
+                  <td className="text-right">{varianceValue > 0 ? `+${formatDnQty0(varianceValue)}` : formatDnQty0(varianceValue)}</td>
+                  <td className="text-center">{qcStatusLabel}</td>
                 </tr>
               );
             })}
             {rnPrintPayload.items.length === 0 && (
               <tr>
-                <td colSpan="6" className="text-center text-slate-400">Tidak ada item.</td>
+                <td colSpan="8" className="text-center text-slate-400">Tidak ada item.</td>
               </tr>
             )}
           </tbody>
         </table>
 
-        <div className="rn-signature-grid">
-          <div className="rn-signature-card">
-            <div className="rn-signature-title">Diserahkan Oleh</div>
-            <div className="rn-signature-space" />
-            <div className="rn-signature-label">(Sopir / Ekspedisi)</div>
+        <div className="rn-footer-section">
+          <div className="rn-signature-grid">
+            <div className="rn-signature-card">
+              <div className="rn-signature-title">Diserahkan Oleh</div>
+              <div className="rn-signature-space" />
+              <div className="rn-signature-label">(Sopir / Ekspedisi)</div>
+            </div>
+            <div className="rn-signature-card">
+              <div className="rn-signature-title">Dicek Oleh</div>
+              <div className="rn-signature-space" />
+              <div className="rn-signature-label">(QC / Checker)</div>
+            </div>
+            <div className="rn-signature-card">
+              <div className="rn-signature-title">Diterima Oleh</div>
+              <div className="rn-signature-space" />
+              <div className="rn-signature-label">(Admin Gudang)</div>
+            </div>
           </div>
-          <div className="rn-signature-card">
-            <div className="rn-signature-title">Dicek Oleh</div>
-            <div className="rn-signature-space" />
-            <div className="rn-signature-label">(QC / Checker)</div>
-          </div>
-          <div className="rn-signature-card">
-            <div className="rn-signature-title">Diterima Oleh</div>
-            <div className="rn-signature-space" />
-            <div className="rn-signature-label">(Admin Gudang)</div>
-          </div>
+          <div className="rn-page-footer" />
         </div>
-        <div className="page-footer" />
       </div>
     );
   };
@@ -2295,6 +2538,11 @@ const TabKanban = (props) => {
 
   const [masterToolsOpen, setMasterToolsOpen] = useState(false);
   const [masterSearch, setMasterSearch] = useState('');
+  const [kanbanSyncLoading, setKanbanSyncLoading] = useState(false);
+  const [showMissingKanbanPanel, setShowMissingKanbanPanel] = useState(false);
+  const [missingKanbanSearch, setMissingKanbanSearch] = useState('');
+  const [missingKanbanCategoryFilter, setMissingKanbanCategoryFilter] = useState('all');
+  const [selectedMissingKanbanCodes, setSelectedMissingKanbanCodes] = useState([]);
   const masterToolsRef = useRef(null);
 
   useEffect(() => {
@@ -2324,6 +2572,134 @@ const TabKanban = (props) => {
         || dropZone.includes(query);
     });
   }, [kanbanSettings, masterSearch]);
+
+  const missingKanbanItems = useMemo(() => {
+    const existingCodes = new Set((kanbanSettings || []).map((row) => String(row.item_code || '').trim()).filter(Boolean));
+    return (items || [])
+      .filter((item) => String(item?.code || '').trim())
+      .filter((item) => !existingCodes.has(String(item.code).trim()))
+      .filter((item) => !String(item.code || '').toUpperCase().startsWith('TEST-'))
+      .sort((a, b) => String(a.code || '').localeCompare(String(b.code || '')));
+  }, [items, kanbanSettings]);
+
+  const missingKanbanPreview = missingKanbanItems.slice(0, 8);
+
+  const masterCategoryFilterOptions = useMemo(() => {
+    const options = (masterCategories || [])
+      .map((category) => ({
+        code: String(category?.code || '').trim(),
+        name: String(category?.name || '').trim(),
+      }))
+      .filter((category) => category.code || category.name);
+    if (options.length > 0) return options;
+    return [
+      { code: 'FG', name: 'Finished Goods' },
+      { code: 'CP', name: 'Child Part' },
+      { code: 'SA', name: 'Sub-Assy' },
+      { code: 'RM', name: 'Raw Material' },
+      { code: 'IM', name: 'Indirect Material' },
+    ];
+  }, [masterCategories]);
+
+  const resolveMissingKanbanCategory = (item) => {
+    const rawValue = String(item?.type || item?.item_type || item?.category || '').trim();
+    const rawLower = rawValue.toLowerCase();
+    const matched = masterCategoryFilterOptions.find((category) => {
+      const codeLower = String(category.code || '').toLowerCase();
+      const nameLower = String(category.name || '').toLowerCase();
+      return (
+        (codeLower && rawLower === codeLower) ||
+        (nameLower && rawLower === nameLower) ||
+        (codeLower && rawLower.includes(codeLower)) ||
+        (nameLower && rawLower.includes(nameLower))
+      );
+    });
+    if (matched) {
+      return {
+        code: matched.code || rawValue,
+        name: matched.name || matched.code || rawValue,
+        label: matched.name ? `${matched.code} - ${matched.name}` : (matched.code || rawValue || '-'),
+      };
+    }
+    return {
+      code: rawValue || '-',
+      name: rawValue || '-',
+      label: rawValue || '-',
+    };
+  };
+
+  const visibleMissingKanbanItems = useMemo(() => {
+    const query = missingKanbanSearch.trim().toLowerCase();
+    const categoryFilter = String(missingKanbanCategoryFilter || 'all').trim().toLowerCase();
+    return missingKanbanItems.filter((item) => {
+      const code = String(item?.code || '').toLowerCase();
+      const name = String(item?.name || '').toLowerCase();
+      const category = resolveMissingKanbanCategory(item);
+      const categoryCode = String(category.code || '').toLowerCase();
+      const categoryName = String(category.name || '').toLowerCase();
+      const matchesSearch = !query || code.includes(query) || name.includes(query) || categoryCode.includes(query) || categoryName.includes(query);
+      const matchesCategory =
+        categoryFilter === 'all' ||
+        categoryCode === categoryFilter ||
+        categoryName === categoryFilter ||
+        String(item?.type || '').toLowerCase() === categoryFilter ||
+        String(item?.category || '').toLowerCase() === categoryFilter;
+      return matchesSearch && matchesCategory;
+    });
+  }, [missingKanbanItems, missingKanbanSearch, missingKanbanCategoryFilter, masterCategoryFilterOptions]);
+
+  useEffect(() => {
+    const missingSet = new Set(missingKanbanItems.map((item) => String(item.code || '').trim()).filter(Boolean));
+    setSelectedMissingKanbanCodes((prev) => prev.filter((code) => missingSet.has(String(code || '').trim())));
+  }, [missingKanbanItems]);
+
+  const selectedVisibleMissingKanbanCodes = useMemo(() => {
+    const visibleCodes = new Set(visibleMissingKanbanItems.map((item) => String(item.code || '').trim()).filter(Boolean));
+    return selectedMissingKanbanCodes.filter((code) => visibleCodes.has(String(code || '').trim()));
+  }, [selectedMissingKanbanCodes, visibleMissingKanbanItems]);
+
+  const allVisibleMissingSelected = visibleMissingKanbanItems.length > 0
+    && visibleMissingKanbanItems.every((item) => selectedVisibleMissingKanbanCodes.includes(String(item.code || '').trim()));
+
+  const toggleMissingKanbanSelection = (code) => {
+    const normalized = String(code || '').trim();
+    if (!normalized) return;
+    setSelectedMissingKanbanCodes((prev) => (
+      prev.includes(normalized)
+        ? prev.filter((value) => value !== normalized)
+        : [...prev, normalized]
+    ));
+  };
+
+  const toggleVisibleMissingSelection = () => {
+    const visibleCodes = visibleMissingKanbanItems.map((item) => String(item.code || '').trim()).filter(Boolean);
+    if (!visibleCodes.length) return;
+    setSelectedMissingKanbanCodes((prev) => {
+      const prevSet = new Set(prev);
+      const shouldSelectAll = !visibleCodes.every((code) => prevSet.has(code));
+      if (shouldSelectAll) {
+        return Array.from(new Set([...prev, ...visibleCodes]));
+      }
+      return prev.filter((code) => !visibleCodes.includes(code));
+    });
+  };
+
+  const clearMissingKanbanSelection = () => setSelectedMissingKanbanCodes([]);
+
+  const handleGenerateMissingKanban = async () => {
+    if (kanbanSyncLoading || missingKanbanItems.length === 0) return;
+    setShowMissingKanbanPanel(true);
+    setKanbanSyncLoading(true);
+    try {
+      const codes = selectedMissingKanbanCodes.length > 0
+        ? selectedMissingKanbanCodes
+        : missingKanbanItems.map((item) => item.code);
+      await handleGenerateKanbanFromMasterItems?.({ itemCodes: codes });
+      clearMissingKanbanSelection();
+    } finally {
+      setKanbanSyncLoading(false);
+    }
+  };
 
   const [requestFilterOpen, setRequestFilterOpen] = useState(null);
   const [requestFilterDrafts, setRequestFilterDrafts] = useState({
@@ -2465,6 +2841,13 @@ const TabKanban = (props) => {
     setDnBatchRemarks(initialRemarks);
     setShowDnBatchModal(true);
   };
+
+  const scanActionType = String(scanActiveResult?.actionType || '').trim();
+  const scanActionLabel = scanActiveResult?.actionLabel || '-';
+  const scanActionHint = scanActiveResult?.actionHint || '-';
+  const isScanIssueAction = scanActionType === 'issue' || scanActionType === 'consumption';
+  const isScanSubconAction = scanActionType === 'external_transfer';
+  const isScanRoutingAction = scanActionType === 'routing_execution';
 
   return (
     <>
@@ -2659,8 +3042,171 @@ const TabKanban = (props) => {
                       >
                         <Plus size={14} /> Kanban Baru
                       </button>
+                      <button
+                        className="px-3 py-1.5 text-xs border rounded flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                        onClick={() => {
+                          setShowMissingKanbanPanel(true);
+                          handleGenerateMissingKanban();
+                        }}
+                        disabled={kanbanSyncLoading || missingKanbanItems.length === 0}
+                      >
+                        <ArrowDownUp size={14} />
+                        {kanbanSyncLoading ? 'Menyinkronkan...' : `Sinkron Master Item (${missingKanbanItems.length})`}
+                      </button>
                     </div>
                   </div>
+
+                  {showMissingKanbanPanel && <>
+                  <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+                    <div className="font-semibold">Alur sinkron master item → kanban</div>
+                    <div className="mt-1">
+                      Sistem membaca semua item master, mencari item yang belum punya `kanban_settings`, lalu membuat default awal dari data master.
+                    </div>
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+                      <span className="rounded-full bg-white/70 px-2 py-0.5 border border-amber-200">
+                        Belum punya kanban: {missingKanbanItems.length} item
+                      </span>
+                      {missingKanbanPreview.map((item) => (
+                        <span key={item.code} className="rounded-full bg-white/70 px-2 py-0.5 border border-amber-200">
+                          {item.code} · {getCategoryLabel(item.type)}
+                        </span>
+                      ))}
+                      {missingKanbanItems.length > missingKanbanPreview.length && (
+                        <span className="text-amber-700">+{missingKanbanItems.length - missingKanbanPreview.length} item lagi</span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="mt-4 rounded-xl border bg-white shadow-sm">
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3">
+                      <div>
+                        <div className="text-sm font-semibold">Preview Item Master Belum Punya Kanban</div>
+                        <div className="text-xs text-slate-500">
+                          Pilih satu per satu atau batch, lalu generate langsung dari master reference.
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <select
+                          className="rounded border px-2 py-1.5 text-xs"
+                          value={missingKanbanCategoryFilter}
+                          onChange={(e) => setMissingKanbanCategoryFilter(e.target.value)}
+                        >
+                          <option value="all">Semua Kategori</option>
+                          {masterCategoryFilterOptions.map((category) => (
+                            <option key={category.code || category.name} value={category.code || category.name}>
+                              {category.code ? `${category.code}${category.name ? ` - ${category.name}` : ''}` : category.name}
+                            </option>
+                          ))}
+                        </select>
+                        <div className="flex items-center gap-2 rounded border px-2 py-1.5 text-xs">
+                          <Search size={14} className="text-slate-400" />
+                          <input
+                            className="outline-none text-xs w-48"
+                            placeholder="Cari kode / nama / kategori..."
+                            value={missingKanbanSearch}
+                            onChange={(e) => setMissingKanbanSearch(e.target.value)}
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          className="rounded border px-3 py-1.5 text-xs disabled:opacity-50"
+                          onClick={toggleVisibleMissingSelection}
+                          disabled={visibleMissingKanbanItems.length === 0}
+                        >
+                          {allVisibleMissingSelected ? 'Unselect Visible' : 'Select Visible'}
+                        </button>
+                        <button
+                          type="button"
+                          className="rounded border px-3 py-1.5 text-xs disabled:opacity-50"
+                          onClick={clearMissingKanbanSelection}
+                          disabled={selectedMissingKanbanCodes.length === 0}
+                        >
+                          Clear Selection
+                        </button>
+                        <button
+                          type="button"
+                          className="rounded bg-indigo-600 px-3 py-1.5 text-xs text-white disabled:opacity-50"
+                          onClick={handleGenerateMissingKanban}
+                          disabled={kanbanSyncLoading || missingKanbanItems.length === 0}
+                        >
+                          {selectedMissingKanbanCodes.length > 0
+                            ? `Generate Selected (${selectedMissingKanbanCodes.length})`
+                            : `Generate All Missing (${missingKanbanItems.length})`}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="min-w-full text-xs">
+                        <thead className="bg-slate-50 text-slate-500">
+                          <tr>
+                            <th className="px-4 py-2 text-left w-10">
+                              <input
+                                type="checkbox"
+                                checked={allVisibleMissingSelected}
+                                onChange={toggleVisibleMissingSelection}
+                                disabled={visibleMissingKanbanItems.length === 0}
+                              />
+                            </th>
+                            <th className="px-4 py-2 text-left">Item Code</th>
+                            <th className="px-4 py-2 text-left">Item Name</th>
+                            <th className="px-4 py-2 text-left">Kategori Master Ref</th>
+                            <th className="px-4 py-2 text-left">Aksi</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {visibleMissingKanbanItems.map((item) => {
+                            const category = resolveMissingKanbanCategory(item);
+                            const itemCode = String(item.code || '').trim();
+                            const selected = selectedMissingKanbanCodes.includes(itemCode);
+                            return (
+                              <tr key={itemCode} className="border-t hover:bg-slate-50">
+                                <td className="px-4 py-2 align-top">
+                                  <input
+                                    type="checkbox"
+                                    checked={selected}
+                                    onChange={() => toggleMissingKanbanSelection(itemCode)}
+                                  />
+                                </td>
+                                <td className="px-4 py-2 font-semibold text-slate-700">{itemCode}</td>
+                                <td className="px-4 py-2 text-slate-600">{item.name || '-'}</td>
+                                <td className="px-4 py-2">
+                                  <span className="rounded-full border bg-white px-2 py-0.5 text-[10px] text-slate-600">
+                                    {category.label}
+                                  </span>
+                                </td>
+                                <td className="px-4 py-2">
+                                  <button
+                                    type="button"
+                                    className="rounded border px-2 py-1 text-[10px] hover:bg-slate-50 disabled:opacity-50"
+                                    onClick={async () => {
+                                      if (!itemCode) return;
+                                      setKanbanSyncLoading(true);
+                                      try {
+                                        await handleGenerateKanbanFromMasterItems?.({ itemCodes: [itemCode] });
+                                      } finally {
+                                        setKanbanSyncLoading(false);
+                                      }
+                                    }}
+                                    disabled={kanbanSyncLoading}
+                                  >
+                                    Generate
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                          {visibleMissingKanbanItems.length === 0 && (
+                            <tr>
+                              <td className="px-4 py-6 text-center text-slate-400" colSpan={5}>
+                                Tidak ada item yang cocok dengan filter.
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                  </>}
 
                   <div className="mt-4 space-y-3">
                     {filteredKanbanSettings.map((row) => (
@@ -2866,6 +3412,7 @@ const TabKanban = (props) => {
               <div className="space-y-4">
                 <div className="bg-white rounded-xl border p-3 flex flex-wrap gap-2 text-xs">
                   {[
+                    { key: 'dashboard', label: 'Dashboard' },
                     { key: 'items', label: 'Kanban Items' },
                     { key: 'requests', label: 'Requests' },
                     { key: 'dn', label: 'DN Register' },
@@ -2883,6 +3430,187 @@ const TabKanban = (props) => {
                     </button>
                   ))}
                 </div>
+
+                {kanbanSubTab === 'dashboard' && (
+                  <div className="space-y-4">
+                    <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-7 gap-3">
+                      {[
+                        { label: 'Active', value: kanbanOperationalSummary.active, tone: 'border-slate-200 bg-white text-slate-900' },
+                        { label: 'Pending', value: kanbanOperationalSummary.pending, tone: 'border-amber-200 bg-amber-50 text-amber-700' },
+                        { label: 'Approved', value: kanbanOperationalSummary.approved, tone: 'border-emerald-200 bg-emerald-50 text-emerald-700' },
+                        { label: 'In Flow', value: kanbanOperationalSummary.inFlow, tone: 'border-blue-200 bg-blue-50 text-blue-700' },
+                        { label: 'Receiving', value: kanbanOperationalSummary.receiving, tone: 'border-orange-200 bg-orange-50 text-orange-700' },
+                        { label: 'Blocked', value: kanbanOperationalSummary.blocked, tone: 'border-rose-200 bg-rose-50 text-rose-700' },
+                        { label: 'Overdue', value: kanbanOperationalSummary.overdue, tone: 'border-red-200 bg-red-50 text-red-700' },
+                      ].map((card) => (
+                        <div key={card.label} className={`rounded-xl border px-4 py-3 ${card.tone}`}>
+                          <div className="text-[10px] uppercase tracking-wide opacity-70">{card.label}</div>
+                          <div className="mt-1 text-2xl font-bold">{card.value}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="rounded-xl border bg-white p-3 shadow-sm">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <div className="text-xs font-semibold text-slate-600">Filter Kategori</div>
+                        <select
+                          className="rounded border px-3 py-1.5 text-xs bg-white"
+                          value={kanbanDashboardCategoryFilter}
+                          onChange={(e) => setKanbanDashboardCategoryFilter(e.target.value)}
+                        >
+                          {kanbanDashboardCategoryOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                        <div className="flex flex-wrap gap-2">
+                          {kanbanDashboardCategoryOptions.filter((option) => option.value !== 'all').map((option) => {
+                            const active = kanbanDashboardCategoryFilter === option.value;
+                            const count = Number(kanbanDashboardCategoryCounts[option.value] || 0);
+                            return (
+                              <button
+                                key={option.value}
+                                type="button"
+                                onClick={() => setKanbanDashboardCategoryFilter(active ? 'all' : option.value)}
+                                className={`rounded-full border px-3 py-1 text-[10px] font-semibold transition ${
+                                  active
+                                    ? 'border-slate-900 bg-slate-900 text-white'
+                                    : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'
+                                }`}
+                              >
+                                {option.label} ({count})
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <div className="ml-auto text-xs text-slate-500">
+                          Menampilkan {kanbanDashboardRows.length} dari {kanbanActiveRows.length} aktif
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1.6fr)_minmax(320px,0.8fr)] gap-4">
+                      <div className="rounded-xl border bg-white p-4 shadow-sm">
+                        <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-3">
+                          <div>
+                            <div className="text-sm font-semibold">Live Kanban Status Board</div>
+                            <div className="text-xs text-slate-500">
+                              Menampilkan status aktif, aging, blocker, dan action berikutnya.
+                            </div>
+                          </div>
+                          <div className="text-xs text-slate-500">
+                            Oldest: <span className="font-semibold text-slate-700">{kanbanOperationalSummary.oldestLabel}</span>
+                          </div>
+                        </div>
+                        <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
+                          {kanbanStatusCards.map((statusCard) => (
+                            <div key={statusCard.key} className={`rounded-xl border p-3 ${statusCard.tone}`}>
+                              <div className="flex items-start justify-between gap-3">
+                                <div>
+                                  <div className="text-xs font-semibold">{statusCard.label}</div>
+                                  <div className="text-[10px] opacity-80">{statusCard.shortLabel}</div>
+                                </div>
+                                <div className="text-right">
+                                  <div className="text-2xl font-bold">{statusCard.count}</div>
+                                  <div className="text-[10px] opacity-80">blocked {statusCard.blocked} · overdue {statusCard.overdue}</div>
+                                </div>
+                              </div>
+                              <div className="mt-2 text-[10px] opacity-80">Next: {statusCard.nextAction}</div>
+                              <div className="mt-1 text-[10px] opacity-80">Oldest: {statusCard.oldestLabel}</div>
+                              <div className="mt-3 space-y-2">
+                                {statusCard.topRows.length > 0 ? statusCard.topRows.map(({ row, health }) => (
+                                  <div key={row.id} className="rounded-lg bg-white/70 border border-white/70 px-2 py-2 text-[11px] text-slate-700">
+                                    <div className="flex items-center justify-between gap-2">
+                                      <div className="font-semibold">{getRequestIdLabel(row)}</div>
+                                      <div className="text-slate-500">{formatRequestAging(health.ageHours)}</div>
+                                    </div>
+                                    <div className="text-slate-500">{row.item_code} · {row.item_name || '-'}</div>
+                                    <div className="mt-1 flex flex-wrap gap-1">
+                                      {health.isBlocked && (
+                                        <span className="rounded-full border border-rose-200 bg-rose-100 px-2 py-0.5 text-[10px] font-semibold text-rose-700">
+                                          Blocked
+                                        </span>
+                                      )}
+                                      {health.isOverdue && (
+                                        <span className="rounded-full border border-red-200 bg-red-100 px-2 py-0.5 text-[10px] font-semibold text-red-700">
+                                          Overdue
+                                        </span>
+                                      )}
+                                      <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] text-slate-600">
+                                        Next: {getKanbanNextAction(row)}
+                                      </span>
+                                    </div>
+                                  </div>
+                                )) : (
+                                  <div className="rounded-lg border border-dashed border-white/80 bg-white/60 px-3 py-4 text-[11px] text-slate-500">
+                                    Tidak ada request aktif di status ini.
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border bg-white p-4 shadow-sm">
+                        <div className="flex items-center justify-between gap-3 border-b pb-3">
+                          <div>
+                            <div className="text-sm font-semibold">Priority Queue</div>
+                            <div className="text-xs text-slate-500">Request aktif diurutkan dari aging tertinggi.</div>
+                          </div>
+                          <button
+                            type="button"
+                            className="rounded border px-2 py-1 text-[10px] text-slate-600 hover:bg-slate-50"
+                            onClick={() => setKanbanSubTab('requests')}
+                          >
+                            Buka Requests
+                          </button>
+                        </div>
+                        <div className="mt-3 space-y-2 max-h-[860px] overflow-auto pr-1">
+                          {kanbanActiveQueue.slice(0, 12).map(({ row, health }, index) => (
+                            <div key={row.id} className="rounded-xl border bg-slate-50 px-3 py-3">
+                              <div className="flex items-start justify-between gap-3">
+                                <div>
+                                  <div className="text-[10px] text-slate-400">#{index + 1}</div>
+                                  <div className="font-semibold text-sm">{getRequestIdLabel(row)}</div>
+                                  <div className="text-[11px] text-slate-500">{row.item_code} · {row.item_name || '-'}</div>
+                                </div>
+                                <div className="text-right">
+                                  <div className="text-sm font-semibold text-slate-800">{formatRequestAging(health.ageHours)}</div>
+                                  <div className="text-[10px] text-slate-500">{row.dn_id ? `DN-${row.dn_id}` : 'No DN'}</div>
+                                </div>
+                              </div>
+                              <div className="mt-2 flex flex-wrap gap-1 text-[10px]">
+                                <span className="rounded-full border bg-white px-2 py-0.5 text-slate-600">
+                                  {String(row.status || '').toUpperCase()}
+                                </span>
+                                <span className="rounded-full border bg-white px-2 py-0.5 text-slate-600">
+                                  Next: {getKanbanNextAction(row)}
+                                </span>
+                                {health.isBlocked && (
+                                  <span className="rounded-full border border-rose-200 bg-rose-100 px-2 py-0.5 text-rose-700">
+                                    Blocked
+                                  </span>
+                                )}
+                                {health.isOverdue && (
+                                  <span className="rounded-full border border-red-200 bg-red-100 px-2 py-0.5 text-red-700">
+                                    Overdue
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+                          {kanbanActiveQueue.length === 0 && (
+                            <div className="rounded-xl border border-dashed px-3 py-8 text-center text-sm text-slate-400">
+                              Tidak ada request aktif.
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 {kanbanSubTab === 'items' && (
                   <div className="space-y-3">
@@ -4620,45 +5348,153 @@ const TabKanban = (props) => {
                         )}
                         {scanActiveResult && (
                           <div className="space-y-2 max-h-64 overflow-y-auto">
-                            <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-xs">
-                              <div className="flex items-center gap-2 text-emerald-700 font-semibold">
-                                <CheckCircle size={14} /> Pemindaian Berhasil
+                            <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4">
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="flex items-center gap-2 text-emerald-700 font-semibold text-xs">
+                                  <CheckCircle size={14} /> Pemindaian Berhasil
+                                </div>
+                                <div className="text-[10px] uppercase tracking-wide text-slate-400">Routing Preview</div>
                               </div>
-                              <div className="mt-2 text-emerald-700">
-                                <div>ID Kanban: {scanActiveResult.kanbanId}</div>
-                                <div>Kode Item: {scanActiveResult.itemCode}</div>
-                                <div>Qty Kartu: {scanActiveResult.qty}</div>
+                              <div className="mt-3">
+                                <div className="text-[10px] uppercase tracking-wide text-slate-500">Item</div>
+                                <div className="text-lg font-bold text-slate-800 leading-tight">
+                                  {scanActiveResult.itemLabel || `${scanActiveResult.itemCode} - ${scanActiveResult.itemName}`}
+                                </div>
+                                <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-slate-600">
+                                  <span className="px-2 py-1 rounded-full bg-white border">Unique No: {scanActiveResult.kanbanId}</span>
+                                  <span className="px-2 py-1 rounded-full bg-white border">Kode Item: {scanActiveResult.itemCode}</span>
+                                  <span className="px-2 py-1 rounded-full bg-white border">Qty Kartu: {scanActiveResult.qty}</span>
+                                </div>
+                              </div>
+                            </div>
+                            <div className="border rounded-xl p-3 bg-indigo-50 border-indigo-200 text-xs">
+                              <div className="text-[10px] uppercase tracking-wide text-indigo-500">Action Type</div>
+                              <div className="mt-1 text-sm font-semibold text-indigo-800">{scanActionLabel}</div>
+                              <div className="mt-1 text-indigo-700">{scanActionHint}</div>
+                              <div className="mt-2 text-[10px] uppercase tracking-wide text-indigo-500">
+                                Target: {scanActiveResult.nextDestination || '-'}
+                              </div>
+                              {scanActiveResult.processState?.stepsTotal > 0 && (
+                                <div className="mt-1 text-indigo-500">
+                                  Progress: {Number(scanActiveResult.processState.currentStepIndex || 0) + 1} / {scanActiveResult.processState.stepsTotal}
+                                </div>
+                              )}
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs">
+                              <div className="border rounded-xl p-3 bg-white">
+                                <div className="text-[10px] uppercase tracking-wide text-slate-400">Posisi Sekarang</div>
+                                <div className="mt-1 text-sm font-semibold text-slate-800">
+                                  {scanActiveResult.currentPosition?.label || scanActiveResult.location || '-'}
+                                </div>
+                                <div className="mt-1 text-slate-500">
+                                  {scanActiveResult.currentPosition?.sourceLabel || scanActiveResult.currentPosition?.source || 'Lokasi kanban / item'}
+                                </div>
+                              </div>
+                              <div className="border rounded-xl p-3 bg-slate-50 border-slate-200">
+                                <div className="text-[10px] uppercase tracking-wide text-slate-400">Proses Sekarang</div>
+                                <div className="mt-1 text-sm font-semibold text-slate-800">
+                                  {scanActiveResult.currentProcess?.label || scanActiveResult.currentProcess?.name || 'Routing belum tersedia'}
+                                </div>
+                                <div className="mt-1 text-slate-500">
+                                  Status: {scanActiveResult.processState?.status || '-'} • Step {scanActiveResult.processState?.currentStepIndex !== undefined ? Number(scanActiveResult.processState.currentStepIndex) + 1 : 1}
+                                </div>
+                              </div>
+                              <div className="border rounded-xl p-3 bg-red-50 border-red-200">
+                                <div className="text-[10px] uppercase tracking-wide text-red-500">Proses Berikutnya</div>
+                                <div className="mt-1 text-sm font-semibold text-red-700">
+                                  {scanActiveResult.nextProcess?.label || scanActiveResult.nextProcess?.name || 'Routing selesai / belum tersedia'}
+                                </div>
+                                <div className="mt-1 text-red-600">
+                                  WC: {scanActiveResult.nextProcess?.workCenter || '-'} • Seq {scanActiveResult.nextProcess?.sequence || '-'} • Std {Number(scanActiveResult.nextProcess?.standardTime || 0)} s
+                                </div>
                               </div>
                             </div>
                             <div className="border rounded-lg p-3 text-xs space-y-2">
-                              <div className="font-semibold text-slate-700">{scanActiveResult.itemName}</div>
                               <div className="grid grid-cols-2 gap-2 text-slate-500">
-                                <div>Lokasi: {scanActiveResult.location}</div>
+                                <div>Lokasi: {scanActiveResult.location || '-'}</div>
                                 <div>Stok Tersedia: <span className={scanActiveResult.status === 'Critical' ? 'text-red-600' : 'text-emerald-600'}>{scanActiveResult.stock} PCS</span></div>
                                 <div>Min/Maks: {scanActiveResult.min} / {scanActiveResult.max}</div>
                                 <div>Status: <span className={`px-2 py-0.5 rounded-full text-[10px] ${scanActiveResult.status === 'Critical' ? 'bg-red-600 text-white' : 'bg-slate-900 text-white'}`}>{scanActiveResult.status}</span></div>
                               </div>
+                              {Array.isArray(scanActiveResult.routingSteps) && scanActiveResult.routingSteps.length > 0 && (
+                                <div className="pt-2 border-t">
+                                  <div className="text-[10px] uppercase tracking-wide text-slate-400 mb-2">Routing Aktif</div>
+                                  <div className="flex flex-wrap gap-2">
+                                    {scanActiveResult.routingSteps.map((step) => (
+                                      <span key={`${step.code || step.name}-${step.sequence}`} className="px-2 py-1 rounded-full bg-slate-100 text-slate-600">
+                                        {step.sequence}. {step.label || step.name || step.code || '-'}
+                                        {step.workCenter ? ` • ${step.workCenter}` : ''}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
                             </div>
                             <div className="flex gap-2">
-                              <button
-                                onClick={async () => {
-                                  setConsumeQty(String(scanActiveResult?.qty || ''));
-                                  setShowConsumeModal(true);
-                                }}
-                                className="flex-1 border py-2 rounded text-xs"
-                              >
-                                Keluarkan Material
-                              </button>
-                              <button
-                                onClick={async () => {
-                                  const outcome = await createRequestFromScan(scanActiveResult);
-                                  await fetchKanbanRequests();
-                                  setScanError(outcome.ok ? '' : outcome.reason || 'Gagal membuat request.');
-                                }}
-                                className="flex-1 bg-slate-900 text-white py-2 rounded text-xs flex items-center justify-center gap-2"
-                              >
-                                <Plus size={14} /> Minta Pemesanan
-                              </button>
+                              {isScanIssueAction && (
+                                <>
+                                  <button
+                                    onClick={async () => {
+                                      setConsumeQty(String(scanActiveResult?.qty || ''));
+                                      setShowConsumeModal(true);
+                                    }}
+                                    className="flex-1 border py-2 rounded text-xs"
+                                  >
+                                    {scanActionType === 'issue' ? 'Issue Material' : 'Keluarkan Material'}
+                                  </button>
+                                  <button
+                                    onClick={async () => {
+                                      const outcome = await createRequestFromScan(scanActiveResult);
+                                      await fetchKanbanRequests();
+                                      setScanError(outcome.ok ? '' : outcome.reason || 'Gagal membuat request.');
+                                    }}
+                                    className="flex-1 bg-slate-900 text-white py-2 rounded text-xs flex items-center justify-center gap-2"
+                                  >
+                                    <Plus size={14} /> Minta Pemesanan
+                                  </button>
+                                </>
+                              )}
+                              {isScanSubconAction && (
+                                <button
+                                  onClick={() => {
+                                    setMainTab('subcon');
+                                    setScanError('');
+                                  }}
+                                  className="flex-1 bg-slate-900 text-white py-2 rounded text-xs flex items-center justify-center gap-2"
+                                >
+                                  <Truck size={14} /> Buka Menu Subcon
+                                </button>
+                              )}
+                              {isScanRoutingAction && (
+                                <>
+                                  <button
+                                    onClick={async () => {
+                                      const outcome = await handleKanbanProcessStart(scanActiveResult);
+                                      setScanError(outcome.ok ? '' : outcome.reason || 'Gagal start proses.');
+                                    }}
+                                    className="flex-1 bg-emerald-600 text-white py-2 rounded text-xs flex items-center justify-center gap-2"
+                                  >
+                                    <Check size={14} /> Start Step
+                                  </button>
+                                  <button
+                                    onClick={async () => {
+                                      const outcome = await handleKanbanProcessFinish(scanActiveResult);
+                                      setScanError(outcome.ok ? '' : outcome.reason || 'Gagal finish proses.');
+                                    }}
+                                    className="flex-1 bg-slate-900 text-white py-2 rounded text-xs flex items-center justify-center gap-2"
+                                  >
+                                    <Settings size={14} /> Finish Step
+                                  </button>
+                                </>
+                              )}
+                              {!isScanIssueAction && !isScanSubconAction && !isScanRoutingAction && (
+                                <button
+                                  onClick={() => setScanError('Kategori item belum dikenali, cek master item.')}
+                                  className="flex-1 border py-2 rounded text-xs"
+                                >
+                                  Cek Kategori Item
+                                </button>
+                              )}
                             </div>
                           </div>
                         )}
@@ -4670,6 +5506,9 @@ const TabKanban = (props) => {
                                 <div key={result.id} className="border rounded-lg p-2 text-xs">
                                   <div className="font-semibold text-slate-700">{result.kanbanId}</div>
                                   <div className="text-slate-500">Item: {result.itemName}</div>
+                                  <div className="text-slate-400">
+                                    Next: {result.nextProcess?.label || result.nextProcess?.name || '-'}
+                                  </div>
                                 </div>
                               ))}
                             </div>
@@ -4691,6 +5530,9 @@ const TabKanban = (props) => {
                               <div>
                                 <div className="font-semibold text-slate-700">{result.kanbanId}</div>
                                 <div className="text-slate-500">{result.itemCode} {result.itemName}</div>
+                                <div className="text-slate-400">
+                                  {result.currentPosition?.label || result.location || '-'} → {result.nextProcess?.label || result.nextProcess?.name || 'Routing belum tersedia'}
+                                </div>
                               </div>
                               <div className="text-right">
                                 <div className="font-semibold text-slate-700">{result.qty || '-'} pcs</div>

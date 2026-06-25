@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Factory, RefreshCw, Truck, X } from 'lucide-react';
 import { QRCodeCanvas } from 'qrcode.react';
-import logoMatra from '../assets/logo-matra.png';
+import logoPrl from '../assets/kop-mrp.png';
 
 const TabSubcon = (props) => {
   const {
@@ -9,6 +9,7 @@ const TabSubcon = (props) => {
     apiFetch,
     masterVendors,
     masterItems,
+    masterProcesses,
     canEditSchedules,
     canViewReport,
     formatDateID,
@@ -35,6 +36,78 @@ const TabSubcon = (props) => {
   const finishedItems = useMemo(() => (
     masterItems.filter((item) => String(item.type || '').toLowerCase().includes('finished'))
   ), [masterItems]);
+  const processMap = useMemo(() => {
+    const map = new Map();
+    (masterProcesses || []).forEach((process) => {
+      const code = String(process.code || '').trim();
+      const name = String(process.name || '').trim();
+      if (code) map.set(code.toLowerCase(), process);
+      if (name) map.set(name.toLowerCase(), process);
+    });
+    return map;
+  }, [masterProcesses]);
+
+  const resolveProcessStep = useCallback((step) => {
+    if (!step) return null;
+    if (typeof step === 'object') {
+      const code = String(step.code || step.processCode || '').trim();
+      if (code) {
+        return processMap.get(code.toLowerCase()) || step;
+      }
+      return step;
+    }
+    const raw = String(step || '').trim();
+    if (!raw) return null;
+    return processMap.get(raw.toLowerCase()) || { code: raw, name: raw, process_type: '' };
+  }, [processMap]);
+
+  const formatRoutingStep = useCallback((step) => {
+    const resolved = resolveProcessStep(step);
+    if (!resolved) return '';
+    const processType = String(resolved.process_type || resolved.processType || '').trim();
+    const workCenter = String(resolved.work_center || resolved.workCenter || '').trim();
+    const sequence = Number.isFinite(Number(resolved.sequence)) ? Number(resolved.sequence) : null;
+    const standardTime = Number.isFinite(Number(resolved.standard_time ?? resolved.standardTime))
+      ? Number(resolved.standard_time ?? resolved.standardTime)
+      : null;
+    const parts = [
+      processType ? `[${processType}]` : '',
+      resolved.code,
+      resolved.name,
+      workCenter ? `WC ${workCenter}` : '',
+      sequence !== null ? `Seq ${sequence}` : '',
+      standardTime !== null ? `${standardTime}s` : '',
+    ].filter(Boolean);
+    return parts.join(' • ');
+  }, [resolveProcessStep]);
+
+  const subconRoutingItems = useMemo(() => {
+    return (masterItems || [])
+      .map((item) => {
+        const routingSteps = Array.isArray(item.process_routing) && item.process_routing.length
+          ? item.process_routing
+          : Array.isArray(item.process_flow) && item.process_flow.length
+            ? item.process_flow
+            : [];
+        if (routingSteps.length === 0) return null;
+        const resolvedSteps = routingSteps.map((step) => resolveProcessStep(step)).filter(Boolean);
+        const hasSubcon = resolvedSteps.some((step) => {
+          const text = [
+            step?.process_type || step?.processType || '',
+            step?.name || '',
+            step?.code || '',
+          ].join(' ').toLowerCase();
+          return text.includes('subcon');
+        });
+        if (!hasSubcon) return null;
+        return {
+          ...item,
+          routingSteps: resolvedSteps,
+        };
+      })
+      .filter(Boolean)
+      .sort((left, right) => String(left.code || '').localeCompare(String(right.code || '')));
+  }, [masterItems, resolveProcessStep]);
 
   const [subconTab, setSubconTab] = useState('delivery');
   const [deliveryForm, setDeliveryForm] = useState({
@@ -110,6 +183,29 @@ const TabSubcon = (props) => {
     if (typeof document === 'undefined') return () => {};
     document.body.classList.toggle('kanban-print-active', printOpen);
     return () => document.body.classList.remove('kanban-print-active');
+  }, [printOpen]);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return undefined;
+    const existingStyle = document.getElementById('subcon-print-page-style');
+    if (printOpen) {
+      if (!existingStyle) {
+        const style = document.createElement('style');
+        style.id = 'subcon-print-page-style';
+        style.textContent = '@media print { @page { size: A4 portrait; margin: 8mm 10mm 12mm 10mm; } }';
+        document.head.appendChild(style);
+      }
+    } else {
+      existingStyle?.remove();
+    }
+    const handleAfterPrint = () => {
+      document.getElementById('subcon-print-page-style')?.remove();
+    };
+    window.addEventListener('afterprint', handleAfterPrint);
+    return () => {
+      document.getElementById('subcon-print-page-style')?.remove();
+      window.removeEventListener('afterprint', handleAfterPrint);
+    };
   }, [printOpen]);
 
   useEffect(() => {
@@ -529,6 +625,7 @@ const TabSubcon = (props) => {
 
       <div className="flex flex-wrap gap-2">
         {[
+          { key: 'routing', label: 'BOM Routing Subcon', icon: <Factory size={14} /> },
           { key: 'delivery', label: 'Subcon Delivery', icon: <Truck size={14} /> },
           { key: 'receipt', label: 'Subcon Receipt', icon: <Factory size={14} /> },
           { key: 'stock-card', label: 'Subcon Stock Card', icon: <RefreshCw size={14} /> },
@@ -552,6 +649,67 @@ const TabSubcon = (props) => {
           <option key={`vendor-${vendor.id}`} value={vendor.id}>{vendor.name}</option>
         ))}
       </datalist>
+
+      {subconTab === 'routing' && (
+        <div className="space-y-4">
+          <div className="bg-white rounded-xl border p-4">
+            <div className="flex items-center justify-between gap-2 mb-3">
+              <div>
+                <div className="text-sm font-semibold">BOM Routing dengan Proses Subcon</div>
+                <div className="text-xs text-slate-500">Daftar item master yang punya langkah proses `Subcon` di routing BOM.</div>
+              </div>
+              <div className="text-xs text-slate-500">
+                Total: {subconRoutingItems.length} item
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-xs">
+                <thead className="bg-slate-100 text-slate-600">
+                  <tr>
+                    <th className="text-left p-2">Item</th>
+                    <th className="text-left p-2">Kategori</th>
+                    <th className="text-left p-2">Routing</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {subconRoutingItems.map((item) => (
+                    <tr key={item.code} className="border-t align-top">
+                      <td className="p-2">
+                        <div className="font-semibold text-slate-700">{item.code}</div>
+                        <div className="text-slate-500">{item.name || '-'}</div>
+                      </td>
+                      <td className="p-2 text-slate-600">{item.type || '-'}</td>
+                      <td className="p-2">
+                        <div className="flex flex-wrap gap-1">
+                          {(item.routingSteps || []).map((step, index) => {
+                            const label = formatRoutingStep(step);
+                            const isSubcon = String(step?.process_type || step?.processType || step?.name || '').toLowerCase().includes('subcon');
+                            return (
+                              <span
+                                key={`${item.code}-${index}`}
+                                className={`rounded-full px-2 py-0.5 text-[10px] border ${isSubcon ? 'bg-purple-50 text-purple-700 border-purple-200' : 'bg-slate-50 text-slate-600 border-slate-200'}`}
+                              >
+                                {label || step?.code || '-'}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                  {subconRoutingItems.length === 0 && (
+                    <tr>
+                      <td colSpan={3} className="p-4 text-center text-slate-400">
+                        Belum ada item master dengan routing Subcon.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
 
       {subconTab === 'delivery' && (
         <div className="space-y-4">
@@ -1372,7 +1530,7 @@ const TabSubcon = (props) => {
                 <div className="kanban-page border border-slate-200 p-6 text-xs">
                   <div className="flex items-start justify-between gap-4">
                     <div className="flex items-center gap-3">
-                      <img src={logoMatra} alt="Logo" className="h-12 w-auto" />
+                      <img src={logoPrl} alt="Logo" className="h-12 w-auto" />
                       <div>
                         <div className="text-sm font-bold text-slate-900">PT MATRA LOGISTIK</div>
                         <div className="text-[10px] text-slate-500">Master Schedule &amp; Kanban System</div>

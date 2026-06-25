@@ -25,6 +25,8 @@ const TabInventory = (props) => {
     ensureXlsx,
     fetchSoOpenSession,
     formatRupiah,
+    masterLocations = [],
+    masterWarehouses = [],
     showToastMessage,
     setInventoryShowKanban,
     inventoryShowKanban,
@@ -386,6 +388,8 @@ const TabInventory = (props) => {
                     ensureXlsx={ensureXlsx}
                     formatNumber0={formatNumber0}
                     formatRupiah={formatRupiah}
+                    masterLocations={masterLocations}
+                    masterWarehouses={masterWarehouses}
                     soOpenSession={soOpenSession}
                     fetchSoOpenSession={fetchSoOpenSession}
                     ensureAiConfigured={ensureAiConfigured}

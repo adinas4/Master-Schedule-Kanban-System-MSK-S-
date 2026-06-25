@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, Suspense } from 'react';
 import { createPortal } from 'react-dom';
 import {
-  Warehouse, CheckCircle, AlertTriangle, Clock, Plus, Save, Trash2, Package, 
+  CheckCircle, AlertTriangle, Clock, Plus, Save, Trash2, Package, 
   RefreshCw, Download, Printer, Sparkles, MessageSquare, X, Copy, Loader2, 
   Trophy, Star, Split, CalendarDays, Wand2, ArrowRightCircle, Percent, 
   Image as ImageIcon, Upload, CalendarOff, Search, Filter, Users, Edit, Bell,
@@ -36,6 +36,18 @@ const TabSettings = React.lazy(() => import('./tabs/TabSettings'));
 const TabSupplierPortal = React.lazy(() => import('./tabs/TabSupplierPortal'));
 const TabAuditLogs = React.lazy(() => import('./tabs/TabAuditLogs'));
 
+const NOTIFICATION_MODULE_OPTIONS = [
+  { value: 'all', label: 'Semua Modul' },
+  { value: 'BOM', label: 'BOM' },
+  { value: 'Kanban', label: 'Kanban' },
+  { value: 'Stock Opname', label: 'Stock Opname' },
+  { value: 'Inbound', label: 'Inbound' },
+  { value: 'Auth', label: 'Auth' },
+  { value: 'Master Ref', label: 'Master Ref' },
+  { value: 'System', label: 'System' },
+  { value: 'Activity', label: 'Activity' },
+];
+
 const resolveApiBase = () => {
   const envValue = String(import.meta.env.VITE_API_BASE || '').trim();
   const fallbackHost = typeof window !== 'undefined' && window.location.hostname
@@ -57,6 +69,13 @@ if (typeof window !== 'undefined') {
 }
 const API_TIMEOUT_MS = 20000;
 const API_HEALTH_INTERVAL_MS = 15000;
+const AUTO_LOGOUT_IDLE_MS = 15 * 60 * 1000;
+const DEFAULT_RESET_PASSWORD = '123456';
+const ADMIN_WHATSAPP_NUMBER = String(import.meta.env.VITE_ADMIN_WHATSAPP_NUMBER || '').replace(/[^\d]/g, '');
+const ADMIN_WHATSAPP_MESSAGE = encodeURIComponent('Halo Admin/IT, saya lupa password. Mohon bantu reset password akun saya. Terima kasih.');
+const ADMIN_WHATSAPP_LINK = ADMIN_WHATSAPP_NUMBER
+  ? `https://wa.me/${ADMIN_WHATSAPP_NUMBER}?text=${ADMIN_WHATSAPP_MESSAGE}`
+  : '';
 
 const pad2 = (value) => String(value).padStart(2, '0');
 
@@ -143,7 +162,10 @@ const apiRequest = async (path, options = {}, token) => {
         const text = await response.text().catch(() => '');
         data = text ? { error: text } : null;
       }
-      throw new Error(data?.error || `HTTP ${response.status}`);
+      const error = new Error(data?.error || `HTTP ${response.status}`);
+      error.status = response.status;
+      error.response = data;
+      throw error;
     }
     if (response.status === 204) return null;
     const contentType = response.headers.get('content-type') || '';
@@ -331,7 +353,7 @@ const buildKanbanIdRegex = (format) => {
 // ==========================================
 // 1. KOMPONEN LOGIN PAGE
 // ==========================================
-const LoginPage = ({ onLogin }) => {
+const LoginPage = ({ onLogin, notice = '' }) => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -358,13 +380,17 @@ const LoginPage = ({ onLogin }) => {
     <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4 font-sans text-slate-800">
       <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md border border-slate-200">
         <div className="flex justify-center mb-6">
-          <div className="bg-indigo-100 p-4 rounded-full">
-            <Warehouse className="text-indigo-600 w-12 h-12" />
-          </div>
+          <img src="/logo.png" alt="Logo MSKS" className="h-24 w-24 object-contain drop-shadow-sm" />
         </div>
         
         <h2 className="text-2xl font-bold text-center text-slate-800 mb-2">Selamat Datang</h2>
         <p className="text-center text-slate-500 mb-8 text-sm">Master Schedule &amp; Kanban System (MSK-S)</p>
+
+        {notice && (
+          <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+            {notice}
+          </div>
+        )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
@@ -394,6 +420,22 @@ const LoginPage = ({ onLogin }) => {
                 onChange={(e) => setPassword(e.target.value)}
                 required
               />
+            </div>
+            <div className="mt-2 text-right">
+              {ADMIN_WHATSAPP_LINK ? (
+                <a
+                  href={ADMIN_WHATSAPP_LINK}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-xs font-medium text-emerald-700 hover:text-emerald-800 hover:underline"
+                >
+                  Lupa password? Hubungi Admin
+                </a>
+              ) : (
+                <span className="text-xs text-slate-400">
+                  Lupa password? Hubungi Admin
+                </span>
+              )}
             </div>
           </div>
 
@@ -440,6 +482,12 @@ const Dashboard = ({ onLogout, token, user }) => {
   const globalSearchInputRef = useRef(null);
   const globalSearchRequestRef = useRef(0);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [notificationRecords, setNotificationRecords] = useState([]);
+  const [notificationLoading, setNotificationLoading] = useState(false);
+  const [notificationError, setNotificationError] = useState('');
+  const [notificationTotal, setNotificationTotal] = useState(0);
+  const [notificationUnreadCount, setNotificationUnreadCount] = useState(0);
+  const [notificationModuleFilter, setNotificationModuleFilter] = useState('all');
   const toastTimerRef = useRef(null);
   const showToastMessage = useCallback((message, actionLabel = '', onAction = null, tone = 'auto') => {
     const raw = String(message || '');
@@ -468,10 +516,13 @@ const Dashboard = ({ onLogout, token, user }) => {
       try {
         return await apiRequest(path, options, token);
       } catch (error) {
+        if (error?.status === 401 && typeof onLogout === 'function') {
+          setTimeout(() => onLogout({ reasonMessage: error.message || 'Sesi berakhir. Silakan login ulang.' }), 0);
+        }
         showToastMessage(error.message || 'Gagal memproses request.');
         throw error;
       }
-    }, [token, showToastMessage]);
+    }, [token, onLogout, showToastMessage]);
     const safeApiFetch = useCallback(async (path, fallback) => {
       try {
         return await apiFetch(path);
@@ -482,6 +533,58 @@ const Dashboard = ({ onLogout, token, user }) => {
         throw error;
       }
     }, [apiFetch]);
+
+  const fetchNotifications = useCallback(async () => {
+    if (!token) return;
+    setNotificationLoading(true);
+    setNotificationError('');
+    try {
+      const moduleQuery = notificationModuleFilter && notificationModuleFilter !== 'all'
+        ? `&module=${encodeURIComponent(notificationModuleFilter)}`
+        : '';
+      const result = await apiFetch(`/api/notifications?limit=50&offset=0${moduleQuery}`);
+      setNotificationRecords(Array.isArray(result?.rows) ? result.rows : []);
+      setNotificationTotal(Number(result?.total || 0));
+      setNotificationUnreadCount(Number(result?.unreadCount || 0));
+    } catch (error) {
+      setNotificationError(error?.message || 'Gagal memuat notifikasi.');
+    } finally {
+      setNotificationLoading(false);
+    }
+  }, [apiFetch, token, notificationModuleFilter]);
+
+  const markNotificationAsRead = useCallback(async (notificationId) => {
+    if (!notificationId) return;
+    try {
+      await apiFetch(`/api/notifications/${notificationId}/read`, { method: 'POST' });
+      await fetchNotifications();
+      showToastMessage('Notifikasi ditandai sudah dibaca.', '', null, 'success');
+    } catch (error) {
+      setNotificationError(error?.message || 'Gagal menandai notifikasi.');
+    }
+  }, [apiFetch, fetchNotifications, showToastMessage]);
+
+  const markAllNotificationsAsRead = useCallback(async () => {
+    try {
+      await apiFetch('/api/notifications/read-all', { method: 'POST' });
+      await fetchNotifications();
+      showToastMessage('Semua notifikasi ditandai sudah dibaca.', '', null, 'success');
+    } catch (error) {
+      setNotificationError(error?.message || 'Gagal menandai semua notifikasi.');
+    }
+  }, [apiFetch, fetchNotifications, showToastMessage]);
+
+  useEffect(() => {
+    if (!token) return;
+    fetchNotifications();
+    const interval = setInterval(fetchNotifications, 60000);
+    return () => clearInterval(interval);
+  }, [token, fetchNotifications]);
+
+  useEffect(() => {
+    if (!notificationsOpen || !token) return;
+    fetchNotifications();
+  }, [notificationsOpen, token, fetchNotifications]);
 
   const xlsxRef = useRef(null);
   const loadXlsx = async () => {
@@ -551,6 +654,18 @@ const Dashboard = ({ onLogout, token, user }) => {
     ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'][new Date().getMonth()],
   );
   const [supplierShortageYear, setSupplierShortageYear] = useState(String(new Date().getFullYear()));
+  const [capacityPlanningMonth, setCapacityPlanningMonth] = useState(
+    ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'][new Date().getMonth()],
+  );
+  const [capacityPlanningYear, setCapacityPlanningYear] = useState(String(new Date().getFullYear()));
+  const [capacityPlanningData, setCapacityPlanningData] = useState({
+    period: null,
+    summary: null,
+    workCenters: [],
+    dailyRows: [],
+    workCenterDailyRows: [],
+    rows: [],
+  });
   const [outstandingPrlMonth, setOutstandingPrlMonth] = useState(
     ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'][new Date().getMonth()],
   );
@@ -618,6 +733,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [userList, setUserList] = useState([]);
   const [userLoading, setUserLoading] = useState(false);
   const [userError, setUserError] = useState('');
+  const [userResettingId, setUserResettingId] = useState(null);
   const [mainTab, setMainTab] = useState('dashboard');
   const [tabReloadNonce, setTabReloadNonce] = useState(0);
   const handleTabRetry = useCallback(() => setTabReloadNonce((prev) => prev + 1), []);
@@ -679,6 +795,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [kanbanSubTab, setKanbanSubTab] = useState('items');
   const [kanbanSearch, setKanbanSearch] = useState('');
   const [kanbanCategoryFilter, setKanbanCategoryFilter] = useState('all');
+  const [kanbanDashboardCategoryFilter, setKanbanDashboardCategoryFilter] = useState('all');
   const [kanbanSettingsForm, setKanbanSettingsForm] = useState({
     itemCode: '',
     minQty: '',
@@ -868,6 +985,10 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [modelFormVisible, setModelFormVisible] = useState(false);
   const [masterModels, setMasterModels] = useState([]);
   const masterModelsMap = useMemo(() => buildModelMap(masterModels), [masterModels]);
+  const masterModelCodeSet = useMemo(
+    () => new Set((masterModels || []).map((model) => String(model.code || '').trim()).filter(Boolean)),
+    [masterModels],
+  );
   const [processFormVisible, setProcessFormVisible] = useState(false);
   const [masterProcesses, setMasterProcesses] = useState([]);
   const masterItemsWithModelCodes = useMemo(
@@ -902,7 +1023,16 @@ const Dashboard = ({ onLogout, token, user }) => {
   }, [masterItems]);
   const [modelCatalogForm, setModelCatalogForm] = useState({ code: '', name: '' });
   const [editingModelCode, setEditingModelCode] = useState(null);
-  const [processCatalogForm, setProcessCatalogForm] = useState({ code: '', name: '' });
+  const getDefaultProcessCatalogForm = () => ({
+    code: '',
+    name: '',
+    processType: '',
+    appliesToLevel: 'All',
+    workCenter: '',
+    sequence: '',
+    standardTime: '',
+  });
+  const [processCatalogForm, setProcessCatalogForm] = useState(() => getDefaultProcessCatalogForm());
   const [editingProcessCode, setEditingProcessCode] = useState(null);
   const [configModalKey, setConfigModalKey] = useState(null);
   const [configModalValue, setConfigModalValue] = useState('');
@@ -1886,6 +2016,25 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
   };
 
+  const handleResetUserPassword = async (userRow) => {
+    const username = String(userRow?.username || '').trim();
+    if (!userRow?.id || !username) return;
+    const confirmed = window.confirm(`Reset password user "${username}" ke default ${DEFAULT_RESET_PASSWORD}?`);
+    if (!confirmed) return;
+    setUserResettingId(userRow.id);
+    try {
+      const result = await apiFetch(`/api/users/${userRow.id}/reset-password`, {
+        method: 'POST',
+      });
+      showToastMessage(result?.message || `Password ${username} berhasil direset ke ${DEFAULT_RESET_PASSWORD}.`, '', null, 'success');
+      alert(`Password user "${username}" sudah direset ke default: ${result?.defaultPassword || DEFAULT_RESET_PASSWORD}`);
+    } catch (error) {
+      alert(`Gagal reset password user "${username}": ${error.message || 'Unknown error'}`);
+    } finally {
+      setUserResettingId(null);
+    }
+  };
+
   const fetchItems = async ({ silent = false } = {}) => {
     if (!silent && !items.length) setItemsLoading(true);
     try {
@@ -2117,6 +2266,76 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
   };
 
+  const buildAutoKanbanSettingPayload = (item) => {
+    const lotQty = Math.max(1, Number(item?.pack_qty ?? item?.order_lot_size ?? item?.packQty ?? item?.orderLotSize ?? 0) || 1);
+    const minQty = Math.max(0, Number(item?.safety_stock ?? item?.safetyStock ?? 0) || 0);
+    const maxQty = Math.max(minQty, lotQty * 4);
+    return {
+      itemCode: item?.code || '',
+      minQty,
+      maxQty,
+      lotQty,
+      leadTimeDays: Number(item?.lead_time_days ?? item?.leadTimeDays ?? 0) || 0,
+      defaultSupplier: item?.vendor_id || item?.supplier_name || item?.supplierName || '',
+      dropZone: item?.line_production || item?.location_name || item?.location_id || '',
+      active: true,
+    };
+  };
+
+  const handleGenerateKanbanFromMasterItems = async ({ itemCodes } = {}) => {
+    const requestedCodes = Array.isArray(itemCodes)
+      ? Array.from(new Set(itemCodes.map((code) => String(code || '').trim()).filter(Boolean)))
+      : [];
+    const existingKanbanCodes = new Set(kanbanSettings.map((row) => String(row.item_code || '').trim()).filter(Boolean));
+    const fallbackCodes = requestedCodes.length > 0
+      ? requestedCodes
+      : items
+          .map((item) => String(item?.code || '').trim())
+          .filter(Boolean)
+          .filter((code) => !existingKanbanCodes.has(code));
+    if (fallbackCodes.length === 0) {
+      alert('Tidak ada item master yang belum punya kanban.');
+      return;
+    }
+    try {
+      const result = await apiRequest('/api/kanban/settings/generate-from-items', {
+        method: 'POST',
+        body: JSON.stringify({
+          onlyMissing: requestedCodes.length === 0,
+          itemCodes: fallbackCodes,
+        }),
+      }, token);
+      const createdCount = Number(result?.created_count || 0);
+      const candidateCount = Number(result?.candidate_count || 0);
+      if (candidateCount > 0) {
+        await fetchKanbanSettings();
+        const requestedCount = Number(result?.requested_count || 0);
+        const scopeLabel = requestedCount > 0 ? `dari ${requestedCount} item terpilih` : 'dari semua item master';
+        alert(`Sinkron kanban selesai. ${createdCount} item baru ditambahkan ${scopeLabel}.`);
+        return;
+      }
+    } catch (bulkError) {
+      try {
+        let createdCount = 0;
+        for (const itemCode of fallbackCodes) {
+          const item = itemsByCode.get(itemCode);
+          if (!item) continue;
+          if (existingKanbanCodes.has(itemCode)) continue;
+          await apiRequest('/api/kanban/settings', {
+            method: 'POST',
+            body: JSON.stringify(buildAutoKanbanSettingPayload(item)),
+          }, token);
+          createdCount += 1;
+        }
+        await fetchKanbanSettings();
+        alert(`Sinkron kanban selesai. ${createdCount} item baru ditambahkan.`);
+        return;
+      } catch (fallbackError) {
+        alert(`Gagal generate kanban dari master item: ${fallbackError.message || bulkError.message || 'Unknown error'}`);
+      }
+    }
+  };
+
   const scheduleStore = useScheduleStore({
     apiFetch,
     onLogout,
@@ -2149,17 +2368,6 @@ const Dashboard = ({ onLogout, token, user }) => {
     schedules,
     selectedScheduleIds,
     setSelectedScheduleIds,
-    bulkReceiveOpen,
-    bulkReceiveDoNumber,
-    setBulkReceiveDoNumber,
-    bulkReceiveDate,
-    setBulkReceiveDate,
-    bulkReceiveQty,
-    setBulkReceiveQty,
-    bulkReceiveDocQty,
-    setBulkReceiveDocQty,
-    bulkReceiveAllowOver,
-    setBulkReceiveAllowOver,
     showForm,
     setShowForm,
     isEditing,
@@ -2207,13 +2415,8 @@ const Dashboard = ({ onLogout, token, user }) => {
     getTotalOrderQty,
     getRemainingQty,
     getPoLineRemainingAfterSchedule,
-    getSplitDecision,
     getKpiStatus,
     getPrintStatusClass,
-    openBulkReceiveModal,
-    closeBulkReceiveModal,
-    handleBulkReceiveSubmit,
-    handleSplitSchedule,
     handleAddPlan,
     handleCancelEdit,
     handleEdit,
@@ -2349,6 +2552,14 @@ const Dashboard = ({ onLogout, token, user }) => {
 
   const clearInboundNav = useCallback(() => setInboundNav(null), []);
 
+  const openInboundScheduleFromToast = useCallback((query = '') => {
+    setMainTab('monitoring');
+    setInboundNav({
+      tab: 'schedule',
+      scheduleQuery: String(query || '').trim(),
+    });
+  }, [setMainTab]);
+
   const handleGlobalSearchResultClick = useCallback((groupKey, item) => {
     if (groupKey === 'po') {
       const poNumber = item?.po_number || item?.poNumber || '';
@@ -2356,8 +2567,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       setInboundNav({ tab: 'master-po', poSearch: poNumber, expandPo: poNumber });
     } else if (groupKey === 'schedules') {
       const query = item?.po_number || item?.poNumber || item?.item || item?.supplier || '';
-      setMainTab('monitoring');
-      setInboundNav({ tab: 'schedule', scheduleQuery: query });
+      openInboundScheduleFromToast(query);
     } else if (groupKey === 'vendors') {
       const vendorQuery = item?.id || item?.name || '';
       setMainTab('masterref');
@@ -2372,7 +2582,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       }
     }
     setGlobalSearchOpen(false);
-  }, [setItemTableFilters, setMainTab, setMasterRefTab, setMasterVendorSearch]);
+  }, [openInboundScheduleFromToast, setItemTableFilters, setMainTab, setMasterRefTab, setMasterVendorSearch]);
 
   useEffect(() => {
     if (!globalSearchOpen) return;
@@ -2404,19 +2614,15 @@ const Dashboard = ({ onLogout, token, user }) => {
     return () => clearTimeout(handle);
   }, [apiFetch, globalSearchOpen, globalSearchQuery]);
 
-  const notificationItems = useMemo(() => {
-    const items = [];
-    if (isMasterEmpty) {
-      items.push({ id: 'master-empty', title: 'Master referensi belum lengkap.', detail: 'Lengkapi data master agar transaksi lancar.' });
-    }
-    if (soOpenSession) {
-      items.push({ id: 'so-open', title: `Stock Opname OPEN (${soOpenSession.period}).`, detail: 'Hindari input produksi/receiving sampai selesai.' });
-    }
-    if (!items.length) {
-      items.push({ id: 'empty', title: 'Tidak ada notifikasi baru.', detail: 'Semua proses berjalan normal.' });
-    }
-    return items;
-  }, [isMasterEmpty, soOpenSession]);
+  const unreadNotificationItems = useMemo(
+    () => notificationRecords.filter((item) => !item.is_read),
+    [notificationRecords],
+  );
+  const readNotificationItems = useMemo(
+    () => notificationRecords.filter((item) => item.is_read),
+    [notificationRecords],
+  );
+  const notificationCount = notificationUnreadCount;
 
   useEffect(() => {
     if (!globalSearchOpen) return;
@@ -3734,7 +3940,14 @@ const Dashboard = ({ onLogout, token, user }) => {
 
   const bomProcessOptions = useMemo(() => {
     const set = new Set();
-    (masterProcesses || []).forEach((proc) => {
+    [...(masterProcesses || [])]
+      .sort((left, right) => {
+        const leftSequence = Number(left?.sequence || 0);
+        const rightSequence = Number(right?.sequence || 0);
+        if (leftSequence !== rightSequence) return leftSequence - rightSequence;
+        return String(left?.code || '').localeCompare(String(right?.code || ''));
+      })
+      .forEach((proc) => {
       const nameValue = String(proc?.name || '').trim();
       if (nameValue) set.add(nameValue);
     });
@@ -3783,7 +3996,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     setModelCatalogForm({ code: '', name: '' });
     setEditingModelCode(null);
     setModelFormVisible(false);
-    setProcessCatalogForm({ code: '', name: '' });
+    setProcessCatalogForm(getDefaultProcessCatalogForm());
     setEditingProcessCode(null);
     setProcessFormVisible(false);
   };
@@ -3882,12 +4095,28 @@ const Dashboard = ({ onLogout, token, user }) => {
       });
       masterFetchedRef.current = true;
       masterRefreshRef.current = Date.now();
+      return true;
     } catch (error) {
       masterFetchedRef.current = false;
       setMasterError(error.message || 'Gagal memuat master referensi.');
+      return false;
     } finally {
       if (!silent) setMasterLoading(false);
     }
+  };
+
+  const finalizeMasterSave = async (successMessage) => {
+    const refreshed = await fetchMasterReferences();
+    if (refreshed) {
+      showToastMessage(successMessage, '', null, 'success');
+      setTablePagination((prev) => ({
+        ...prev,
+        masterItems: { ...(prev.masterItems || { page: 1, perPage: 25 }), page: 1 },
+      }));
+      return true;
+    }
+    showToastMessage('Data tersimpan, tapi tabel master gagal dimuat ulang.', '', null, 'error');
+    return false;
   };
 
   useEffect(() => {
@@ -3916,7 +4145,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
     resetMasterForms();
     setMasterFormVisible((prev) => ({ ...prev, plant: false }));
-    await fetchMasterReferences();
+    await finalizeMasterSave('Plant berhasil disimpan.');
   };
 
   const handleSaveArea = async () => {
@@ -3932,7 +4161,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
     resetMasterForms();
     setMasterFormVisible((prev) => ({ ...prev, area: false }));
-    await fetchMasterReferences();
+    await finalizeMasterSave('Area berhasil disimpan.');
   };
 
   const handleSaveDelivery = async () => {
@@ -3948,7 +4177,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
     resetMasterForms();
     setMasterFormVisible((prev) => ({ ...prev, delivery: false }));
-    await fetchMasterReferences();
+    await finalizeMasterSave('Delivery berhasil disimpan.');
   };
 
   const handleSaveWarehouse = async () => {
@@ -3964,7 +4193,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
     resetMasterForms();
     setMasterFormVisible((prev) => ({ ...prev, warehouse: false }));
-    await fetchMasterReferences();
+    await finalizeMasterSave('Warehouse berhasil disimpan.');
   };
 
   const handleSaveVendor = async () => {
@@ -3995,7 +4224,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
     resetMasterForms();
     setMasterFormVisible((prev) => ({ ...prev, vendor: false }));
-    await fetchMasterReferences();
+    await finalizeMasterSave('Vendor berhasil disimpan.');
   };
 
   const handleSaveItemMaster = async () => {
@@ -4061,12 +4290,16 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
     resetMasterForms();
     setMasterFormVisible((prev) => ({ ...prev, item: false }));
-      await fetchMasterReferences();
+      await finalizeMasterSave('Item master berhasil disimpan.');
     };
 
     const addModelCodeToItemForm = (value) => {
       const trimmed = String(value || '').trim();
       if (!trimmed) return;
+      if (!masterModelCodeSet.has(trimmed)) {
+        showToastMessage('Model harus dipilih dari master ref model.', '', null, 'error');
+        return;
+      }
       setItemMasterForm((prev) => {
         const existing = prev.modelCodes || [];
         if (existing.includes(trimmed)) return prev;
@@ -4080,13 +4313,6 @@ const Dashboard = ({ onLogout, token, user }) => {
         ...prev,
         modelCodes: (prev.modelCodes || []).filter((value) => value !== code),
       }));
-    };
-
-    const handleItemModelEntryKey = (event) => {
-      if (event.key === 'Enter') {
-        event.preventDefault();
-        addModelCodeToItemForm(itemModelEntry);
-      }
     };
 
   const handleSaveLocation = async () => {
@@ -4115,7 +4341,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
     resetMasterForms();
     setMasterFormVisible((prev) => ({ ...prev, location: false }));
-    await fetchMasterReferences();
+    await finalizeMasterSave('Location berhasil disimpan.');
   };
 
   const handleSavePacking = async () => {
@@ -4131,7 +4357,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
     resetMasterForms();
     setMasterFormVisible((prev) => ({ ...prev, packing: false }));
-    await fetchMasterReferences();
+    await finalizeMasterSave('Packing berhasil disimpan.');
   };
 
   const handleSaveCategory = async () => {
@@ -4147,7 +4373,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
     resetMasterForms();
     setMasterFormVisible((prev) => ({ ...prev, category: false }));
-    await fetchMasterReferences();
+    await finalizeMasterSave('Category berhasil disimpan.');
   };
 
   const handleSaveModel = async () => {
@@ -4163,7 +4389,9 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
     resetMasterForms();
     setModelFormVisible(false);
-    await fetchMasterReferences();
+    const refreshed = await finalizeMasterSave('Model berhasil disimpan.');
+    if (!refreshed) return null;
+    return payload;
   };
 
   const handleEditModel = (model) => {
@@ -4179,23 +4407,114 @@ const Dashboard = ({ onLogout, token, user }) => {
   };
 
   const handleSaveProcess = async () => {
-    if (!processCatalogForm.code || !processCatalogForm.name) {
-      alert('Code dan Name process wajib diisi.');
+    if (!processCatalogForm.code || !processCatalogForm.name || !processCatalogForm.processType) {
+      alert('Code, Name, dan Process Type wajib diisi.');
       return;
     }
-    const payload = { code: processCatalogForm.code.trim(), name: processCatalogForm.name.trim() };
-    if (editingProcessCode) {
-      await apiFetch(`/api/master/processes/${editingProcessCode}`, { method: 'PUT', body: JSON.stringify(payload) });
-    } else {
-      await apiFetch('/api/master/processes', { method: 'POST', body: JSON.stringify(payload) });
+    const normalizeProcessType = (value) => {
+      const raw = String(value || '').trim();
+      if (!raw) return '';
+      if (raw.toLowerCase() === 'subcon') return 'Subcon';
+      return raw;
+    };
+    const standardTimeValue = parseFloat(String(processCatalogForm.standardTime || '').replace(',', '.'));
+    const normalizeProcessWorkCenter = (value) => {
+      const raw = String(value || '').trim();
+      if (!raw) return '';
+      const lowered = raw.toLowerCase();
+      const match = (masterLocations || []).find((location) => {
+        const locationId = String(location.id || '').trim();
+        const locationType = String(location.line_description || location.lineDescription || '').trim();
+        const fifoLane = String(location.fifo_lane || location.fifoLane || '').trim();
+        const aliases = [
+          locationId,
+          locationType,
+          fifoLane,
+          `${locationId} - ${locationType}`,
+          `${locationId} ? ${locationType}`,
+          `${locationId} ? ${locationType}${fifoLane ? ` ? ${fifoLane}` : ''}`,
+        ].filter(Boolean);
+        return aliases.some((alias) => String(alias).trim().toLowerCase() === lowered);
+      });
+      return match ? String(match.id || '').trim() : '';
+    };
+    const normalizedWorkCenter = normalizeProcessWorkCenter(processCatalogForm.workCenter);
+    if (!normalizedWorkCenter) {
+      alert('Work Center / Production Line harus dipilih dari master ref.');
+      return;
     }
-    resetMasterForms();
-    setProcessFormVisible(false);
-    await fetchMasterReferences();
+    const payload = {
+      code: processCatalogForm.code.trim(),
+      name: processCatalogForm.name.trim(),
+      processType: normalizeProcessType(processCatalogForm.processType),
+      appliesToLevel: processCatalogForm.appliesToLevel || 'All',
+      workCenter: normalizedWorkCenter,
+      sequence: Number.parseInt(String(processCatalogForm.sequence || '').trim(), 10) || 0,
+      standardTime: Number.isFinite(standardTimeValue) ? Math.max(0, standardTimeValue) : 0,
+    };
+    try {
+      let savedProcess = null;
+      if (editingProcessCode) {
+        savedProcess = await apiFetch(`/api/master/processes/${editingProcessCode}`, { method: 'PUT', body: JSON.stringify(payload) });
+      } else {
+        savedProcess = await apiFetch('/api/master/processes', { method: 'POST', body: JSON.stringify(payload) });
+      }
+      const nextProcess = savedProcess || {
+        code: payload.code,
+        name: payload.name,
+        process_type: payload.processType,
+        applies_to_level: payload.appliesToLevel,
+        work_center: payload.workCenter,
+        sequence: payload.sequence,
+        standard_time: payload.standardTime,
+      };
+      setMasterProcesses((prev) => {
+        const referenceCode = String(editingProcessCode || payload.code || '').trim();
+        const resultCode = String(nextProcess.code || payload.code || referenceCode || '').trim();
+        const next = (prev || []).filter((process) => {
+          const processCode = String(process.code || '').trim();
+          return processCode !== referenceCode && processCode !== resultCode;
+        });
+        return [...next, nextProcess];
+      });
+      resetMasterForms();
+      setProcessFormVisible(false);
+      await finalizeMasterSave('Process berhasil disimpan.');
+    } catch (error) {
+      showToastMessage(error.message || 'Gagal menyimpan process.', '', null, 'error');
+    }
   };
 
   const handleEditProcess = (process) => {
-    setProcessCatalogForm({ code: process.code, name: process.name });
+    const resolveProcessWorkCenterValue = (value) => {
+      const raw = String(value || '').trim();
+      if (!raw) return '';
+      const lowered = raw.toLowerCase();
+      const match = (masterLocations || []).find((location) => {
+        const locationId = String(location.id || '').trim();
+        const locationType = String(location.line_description || location.lineDescription || '').trim();
+        const fifoLane = String(location.fifo_lane || location.fifoLane || '').trim();
+        const aliases = [
+          locationId,
+          locationType,
+          fifoLane,
+          `${locationId} - ${locationType}`,
+          `${locationId} ? ${locationType}`,
+          `${locationId} ? ${locationType}${fifoLane ? ` ? ${fifoLane}` : ''}`,
+        ].filter(Boolean);
+        return aliases.some((alias) => String(alias).trim().toLowerCase() === lowered);
+      });
+      return match ? String(match.id || '').trim() : raw;
+    };
+    setProcessCatalogForm({
+      code: process.code || '',
+      name: process.name || '',
+      processType: process.process_type || process.processType || process.name || '',
+      appliesToLevel: process.applies_to_level || process.appliesToLevel || 'All',
+      workCenter: resolveProcessWorkCenterValue(process.work_center || process.workCenter || ''),
+      sequence: String(process.sequence ?? ''),
+      standardTime: String(process.standard_time ?? process.standardTime ?? ''),
+    });
     setEditingProcessCode(process.code);
     setProcessFormVisible(true);
   };
@@ -4223,7 +4542,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
     resetMasterForms();
     setMasterFormVisible((prev) => ({ ...prev, customer: false }));
-    await fetchMasterReferences();
+    await finalizeMasterSave('Customer berhasil disimpan.');
   };
 
   const handleSaveConfig = async (override = null) => {
@@ -4265,7 +4584,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       requestIdFormat: nextConfig.requestIdFormat,
     };
     await apiFetch('/api/master/config', { method: 'PUT', body: JSON.stringify(payload) });
-    await fetchMasterReferences();
+    await finalizeMasterSave('Konfigurasi master berhasil disimpan.');
   };
 
   const openConfigModal = (key) => {
@@ -5055,6 +5374,15 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (match?.groups?.uniq) {
       return match.groups.uniq;
     }
+    const separatorMatch = trimmed.match(/^(.+?)[-_\/](\d+)(?:[-_\/].*)?$/);
+    if (separatorMatch?.[1] && masterItemsByCode.has(separatorMatch[1])) {
+      return separatorMatch[1];
+    }
+    const lastDash = trimmed.lastIndexOf('-');
+    if (lastDash > 0) {
+      const prefix = trimmed.slice(0, lastDash).trim();
+      if (masterItemsByCode.has(prefix)) return prefix;
+    }
     return trimmed;
   }
 
@@ -5113,6 +5441,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     const item = itemsByCode.get(code);
     const masterItem = masterItemsByCode.get(code);
     const masterLocation = masterLocationsById.get(masterItem?.location_id);
+    const actionMeta = resolveKanbanActionMeta(masterItem?.type || setting?.item_type || item?.type || payload.category || '');
     const stock = Number(fifoTotalsByItemCode.get(code) ?? 0);
     const min = Number(masterItem?.safety_stock ?? 0);
     const max = Number(setting?.max_qty ?? 0);
@@ -5127,10 +5456,98 @@ const Dashboard = ({ onLogout, token, user }) => {
       min,
       max,
       status,
+      itemCategoryCode: actionMeta.categoryCode,
+      itemCategoryLabel: actionMeta.categoryLabel,
+      actionType: actionMeta.actionType,
+      actionLabel: actionMeta.actionLabel,
+      actionHint: actionMeta.actionHint,
+      nextDestination: actionMeta.nextDestination,
       scannedAt: new Date().toISOString(),
       category: getCategoryLabel(setting?.item_type || ''),
       location: masterLocation?.id || masterLocation?.name || '-',
     };
+  };
+
+  const fetchScanPreview = async (payload, index = 0) => {
+    const fallback = buildScanResult(payload, index);
+    try {
+      const data = await apiFetch('/api/kanban/scan-preview', {
+        method: 'POST',
+        body: JSON.stringify({
+          kanbanId: payload.kanbanId || '',
+          itemCode: payload.item || fallback.itemCode || '',
+          qty: payload.qty || '',
+          area: payload.area || '',
+        }),
+      });
+      return {
+        ...fallback,
+        ...data,
+        currentPosition: data.currentPosition || fallback.currentPosition,
+        nextProcess: data.nextProcess || fallback.nextProcess,
+        routingSteps: Array.isArray(data.routingSteps) ? data.routingSteps : [],
+      };
+    } catch (error) {
+      return {
+        ...fallback,
+        scanPreviewError: error.message || 'Gagal mengambil preview routing.',
+      };
+    }
+  };
+
+  const refreshScanPreviewResult = async (result) => {
+    if (!result?.kanbanId) return result;
+    const refreshed = await fetchScanPreview({
+      kanbanId: result.kanbanId,
+      item: result.itemCode || '',
+      qty: result.qty || '',
+      area: result.area || '',
+    }, Number(result.id || 1) - 1);
+    setScanActiveResult(refreshed);
+    setScanResults((prev) => prev.map((row) => (row.id === result.id ? refreshed : row)));
+    return refreshed;
+  };
+
+  const handleKanbanProcessStart = async (result) => {
+    if (!result?.kanbanId) {
+      return { ok: false, reason: 'Kanban ID tidak valid.' };
+    }
+    try {
+      await apiFetch('/api/kanban/process/start', {
+        method: 'POST',
+        body: JSON.stringify({
+          kanbanId: result.kanbanId,
+          itemCode: result.itemCode || '',
+          qty: result.qty || '',
+          area: result.area || '',
+        }),
+      });
+      await refreshScanPreviewResult(result);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, reason: error.message || 'Gagal start proses.' };
+    }
+  };
+
+  const handleKanbanProcessFinish = async (result) => {
+    if (!result?.kanbanId) {
+      return { ok: false, reason: 'Kanban ID tidak valid.' };
+    }
+    try {
+      await apiFetch('/api/kanban/process/finish', {
+        method: 'POST',
+        body: JSON.stringify({
+          kanbanId: result.kanbanId,
+          itemCode: result.itemCode || '',
+          qty: result.qty || '',
+          area: result.area || '',
+        }),
+      });
+      await refreshScanPreviewResult(result);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, reason: error.message || 'Gagal finish proses.' };
+    }
   };
 
   const createRequestFromScan = async (result) => {
@@ -5395,18 +5812,14 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
     setScanError('');
     const parsed = lines.map((line) => parseScanLine(line)).filter(Boolean);
-    const results = parsed.map((payload, idx) => buildScanResult(payload, idx));
+    const results = await Promise.all(parsed.map((payload, idx) => fetchScanPreview(payload, idx)));
     setScanResults(results);
     setScanActiveResult(results[0] || null);
-    const failures = [];
-    for (const result of results) {
-      // Auto-create request for each scanned card
-      const outcome = await createRequestFromScan(result);
-      if (!outcome.ok) failures.push(`${result.kanbanId}: ${outcome.reason}`);
-    }
-    await fetchKanbanRequests();
+    const failures = results
+      .filter((result) => result.scanPreviewError)
+      .map((result) => `${result.kanbanId}: ${result.scanPreviewError}`);
     if (failures.length > 0) {
-      setScanError(failures.join('n'));
+      setScanError(failures.join('\n'));
     }
   };
 
@@ -5593,7 +6006,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   const handleImportItemsXls = (e) => {
     const file = e.target.files[0];
     if (!file) return;
-    readXlsRows(file, async (rows) => {
+    readItemImportRows(file).then(async (rows) => {
       if (!rows.length) { showToastMessage('File kosong.'); return; }
       try {
         const existingCodes = new Set(masterItems.map((item) => String(item.code || '').trim()).filter(Boolean));
@@ -5601,20 +6014,27 @@ const Dashboard = ({ onLogout, token, user }) => {
         let updated = 0;
         let skipped = 0;
         const payloads = [];
-        rows.forEach((row) => {
-          const code = row['Kode Item'] || row['Code'] || row['code'];
-          const name = row['Nama Item'] || row['Name'] || row['name'];
-          const partNo = row['Part No'] || row['PART NO'] || row['PartNo'] || row['partNo'] || row['Part Number'] || row['part number'];
-          const typeRaw = row['Type'] || row['type'];
-          const unit = row['Satuan'] || row['Unit'] || row['unit'];
-          const model = row['Model'] || row['model'];
-          const weight = row['Berat'] || row['Weight'] || row['weight'];
-          const cycle = row['Cycle'] || row['cycle'];
-          const safetyStock = row['Safety Stock'] || row['Safety'] || row['safetyStock'];
-          const packQty = row['SNP'] || row['Pack Qty'] || row['PackQty'] || row['packQty'];
-          const type = normalizeType(typeRaw);
+        const skippedReasons = [];
+        rows.forEach((row, index) => {
+          const rowNumber = index + 2;
+          const sheetName = String(row.__sheetName || '').trim();
+          const code = getImportValue(row, ['Kode Item', 'UNIQ', 'Uniq', 'UNIQ NO', 'Code', 'code', 'Kode Material']);
+          const name = getImportValue(row, ['Nama Item', 'Part Name', 'PART NAME', 'PartName', 'Name', 'name']);
+          const partNo = getImportValue(row, ['Part No', 'PART NO', 'PartNo', 'partNo', 'Part Number', 'part number']);
+          const typeRaw = getImportValue(row, ['Type', 'type', 'Category', 'category', 'Kategori', 'kategori']);
+          const unit = getImportValue(row, ['Satuan', 'Unit', 'unit', 'UOM', 'uom', 'OUM', 'oum']);
+          const model = getImportValue(row, ['Model', 'model']);
+          const weight = getImportValue(row, ['Berat', 'Weight', 'weight', 'Kgs', 'kgs']);
+          const cycle = getImportValue(row, ['Cycle', 'cycle']);
+          const safetyStock = getImportValue(row, ['Safety Stock', 'Safety', 'safetyStock']);
+          const packQty = getImportValue(row, ['SNP', 'Pack Qty', 'PackQty', 'packQty', 'QTY / KBN RM', 'QTY / KBN FG']);
+          const type = inferImportType(typeRaw, sheetName, file.name);
           if (!code || !name || !type || !unit) {
             skipped += 1;
+            skippedReasons.push(
+              `Baris ${rowNumber}${sheetName ? ` [${sheetName}]` : ''}: field wajib kurang (${!code ? 'UNIQ/Kode Item, ' : ''}${!name ? 'Part Name/Nama Item, ' : ''}${!type ? `Type/Kategori "${String(typeRaw || '').trim() || '-'}", ` : ''}${!unit ? 'Unit/UOM, ' : ''})`
+                .replace(/, $/, ''),
+            );
             return;
           }
           payloads.push({
@@ -5641,13 +6061,20 @@ const Dashboard = ({ onLogout, token, user }) => {
             }
           } catch (error) {
             skipped += 1;
+            skippedReasons.push(`${payload.code}: ${error.message || 'gagal simpan'}`);
           }
         }
         await fetchItems();
-        showToastMessage(`Import items selesai. Inserted: ${inserted}, Updated: ${updated}, Skipped: ${skipped}.`);
+        const summaryMessage = `Import items selesai. Inserted: ${inserted}, Updated: ${updated}, Skipped: ${skipped}.`;
+        showToastMessage(summaryMessage);
+        if (skippedReasons.length > 0) {
+          alert(`${summaryMessage}\n\nDetail skip:\n- ${skippedReasons.slice(0, 12).join('\n- ')}${skippedReasons.length > 12 ? `\n- ... dan ${skippedReasons.length - 12} lainnya` : ''}`);
+        }
       } catch (error) {
         showToastMessage(`Import items gagal: ${error.message || 'Unknown error'}`);
       }
+    }).catch((error) => {
+      showToastMessage(`Import items gagal: ${error.message || 'Unknown error'}`);
     });
     if (itemsImportRef.current) itemsImportRef.current.value = '';
   };
@@ -6503,6 +6930,98 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
   };
 
+  const fetchCapacityPlanningReport = async () => {
+    setReportLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (capacityPlanningMonth) params.set('month', capacityPlanningMonth);
+      if (capacityPlanningYear) params.set('year', capacityPlanningYear);
+      const query = params.toString();
+      const data = await apiFetch(`/api/reports/capacity-planning-daily${query ? `?${query}` : ''}`);
+      setCapacityPlanningData({
+        period: data?.period || null,
+        summary: data?.summary || null,
+        workCenters: Array.isArray(data?.workCenters) ? data.workCenters : [],
+        dailyRows: Array.isArray(data?.dailyRows) ? data.dailyRows : [],
+        workCenterDailyRows: Array.isArray(data?.workCenterDailyRows) ? data.workCenterDailyRows : [],
+        rows: Array.isArray(data?.rows) ? data.rows : [],
+      });
+      if (data?.period?.monthKey) setCapacityPlanningMonth(data.period.monthKey);
+      if (data?.period?.year) setCapacityPlanningYear(String(data.period.year));
+    } catch (error) {
+      setCapacityPlanningData({
+        period: null,
+        summary: null,
+        workCenters: [],
+        dailyRows: [],
+        workCenterDailyRows: [],
+        rows: [],
+      });
+      alert('Gagal memuat laporan capacity planning.');
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
+  const handleExportCapacityPlanningExcel = async () => {
+    const XLSX = await ensureXlsx();
+    if (!XLSX) return;
+    const summary = capacityPlanningData?.summary || {};
+    const rows = (capacityPlanningData?.rows || []).map((row) => ({
+      'Item Code': row.itemCode,
+      'Item Name': row.itemName,
+      Type: row.itemType,
+      'Planned Qty': row.plannedQty,
+      'Actual Qty': row.actualQty,
+      'Lead Time / Unit (Hours)': row.unitLeadTimeHours,
+      'Planned Load Hours': row.plannedLoadHours,
+      'Actual Load Hours': row.actualLoadHours,
+      Routing: row.routingSummary || '-',
+    }));
+    const workCenters = (capacityPlanningData?.workCenters || []).map((row) => ({
+      'Work Center': row.workCenter,
+      'Planned Qty': row.plannedQty,
+      'Actual Qty': row.actualQty,
+      'Planned Load Hours': row.plannedLoadHours,
+      'Actual Load Hours': row.actualLoadHours,
+      'Total Load Hours': row.totalLoadHours,
+      Processes: Array.isArray(row.processNames) ? row.processNames.join(', ') : '-',
+    }));
+    const dailyRows = (capacityPlanningData?.dailyRows || []).map((row) => ({
+      Date: row.date,
+      'Planned Qty': row.plannedQty,
+      'Actual Qty': row.actualQty,
+      'Planned Load Hours': row.plannedLoadHours,
+      'Actual Load Hours': row.actualLoadHours,
+      'Total Load Hours': row.totalLoadHours,
+    }));
+    const workCenterDailyRows = (capacityPlanningData?.workCenterDailyRows || []).map((row) => ({
+      Date: row.date,
+      'Work Center': row.workCenter,
+      'Planned Qty': row.plannedQty,
+      'Actual Qty': row.actualQty,
+      'Planned Load Hours': row.plannedLoadHours,
+      'Actual Load Hours': row.actualLoadHours,
+      'Total Load Hours': row.totalLoadHours,
+    }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([{
+      Period: capacityPlanningData?.period?.label || `${capacityPlanningMonth || '-'} ${capacityPlanningYear || ''}`.trim(),
+      'Total Planned Qty': summary.totalPlannedQty || 0,
+      'Total Actual Qty': summary.totalActualQty || 0,
+      'Total Planned Load Hours': summary.totalPlannedLoadHours || 0,
+      'Total Actual Load Hours': summary.totalActualLoadHours || 0,
+      'Routed Items': summary.routedItems || 0,
+      'Work Centers': summary.workCenters || 0,
+      'Dates': summary.dates || 0,
+    }]), 'Summary');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(workCenters.length ? workCenters : [{ Info: 'Tidak ada data' }]), 'Work Centers');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(dailyRows.length ? dailyRows : [{ Info: 'Tidak ada data' }]), 'Daily');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(workCenterDailyRows.length ? workCenterDailyRows : [{ Info: 'Tidak ada data' }]), 'WorkCenter Daily');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.length ? rows : [{ Info: 'Tidak ada data' }]), 'Items');
+    XLSX.writeFile(wb, `Capacity_Planning_${capacityPlanningYear || new Date().getFullYear()}_${capacityPlanningMonth || 'all'}_${new Date().toISOString().split('T')[0]}.xlsx`);
+  };
+
   const handleExportQualityObjectivesExcel = async () => {
     const XLSX = await ensureXlsx();
     if (!XLSX) return;
@@ -6764,6 +7283,12 @@ const Dashboard = ({ onLogout, token, user }) => {
   }, [mainTab, reportTab, scorecardFilterMonthStart, scorecardFilterMonthEnd, scorecardFilterSupplier, masterVendors.length, canViewMaster]);
 
   useEffect(() => {
+    if (mainTab !== 'reports') return;
+    if (reportTab !== 'capacity-planning') return;
+    fetchCapacityPlanningReport();
+  }, [mainTab, reportTab, capacityPlanningMonth, capacityPlanningYear]);
+
+  useEffect(() => {
     if (mainTab === 'kanban') {
       fetchKanbanSettings({ silent: dataCacheRef.current.kanbanSettingsLoaded });
       fetchKanbanRequests({ silent: dataCacheRef.current.kanbanRequestsLoaded });
@@ -6852,12 +7377,10 @@ const Dashboard = ({ onLogout, token, user }) => {
           }
           lastScanRef.current = { value, time: now };
           const payload = parseScanLine(value);
-          const built = buildScanResult(payload, 0);
+          const built = await fetchScanPreview(payload, 0);
           setScanResults([built]);
           setScanActiveResult(built);
-          const outcome = await createRequestFromScan(built);
-          await fetchKanbanRequests();
-          setScanError(outcome.ok ? '' : outcome.reason || 'Gagal membuat request.');
+          setScanError(built.scanPreviewError ? built.scanPreviewError : '');
         },
         { returnDetailedScanResult: true },
       );
@@ -7064,6 +7587,77 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (raw.includes('subcon')) return 'Subcon';
     if (raw.includes('finished')) return 'Finished';
     return value;
+  };
+
+  const resolveKanbanActionMeta = (itemType) => {
+    const text = String(itemType || '').trim().toLowerCase();
+    if (!text) {
+      return {
+        categoryCode: 'UNKNOWN',
+        categoryLabel: 'Material',
+        actionType: 'routing_execution',
+        actionLabel: 'Routing Execution',
+        actionHint: 'Kategori belum ditentukan, cek routing item.',
+        nextDestination: 'Routing Master',
+      };
+    }
+    if (text.includes('raw')) {
+      return {
+        categoryCode: 'RM',
+        categoryLabel: 'Raw Material',
+        actionType: 'issue',
+        actionLabel: 'Stock Movement / Issue',
+        actionHint: 'Scan ini dipakai untuk issue stok ke line / work order.',
+        nextDestination: 'Gudang / Line',
+      };
+    }
+    if (text.includes('indirect') || text.includes('consum')) {
+      return {
+        categoryCode: 'IM',
+        categoryLabel: 'Indirect Material',
+        actionType: 'consumption',
+        actionLabel: 'Consumption',
+        actionHint: 'Scan ini dipakai untuk pemakaian consumable / indirect.',
+        nextDestination: 'Work Center / Department',
+      };
+    }
+    if (text.includes('subcon')) {
+      return {
+        categoryCode: 'SUBCON',
+        categoryLabel: 'Subcon',
+        actionType: 'external_transfer',
+        actionLabel: 'External Transfer / Subcon',
+        actionHint: 'Scan ini dipakai untuk kirim / terima material subcon.',
+        nextDestination: 'Vendor / Subcon',
+      };
+    }
+    if (text.includes('fg') || text.includes('finish') || text.includes('sub assy') || text.includes('subassy') || text.includes('child part') || text === 'cp' || text.startsWith('cp')) {
+      const categoryCode = text.includes('sub assy') || text.includes('subassy')
+        ? 'SA'
+        : text.includes('child part') || text === 'cp' || text.startsWith('cp')
+          ? 'CP'
+          : 'FG';
+      return {
+        categoryCode,
+        categoryLabel: categoryCode === 'SA'
+          ? 'Sub-Assy'
+          : categoryCode === 'CP'
+            ? 'Child Part'
+            : 'Finished Goods',
+        actionType: 'routing_execution',
+        actionLabel: 'Routing Execution',
+        actionHint: 'Scan ini mengikuti routing proses aktif item.',
+        nextDestination: 'Routing / Work Center',
+      };
+    }
+    return {
+      categoryCode: 'MATERIAL',
+      categoryLabel: itemType || 'Material',
+      actionType: 'routing_execution',
+      actionLabel: 'Routing Execution',
+      actionHint: 'Kategori tidak dikenali, gunakan routing aktif item.',
+      nextDestination: 'Routing / Work Center',
+    };
   };
 
   const formatScanTime = (value) => {
@@ -7697,11 +8291,128 @@ const Dashboard = ({ onLogout, token, user }) => {
   };
 
   const normalizeType = (value) => {
-    const val = String(value || '').toLowerCase();
-    if (val.includes('raw')) return 'Raw';
-    if (val.includes('sub')) return 'Sub-Assy';
-    if (val.includes('fin')) return 'Finished';
+    const rawValue = String(value || '').trim();
+    const val = rawValue.toLowerCase();
+    if (!val) return '';
+    const directCode = masterCategories.find((category) => String(category.code || '').trim().toLowerCase() === val)?.code
+      || masterCategoryOptions.find((category) => String(category || '').trim().toLowerCase() === val);
+    if (directCode) return directCode;
+    const byName = categoryCodeByName.get(val);
+    if (byName) return byName;
+    const findByKeyword = (keywords, fallback) => {
+      const foundMaster = masterCategories.find((category) => {
+        const codeValue = String(category.code || '').trim().toLowerCase();
+        const nameValue = String(category.name || '').trim().toLowerCase();
+        return keywords.some((keyword) => codeValue.includes(keyword) || nameValue.includes(keyword));
+      });
+      if (foundMaster?.code) return foundMaster.code;
+      const foundOption = masterCategoryOptions.find((category) => {
+        const optionValue = String(category || '').trim().toLowerCase();
+        return keywords.some((keyword) => optionValue.includes(keyword));
+      });
+      return foundOption || fallback;
+    };
+    if (val.includes('raw') || val === 'rm') return findByKeyword(['raw', 'rm'], 'Raw Material');
+    if (val.includes('indirect') || val === 'im') return findByKeyword(['indirect', 'im'], 'Indirect Material');
+    if (val.includes('consum')) return findByKeyword(['consum'], 'Consumable');
+    if (val.includes('subcon')) return findByKeyword(['subcon'], 'Subcon');
+    if (val.includes('child') || val === 'cp' || val.startsWith('cp ')) return findByKeyword(['child', 'cp'], 'Child Part');
+    if (val.includes('sub assy') || val.includes('sub-assy') || val.includes('subassy') || val === 'sa') return findByKeyword(['sub assy', 'sub-assy', 'subassy', 'sa'], 'Sub-Assy');
+    if (val.includes('fin') || val.includes('fg')) return findByKeyword(['finished', 'fg'], 'Finished');
     return '';
+  };
+
+  const normalizeImportRow = (row = {}) => {
+    const normalized = {};
+    Object.entries(row || {}).forEach(([key, value]) => {
+      const normalizedKey = String(key || '').trim().toLowerCase();
+      if (!normalizedKey || normalized[normalizedKey] !== undefined) return;
+      normalized[normalizedKey] = value;
+    });
+    return normalized;
+  };
+
+  const getImportValue = (row, keys = []) => {
+    const normalizedRow = normalizeImportRow(row);
+    for (const key of keys) {
+      const normalizedKey = String(key || '').trim().toLowerCase();
+      if (!normalizedKey) continue;
+      const value = normalizedRow[normalizedKey];
+      if (value !== undefined && String(value ?? '').trim() !== '') return value;
+    }
+    return '';
+  };
+
+  const inferImportType = (typeValue, sheetName = '', fileName = '') => {
+    const directType = normalizeType(typeValue);
+    if (directType) return directType;
+    const context = `${sheetName} ${fileName}`.toLowerCase();
+    if (context.includes('raw') || /\brm\b/.test(context)) return normalizeType('raw');
+    if (context.includes('indirect') || /\bim\b/.test(context)) return normalizeType('indirect');
+    if (context.includes('consum')) return normalizeType('consumable');
+    if (context.includes('subcon')) return normalizeType('subcon');
+    if (context.includes('child') || /\bcp\b/.test(context)) return normalizeType('child part');
+    if (context.includes('sub assy') || context.includes('sub-assy') || context.includes('subassy') || /\bsa\b/.test(context)) return normalizeType('sub assy');
+    if (context.includes('finish') || /\bfg\b/.test(context) || context.includes('master product')) return normalizeType('finished');
+    return '';
+  };
+
+  const readItemImportRows = async (file) => {
+    const XLSX = await ensureXlsx();
+    if (!XLSX || !file) return [];
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (evt) => {
+        try {
+          const bstr = evt.target.result;
+          const wb = XLSX.read(bstr, { type: 'binary' });
+          const headerHints = ['kode item', 'uniq', 'uniq no', 'part name', 'nama item', 'part no', 'type', 'kategori', 'category', 'unit', 'uom', 'oum'];
+          const collectedRows = [];
+          wb.SheetNames.forEach((sheetName) => {
+            const ws = wb.Sheets[sheetName];
+            const matrix = XLSX.utils.sheet_to_json(ws, { header: 1, blankrows: false, defval: '' });
+            if (!Array.isArray(matrix) || matrix.length === 0) return;
+            let headerIndex = -1;
+            for (let index = 0; index < Math.min(matrix.length, 12); index += 1) {
+              const row = Array.isArray(matrix[index]) ? matrix[index] : [];
+              const normalizedCells = row.map((cell) => String(cell || '').trim().toLowerCase());
+              const hitCount = headerHints.filter((hint) => normalizedCells.some((cell) => cell.includes(hint))).length;
+              if (hitCount >= 2) {
+                headerIndex = index;
+                break;
+              }
+            }
+            if (headerIndex === -1) return;
+            const headerRow = (matrix[headerIndex] || []).map((cell, index) => {
+              const label = String(cell || '').trim();
+              return label || `column_${index + 1}`;
+            });
+            for (let index = headerIndex + 1; index < matrix.length; index += 1) {
+              const row = Array.isArray(matrix[index]) ? matrix[index] : [];
+              if (!row.some((cell) => String(cell || '').trim() !== '')) continue;
+              const rowObject = {};
+              headerRow.forEach((header, cellIndex) => {
+                rowObject[header] = row[cellIndex] ?? '';
+              });
+              rowObject.__sheetName = sheetName;
+              collectedRows.push(rowObject);
+            }
+          });
+          if (collectedRows.length > 0) {
+            resolve(collectedRows);
+            return;
+          }
+          const wsname = wb.SheetNames[0];
+          const ws = wb.Sheets[wsname];
+          const data = XLSX.utils.sheet_to_json(ws);
+          resolve(Array.isArray(data) ? data : []);
+        } catch (error) {
+          reject(error);
+        }
+      };
+      reader.onerror = () => reject(new Error('Gagal membaca file Excel.'));
+      reader.readAsBinaryString(file);
+    });
   };
 
   const readXlsRows = async (file, onRows) => {
@@ -8124,12 +8835,6 @@ const Dashboard = ({ onLogout, token, user }) => {
     batchForm,
     bomProcessOptions,
     buildKanbanId,
-    bulkReceiveDate,
-    bulkReceiveDoNumber,
-    bulkReceiveOpen,
-    bulkReceiveQty,
-    bulkReceiveDocQty,
-    bulkReceiveAllowOver,
     inboundCardAdjustLoading,
     inboundCardAdjustOpen,
     inboundCardAdjustSchedule,
@@ -8162,7 +8867,6 @@ const Dashboard = ({ onLogout, token, user }) => {
     resolveSupplierLabel,
     categoryForm,
     categoryNameByCode,
-    closeBulkReceiveModal,
     closeConfigModal,
     closeDnDetailModal,
     closeDnPrintModal,
@@ -8196,6 +8900,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     fetchKanbanSettings,
     fetchDeliveryNotes,
     fetchReceiveNotes,
+    refreshSchedules,
     fetchMasterReferences,
     fetchReport,
     fetchQualityObjectivesReport,
@@ -8259,7 +8964,6 @@ const Dashboard = ({ onLogout, token, user }) => {
     getPrlVolPerDay,
     getRemainingQty,
     getPoLineRemainingAfterSchedule,
-    getSplitDecision,
     getRequestIdLabel,
     getUniqueSuppliers,
     ensureXlsx,
@@ -8268,7 +8972,6 @@ const Dashboard = ({ onLogout, token, user }) => {
     handleAddPlan,
     handleApproveAndCreateDn,
     handleBatchSubmit,
-    handleBulkReceiveSubmit,
     handleCancelEdit,
     handleInboundCardAdjustSubmit,
     handleInboundCardScanSubmit,
@@ -8319,7 +9022,6 @@ const Dashboard = ({ onLogout, token, user }) => {
     handleFifoIssue,
     handleFifoReceive,
     handleInventoryDelete,
-    handleItemModelEntryKey,
     handleLoadSampleScan,
     handleManualRequest,
     handlePrintPDF,
@@ -8343,6 +9045,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     handleSaveDelivery,
     handleSaveItemMaster,
     handleSaveKanbanSetting,
+    handleGenerateKanbanFromMasterItems,
     handleSaveLocation,
     handleSaveModel,
     handleSaveProcess,
@@ -8352,7 +9055,6 @@ const Dashboard = ({ onLogout, token, user }) => {
     handleSaveWarehouse,
     handleSendEmail,
     handleSendEmailReminder,
-    handleSplitSchedule,
     handleSyncInventoryFromKanban,
     handleUnlockActual,
     handleUpdateActual,
@@ -8386,6 +9088,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     itemDuplicateKeySets,
     kanbanCategory,
     kanbanCategoryFilter,
+    kanbanDashboardCategoryFilter,
     kanbanDnPaginationMeta,
     kanbanEditMode,
     kanbanEmptyPaginationMeta,
@@ -8442,11 +9145,11 @@ const Dashboard = ({ onLogout, token, user }) => {
     processFormVisible,
     monthKeyByIndex,
     newPlan,
-    openBulkReceiveModal,
     openConfigModal,
     openDnDetailModal,
     openDnModal,
     openInboundCardAdjustModal,
+    openInboundScheduleFromToast,
     openInventoryDetail,
     openQrModal,
     openReceiveModal,
@@ -8490,6 +9193,12 @@ const Dashboard = ({ onLogout, token, user }) => {
     reportSummary,
     reportSupplier,
     reportTab,
+    getWorkingDays,
+    capacityPlanningMonth,
+    setCapacityPlanningMonth,
+    capacityPlanningYear,
+    setCapacityPlanningYear,
+    capacityPlanningData,
     qualityObjectivesMonth,
     qualityObjectivesData,
     stockCoverageDays,
@@ -8528,15 +9237,19 @@ const Dashboard = ({ onLogout, token, user }) => {
       supplierShortageSupplierOptions,
       supplierShortageMonth,
       setSupplierShortageMonth,
-      supplierShortageYear,
-      setSupplierShortageYear,
-      outstandingPrlRows,
-      outstandingPrlMonth,
-      outstandingPrlYear,
+    supplierShortageYear,
+    setSupplierShortageYear,
+    outstandingPrlRows,
+    outstandingPrlMonth,
+    outstandingPrlYear,
+    fetchCapacityPlanningReport,
+    handleExportCapacityPlanningExcel,
     kpiSummary,
     kpiLoading,
     resetMasterForms,
     resolveVendorFromSupplier,
+    handleKanbanProcessStart,
+    handleKanbanProcessFinish,
     scanActiveResult,
     scanError,
     scanInput,
@@ -8562,11 +9275,6 @@ const Dashboard = ({ onLogout, token, user }) => {
     setActiveMenu,
     setAreaForm,
     setBatchForm,
-    setBulkReceiveDate,
-    setBulkReceiveDoNumber,
-    setBulkReceiveQty,
-    setBulkReceiveDocQty,
-    setBulkReceiveAllowOver,
     setInboundCardAdjustOpen,
     setInboundCardAdjustTarget,
     setInboundCardScanOpen,
@@ -8617,6 +9325,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     setItemTableFilters,
     setKanbanCategory,
     setKanbanCategoryFilter,
+    setKanbanDashboardCategoryFilter,
     setKanbanEditMode,
     setKanbanRequestStatusFilter,
     setKanbanRequestQuickFilter,
@@ -8737,10 +9446,15 @@ const Dashboard = ({ onLogout, token, user }) => {
                       <button
                         type="button"
                         onClick={handleNotifications}
-                        className="bg-white border border-slate-200 text-slate-600 p-2 rounded-lg shadow-sm hover:bg-slate-50 transition"
+                        className="relative bg-white border border-slate-200 text-slate-600 p-2 rounded-lg shadow-sm hover:bg-slate-50 transition"
                         title="Notifikasi"
                       >
                         <Bell size={20} />
+                        {notificationCount > 0 && (
+                          <span className="absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-600 px-1 text-[10px] font-bold text-white">
+                            {notificationCount}
+                          </span>
+                        )}
                       </button>
                     <button
                       type="button"
@@ -8871,7 +9585,7 @@ const Dashboard = ({ onLogout, token, user }) => {
                       Master Referensi
                     </button>
                   )}
-                  {isAdmin && (
+                  {isAdmin ? (
                     <div className={`relative ${settingsMenuOpen ? 'z-[120]' : 'z-10'}`}>
                       <button
                         onClick={(e) => {
@@ -8907,6 +9621,13 @@ const Dashboard = ({ onLogout, token, user }) => {
                         </div>
                       )}
                     </div>
+                  ) : (
+                    <button
+                      onClick={() => setMainTab('settings')}
+                      className={`px-4 py-2 rounded-full text-sm border transition ${(mainTab === 'settings') ? 'bg-slate-900 text-white border-slate-900 shadow' : 'bg-white/80 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
+                    >
+                      Pengaturan
+                    </button>
                   )}
                 </div>
 
@@ -8967,6 +9688,14 @@ const Dashboard = ({ onLogout, token, user }) => {
                         )}
                         {canViewReport && (
                           <button
+                            onClick={() => { setMainTab('reports'); setReportTab('inbound-matrix'); setReportMenuOpen(false); }}
+                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
+                          >
+                            <FileSpreadsheet size={14} /> Delivery Matrix Inbound
+                          </button>
+                        )}
+                        {canViewReport && (
+                          <button
                             onClick={() => { setMainTab('reports'); setReportTab('fifo-violations'); setReportMenuOpen(false); }}
                             className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
                           >
@@ -9011,6 +9740,14 @@ const Dashboard = ({ onLogout, token, user }) => {
                             className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
                           >
                             <ListChecks size={14} /> Outstanding PRL
+                          </button>
+                        )}
+                        {canViewReport && (
+                          <button
+                            onClick={() => { setMainTab('reports'); setReportTab('capacity-planning'); setReportMenuOpen(false); }}
+                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
+                          >
+                            <BarChart3 size={14} /> Capacity Planning
                           </button>
                         )}
                       </div>
@@ -9263,7 +10000,17 @@ const Dashboard = ({ onLogout, token, user }) => {
                                 </td>
                                 <td className="p-3 text-xs text-gray-500">{formatUserCreatedAt(u.created_at)}</td>
                                 <td className="p-3">
-                                  <button onClick={() => handleEditUser(u)} className="text-indigo-600 text-xs">Edit</button>
+                                  <div className="flex flex-wrap items-center gap-3">
+                                    <button onClick={() => handleEditUser(u)} className="text-indigo-600 text-xs">Edit</button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleResetUserPassword(u)}
+                                      disabled={userResettingId === u.id}
+                                      className="text-rose-600 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                                    >
+                                      {userResettingId === u.id ? 'Resetting...' : 'Reset Password'}
+                                    </button>
+                                  </div>
                                 </td>
                               </tr>
                             );
@@ -9608,13 +10355,127 @@ const Dashboard = ({ onLogout, token, user }) => {
                   <X size={16} />
                 </button>
               </div>
-              <div className="p-4 space-y-3">
-                {notificationItems.map((item) => (
-                  <div key={item.id} className="rounded-xl border border-slate-200 bg-white px-4 py-3">
-                    <div className="text-sm font-semibold text-slate-900">{item.title}</div>
-                    <div className="text-xs text-slate-500">{item.detail}</div>
+              <div className="border-b border-slate-100 px-5 py-3">
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-xs text-slate-500">
+                    <span>{notificationTotal} notifikasi tersimpan</span>
+                    <button
+                      type="button"
+                      onClick={markAllNotificationsAsRead}
+                      className="font-semibold text-indigo-600 hover:text-indigo-700 disabled:text-slate-400"
+                      disabled={!notificationUnreadCount || notificationLoading}
+                    >
+                      Tandai semua dibaca
+                    </button>
                   </div>
-                ))}
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={notificationModuleFilter}
+                      onChange={(event) => setNotificationModuleFilter(event.target.value)}
+                      className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 shadow-sm outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+                    >
+                      {NOTIFICATION_MODULE_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => setNotificationModuleFilter('all')}
+                      className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                      disabled={notificationModuleFilter === 'all'}
+                    >
+                      Reset
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div className="p-4 space-y-4 overflow-y-auto h-[calc(100%-118px)]">
+                {notificationLoading && (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500">
+                    Memuat notifikasi...
+                  </div>
+                )}
+                {notificationError && (
+                  <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-700">
+                    {notificationError}
+                  </div>
+                )}
+                {!notificationLoading && !notificationError && notificationRecords.length === 0 && (
+                  <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 px-4 py-6 text-center text-xs text-slate-500">
+                    Tidak ada notifikasi baru.
+                  </div>
+                )}
+                {unreadNotificationItems.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Belum dibaca</div>
+                    {unreadNotificationItems.map((item) => (
+                      <div key={item.id} className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <div className="text-[10px] uppercase tracking-wide text-slate-400">{item.module}</div>
+                            <div className="text-sm font-semibold text-slate-900">{item.title}</div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                              item.severity === 'warning'
+                                ? 'bg-amber-100 text-amber-700'
+                                : item.severity === 'error'
+                                  ? 'bg-rose-100 text-rose-700'
+                                  : 'bg-slate-100 text-slate-600'
+                            }`}>
+                              {item.severity}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => markNotificationAsRead(item.id)}
+                              className="rounded-md border border-amber-300 bg-white px-2 py-1 text-[10px] font-semibold text-amber-700 hover:bg-amber-100"
+                            >
+                              Dibaca
+                            </button>
+                          </div>
+                        </div>
+                        <div className="mt-1 text-xs text-slate-600">{item.detail}</div>
+                        <div className="mt-2 text-[10px] text-slate-400">
+                          {item.created_at ? new Date(item.created_at).toLocaleString('id-ID') : '-'}
+                          {item.status ? ` • ${String(item.status).toUpperCase()}` : ''}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {readNotificationItems.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Riwayat</div>
+                    {readNotificationItems.map((item) => (
+                      <div key={item.id} className="rounded-xl border border-slate-200 bg-white px-4 py-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <div className="text-[10px] uppercase tracking-wide text-slate-400">{item.module}</div>
+                            <div className="text-sm font-semibold text-slate-900">{item.title}</div>
+                          </div>
+                          <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                            item.status === 'resolved'
+                              ? 'bg-emerald-100 text-emerald-700'
+                              : item.severity === 'warning'
+                                ? 'bg-amber-100 text-amber-700'
+                                : item.severity === 'error'
+                                  ? 'bg-rose-100 text-rose-700'
+                                  : 'bg-slate-100 text-slate-600'
+                          }`}>
+                            {String(item.status || item.severity || 'info').toUpperCase()}
+                          </span>
+                        </div>
+                        <div className="mt-1 text-xs text-slate-500">{item.detail}</div>
+                        <div className="mt-2 text-[10px] text-slate-400">
+                          {item.read_at ? `Dibaca: ${new Date(item.read_at).toLocaleString('id-ID')}` : ''}
+                          {item.created_at ? ` • Dibuat: ${new Date(item.created_at).toLocaleString('id-ID')}` : ''}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -9623,16 +10484,32 @@ const Dashboard = ({ onLogout, token, user }) => {
         {toast.open && (
             <div className="fixed top-6 right-6 z-50 print:hidden">
               <div
+                role={toast.onAction ? 'button' : undefined}
+                tabIndex={toast.onAction ? 0 : undefined}
+                onClick={toast.onAction ? () => {
+                  toast.onAction();
+                  setToast((prev) => ({ ...prev, open: false }));
+                } : undefined}
+                onKeyDown={toast.onAction ? (event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    toast.onAction();
+                    setToast((prev) => ({ ...prev, open: false }));
+                  }
+                } : undefined}
                 className={`rounded-lg shadow-lg px-4 py-3 flex items-center gap-3 border ${
                   toast.tone === 'error'
                     ? 'bg-rose-50 border-rose-200 text-rose-700'
+                    : toast.tone === 'success'
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
                     : 'bg-white border-slate-200 text-slate-700'
-                }`}
+                } ${toast.onAction ? 'cursor-pointer hover:shadow-xl focus:outline-none focus:ring-2 focus:ring-indigo-200' : ''}`}
               >
                 <div className="text-sm">{toast.message}</div>
                 {toast.actionLabel && toast.onAction && (
                   <button
-                    onClick={() => {
+                    onClick={(event) => {
+                      event.stopPropagation();
                       toast.onAction();
                       setToast((prev) => ({ ...prev, open: false }));
                     }}
@@ -9642,7 +10519,10 @@ const Dashboard = ({ onLogout, token, user }) => {
                   </button>
                 )}
                 <button
-                  onClick={() => setToast((prev) => ({ ...prev, open: false }))}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setToast((prev) => ({ ...prev, open: false }));
+                  }}
                   className="text-slate-400 hover:text-slate-600"
                 >
                   <X size={14} />
@@ -9703,8 +10583,11 @@ const Dashboard = ({ onLogout, token, user }) => {
 // --- KOMPONEN UTAMA (WRAPPER) ---
 const MainApp = () => {
   const [auth, setAuth] = useState({ token: null, user: null, loading: true });
+  const [authNotice, setAuthNotice] = useState('');
   const apiHealth = useApiHealth();
   const authBootstrappedRef = useRef(false);
+  const idleLogoutTimerRef = useRef(null);
+  const idleLogoutPendingRef = useRef(false);
 
   useEffect(() => {
     if (authBootstrappedRef.current) return;
@@ -9728,14 +10611,71 @@ const MainApp = () => {
 
 
   const handleLogin = useCallback((token, user) => {
+    setAuthNotice('');
+    idleLogoutPendingRef.current = false;
     localStorage.setItem('authToken', token);
     setAuth({ token, user, loading: false });
   }, []);
 
-  const handleLogout = useCallback(() => {
+  const handleLogout = useCallback(async (options = {}) => {
+    const reasonMessage = String(options?.reasonMessage || '').trim();
+    if (auth.token) {
+      try {
+        await apiRequest('/api/auth/logout', { method: 'POST' }, auth.token);
+      } catch {
+        // ignore logout errors; local session is cleared regardless
+      }
+    }
+    if (idleLogoutTimerRef.current) {
+      clearTimeout(idleLogoutTimerRef.current);
+      idleLogoutTimerRef.current = null;
+    }
+    idleLogoutPendingRef.current = false;
     localStorage.removeItem('authToken');
+    setAuthNotice(reasonMessage);
     setAuth({ token: null, user: null, loading: false });
-  }, []);
+  }, [auth.token]);
+
+  useEffect(() => {
+    if (!auth.token) {
+      if (idleLogoutTimerRef.current) {
+        clearTimeout(idleLogoutTimerRef.current);
+        idleLogoutTimerRef.current = null;
+      }
+      idleLogoutPendingRef.current = false;
+      return undefined;
+    }
+
+    const triggerIdleLogout = () => {
+      if (idleLogoutPendingRef.current) return;
+      idleLogoutPendingRef.current = true;
+      handleLogout({ reasonMessage: 'Sesi berakhir otomatis setelah 15 menit tanpa aktivitas. Silakan login kembali.' });
+    };
+
+    const resetIdleTimer = () => {
+      if (idleLogoutTimerRef.current) {
+        clearTimeout(idleLogoutTimerRef.current);
+      }
+      idleLogoutPendingRef.current = false;
+      idleLogoutTimerRef.current = setTimeout(triggerIdleLogout, AUTO_LOGOUT_IDLE_MS);
+    };
+
+    const events = ['mousemove', 'keydown', 'click', 'touchstart'];
+    events.forEach((eventName) => {
+      window.addEventListener(eventName, resetIdleTimer, { passive: true });
+    });
+    resetIdleTimer();
+
+    return () => {
+      events.forEach((eventName) => {
+        window.removeEventListener(eventName, resetIdleTimer);
+      });
+      if (idleLogoutTimerRef.current) {
+        clearTimeout(idleLogoutTimerRef.current);
+        idleLogoutTimerRef.current = null;
+      }
+    };
+  }, [auth.token, handleLogout]);
 
   if (auth.loading) {
     return <div className="min-h-screen bg-slate-100 flex items-center justify-center text-slate-600">Loading...</div>;
@@ -9753,7 +10693,7 @@ const MainApp = () => {
       />
       {auth.token
         ? <Dashboard onLogout={handleLogout} token={auth.token} user={auth.user} />
-        : <LoginPage onLogin={handleLogin} />}
+        : <LoginPage onLogin={handleLogin} notice={authNotice} />}
     </>
   );
 };

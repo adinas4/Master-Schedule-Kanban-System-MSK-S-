@@ -25,8 +25,6 @@ const DEFAULT_EDIT_FORM = {
   deliveryTime: '',
 };
 
-const SPLIT_TOLERANCE_RATIO = 0.1;
-
 const getCurrentMonthRange = () => {
   const now = new Date();
   const year = now.getFullYear();
@@ -115,12 +113,6 @@ export const useScheduleStore = ({
   const shouldPrefetchSchedules = prefetchAllSchedules !== false;
   const scheduleUpdateTimers = useRef(new Map());
   const [selectedScheduleIds, setSelectedScheduleIds] = useState([]);
-  const [bulkReceiveOpen, setBulkReceiveOpen] = useState(false);
-  const [bulkReceiveDoNumber, setBulkReceiveDoNumber] = useState('');
-  const [bulkReceiveDate, setBulkReceiveDate] = useState('');
-  const [bulkReceiveQty, setBulkReceiveQty] = useState({});
-  const [bulkReceiveDocQty, setBulkReceiveDocQty] = useState({});
-  const [bulkReceiveAllowOver, setBulkReceiveAllowOver] = useState(false);
   const [showForm, setShowForm] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [editingId, setEditingId] = useState(null);
@@ -483,24 +475,6 @@ export const useScheduleStore = ({
     return Number.isFinite(totals.totalOrder) ? totals.totalOrder : null;
   };
 
-  const getSplitDecisionByQty = (orderedQty, receivedQty) => {
-    const ordered = Math.max(0, Number(orderedQty || 0));
-    const received = Math.max(0, Number(receivedQty || 0));
-    const outstanding = Math.max(0, ordered - received);
-    const threshold = ordered * SPLIT_TOLERANCE_RATIO;
-    const isPartial = received > 0 && received < ordered;
-    return {
-      ordered,
-      received,
-      outstanding,
-      threshold,
-      isPartial,
-      withinTolerance: isPartial && outstanding <= threshold,
-      needsSplit: isPartial && outstanding > threshold,
-    };
-  };
-  const getSplitDecision = (item) => getSplitDecisionByQty(item?.requestQty, item?.receivedQty);
-
   const padDatePart = (value) => String(value).padStart(2, '0');
   const toDateKey = (date) => (
     `${date.getFullYear()}-${padDatePart(date.getMonth() + 1)}-${padDatePart(date.getDate())}`
@@ -683,47 +657,6 @@ export const useScheduleStore = ({
     return 'print-status--pending';
   };
 
-  const openBulkReceiveModal = (ids = selectedScheduleIds) => {
-    if (isStockOpnameLocked) {
-      alert('Selesaikan dulu Stock Opname!');
-      return;
-    }
-    const baseRows = schedulesLoaded ? schedules : filteredSchedules;
-    const validIds = ids.filter((id) => {
-      const row = baseRows.find((item) => item.id === id);
-      return row && !row.actualLocked;
-    });
-    if (validIds.length === 0) {
-      alert('Pilih data yang belum terkunci.');
-      return;
-    }
-    const qtyMap = {};
-    const docQtyMap = {};
-    validIds.forEach((id) => {
-      const row = baseRows.find((item) => item.id === id);
-      if (!row) return;
-      const remaining = getRemainingQty(row);
-      qtyMap[id] = remaining;
-      docQtyMap[id] = remaining;
-    });
-    setSelectedScheduleIds(validIds);
-    setBulkReceiveDoNumber('');
-    setBulkReceiveDate(getTodayValue());
-    setBulkReceiveQty(qtyMap);
-    setBulkReceiveDocQty(docQtyMap);
-    setBulkReceiveAllowOver(false);
-    setBulkReceiveOpen(true);
-  };
-
-  const closeBulkReceiveModal = () => {
-    setBulkReceiveOpen(false);
-    setBulkReceiveDoNumber('');
-    setBulkReceiveDate('');
-    setBulkReceiveQty({});
-    setBulkReceiveDocQty({});
-    setBulkReceiveAllowOver(false);
-  };
-
   const isDuplicateDoNumber = (item) => {
     const doNumber = String(item.doNumber || '').trim().toLowerCase();
     if (!doNumber) return false;
@@ -738,187 +671,6 @@ export const useScheduleStore = ({
         (!poLineId && other.poNumber === item.poNumber && (other.itemCode || other.item_code || other.item) === itemCode)
       )
     ));
-  };
-  const handleBulkReceiveSubmit = async () => {
-    if (isStockOpnameLocked) { alert('Selesaikan dulu Stock Opname!'); return; }
-    if (!canEditSchedules) { alert('Anda tidak memiliki akses edit.'); return; }
-    if (!bulkReceiveDoNumber.trim()) { alert('Nomor Surat Jalan wajib diisi.'); return; }
-    if (!bulkReceiveDate) { alert('Tanggal tiba wajib diisi.'); return; }
-    if (!schedulesLoaded) {
-      await ensureSchedulesLoaded();
-    }
-    const baseRows = schedulesLoaded ? schedules : filteredSchedules;
-    const selectedRows = baseRows.filter((row) => selectedScheduleIds.includes(row.id) && !row.actualLocked);
-    if (selectedRows.length === 0) { alert('Tidak ada data yang dipilih.'); return; }
-    const looseRows = selectedRows
-      .map((row) => {
-        const receivedQty = Number(bulkReceiveQty[row.id] || 0);
-        const nsp = typeof resolveNspForItem === 'function' ? resolveNspForItem(row.item) : 0;
-        return { row, receivedQty, nsp };
-      })
-      .filter((entry) => entry.nsp > 0 && entry.receivedQty > 0 && entry.receivedQty % entry.nsp !== 0);
-    if (looseRows.length > 0) {
-      const preview = looseRows.slice(0, 3).map((entry) => `${entry.row.poNumber} (${entry.row.item}) ${entry.receivedQty}/${entry.nsp}`).join(', ');
-      const suffix = looseRows.length > 3 ? ` dan ${looseRows.length - 3} lainnya` : '';
-      const ok = window.confirm(`Ada Qty penerimaan yang tidak sesuai NSP. Contoh: ${preview}${suffix}. Lanjutkan penerimaan Loose Item?`);
-      if (!ok) return;
-    }
-    const remainingById = selectedRows.reduce((acc, row) => {
-      acc[row.id] = getRemainingQty(row);
-      return acc;
-    }, {});
-    const payloadRows = selectedRows.map((row) => {
-      const receivedQty = Number(bulkReceiveQty[row.id] || 0);
-      const docQty = Number(bulkReceiveDocQty[row.id] || 0);
-      const orderedQty = Number(row.requestQty || 0);
-      const safeDnId = Number.isFinite(Number(row.dnId)) && Number(row.dnId) > 0 ? Number(row.dnId) : null;
-      const safeRequestId = Number.isFinite(Number(row.requestId)) && Number(row.requestId) > 0 ? Number(row.requestId) : null;
-      const splitDecision = getSplitDecisionByQty(orderedQty, receivedQty);
-      const timeStatus = resolveTimingStatus(row.requestDate, bulkReceiveDate);
-      const nextStatus = timeStatus;
-      const nextNotes = splitDecision.needsSplit
-        ? (row.notes ? `${row.notes} (Parsial)` : '(Parsial)')
-        : row.notes;
-      const safeItemCode = row.itemCode || row.item_code || '';
-      return {
-        ...row,
-        itemCode: safeItemCode,
-        item: safeItemCode || row.item,
-        poLineId: row.poLineId || row.po_line_id,
-        doNumber: bulkReceiveDoNumber,
-        arrivalDate: bulkReceiveDate,
-        receivedQty,
-        docQty,
-        status: nextStatus,
-        notes: nextNotes,
-        dnId: safeDnId,
-        requestId: safeRequestId,
-      };
-    });
-    if (payloadRows.some((row) => !row.itemCode)) {
-      alert('Kode item tidak ditemukan. Refresh data jadwal atau lengkapi PO line sebelum input kedatangan.');
-      return;
-    }
-    if (payloadRows.some((row) => row.receivedQty <= 0 || row.docQty <= 0)) {
-      alert('Qty dokumen dan qty tiba harus diisi.');
-      return;
-    }
-    const hasOverDelivery = payloadRows.some((row) => row.receivedQty > (remainingById[row.id] ?? 0));
-    if (hasOverDelivery) {
-      const ok = window.confirm('Kuantitas kedatangan melebihi Sisa PO. Apakah Anda yakin ingin melanjutkan?');
-      if (!ok) return;
-    }
-    try {
-      const sjCheck = await apiFetch('/api/schedules/check-sj', {
-        method: 'POST',
-        body: {
-          doNumber: bulkReceiveDoNumber,
-          ignoreIds: payloadRows.map((row) => row.id),
-          items: payloadRows.map((row) => ({
-            poNumber: row.poNumber,
-            itemCode: row.itemCode,
-            poLineId: row.poLineId || row.po_line_id,
-          })),
-        },
-      });
-      if (sjCheck?.status === 'block') {
-        alert(`Nomor SJ "${bulkReceiveDoNumber}" sudah pernah dipakai untuk PO/Item yang sama. Input dibatalkan untuk mencegah duplikasi.`);
-        return;
-      }
-      if (sjCheck?.status === 'warn') {
-        const matches = Array.isArray(sjCheck.matches) ? sjCheck.matches : [];
-        const preview = matches.slice(0, 3)
-          .map((row) => `${row.itemName || row.itemCode || '-'} / ${row.poNumber || '-'}`)
-          .join(', ');
-        const suffix = matches.length > 3 ? ` dan ${matches.length - 3} lainnya` : '';
-        const message = matches.length > 0
-          ? `Peringatan: Nomor SJ "${bulkReceiveDoNumber}" sudah pernah diinput sebelumnya untuk barang ${preview}${suffix}. Apakah ini adalah pengiriman gabungan?`
-          : `Peringatan: Nomor SJ "${bulkReceiveDoNumber}" sudah pernah dipakai sebelumnya. Apakah ini pengiriman gabungan?`;
-        const ok = window.confirm(message);
-        if (!ok) return;
-      }
-    } catch (error) {
-      console.error('SJ Check Error:', error);
-      alert('Gagal memeriksa duplikasi Nomor SJ. Silakan coba lagi.');
-      return;
-    }
-    const duplicateMap = new Map();
-    for (const row of payloadRows) {
-      const key = `${String(row.doNumber || '').trim().toLowerCase()}|${row.poNumber}|${row.itemCode || row.item}`;
-      if (duplicateMap.has(key)) {
-        alert('Nomor SJ duplikat untuk PO/Item yang sama.');
-        return;
-      }
-      duplicateMap.set(key, true);
-    }
-    const nextSchedules = schedules.map((row) => {
-      const updated = payloadRows.find((item) => item.id === row.id);
-      return updated ? { ...row, ...updated } : row;
-    });
-    for (const row of payloadRows) {
-      const checkItem = nextSchedules.find((item) => item.id === row.id) || row;
-      if (isDuplicateDoNumber(checkItem)) {
-        alert('Nomor SJ duplikat untuk PO/Item yang sama.');
-        return;
-      }
-    }
-    if (!window.confirm('Simpan data aktual batch? Data akan dikunci.')) return;
-    const timers = scheduleUpdateTimers.current;
-    try {
-      const updates = await postSequential(payloadRows, async (row) => {
-        if (timers.has(row.id)) {
-          clearTimeout(timers.get(row.id));
-          timers.delete(row.id);
-        }
-        const payload = { ...row, actualLocked: true, allowOverReceive: bulkReceiveAllowOver };
-        const updatedRow = await updateSchedule(row.id, payload);
-        return updatedRow;
-      });
-      setSchedules((prev) => [
-        ...prev.map((row) => {
-          const updated = updates.find((item) => item.id === row.id);
-          return updated ? mergeScheduleRow(row, updated) : row;
-        }),
-      ]);
-      setFilteredSchedules((prev) => (
-        prev.map((row) => {
-          const updated = updates.find((item) => item.id === row.id);
-          return updated ? mergeScheduleRow(row, updated) : row;
-        })
-      ));
-      closeBulkReceiveModal();
-      alert('Data aktual batch tersimpan.');
-    } catch (error) {
-      console.error('Bulk Receive Error:', error);
-      const message = error.message || 'Gagal menyimpan data aktual batch.';
-      if (showToastMessage) {
-        showToastMessage(message, '', null, 'error');
-      } else {
-        alert(message);
-      }
-    }
-  };
-
-  const handleSplitSchedule = async (originalItem) => {
-    if (!canEditSchedules) { alert("Anda tidak memiliki akses edit."); return; }
-    const splitDecision = getSplitDecisionByQty(originalItem.requestQty, originalItem.receivedQty);
-    if (splitDecision.received <= 0 || splitDecision.received >= splitDecision.ordered) { alert("Hanya untuk penerimaan parsial."); return; }
-    if (splitDecision.withinTolerance) { alert("Sisa PO masih dalam toleransi 10%. Tidak perlu split."); return; }
-    if (window.confirm(`Buat jadwal baru untuk sisa ${splitDecision.outstanding} barang?`)) {
-      try {
-        const result = await apiFetch(`/api/schedules/${originalItem.id}/split`, { method: 'POST' });
-        if (result?.updated && result?.created) {
-          setSchedules((prev) => [
-            ...prev.map((s) => (s.id === result.updated.id ? result.updated : s)),
-            result.created,
-          ]);
-        }
-        await refreshSchedules({ page: schedulePage, perPage: schedulePerPage, silent: true });
-      } catch (error) {
-        console.error("Split Error:", error);
-        alert(error?.message || "Gagal menyimpan split ke database.");
-      }
-    }
   };
 
   const handleEdit = (item) => {
@@ -1294,7 +1046,7 @@ export const useScheduleStore = ({
     try {
       const sjCheck = await apiFetch('/api/schedules/check-sj', {
         method: 'POST',
-        body: {
+        body: JSON.stringify({
           doNumber: item.doNumber,
           ignoreIds: [item.id],
           items: [{
@@ -1302,7 +1054,7 @@ export const useScheduleStore = ({
             itemCode: item.itemCode || item.item_code || item.item,
             poLineId: item.poLineId || item.po_line_id,
           }],
-        },
+        }),
       });
       if (sjCheck?.status === 'block') {
         alert(`Nomor SJ "${item.doNumber}" sudah pernah dipakai untuk PO/Item yang sama. Input dibatalkan.`);
@@ -1893,17 +1645,6 @@ export const useScheduleStore = ({
     schedules,
     selectedScheduleIds,
     setSelectedScheduleIds,
-    bulkReceiveOpen,
-    bulkReceiveDoNumber,
-    setBulkReceiveDoNumber,
-    bulkReceiveDate,
-    setBulkReceiveDate,
-    bulkReceiveQty,
-    setBulkReceiveQty,
-    bulkReceiveDocQty,
-    setBulkReceiveDocQty,
-    bulkReceiveAllowOver,
-    setBulkReceiveAllowOver,
     showForm,
     setShowForm,
     isEditing,
@@ -1951,13 +1692,8 @@ export const useScheduleStore = ({
     getTotalOrderQty,
     getRemainingQty,
     getPoLineRemainingAfterSchedule,
-    getSplitDecision,
     getKpiStatus,
     getPrintStatusClass,
-    openBulkReceiveModal,
-    closeBulkReceiveModal,
-    handleBulkReceiveSubmit,
-    handleSplitSchedule,
     handleAddPlan,
     handleCancelEdit,
     handleEdit,

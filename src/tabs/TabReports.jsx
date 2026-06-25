@@ -1,4 +1,15 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Bar,
+  CartesianGrid,
+  ComposedChart,
+  Line,
+  Legend,
+  ReferenceLine,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
 import {
   AlertTriangle,
   ArrowDownUp,
@@ -17,6 +28,51 @@ import {
   X,
 } from 'lucide-react';
 import logoMatra from '../assets/logo-matra.png';
+import TabReportInbound from './TabReportInbound';
+
+const SafeResponsiveContainer = ({ children }) => {
+  const containerRef = useRef(null);
+  const [size, setSize] = useState({ width: 0, height: 0 });
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+    const node = containerRef.current;
+    if (!node) return undefined;
+    let raf;
+    const updateSize = () => {
+      const rect = node.getBoundingClientRect();
+      const nextWidth = Math.max(0, Math.floor(rect.width));
+      const nextHeight = Math.max(0, Math.floor(rect.height));
+      setSize((prev) => (prev.width === nextWidth && prev.height === nextHeight ? prev : { width: nextWidth, height: nextHeight }));
+    };
+    const scheduleUpdate = () => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(updateSize);
+    };
+    scheduleUpdate();
+    window.addEventListener('resize', scheduleUpdate);
+    let observer;
+    if (typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(scheduleUpdate);
+      observer.observe(node);
+    }
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      window.removeEventListener('resize', scheduleUpdate);
+      if (observer) observer.disconnect();
+    };
+  }, []);
+
+  const content = size.width > 0 && size.height > 0 && React.isValidElement(children)
+    ? React.cloneElement(children, { width: size.width, height: size.height })
+    : null;
+
+  return (
+    <div ref={containerRef} style={{ width: '100%', height: '100%', minWidth: 1, minHeight: 1 }}>
+      {content}
+    </div>
+  );
+};
 
 const TabReports = (props) => {
   const {
@@ -120,6 +176,17 @@ const TabReports = (props) => {
     masterCategories,
     masterLocations,
     masterProcesses,
+    getWorkingDays,
+    capacityPlanningMonth,
+    setCapacityPlanningMonth,
+    capacityPlanningYear,
+    setCapacityPlanningYear,
+    capacityPlanningData,
+    fetchCapacityPlanningReport,
+    handleExportCapacityPlanningExcel,
+    scheduleLoading,
+    schedules,
+    ensureSchedulesLoaded,
   } = props;
 
   const formatPrintDate = (value) => {
@@ -127,6 +194,22 @@ const TabReports = (props) => {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return String(value);
     return date.toLocaleDateString('id-ID', { day: '2-digit', month: 'long', year: 'numeric' });
+  };
+  const formatQuantity = (value) => Number(value || 0).toLocaleString('id-ID', { maximumFractionDigits: 2 });
+  const formatCount = (value) => Number(value || 0).toLocaleString('id-ID');
+  const formatPercent = (value) => `${Number(value || 0).toFixed(1)}%`;
+  const countWeekdaysInMonth = (monthKey, yearValue) => {
+    const monthNum = monthKeyMap[String(monthKey || '').toLowerCase()];
+    const yearNum = Number(yearValue || 0);
+    if (!monthNum || !yearNum) return 0;
+    const daysInMonth = new Date(yearNum, monthNum, 0).getDate();
+    let count = 0;
+    for (let day = 1; day <= daysInMonth; day += 1) {
+      const date = new Date(yearNum, monthNum - 1, day);
+      const weekday = date.getDay();
+      if (weekday !== 0 && weekday !== 6) count += 1;
+    }
+    return count;
   };
 
   const todayLabel = new Date().toLocaleDateString('id-ID', { day: '2-digit', month: 'long', year: 'numeric' });
@@ -345,6 +428,9 @@ const TabReports = (props) => {
 
   const [reportPrintOrientation, setReportPrintOrientation] = useState('portrait');
   const [scorecardExpanded, setScorecardExpanded] = useState({});
+  const [capacityPlanningWorkCenter, setCapacityPlanningWorkCenter] = useState('');
+  const [capacityPlanningShiftCount, setCapacityPlanningShiftCount] = useState(3);
+  const [capacityPlanningShiftHours, setCapacityPlanningShiftHours] = useState(8);
 
   const qualityPeriodLabel = qualityObjectivesData?.period?.label || qualityObjectivesMonth || '-';
   const formatQualityPercent = (value) => {
@@ -410,6 +496,71 @@ const TabReports = (props) => {
       <div className="mt-4 h-20 rounded bg-slate-200" />
     </div>
   );
+
+  const capacityWorkCenterRows = useMemo(() => {
+    const rows = Array.isArray(capacityPlanningData?.workCenters) ? capacityPlanningData.workCenters : [];
+    return [...rows].sort((left, right) => Number(right.loadHours || 0) - Number(left.loadHours || 0) || String(left.workCenter || '').localeCompare(String(right.workCenter || '')));
+  }, [capacityPlanningData?.workCenters]);
+
+  const capacitySelectedWorkCenter = useMemo(() => {
+    if (!capacityWorkCenterRows.length) return null;
+    const exactMatch = capacityWorkCenterRows.find((row) => row.workCenter === capacityPlanningWorkCenter);
+    return exactMatch || capacityWorkCenterRows[0];
+  }, [capacityWorkCenterRows, capacityPlanningWorkCenter]);
+
+  useEffect(() => {
+    if (!capacityWorkCenterRows.length) {
+      if (capacityPlanningWorkCenter) setCapacityPlanningWorkCenter('');
+      return;
+    }
+    if (!capacityPlanningWorkCenter || !capacityWorkCenterRows.some((row) => row.workCenter === capacityPlanningWorkCenter)) {
+      setCapacityPlanningWorkCenter(capacityWorkCenterRows[0].workCenter);
+    }
+  }, [capacityWorkCenterRows, capacityPlanningWorkCenter]);
+
+  const capacityWorkingDays = useMemo(() => {
+    const configuredDays = typeof getWorkingDays === 'function'
+      ? Number(getWorkingDays(capacityPlanningMonth, capacityPlanningYear) || 0)
+      : 0;
+    return configuredDays > 0 ? configuredDays : countWeekdaysInMonth(capacityPlanningMonth, capacityPlanningYear);
+  }, [capacityPlanningMonth, capacityPlanningYear, getWorkingDays]);
+
+  const capacityDailyRows = useMemo(() => (
+    Array.isArray(capacityPlanningData?.dailyRows)
+      ? [...capacityPlanningData.dailyRows].sort((left, right) => String(left.date || '').localeCompare(String(right.date || '')))
+      : []
+  ), [capacityPlanningData?.dailyRows]);
+
+  const capacitySelectedWorkCenterDailyRows = useMemo(() => {
+    const rows = Array.isArray(capacityPlanningData?.workCenterDailyRows) ? capacityPlanningData.workCenterDailyRows : [];
+    if (!capacitySelectedWorkCenter?.workCenter) return rows;
+    return rows
+      .filter((row) => row.workCenter === capacitySelectedWorkCenter.workCenter)
+      .sort((left, right) => String(left.date || '').localeCompare(String(right.date || '')));
+  }, [capacityPlanningData?.workCenterDailyRows, capacitySelectedWorkCenter?.workCenter]);
+
+  const capacityPerDayHours = Number(capacityPlanningShiftCount || 0) * Number(capacityPlanningShiftHours || 0);
+  const capacitySelectedLoadHours = Number(capacitySelectedWorkCenter?.totalLoadHours || 0);
+  const capacityUtilization = capacityWorkingDays > 0 && capacityPerDayHours > 0
+    ? (capacitySelectedLoadHours / (capacityWorkingDays * capacityPerDayHours)) * 100
+    : 0;
+  const capacitySelectedChartData = useMemo(() => (
+    capacitySelectedWorkCenterDailyRows.map((row) => ({
+      date: row.date,
+      plannedLoadHours: Number(row.plannedLoadHours || 0),
+      actualLoadHours: Number(row.actualLoadHours || 0),
+      capacityHours: capacityPerDayHours,
+    }))
+  ), [capacitySelectedWorkCenterDailyRows, capacityPerDayHours]);
+
+  const capacityDailyChartData = useMemo(() => (
+    capacityDailyRows.map((row) => ({
+      date: row.date,
+      plannedLoadHours: Number(row.plannedLoadHours || 0),
+      actualLoadHours: Number(row.actualLoadHours || 0),
+      capacityHours: capacityPerDayHours,
+    }))
+  ), [capacityDailyRows, capacityPerDayHours]);
 
   return (
     <>
@@ -1451,6 +1602,295 @@ const TabReports = (props) => {
                 </div>
               )}
 
+              {reportTab === 'capacity-planning' && canViewReport && (
+                <div className="bg-white rounded-xl shadow-sm border p-4 report-print-scope">
+                  {(() => {
+                    const range = buildMonthRange(capacityPlanningMonth, capacityPlanningYear);
+                    return renderReportHeader('LAPORAN CAPACITY PLANNING', range.start || reportStart, range.end || reportEnd);
+                  })()}
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="font-bold text-slate-900 flex items-center gap-2"><BarChart3 size={18}/> Capacity Planning</h3>
+                    <div className="flex gap-2 items-center print:hidden">
+                      <button onClick={fetchCapacityPlanningReport} className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1 rounded text-xs">Refresh</button>
+                      <button onClick={handleExportCapacityPlanningExcel} className="bg-emerald-500 hover:bg-emerald-600 text-white px-3 py-1 rounded text-xs">Excel</button>
+                      <select
+                        className="border rounded px-2 py-1 text-xs text-slate-700"
+                        value={reportPrintOrientation}
+                        onChange={(e) => setReportPrintOrientation(e.target.value)}
+                      >
+                        <option value="portrait">Portrait</option>
+                        <option value="landscape">Landscape</option>
+                      </select>
+                      <button onClick={handlePrintReport} className="bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded text-xs">PDF</button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4 print:hidden">
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Bulan</label>
+                      <select
+                        className="border p-2 rounded w-full text-sm"
+                        value={capacityPlanningMonth}
+                        onChange={(e) => setCapacityPlanningMonth(e.target.value)}
+                      >
+                        {monthOptions.map((opt) => (
+                          <option key={opt.key} value={opt.key}>{opt.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Tahun</label>
+                      <input
+                        type="number"
+                        className="border p-2 rounded w-full text-sm"
+                        value={capacityPlanningYear}
+                        onChange={(e) => setCapacityPlanningYear(e.target.value)}
+                      />
+                    </div>
+                    <div className="flex items-end">
+                      <button onClick={fetchCapacityPlanningReport} className="bg-indigo-600 text-white px-4 py-2 rounded w-full text-sm">Terapkan</button>
+                    </div>
+                  </div>
+                  {capacityPlanningData?.summary && (
+                    <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mb-6">
+                      <div className="bg-white p-3 rounded border text-center">
+                        <div className="text-xs text-gray-400 uppercase">Plan Qty</div>
+                        <div className="font-bold">{formatQuantity(capacityPlanningData.summary.totalPlannedQty)}</div>
+                      </div>
+                      <div className="bg-white p-3 rounded border text-center">
+                        <div className="text-xs text-gray-400 uppercase">Actual Qty</div>
+                        <div className="font-bold">{formatQuantity(capacityPlanningData.summary.totalActualQty)}</div>
+                      </div>
+                      <div className="bg-white p-3 rounded border text-center">
+                        <div className="text-xs text-gray-400 uppercase">Plan Load Hours</div>
+                        <div className="font-bold text-indigo-600">{formatQuantity(capacityPlanningData.summary.totalPlannedLoadHours)}</div>
+                      </div>
+                      <div className="bg-white p-3 rounded border text-center">
+                        <div className="text-xs text-gray-400 uppercase">Actual Load Hours</div>
+                        <div className="font-bold text-emerald-600">{formatQuantity(capacityPlanningData.summary.totalActualLoadHours)}</div>
+                      </div>
+                      <div className="bg-white p-3 rounded border text-center">
+                        <div className="text-xs text-gray-400 uppercase">Work Centers</div>
+                        <div className="font-bold">{formatCount(capacityPlanningData.summary.workCenters)}</div>
+                      </div>
+                      <div className="bg-white p-3 rounded border text-center">
+                        <div className="text-xs text-gray-400 uppercase">Tanggal</div>
+                        <div className="font-bold">{formatCount(capacityPlanningData.summary.dates)}</div>
+                      </div>
+                    </div>
+                  )}
+                  <div className="mb-6 rounded-lg border bg-white p-3">
+                    <div className="mb-3 text-sm font-semibold text-slate-700">Load Harian Total</div>
+                    <div className="h-72">
+                      <SafeResponsiveContainer>
+                        <ComposedChart data={capacityDailyChartData}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="date" tick={{ fontSize: 11 }} interval={Math.max(0, Math.floor((capacityDailyChartData.length || 1) / 12))} />
+                          <YAxis tickFormatter={(value) => `${value}`} />
+                          <Tooltip formatter={(value) => formatQuantity(value)} />
+                          <Legend />
+                          <ReferenceLine y={capacityPerDayHours} stroke="#ef4444" strokeDasharray="4 4" label={{ value: 'Capacity/Day', position: 'insideTopRight', fill: '#ef4444', fontSize: 11 }} />
+                          <Bar dataKey="plannedLoadHours" fill="#3b82f6" name="Planned Load" />
+                          <Bar dataKey="actualLoadHours" fill="#f59e0b" name="Actual Load" />
+                          <Line type="monotone" dataKey="capacityHours" stroke="#ef4444" strokeWidth={2} dot={false} name="Capacity/Day" />
+                        </ComposedChart>
+                      </SafeResponsiveContainer>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 lg:grid-cols-4 gap-3 mb-6">
+                    <div className="lg:col-span-2 rounded-lg border bg-white p-3">
+                      <label className="text-xs font-semibold text-gray-500">Work Center Detail</label>
+                      <select
+                        className="mt-1 border p-2 rounded w-full text-sm"
+                        value={capacityPlanningWorkCenter}
+                        onChange={(e) => setCapacityPlanningWorkCenter(e.target.value)}
+                      >
+                        {capacityWorkCenterRows.length === 0 && <option value="">Tidak ada work center</option>}
+                        {capacityWorkCenterRows.map((row) => (
+                          <option key={row.workCenter} value={row.workCenter}>
+                            {row.workCenter} - {formatQuantity(row.totalLoadHours)} jam
+                          </option>
+                        ))}
+                      </select>
+                      <div className="grid grid-cols-2 gap-3 mt-3">
+                        <div>
+                          <label className="text-xs font-semibold text-gray-500">Shift / Hari</label>
+                          <input
+                            type="number"
+                            min="1"
+                            max="3"
+                            className="mt-1 border p-2 rounded w-full text-sm"
+                            value={capacityPlanningShiftCount}
+                            onChange={(e) => setCapacityPlanningShiftCount(Math.min(3, Math.max(1, Number(e.target.value) || 1)))}
+                          />
+                        </div>
+                        <div>
+                          <label className="text-xs font-semibold text-gray-500">Jam / Shift</label>
+                          <input
+                            type="number"
+                            min="1"
+                            step="0.5"
+                            className="mt-1 border p-2 rounded w-full text-sm"
+                            value={capacityPlanningShiftHours}
+                            onChange={(e) => setCapacityPlanningShiftHours(Math.max(0.5, Number(e.target.value) || 8))}
+                          />
+                        </div>
+                      </div>
+                      <div className="mt-3 text-xs text-slate-500">
+                        Chart di bawah dibaca dari `schedule.request_date` dan `production_orders.production_date`.
+                      </div>
+                    </div>
+                    <div className="rounded-lg border bg-slate-50 p-3">
+                      <div className="text-xs font-semibold text-gray-500 uppercase">Work Days</div>
+                      <div className="mt-1 text-2xl font-bold text-slate-900">{formatCount(capacityWorkingDays)}</div>
+                      <div className="mt-2 text-xs text-slate-500">Perhitungan mengikuti konfigurasi hari kerja bila tersedia, lalu fallback ke Senin-Jumat.</div>
+                    </div>
+                    <div className="rounded-lg border bg-slate-50 p-3">
+                      <div className="text-xs font-semibold text-gray-500 uppercase">Load / Period</div>
+                      <div className="mt-1 text-2xl font-bold text-indigo-600">{formatQuantity(capacitySelectedLoadHours)}</div>
+                      <div className="mt-2 text-xs text-slate-500">Total load work center terpilih dalam periode ini.</div>
+                    </div>
+                    <div className="rounded-lg border bg-slate-50 p-3">
+                      <div className="text-xs font-semibold text-gray-500 uppercase">Utilization</div>
+                      <div className="mt-1 text-2xl font-bold text-emerald-600">{formatPercent(capacityUtilization)}</div>
+                        <div className="mt-2 text-xs text-slate-500">Dibandingkan dengan kapasitas {formatQuantity(capacityPerDayHours)} jam/hari.</div>
+                    </div>
+                  </div>
+                  {capacitySelectedChartData.length > 0 && (
+                    <div className="mb-6 rounded-lg border bg-white p-3">
+                      <div className="mb-3 text-sm font-semibold text-slate-700">Load Harian Work Center Terpilih</div>
+                      <div className="h-80">
+                        <SafeResponsiveContainer>
+                          <ComposedChart data={capacitySelectedChartData}>
+                            <CartesianGrid strokeDasharray="3 3" />
+                            <XAxis dataKey="date" tick={{ fontSize: 11 }} interval={Math.max(0, Math.floor((capacitySelectedChartData.length || 1) / 12))} />
+                            <YAxis tickFormatter={(value) => `${value}`} />
+                            <Tooltip formatter={(value) => formatQuantity(value)} />
+                            <Legend />
+                            <ReferenceLine y={capacityPerDayHours} stroke="#ef4444" strokeDasharray="4 4" label={{ value: 'Capacity/Day', position: 'insideTopRight', fill: '#ef4444', fontSize: 11 }} />
+                            <Bar dataKey="plannedLoadHours" fill="#3b82f6" name="Planned Load" />
+                            <Bar dataKey="actualLoadHours" fill="#f59e0b" name="Actual Load" />
+                            <Line type="monotone" dataKey="capacityHours" stroke="#ef4444" strokeWidth={2} dot={false} name="Capacity/Day" />
+                          </ComposedChart>
+                        </SafeResponsiveContainer>
+                      </div>
+                    </div>
+                  )}
+                  {capacitySelectedChartData.length > 0 && (
+                    <div className="mb-6 rounded-lg border bg-white overflow-x-auto">
+                      <div className="px-4 py-3 border-b bg-slate-50 text-sm font-semibold text-slate-700">Detail Harian Work Center Terpilih</div>
+                      <table className="min-w-full text-sm">
+                        <thead className="bg-slate-100">
+                          <tr>
+                            <th className="p-3 text-left">Tanggal</th>
+                            <th className="p-3 text-right">Planned Load</th>
+                            <th className="p-3 text-right">Actual Load</th>
+                            <th className="p-3 text-right">Capacity</th>
+                            <th className="p-3 text-right">Utilization</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {capacitySelectedChartData.map((row, idx) => {
+                            const utilization = row.capacityHours > 0 ? ((Number(row.plannedLoadHours || 0) + Number(row.actualLoadHours || 0)) / Number(row.capacityHours || 0)) * 100 : 0;
+                            return (
+                              <tr key={`${row.date}-${idx}`} className="border-t">
+                                <td className="p-3 font-medium">{row.date}</td>
+                                <td className="p-3 text-right">{formatQuantity(row.plannedLoadHours)}</td>
+                                <td className="p-3 text-right">{formatQuantity(row.actualLoadHours)}</td>
+                                <td className="p-3 text-right">{formatQuantity(row.capacityHours)}</td>
+                                <td className="p-3 text-right">{formatPercent(utilization)}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                  <div className="space-y-6">
+                    <div className="bg-white rounded-lg border overflow-x-auto">
+                      <div className="px-4 py-3 border-b bg-slate-50 text-sm font-semibold text-slate-700">Work Center Load</div>
+                      <table className="min-w-full text-sm">
+                        <thead className="bg-slate-100">
+                          <tr>
+                            <th className="p-3 text-left">Work Center</th>
+                            <th className="p-3 text-right">Planned Load</th>
+                            <th className="p-3 text-right">Actual Load</th>
+                            <th className="p-3 text-right">Total Load</th>
+                            <th className="p-3 text-left">Processes</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {reportLoading && (
+                            <tr><td colSpan="5" className="p-4 text-center text-gray-400">Memuat...</td></tr>
+                          )}
+                          {!reportLoading && (!capacityPlanningData?.workCenters || capacityPlanningData.workCenters.length === 0) && (
+                            <tr><td colSpan="5" className="p-4 text-center text-gray-400">Tidak ada data.</td></tr>
+                          )}
+                          {!reportLoading && (capacityPlanningData?.workCenters || []).map((row, idx) => (
+                            <tr key={`${row.workCenter || 'wc'}-${idx}`} className="border-t">
+                              <td className="p-3 font-medium">{row.workCenter || '-'}</td>
+                              <td className="p-3 text-right">{formatQuantity(row.plannedLoadHours)}</td>
+                              <td className="p-3 text-right">{formatQuantity(row.actualLoadHours)}</td>
+                              <td className="p-3 text-right">{formatQuantity(row.totalLoadHours)}</td>
+                              <td className="p-3 text-xs text-slate-600">{Array.isArray(row.processNames) && row.processNames.length > 0 ? row.processNames.join(', ') : '-'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    <div className="bg-white rounded-lg border overflow-x-auto">
+                      <div className="px-4 py-3 border-b bg-slate-50 text-sm font-semibold text-slate-700">Item Lead Time & Routing</div>
+                      <table className="min-w-full text-sm">
+                        <thead className="bg-slate-100">
+                          <tr>
+                            <th className="p-3 text-left">Item</th>
+                            <th className="p-3 text-left">Type</th>
+                            <th className="p-3 text-right">Planned Qty</th>
+                            <th className="p-3 text-right">Actual Qty</th>
+                            <th className="p-3 text-right">Lead Time / Unit (Jam)</th>
+                            <th className="p-3 text-right">Planned Load</th>
+                            <th className="p-3 text-right">Actual Load</th>
+                            <th className="p-3 text-left">Routing</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {reportLoading && (
+                            <tr><td colSpan="7" className="p-4 text-center text-gray-400">Memuat...</td></tr>
+                          )}
+                          {!reportLoading && (!capacityPlanningData?.rows || capacityPlanningData.rows.length === 0) && (
+                            <tr><td colSpan="7" className="p-4 text-center text-gray-400">Tidak ada data.</td></tr>
+                          )}
+                          {!reportLoading && (capacityPlanningData?.rows || []).map((row, idx) => (
+                            <tr key={`${row.itemCode || 'item'}-${idx}`} className="border-t">
+                              <td className="p-3">
+                                <div className="font-semibold">{row.itemCode || '-'}</div>
+                                <div className="text-xs text-slate-500">{row.itemName || '-'}</div>
+                              </td>
+                              <td className="p-3">{row.itemType || '-'}</td>
+                              <td className="p-3 text-right">{formatQuantity(row.plannedQty)}</td>
+                              <td className="p-3 text-right">{formatQuantity(row.actualQty)}</td>
+                              <td className="p-3 text-right">{formatQuantity(row.unitLeadTimeHours)}</td>
+                              <td className="p-3 text-right">{formatQuantity(row.plannedLoadHours)}</td>
+                              <td className="p-3 text-right">{formatQuantity(row.actualLoadHours)}</td>
+                              <td className="p-3 text-xs text-slate-600">
+                                <div>{row.routingSummary || '-'}</div>
+                                {Array.isArray(row.workCenters) && row.workCenters.length > 0 && (
+                                  <div className="mt-1 text-[11px] text-slate-400">
+                                    {row.workCenters.map((wc) => `${wc.workCenter}: ${formatQuantity(wc.loadHours)} jam`).join(' | ')}
+                                  </div>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                  {renderReportSignatures()}
+                  <div className="report-page-footer print-only" />
+                </div>
+              )}
+
               {reportTab === 'outstanding-prl' && canViewReport && (
                 <div className="bg-white rounded-xl shadow-sm border p-4 report-print-scope">
                   {(() => {
@@ -1537,6 +1977,14 @@ const TabReports = (props) => {
                   {renderReportSignatures()}
                   <div className="report-page-footer print-only" />
                 </div>
+              )}
+
+              {reportTab === 'inbound-matrix' && canViewReport && (
+                <TabReportInbound
+                  schedules={schedules}
+                  ensureSchedulesLoaded={ensureSchedulesLoaded}
+                  scheduleLoading={scheduleLoading}
+                />
               )}
 
             </div>

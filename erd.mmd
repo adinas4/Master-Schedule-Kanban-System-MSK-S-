@@ -1,83 +1,320 @@
 erDiagram
-  master_bom {
+  users {
     integer id PK
-    text parent_code FK
-    text child_code FK
-    numeric quantity
-    numeric scrap_factor
-    timestamp_with_time_zone created_at
-    text component_type
-    text component_description
-    text model_spec
-    text line_production
-    text supplier_name
-    text packing
-    numeric cycle_time_seconds
-    jsonb process_flow
-    numeric cost_rp
+    text username
+    text role
+    text supplier_id
+    jsonb permissions
+  }
+
+  auth_sessions {
+    integer id PK
+    integer user_id FK
+    text session_jti
+    text status
+    timestamptz expires_at
+  }
+
+  notifications {
+    integer id PK
+    integer user_id FK
+    text notification_key
+    text status
+    boolean is_read
+  }
+
+  audit_logs {
+    bigint id PK
+    integer user_id FK
+    text action
+    text table_name
+    text record_id
+  }
+
+  master_plants {
+    text id PK
+    text name
+    text site
+  }
+
+  master_areas {
+    text id PK
+    text plant_id FK
+    text name
+  }
+
+  master_deliveries {
+    text id PK
+    text area_id FK
+    text address
+  }
+
+  master_warehouses {
+    text id PK
+    text name
+    text site
+    text type
+  }
+
+  master_locations {
+    text id PK
+    text warehouse_id FK
+    text area_id FK
+    text category
+    text fifo_lane
+  }
+
+  master_vendors {
+    text id PK
+    text name
+    text type
+    text role
     integer lead_time_days
   }
-  delivery_notes {
-    integer id PK
-    text dn_number
-    integer request_id FK
-    text supplier
-    date planned_date
-    text status
-    timestamp_with_time_zone created_at
+
+  master_customers {
+    text id PK
+    text name
+    text email
+    integer lead_time_days
   }
-  item_customers {
-    text item_code PK FK
-    text customer_id PK FK
-    numeric share_percent
+
+  master_categories {
+    text code PK
+    text name
   }
+
+  master_packings {
+    text code PK
+    text name
+  }
+
+  master_models {
+    text code PK
+    text name
+  }
+
+  master_processes {
+    text code PK
+    text name
+    text process_type
+    text applies_to_level
+    text work_center
+    integer sequence
+    numeric standard_time
+  }
+
+  items {
+    text code PK
+    text name
+    text type
+    text unit
+    text vendor_id
+    text location_id
+    text moving_status
+    numeric qty_on_hand
+  }
+
   item_suppliers {
     text item_code PK FK
     text vendor_id PK FK
     numeric share_percent
   }
-  items {
-    text code PK
-    text name
-    text part_no
-    text type
-    text unit
-    text model
-    numeric weight
-    numeric price
-    text vendor_id
-    text location_id
-    text image_url
-    text cycle
-    integer shelf_life_days
-    numeric safety_stock
-    numeric qty_on_hand
-    text type_pack
-    timestamp_with_time_zone created_at
+
+  item_customers {
+    text item_code PK FK
+    text customer_id PK FK
+    numeric share_percent
   }
-  kanban_events {
+
+  master_config {
     integer id PK
-    integer request_id FK
-    text event
-    integer by_user FK
-    jsonb meta
-    timestamp_with_time_zone created_at
+    jsonb fifo_method
+    jsonb document_numbering
+    text qc_status
+    text hold_location
+    jsonb working_days
+    text kanban_id_format
+    text request_id_format
   }
-  kanban_requests {
+
+  app_settings {
+    text key PK
+    text value
+    timestamptz updated_at
+  }
+
+  master_bom_headers {
+    integer id PK
+    text parent_code FK
+    text bom_version
+    date effective_date
+    text reference
+  }
+
+  master_bom {
+    integer id PK
+    integer header_id FK
+    text parent_code FK
+    text child_code FK
+    numeric quantity
+    numeric scrap_factor
+  }
+
+  po_headers {
+    text po_number PK
+    date po_date
+    text supplier_id FK
+    text status
+  }
+
+  po_lines {
+    integer id PK
+    text po_number FK
+    integer line_no
+    text item_code FK
+    numeric qty_order
+    numeric qty_received
+  }
+
+  schedules {
+    integer id PK
+    text po_number FK
+    integer po_line_id FK
+    text item_code FK
+    text supplier
+    text supplier_id
+    date request_date
+    date arrival_date
+    integer request_qty
+    integer received_qty
+    text do_number
+    text status
+    integer dn_id FK
+    integer request_id FK
+  }
+
+  stock_batches {
     integer id PK
     text item_code FK
-    text request_code
-    numeric request_qty
-    text trigger_type
+    integer schedule_id FK
+    numeric qty_in
+    numeric qty_out
+    date arrival_date
+    text do_number
+    text batch_no
+  }
+
+  stock_movements {
+    integer id PK
+    text item_code FK
+    integer batch_id FK
+    numeric qty
+    text direction
+    text reason
+  }
+
+  fifo_violations {
+    integer id PK
+    text item_code
+    integer batch_id
+    text chosen_batch_no
+    text oldest_batch_no
+    text reason
+  }
+
+  inventory_ledgers {
+    integer id PK
+    timestamptz date
+    text item_id FK
+    text transaction_type
+    integer user_id FK
+    numeric qty_in
+    numeric qty_out
+    numeric balance
+  }
+
+  inventory_reservations {
+    bigint id PK
+    text item_code FK
+    integer created_by FK
+    text source_type
+    text source_id
+    numeric reserved_qty
+    text status
+  }
+
+  inventory_allocations {
+    bigint id PK
+    bigint reservation_id FK
+    text item_code FK
+    integer batch_id FK
+    integer created_by FK
+    numeric allocated_qty
+    numeric issued_qty
+    text status
+  }
+
+  so_sessions {
+    integer id PK
+    text period
     text status
     integer created_by FK
-    integer approved_by FK
-    integer dn_id
-    integer schedule_id
-    text notes
-    timestamp_with_time_zone created_at
-    timestamp_with_time_zone updated_at
   }
+
+  so_items {
+    integer id PK
+    integer session_id FK
+    text item_code FK
+    numeric book_qty
+    numeric actual_qty
+  }
+
+  prl_records {
+    integer id PK
+    text item_code FK
+    integer year
+    integer approved_by FK
+    jsonb months
+    jsonb status
+  }
+
+  item_daily_usage {
+    text item_code PK FK
+    numeric daily_usage_qty
+    integer window_days
+    date window_start
+    date window_end
+    numeric total_usage
+  }
+
+  item_daily_usage_history {
+    bigint id PK
+    text item_code FK
+    numeric daily_usage_qty
+    integer window_days
+    date window_start
+    date window_end
+    numeric total_usage
+  }
+
+  supplier_lead_time_history {
+    bigint id PK
+    text supplier_id FK
+    integer schedule_id FK
+    text po_number
+    date received_date
+    integer lead_time_days
+  }
+
+  supplier_lead_time_stats {
+    text supplier_id PK FK
+    numeric avg_lead_time_days
+    integer sample_size
+    date window_start
+    date window_end
+  }
+
   kanban_settings {
     text item_code PK FK
     numeric min_qty
@@ -86,88 +323,143 @@ erDiagram
     integer lead_time_days
     text default_supplier
     boolean active
-    timestamp_with_time_zone created_at
-    timestamp_with_time_zone updated_at
   }
-  master_areas {
-    text id PK
-    text name
-    text plant_id FK
-  }
-  master_categories {
-    text code PK
-    text name
-  }
-  master_config {
-    integer id PK
-    jsonb fifo_method
-    jsonb document_numbering
-    ARRAY qc_status
-    text hold_location
-    jsonb working_days
-    text kanban_id_format
-    text request_id_format
-  }
-  master_customers {
-    text id PK
-    text name
-    text email
-    integer lead_time_days
-  }
-  master_deliveries {
-    text id PK
-    text area_id FK
-    text address
-  }
-  master_locations {
-    text id PK
-    text warehouse_id FK
-    text category
-    text fifo_lane
-  }
-  master_models {
-    text code PK
-    text name
-    timestamp_with_time_zone created_at
-  }
-  master_packings {
-    text code PK
-    text name
-  }
-  master_plants {
-    text id PK
-    text name
-    text site
-  }
-  master_vendors {
-    text id PK
-    text name
-    text type
-    text role
-    text email
-    integer lead_time_days
-  }
-  master_warehouses {
-    text id PK
-    text name
-    text site
-  }
-  prl_records {
+
+  kanban_requests {
     integer id PK
     text item_code FK
-    integer year
-    text part_no
-    text description
-    text model
-    numeric qty_per_kanban
-    text uom
-    text type_pack
-    text volume
-    jsonb months
-    jsonb status
-    timestamp_with_time_zone created_at
-    timestamp_with_time_zone updated_at
+    text request_code
+    text status
+    integer created_by FK
+    integer approved_by FK
+    integer dn_id
+    integer schedule_id
   }
+
+  kanban_events {
+    integer id PK
+    integer request_id FK
+    text event
+    integer by_user FK
+  }
+
+  delivery_notes {
+    integer id PK
+    text dn_number
+    integer request_id FK
+    text supplier
+    text supplier_id
+    date planned_date
+    text status
+  }
+
+  delivery_note_items {
+    integer id PK
+    integer dn_id FK
+    integer request_id FK
+    text item_code
+    numeric request_qty
+    text drop_zone
+  }
+
+  receive_notes {
+    integer id PK
+    text rn_number
+    integer dn_id FK
+    integer schedule_id FK
+    text item_code
+    numeric received_qty
+    text qc_status
+    text status
+    integer received_by FK
+  }
+
+  receive_note_headers {
+    integer id PK
+    text rn_number
+    text supplier
+    text po_number
+    text do_number
+    text status
+    text duplicate_status
+    integer created_by FK
+    integer validated_by FK
+    integer posted_by FK
+    integer reversed_by FK
+    integer reversal_of FK
+  }
+
+  receive_note_items {
+    integer id PK
+    integer rn_id FK
+    integer origin_dn_id FK
+    text item_code FK
+    integer schedule_id FK
+    integer reversal_of_item_id FK
+    integer line_no
+    numeric doc_qty
+    numeric received_qty
+    numeric posted_qty
+    text line_status
+  }
+
+  kanban_cards {
+    integer id PK
+    integer dn_id FK
+    text item_code FK
+    integer request_id FK
+    integer card_seq
+    integer total_cards
+    numeric card_qty
+    text card_uid
+  }
+
+  kanban_process_cards {
+    integer id PK
+    text kanban_id
+    text item_code FK
+    text current_status
+    integer created_by FK
+    integer updated_by FK
+  }
+
+  kanban_process_card_steps {
+    integer id PK
+    integer kanban_card_id FK
+    integer sequence
+    text process_code
+    text process_name
+    text status
+    integer operator_id FK
+  }
+
+  kanban_process_card_logs {
+    integer id PK
+    integer kanban_card_id FK
+    integer step_id FK
+    text action
+    integer operator_id FK
+  }
+
+  production_orders {
+    integer id PK
+    text product_code FK
+    text supplier
+    numeric qty
+    date production_date
+    text kanban_id
+    integer created_by
+  }
+
+  production_import_batches {
+    integer id PK
+    text file_name
+    integer total_rows
+    integer success_rows
+    text status
+    integer created_by FK
+  }
+
   production_consumption {
     integer id PK
     integer production_id FK
@@ -175,90 +467,180 @@ erDiagram
     integer batch_id FK
     numeric qty
   }
-  production_orders {
+
+  wip_import_batches {
     integer id PK
-    text product_code FK
-    text supplier
-    numeric qty
-    timestamp_with_time_zone created_at
-  }
-  receive_notes {
-    integer id PK
-    text rn_number
-    integer dn_id FK
-    integer schedule_id FK
-    numeric received_qty
-    text qc_status
+    text file_name
+    integer total_rows
+    integer success_rows
+    numeric total_qty
     text status
-    timestamp_with_time_zone received_at
-    text notes
-  }
-  schedules {
-    integer id PK
-    text po_number
-    text supplier
-    text item
-    date request_date
-    text delivery_time
-    integer request_qty
-    date arrival_date
-    integer received_qty
-    text do_number
-    text status
-    text notes
-    boolean has_split
-    boolean is_split_result
-    boolean actual_locked
-    timestamp_with_time_zone created_at
-    timestamp_with_time_zone updated_at
-    integer dn_id FK
-    integer request_id FK
-  }
-  stock_batches {
-    integer id PK
-    text item_code FK
-    numeric qty_in
-    numeric qty_out
-    date arrival_date
-    text do_number
-    text batch_no
-    integer schedule_id FK
-    timestamp_with_time_zone created_at
-  }
-  users {
-    integer id PK
-    text username
-    text password_hash
-    text role
-    timestamp_with_time_zone created_at
-    timestamp_with_time_zone updated_at
-    jsonb permissions
+    integer created_by FK
   }
 
-  schedules ||--o{ stock_batches : "schedule_id->id"
-  items ||--o{ item_customers : "item_code->code"
-  items ||--o{ production_consumption : "item_code->code"
-  items ||--o{ master_bom : "child_code->code"
+  wip_stock_movements {
+    integer id PK
+    date production_date
+    text item_code FK
+    text from_location
+    text to_location
+    numeric qty_good
+    numeric qty_reject
+    integer import_batch_id FK
+    integer created_by FK
+  }
+
+  subcon_deliveries {
+    integer id PK
+    text sj_number
+    text vendor_id FK
+    text item_code FK
+    numeric qty
+    date delivery_date
+    text status
+    integer created_by FK
+  }
+
+  subcon_receipts {
+    integer id PK
+    text vendor_id FK
+    integer delivery_id FK
+    text product_code FK
+    numeric qty
+    date receipt_date
+    integer created_by FK
+  }
+
+  subcon_backflush_lines {
+    integer id PK
+    integer receipt_id FK
+    integer delivery_id FK
+    text item_code FK
+    numeric qty
+  }
+
+  subcon_stock_movements {
+    integer id PK
+    text vendor_id FK
+    text item_code FK
+    numeric qty
+    text direction
+    integer created_by FK
+  }
+
+  subcon_stock_opname {
+    integer id PK
+    text vendor_id FK
+    text item_code FK
+    numeric actual_qty
+    date opname_date
+    integer created_by FK
+  }
+
+  users ||--o{ auth_sessions : "user_id->id"
+  users ||--o{ notifications : "user_id->id"
+  users ||--o{ audit_logs : "user_id->id"
+
+  master_plants ||--o{ master_areas : "plant_id->id"
+  master_areas ||--o{ master_deliveries : "area_id->id"
+  master_areas ||--o{ master_locations : "area_id->id"
+  master_warehouses ||--o{ master_locations : "warehouse_id->id"
+
+  master_vendors ||--o{ item_suppliers : "vendor_id->id"
+  master_vendors ||--o{ po_headers : "supplier_id->id"
+  master_vendors ||--o{ supplier_lead_time_history : "supplier_id->id"
+  master_vendors ||--o| supplier_lead_time_stats : "supplier_id->id"
+  master_vendors ||--o{ subcon_deliveries : "vendor_id->id"
+  master_vendors ||--o{ subcon_receipts : "vendor_id->id"
+  master_vendors ||--o{ subcon_stock_movements : "vendor_id->id"
+  master_vendors ||--o{ subcon_stock_opname : "vendor_id->id"
+
   master_customers ||--o{ item_customers : "customer_id->id"
+
+  items ||--o{ item_suppliers : "item_code->code"
+  items ||--o{ item_customers : "item_code->code"
+  items ||--o{ master_bom_headers : "parent_code->code"
+  items ||--o{ master_bom : "parent_code/child_code->code"
+  items ||--o{ po_lines : "item_code->code"
+  items ||--o{ schedules : "item_code->code"
+  items ||--o{ stock_batches : "item_code->code"
+  items ||--o{ stock_movements : "item_code->code"
+  items ||--o{ inventory_ledgers : "item_id->code"
+  items ||--o{ inventory_reservations : "item_code->code"
+  items ||--o{ inventory_allocations : "item_code->code"
+  items ||--o{ so_items : "item_code->code"
+  items ||--o{ prl_records : "item_code->code"
+  items ||--o| item_daily_usage : "item_code->code"
+  items ||--o{ item_daily_usage_history : "item_code->code"
+  items ||--o| kanban_settings : "item_code->code"
+  items ||--o{ kanban_requests : "item_code->code"
+  items ||--o{ delivery_note_items : "item_code->code"
+  items ||--o{ receive_notes : "item_code->code"
+  items ||--o{ receive_note_items : "item_code->code"
+  items ||--o{ kanban_cards : "item_code->code"
+  items ||--o{ kanban_process_cards : "item_code->code"
+  items ||--o{ production_orders : "product_code->code"
+  items ||--o{ production_consumption : "item_code->code"
+  items ||--o{ wip_stock_movements : "item_code->code"
+  items ||--o{ subcon_deliveries : "item_code->code"
+  items ||--o{ subcon_receipts : "product_code->code"
+  items ||--o{ subcon_backflush_lines : "item_code->code"
+  items ||--o{ subcon_stock_movements : "item_code->code"
+  items ||--o{ subcon_stock_opname : "item_code->code"
+
+  master_bom_headers ||--o{ master_bom : "header_id->id"
+
+  po_headers ||--o{ po_lines : "po_number->po_number"
+  po_headers ||--o{ schedules : "po_number->po_number"
+  po_lines ||--o{ schedules : "po_line_id->id"
+
+  schedules ||--o| stock_batches : "schedule_id->id"
+  schedules ||--o{ receive_notes : "schedule_id->id"
+  schedules ||--o{ receive_note_items : "schedule_id->id"
+  schedules ||--o| supplier_lead_time_history : "schedule_id->id"
+
+  stock_batches ||--o{ stock_movements : "batch_id->id"
+  stock_batches ||--o{ inventory_allocations : "batch_id->id"
+  stock_batches ||--o{ production_consumption : "batch_id->id"
+
+  inventory_reservations ||--o{ inventory_allocations : "reservation_id->id"
+  so_sessions ||--o{ so_items : "session_id->id"
+
+  users ||--o{ so_sessions : "created_by->id"
+  users ||--o{ prl_records : "approved_by->id"
+  users ||--o{ inventory_ledgers : "user_id->id"
+  users ||--o{ inventory_reservations : "created_by->id"
+  users ||--o{ inventory_allocations : "created_by->id"
+
+  users ||--o{ kanban_requests : "created_by/approved_by->id"
   kanban_requests ||--o{ kanban_events : "request_id->id"
   users ||--o{ kanban_events : "by_user->id"
-  items ||--o{ master_bom : "parent_code->code"
-  stock_batches ||--o{ production_consumption : "batch_id->id"
-  items ||--o{ prl_records : "item_code->code"
-  items ||--o{ stock_batches : "item_code->code"
-  items ||--o{ production_orders : "product_code->code"
-  items ||--o{ item_suppliers : "item_code->code"
-  master_areas ||--o{ master_deliveries : "area_id->id"
-  delivery_notes ||--o{ schedules : "dn_id->id"
-  master_warehouses ||--o{ master_locations : "warehouse_id->id"
-  master_vendors ||--o{ item_suppliers : "vendor_id->id"
   kanban_requests ||--o{ delivery_notes : "request_id->id"
-  items ||--o{ kanban_requests : "item_code->code"
-  kanban_requests ||--o{ schedules : "request_id->id"
-  users ||--o{ kanban_requests : "created_by->id"
+  kanban_requests ||--o{ delivery_note_items : "request_id->id"
+  kanban_requests ||--o{ kanban_cards : "request_id->id"
+
+  delivery_notes ||--o{ delivery_note_items : "dn_id->id"
   delivery_notes ||--o{ receive_notes : "dn_id->id"
-  schedules ||--o{ receive_notes : "schedule_id->id"
-  production_orders ||--o{ production_consumption : "production_id->id"
-  items ||--o{ kanban_settings : "item_code->code"
-  master_plants ||--o{ master_areas : "plant_id->id"
-  users ||--o{ kanban_requests : "approved_by->id"
+  delivery_notes ||--o{ receive_note_items : "origin_dn_id->id"
+  delivery_notes ||--o{ kanban_cards : "dn_id->id"
+
+  users ||--o{ receive_notes : "received_by->id"
+  users ||--o{ receive_note_headers : "created_by/validated_by/posted_by/reversed_by->id"
+  receive_note_headers ||--o{ receive_note_items : "rn_id->id"
+  receive_note_headers ||--o| receive_note_headers : "reversal_of->id"
+  receive_note_items ||--o| receive_note_items : "reversal_of_item_id->id"
+
+  users ||--o{ kanban_process_cards : "created_by/updated_by->id"
+  kanban_process_cards ||--o{ kanban_process_card_steps : "kanban_card_id->id"
+  kanban_process_cards ||--o{ kanban_process_card_logs : "kanban_card_id->id"
+  kanban_process_card_steps ||--o{ kanban_process_card_logs : "step_id->id"
+  users ||--o{ kanban_process_card_steps : "operator_id->id"
+  users ||--o{ kanban_process_card_logs : "operator_id->id"
+
+  users ||--o{ production_import_batches : "created_by->id"
+  users ||--o{ wip_import_batches : "created_by->id"
+  users ||--o{ wip_stock_movements : "created_by->id"
+  users ||--o{ subcon_deliveries : "created_by->id"
+  users ||--o{ subcon_receipts : "created_by->id"
+  users ||--o{ subcon_stock_movements : "created_by->id"
+  users ||--o{ subcon_stock_opname : "created_by->id"

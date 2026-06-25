@@ -21,6 +21,8 @@ const app = express();
 const port = Number(process.env.PORT || 4000);
 const jwtSecret = process.env.JWT_SECRET || "dev-secret-change";
 const requestContext = new AsyncLocalStorage();
+const SESSION_INACTIVITY_TIMEOUT_MINUTES = Number(process.env.SESSION_INACTIVITY_TIMEOUT_MINUTES || 15);
+const DEFAULT_RESET_PASSWORD = String(process.env.DEFAULT_RESET_PASSWORD || "123456");
 
 app.use(cors());
 // Increase payload limit to support large Excel imports
@@ -39,6 +41,21 @@ app.use("/uploads", express.static(uploadsRoot));
 
 const TEST_ITEM_PREFIX = /^TEST-/i;
 const isPlainObject = (value) => Object.prototype.toString.call(value) === "[object Object]";
+const normalizeJsonArrayInput = (value) => {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+    try {
+      const parsed = JSON.parse(trimmed);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+};
+const toJsonbArray = (value) => JSON.stringify(normalizeJsonArrayInput(value));
 const isTestItemKey = (key) => {
   const normalized = String(key || "").toLowerCase();
   if (normalized === "code") return true;
@@ -588,6 +605,106 @@ const ensureSchema = async () => {
   `);
 
   await pool.query(`
+    create table if not exists auth_sessions (
+      id serial primary key,
+      user_id integer not null references users(id) on delete cascade,
+      session_jti text not null unique,
+      status text not null default 'active',
+      device_label text,
+      user_agent text,
+      ip_address text,
+      created_at timestamptz not null default now(),
+      last_seen_at timestamptz not null default now(),
+      last_activity_at timestamptz not null default now(),
+      expires_at timestamptz not null,
+      revoked_at timestamptz,
+      revoked_reason text
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_auth_sessions_user_status
+    on auth_sessions (user_id, status, expires_at desc);
+  `);
+
+  await pool.query(`
+    create unique index if not exists idx_auth_sessions_session_jti
+    on auth_sessions (session_jti);
+  `);
+
+  await pool.query(`
+    alter table auth_sessions
+    add column if not exists session_jti text;
+  `);
+
+  await pool.query(`
+    alter table auth_sessions
+    add column if not exists device_label text;
+  `);
+
+  await pool.query(`
+    alter table auth_sessions
+    add column if not exists revoked_reason text;
+  `);
+
+  await pool.query(`
+    alter table auth_sessions
+    add column if not exists last_activity_at timestamptz;
+  `);
+
+  await pool.query(`
+    update auth_sessions
+    set last_activity_at = coalesce(last_activity_at, last_seen_at, created_at, now())
+    where last_activity_at is null;
+  `);
+
+  await pool.query(`
+    alter table auth_sessions
+    alter column last_activity_at set default now();
+  `);
+
+  await pool.query(`
+    alter table auth_sessions
+    alter column last_activity_at set not null;
+  `);
+
+  await pool.query(`
+    create table if not exists notifications (
+      id serial primary key,
+      user_id integer not null references users(id) on delete cascade,
+      notification_key text not null,
+      module text not null default 'System',
+      severity text not null default 'info',
+      title text not null,
+      detail text,
+      entity_type text,
+      entity_id text,
+      payload jsonb not null default '{}'::jsonb,
+      status text not null default 'open',
+      is_read boolean not null default false,
+      read_at timestamptz,
+      resolved_at timestamptz,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create unique index if not exists idx_notifications_user_key
+    on notifications (user_id, notification_key);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_notifications_user_status
+    on notifications (user_id, status, is_read, created_at desc);
+  `);
+
+  await pool.query(`
+    alter table auth_sessions
+    add column if not exists revoked_at timestamptz;
+  `);
+
+  await pool.query(`
     alter table schedules
     add column if not exists actual_locked boolean not null default false;
   `);
@@ -685,6 +802,7 @@ const ensureSchema = async () => {
       order_lot_size numeric not null default 0,
       max_delivery_per_rit numeric not null default 0,
       process_flow jsonb not null default '[]'::jsonb,
+      process_routing jsonb not null default '[]'::jsonb,
       created_at timestamptz not null default now()
     );
   `);
@@ -830,6 +948,10 @@ const ensureSchema = async () => {
     alter table items
     add column if not exists process_flow jsonb not null default '[]'::jsonb;
   `);
+  await pool.query(`
+    alter table items
+    add column if not exists process_routing jsonb not null default '[]'::jsonb;
+  `);
 
   await pool.query(`
     DO $$
@@ -864,6 +986,9 @@ const ensureSchema = async () => {
       parent_code text not null references items(code) on delete cascade,
       bom_version text,
       effective_date date,
+      effective_start_date date,
+      effective_end_date date,
+      revision_no integer,
       reference text,
       created_at timestamptz not null default now()
     );
@@ -889,6 +1014,8 @@ const ensureSchema = async () => {
       child_code text not null references items(code) on delete cascade,
       quantity numeric not null default 0,
       scrap_factor numeric not null default 0,
+      process_flow jsonb not null default '[]'::jsonb,
+      process_routing jsonb not null default '[]'::jsonb,
       created_at timestamptz not null default now()
     );
   `);
@@ -952,6 +1079,10 @@ const ensureSchema = async () => {
   `);
   await pool.query(`
     alter table master_bom
+    add column if not exists process_routing jsonb not null default '[]'::jsonb;
+  `);
+  await pool.query(`
+    alter table master_bom
     add column if not exists cost_rp numeric not null default 0;
   `);
   await pool.query(`
@@ -962,6 +1093,18 @@ const ensureSchema = async () => {
   await pool.query(`
     alter table master_bom
     add column if not exists assembly_note text;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists yield_factor numeric not null default 1.00;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists position_code text;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists substitute_material_codes jsonb not null default '[]'::jsonb;
   `);
   await pool.query(`
     insert into master_bom_headers (parent_code, bom_version, reference)
@@ -979,6 +1122,27 @@ const ensureSchema = async () => {
       and h.bom_version = 'Legacy';
   `);
   await pool.query(`
+    update master_bom_headers
+    set effective_start_date = coalesce(effective_start_date, effective_date, created_at::date, current_date)
+    where effective_start_date is null;
+  `);
+  await pool.query(`
+    with ranked_headers as (
+      select
+        id,
+        row_number() over (
+          partition by parent_code
+          order by coalesce(effective_start_date, effective_date, created_at::date, current_date) asc, created_at asc, id asc
+        ) as next_revision_no
+      from master_bom_headers
+    )
+    update master_bom_headers h
+    set revision_no = r.next_revision_no
+    from ranked_headers r
+    where h.id = r.id
+      and (h.revision_no is null or h.revision_no <= 0);
+  `);
+  await pool.query(`
     DO $$
     BEGIN
       IF EXISTS (
@@ -993,12 +1157,43 @@ const ensureSchema = async () => {
   await pool.query(`
     DO $$
     BEGIN
-      IF NOT EXISTS (
+      IF EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'master_bom_header_child_unique'
       ) THEN
+        ALTER TABLE master_bom DROP CONSTRAINT master_bom_header_child_unique;
+      END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'master_bom_parent_child_header_unique'
+      ) THEN
         ALTER TABLE master_bom
-        ADD CONSTRAINT master_bom_header_child_unique UNIQUE (header_id, child_code);
+        ADD CONSTRAINT master_bom_parent_child_header_unique UNIQUE (header_id, parent_code, child_code);
+      END IF;
+    END
+    $$;
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'master_bom_headers_parent_version_unique'
+      ) THEN
+        ALTER TABLE master_bom_headers DROP CONSTRAINT master_bom_headers_parent_version_unique;
+      END IF;
+    END
+    $$;
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'master_bom_headers_parent_revision_unique'
+      ) THEN
+        ALTER TABLE master_bom_headers
+        ADD CONSTRAINT master_bom_headers_parent_revision_unique UNIQUE (parent_code, revision_no);
       END IF;
     END
     $$;
@@ -1478,11 +1673,82 @@ const ensureSchema = async () => {
   `);
 
   await pool.query(`
+    create table if not exists kanban_process_cards (
+      id serial primary key,
+      kanban_id text not null unique,
+      item_code text not null references items(code),
+      item_category text not null default '',
+      action_type text not null default 'routing_execution',
+      routing_snapshot jsonb not null default '[]'::jsonb,
+      current_step_index integer not null default 0,
+      current_step_code text,
+      current_step_name text,
+      current_work_center text,
+      current_status text not null default 'waiting',
+      source_location text,
+      target_location text,
+      last_scanned_at timestamptz,
+      created_by integer references users(id),
+      updated_by integer references users(id),
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_kanban_process_cards_item_code
+    on kanban_process_cards (item_code);
+  `);
+
+  await pool.query(`
+    create table if not exists kanban_process_card_steps (
+      id serial primary key,
+      kanban_card_id integer not null references kanban_process_cards(id) on delete cascade,
+      sequence integer not null,
+      process_code text not null,
+      process_name text not null,
+      process_type text,
+      applies_to_level text not null default 'All',
+      work_center text,
+      standard_time numeric not null default 0,
+      status text not null default 'pending',
+      started_at timestamptz,
+      finished_at timestamptz,
+      operator_id integer references users(id),
+      notes text,
+      unique (kanban_card_id, sequence)
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_kanban_process_card_steps_card
+    on kanban_process_card_steps (kanban_card_id, sequence);
+  `);
+
+  await pool.query(`
+    create table if not exists kanban_process_card_logs (
+      id serial primary key,
+      kanban_card_id integer not null references kanban_process_cards(id) on delete cascade,
+      step_id integer references kanban_process_card_steps(id) on delete set null,
+      action text not null,
+      message text,
+      payload jsonb not null default '{}'::jsonb,
+      operator_id integer references users(id),
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_kanban_process_card_logs_card
+    on kanban_process_card_logs (kanban_card_id, created_at desc);
+  `);
+
+  await pool.query(`
     create table if not exists receive_notes (
       id serial primary key,
       rn_number text not null unique,
       dn_id integer references delivery_notes(id),
-      schedule_id integer not null references schedules(id),
+      schedule_id integer references schedules(id) on delete set null,
       item_code text,
       received_qty numeric not null,
       qc_status text not null check (qc_status in ('ok','hold','reject')),
@@ -1887,8 +2153,83 @@ const ensureSchema = async () => {
   `);
 
   await pool.query(`
+    create table if not exists receipt_allocations (
+      id bigserial primary key,
+      rn_id integer not null references receive_note_headers(id) on delete cascade,
+      rn_item_id integer not null references receive_note_items(id) on delete cascade,
+      supplier text not null,
+      do_number text not null,
+      po_number text not null,
+      source_type text not null,
+      schedule_id integer references schedules(id) on delete set null,
+      po_line_id integer references po_lines(id) on delete set null,
+      item_code text not null references items(code),
+      planned_date date,
+      request_date date,
+      po_date date,
+      available_before numeric not null default 0,
+      allocated_qty numeric not null default 0,
+      available_after numeric not null default 0,
+      created_by integer references users(id),
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    do $$
+    begin
+      if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'receipt_allocations_source_type_check'
+      ) then
+        alter table receipt_allocations
+        add constraint receipt_allocations_source_type_check
+        check (source_type in ('schedule','po_line'));
+      end if;
+    end
+    $$;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receipt_allocations_rn_id
+    on receipt_allocations (rn_id);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receipt_allocations_rn_item_id
+    on receipt_allocations (rn_item_id);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receipt_allocations_po_number
+    on receipt_allocations (po_number);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receipt_allocations_schedule_id
+    on receipt_allocations (schedule_id);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receipt_allocations_po_line_id
+    on receipt_allocations (po_line_id);
+  `);
+
+  await pool.query(`
     alter table receive_notes
     alter column schedule_id drop not null;
+  `);
+
+  await pool.query(`
+    alter table receive_notes
+    drop constraint if exists receive_notes_schedule_id_fkey;
+  `);
+
+  await pool.query(`
+    alter table receive_notes
+    add constraint receive_notes_schedule_id_fkey
+    foreign key (schedule_id) references schedules(id) on delete set null;
   `);
 
   await pool.query(`
@@ -2842,8 +3183,51 @@ const ensureSchema = async () => {
     create table if not exists master_processes (
       code text primary key,
       name text not null,
+      process_type text not null default '',
+      applies_to_level text not null default 'All',
+      work_center text not null default '',
+      sequence integer not null default 0,
+      standard_time numeric not null default 0,
       created_at timestamptz not null default now()
     );
+  `);
+
+  await pool.query(`alter table master_processes add column if not exists process_type text not null default ''`);
+  await pool.query(`alter table master_processes add column if not exists applies_to_level text not null default 'All'`);
+  await pool.query(`alter table master_processes add column if not exists work_center text not null default ''`);
+  await pool.query(`alter table master_processes add column if not exists sequence integer not null default 0`);
+  await pool.query(`alter table master_processes add column if not exists standard_time numeric not null default 0`);
+  await pool.query(`
+    update master_processes
+    set process_type = case
+      when lower(name) like '%assy%' then 'Assembly'
+      when lower(name) like '%bend%' then 'Bending'
+      when lower(name) like '%edge%' then 'Edge'
+      when lower(name) like '%flat%' then 'Flat'
+      when lower(name) like '%hogring%' then 'Hog Ring'
+      when lower(name) like '%machin%' then 'Machining'
+      when lower(name) like '%notch%' then 'Notching'
+      when lower(name) like '%plat%' then 'Plating'
+      when lower(name) like '%press%' then 'Pressing'
+      when lower(name) like '%qc%' or lower(name) like '%check%' then 'Inspection'
+      when lower(name) like '%paint%' then 'Painting'
+      when lower(name) like '%spot nut%' then 'Spot Nut'
+      when lower(name) like '%spot projection%' then 'Spot Projection'
+      when lower(name) like '%stamp%' then 'Stamping'
+      when lower(name) like '%straight%' then 'Straightening'
+      when lower(name) like '%sunvisor%' then 'Sunvisor'
+      when lower(name) like '%swag%' then 'Swaging'
+      when lower(name) like '%weld%' then 'Welding'
+      else coalesce(nullif(trim(process_type), ''), name)
+    end
+    where coalesce(trim(process_type), '') = ''
+  `);
+  await pool.query(`
+    update master_processes p
+    set work_center = l.id
+    from master_locations l
+    where coalesce(trim(p.work_center), '') = ''
+      and lower(trim(coalesce(l.fifo_lane, ''))) = lower(trim(coalesce(p.name, '')))
   `);
 
   await pool.query(`
@@ -3241,6 +3625,8 @@ const toDbSchedule = (payload = {}) => {
 const mapRowToSchedule = (row) => {
   const resolvedItemCode = row.resolved_item_code || row.po_item_code || row.item_code || row.item || null;
   const supplierId = row.supplier_id || row.po_supplier_id || row.supplier || null;
+  const effectiveArrivalDate = row.latest_arrival_date || row.arrival_date || null;
+  const effectiveDoNumber = row.latest_do_number || row.do_number || null;
   return {
     id: row.id,
     poNumber: row.po_number,
@@ -3253,12 +3639,12 @@ const mapRowToSchedule = (row) => {
     requestDate: formatDateOnly(row.request_date),
     deliveryTime: row.delivery_time,
     requestQty: row.request_qty,
-    arrivalDate: formatDateOnly(row.arrival_date),
+    arrivalDate: formatDateOnly(effectiveArrivalDate),
     receivedQty: row.received_qty,
-    doNumber: row.do_number,
+    doNumber: effectiveDoNumber,
     status: getScheduleStatusFromActual({
       requestDate: row.request_date,
-      arrivalDate: row.arrival_date,
+      arrivalDate: effectiveArrivalDate,
     }),
     poStatus: row.po_status || null,
     notes: row.notes,
@@ -3311,6 +3697,37 @@ const normalizeDateOnly = (value) => {
   const parsed = new Date(String(value));
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed.toISOString().slice(0, 10);
+};
+
+const normalizePositiveInteger = (value, fallback = 1) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+};
+
+const normalizeYieldFactor = (value, fallback = 1) => {
+  if (value === "" || value === null || value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+};
+
+const normalizeSubstituteMaterialCodes = (value) => {
+  const codes = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[\n,;]+/g)
+      : [];
+  const seen = new Set();
+  return codes
+    .map((entry) => String(entry || "").trim())
+    .filter(Boolean)
+    .filter((entry) => {
+      const key = entry.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
 };
 
 const normalizeLocationKey = (value) => String(value || "").trim().toLowerCase();
@@ -4009,6 +4426,7 @@ const loadReceiptScheduleCandidates = async (client, { supplierId, itemCode, poN
       s.id as schedule_id,
       s.po_number,
       coalesce(s.item_code, s.item) as item_code,
+      coalesce(s.planned_date, s.request_date) as planned_date,
       s.request_date,
       s.request_qty,
       s.received_qty,
@@ -4021,7 +4439,7 @@ const loadReceiptScheduleCandidates = async (client, { supplierId, itemCode, poN
       and upper(coalesce(s.status, '')) not in ('CANCELLED','REJECTED','CLOSED')
     order by
       case when s.po_number = $3 then 0 else 1 end,
-      s.request_date asc nulls last,
+      coalesce(s.planned_date, s.request_date) asc nulls last,
       s.id asc
     limit $4
     `,
@@ -4093,6 +4511,311 @@ const loadReceiptPoLineCandidates = async (client, { supplierId, itemCode, poNum
     score: Number(row.score || 0),
     reason: row.po_number === normalizedPo ? "same_po_item_open_but_no_schedule" : "open_po_line_no_schedule",
   }));
+};
+
+const loadActualDrivenScheduleCandidates = async (client, { supplierKeys = [], poNumber, poLineId, itemCode, limit = 200 } = {}) => {
+  const normalizedSupplierKeys = Array.from(
+    new Set(
+      (Array.isArray(supplierKeys) ? supplierKeys : [])
+        .map((value) => String(value || "").trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  );
+  const normalizedPo = normalizePoNumber(poNumber);
+  const normalizedPoLineId = parsePositiveId(poLineId);
+  const normalizedItemCode = normalizeItemCode(itemCode);
+  if (normalizedSupplierKeys.length === 0 || !normalizedPo || !normalizedItemCode) return [];
+  const result = await client.query(
+    `
+    select
+      s.id as schedule_id,
+      s.po_number,
+      s.po_line_id,
+      coalesce(s.item_code, s.item) as item_code,
+      s.request_date,
+      s.received_qty,
+      ph.po_date,
+      greatest(coalesce(s.request_qty, 0) - coalesce(s.received_qty, 0), 0)::numeric as outstanding_qty
+    from schedules s
+    left join po_headers ph on ph.po_number = s.po_number
+    where lower(trim(coalesce(s.supplier_id, s.supplier))) = any($1::text[])
+      and s.po_number = $2
+      and lower(trim(coalesce(s.item_code, s.item))) = lower(trim($3))
+      and greatest(coalesce(s.request_qty, 0) - coalesce(s.received_qty, 0), 0) > 0
+      and upper(coalesce(s.status, '')) not in ('CANCELLED', 'REJECTED', 'CLOSED')
+      and (
+        $4::int is null
+        or s.po_line_id = $4::int
+        or (s.po_line_id is null and s.po_number = $2 and lower(trim(coalesce(s.item_code, s.item))) = lower(trim($3)))
+      )
+    order by
+      coalesce(s.request_date, ph.po_date) asc nulls last,
+      s.id asc
+    limit $5
+    `,
+    [normalizedSupplierKeys, normalizedPo, normalizedItemCode, normalizedPoLineId, limit],
+  );
+  return (result.rows || []).map((row) => ({
+    allocationType: "schedule",
+    scheduleId: row.schedule_id,
+    poLineId: row.po_line_id,
+    poNumber: row.po_number,
+    itemCode: row.item_code,
+    plannedDate: formatDateOnly(row.planned_date || row.request_date),
+    requestDate: formatDateOnly(row.request_date),
+    poDate: formatDateOnly(row.po_date),
+    plannedDate: formatDateOnly(row.request_date || row.po_date),
+    outstandingQty: Number(row.outstanding_qty || 0),
+  }));
+};
+
+const loadActualDrivenPoLineCandidates = async (client, { supplierKeys = [], poNumber, poLineId, itemCode, limit = 200 } = {}) => {
+  const normalizedSupplierKeys = Array.from(
+    new Set(
+      (Array.isArray(supplierKeys) ? supplierKeys : [])
+        .map((value) => String(value || "").trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  );
+  const normalizedPo = normalizePoNumber(poNumber);
+  const normalizedPoLineId = parsePositiveId(poLineId);
+  const normalizedItemCode = normalizeItemCode(itemCode);
+  if (normalizedSupplierKeys.length === 0 || !normalizedPo || !normalizedItemCode) return [];
+  const result = await client.query(
+    `
+    select
+      pl.id as po_line_id,
+      pl.po_number,
+      pl.item_code,
+      ph.po_date,
+      pl.line_no,
+      (
+        pl.qty_order - pl.qty_received - (
+          select coalesce(sum(greatest(s.request_qty - s.received_qty, 0)), 0)::numeric
+          from schedules s
+          where s.po_line_id = pl.id
+             or (s.po_line_id is null and s.po_number = pl.po_number and lower(trim(coalesce(s.item_code, s.item))) = lower(trim(pl.item_code)))
+        )
+      )::numeric as outstanding_qty
+    from po_lines pl
+    join po_headers ph on ph.po_number = pl.po_number
+    where lower(trim(ph.supplier_id)) = any($1::text[])
+      and pl.po_number = $2
+      and lower(trim(pl.item_code)) = lower(trim($3))
+      and ph.status in ('open', 'partial')
+      and ($4::int is null or pl.id = $4::int)
+      and (
+        pl.qty_order - pl.qty_received - (
+          select coalesce(sum(greatest(s.request_qty - s.received_qty, 0)), 0)::numeric
+          from schedules s
+          where s.po_line_id = pl.id
+             or (s.po_line_id is null and s.po_number = pl.po_number and lower(trim(coalesce(s.item_code, s.item))) = lower(trim(pl.item_code)))
+        )
+      ) > 0
+    order by
+      ph.po_date asc nulls last,
+      pl.po_number asc,
+      pl.line_no asc,
+      pl.id asc
+    limit $5
+    `,
+    [normalizedSupplierKeys, normalizedPo, normalizedItemCode, normalizedPoLineId, limit],
+  );
+  return (result.rows || []).map((row) => ({
+    allocationType: "po_line",
+    scheduleId: null,
+    poLineId: row.po_line_id,
+    poNumber: row.po_number,
+    itemCode: row.item_code,
+    requestDate: formatDateOnly(row.po_date),
+    poDate: formatDateOnly(row.po_date),
+    plannedDate: formatDateOnly(row.po_date),
+    outstandingQty: Number(row.outstanding_qty || 0),
+  }));
+};
+
+const buildActualDrivenReceiptAllocations = async (client, { supplier, poNumber, poLineId, itemCode, qty, allowOverReceive = false }) => {
+  const supplierValue = String(supplier || "").trim();
+  const normalizedItemCode = normalizeItemCode(itemCode);
+  const qtyValue = Number(qty);
+  if (!supplierValue) {
+    const error = new Error("supplier wajib diisi.");
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!normalizedItemCode) {
+    const error = new Error("itemCode wajib diisi.");
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!Number.isFinite(qtyValue) || qtyValue <= 0) {
+    const error = new Error("receivedQty wajib > 0.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const supplierRow = await resolveVendorRow(client, supplierValue);
+  const supplierId = await resolveReceiptSupplierId(client, supplierValue);
+  const supplierKeys = Array.from(
+    new Set(
+      [supplierValue, supplierId, supplierRow?.id, supplierRow?.name]
+        .map((value) => String(value || "").trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  );
+  const poHeader = await resolvePoHeader(client, poNumber);
+  const normalizedPoNumber = normalizePoNumber(poNumber);
+  const normalizedPoLineId = parsePositiveId(poLineId);
+  if (!normalizedPoNumber) {
+    const error = new Error("poNumber wajib diisi.");
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!poHeader) {
+    const error = new Error("PO tidak ditemukan.");
+    error.statusCode = 404;
+    throw error;
+  }
+  const poSupplierId = String(poHeader.supplier_id || "").trim().toLowerCase();
+  if (poSupplierId && supplierId && poSupplierId !== String(supplierId).trim().toLowerCase()) {
+    const error = new Error("Supplier receipt tidak sesuai dengan supplier PO.");
+    error.statusCode = 409;
+    throw error;
+  }
+  const poLineCheck = normalizedPoLineId
+    ? await resolvePoLineById(client, normalizedPoLineId)
+    : null;
+  if (normalizedPoLineId && (!poLineCheck || normalizePoNumber(poLineCheck.po_number) !== normalizedPoNumber)) {
+    const error = new Error("PO line tidak sesuai dengan PO yang dipilih.");
+    error.statusCode = 409;
+    throw error;
+  }
+  const scheduleCandidates = await loadActualDrivenScheduleCandidates(client, {
+    supplierKeys,
+    poNumber: normalizedPoNumber,
+    poLineId: normalizedPoLineId,
+    itemCode: normalizedItemCode,
+  });
+  const poLineCandidates = await loadActualDrivenPoLineCandidates(client, {
+    supplierKeys,
+    poNumber: normalizedPoNumber,
+    poLineId: normalizedPoLineId,
+    itemCode: normalizedItemCode,
+  });
+  const candidates = [...scheduleCandidates, ...poLineCandidates];
+  const totalAvailable = candidates.reduce((accumulator, candidate) => accumulator + Number(candidate.outstandingQty || 0), 0);
+  const preferredCandidate = (() => {
+    if (normalizedPoLineId) {
+      const existingCandidate = candidates.find((candidate) => Number(candidate.poLineId || 0) === normalizedPoLineId);
+      if (existingCandidate) return existingCandidate;
+      if (poLineCheck) {
+        return {
+          allocationType: "po_line",
+          scheduleId: null,
+          poLineId: poLineCheck.id,
+          poNumber: poLineCheck.po_number,
+          itemCode: poLineCheck.item_code,
+          requestDate: formatDateOnly(poHeader.po_date),
+          poDate: formatDateOnly(poHeader.po_date),
+          plannedDate: formatDateOnly(poHeader.po_date),
+          outstandingQty: Math.max(0, Number(poLineCheck.qty_order || 0) - Number(poLineCheck.qty_received || 0)),
+        };
+      }
+    }
+    return candidates[0] || null;
+  })();
+
+  if (totalAvailable < qtyValue && !allowOverReceive) {
+    const error = new Error(`Qty aktual melebihi sisa open schedule/PO. Sisa tersedia: ${totalAvailable}.`);
+    error.statusCode = 409;
+    error.remainingQty = totalAvailable;
+    throw error;
+  }
+
+  const itemInfo = await resolveInboundItemInfo(client, normalizedItemCode);
+  if (!itemInfo?.itemCode || normalizeItemCode(itemInfo.itemCode) !== normalizedItemCode) {
+    const error = new Error("Part code tidak valid.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const allocations = [];
+  let remainingQty = qtyValue;
+  for (const candidate of candidates) {
+    if (remainingQty <= 0) break;
+    const candidateOutstanding = Math.max(0, Number(candidate.outstandingQty || 0));
+    if (candidateOutstanding <= 0) continue;
+    const allocatedQty = Math.min(remainingQty, candidateOutstanding);
+    allocations.push({
+      ...candidate,
+      allocatedQty,
+      itemCode: itemInfo.itemCode || normalizedItemCode,
+      itemName: itemInfo.itemName || normalizedItemCode,
+      partNo: itemInfo.itemName || normalizedItemCode,
+      unit: itemInfo.unit || null,
+      packQty: itemInfo.packQty || null,
+      matchBasis: candidate.allocationType === "schedule" ? "schedule" : "po_line",
+    });
+    remainingQty -= allocatedQty;
+  }
+
+  if (allowOverReceive && remainingQty > 0) {
+    if (!preferredCandidate) {
+      const error = new Error("PO line untuk over receive tidak ditemukan.");
+      error.statusCode = 409;
+      throw error;
+    }
+    allocations.push({
+      ...preferredCandidate,
+      allocatedQty: remainingQty,
+      outstandingQty: Math.max(0, Number(preferredCandidate.outstandingQty || 0)),
+      matchBasis: preferredCandidate.allocationType === "schedule" ? "schedule" : "po_line",
+      overrideReason: "actual_receive_over_po",
+    });
+    remainingQty = 0;
+  }
+
+  return {
+    supplierId: supplierId || supplierValue,
+    supplierName: supplierRow?.name || supplierValue,
+    poNumber: normalizedPoNumber,
+    poLineId: normalizedPoLineId,
+    itemInfo,
+    allocations,
+    totalAvailable,
+    totalAllocated: qtyValue - remainingQty,
+    remainingQty,
+    supplierKeys,
+  };
+};
+
+const insertReceiptAllocationAudit = async (client, payload = {}, user = null) => {
+  const result = await client.query(
+    `
+    insert into receipt_allocations
+      (rn_id, rn_item_id, supplier, do_number, po_number, source_type, schedule_id, po_line_id, item_code, planned_date, request_date, po_date, available_before, allocated_qty, available_after, created_by)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+    returning *
+    `,
+    [
+      parsePositiveId(payload.rnId),
+      parsePositiveId(payload.rnItemId),
+      String(payload.supplier || "").trim(),
+      String(payload.doNumber || "").trim(),
+      String(payload.poNumber || "").trim(),
+      String(payload.sourceType || "schedule").trim(),
+      parsePositiveId(payload.scheduleId),
+      parsePositiveId(payload.poLineId),
+      normalizeItemCode(payload.itemCode),
+      payload.plannedDate || null,
+      payload.requestDate || null,
+      payload.poDate || null,
+      Number(payload.availableBefore || 0),
+      Number(payload.allocatedQty || 0),
+      Number(payload.availableAfter || 0),
+      user?.id || null,
+    ],
+  );
+  return result.rows[0] || null;
 };
 
 const recommendReceiptCandidatesForLine = async (client, { header, line, limit = 10 } = {}) => {
@@ -4723,7 +5446,12 @@ const postReceiptDraft = async (client, draftId, user = null, options = {}) => {
 
     if (schedule) {
       const nextReceived = Number(schedule.received_qty || 0) + qtyValue;
-      const nextStatus = qcStatus === "ok" ? "RECEIVED" : qcStatus === "hold" ? "HOLD" : "REJECTED";
+      const requestQty = Number(schedule.request_qty || 0);
+      const nextStatus = qcStatus === "ok"
+        ? (nextReceived < requestQty ? "PARTIAL" : "RECEIVED")
+        : qcStatus === "hold"
+          ? "HOLD"
+          : "REJECTED";
       await client.query(
         `
         update schedules
@@ -5050,31 +5778,152 @@ const assertBatchNotExpired = (batch, itemCode, warnings, warningSet) => {
   }
 };
 
-const getBomChildren = async (client, parentCode) => {
+const validateBomHeaderWindow = ({ effectiveStartDate, effectiveEndDate }) => {
+  if (effectiveStartDate && !normalizeDateOnly(effectiveStartDate)) {
+    throw new Error("effectiveStartDate tidak valid");
+  }
+  if (effectiveEndDate && !normalizeDateOnly(effectiveEndDate)) {
+    throw new Error("effectiveEndDate tidak valid");
+  }
+  const startDate = normalizeDateOnly(effectiveStartDate);
+  const endDate = normalizeDateOnly(effectiveEndDate);
+  if (startDate && endDate && endDate < startDate) {
+    throw new Error("effectiveEndDate tidak boleh lebih kecil dari effectiveStartDate");
+  }
+  return { startDate, endDate };
+};
+
+const ensureBomHeader = async (client, {
+  parentCode,
+  bomVersion = "",
+  revisionNo = 1,
+  effectiveStartDate = null,
+  effectiveEndDate = null,
+  reference = "",
+}) => {
+  const parentCodeValue = String(parentCode || "").trim();
+  if (!parentCodeValue) {
+    throw new Error("parentCode wajib diisi");
+  }
+  const { startDate, endDate } = validateBomHeaderWindow({ effectiveStartDate, effectiveEndDate });
+  const normalizedRevisionNo = normalizePositiveInteger(revisionNo, 1);
   const result = await client.query(
-    `select b.child_code as child_code, b.quantity as quantity, b.scrap_factor as scrap_factor, i.type as child_type
-     from master_bom b
-     join items i on i.code = b.child_code
-     where b.parent_code = $1`,
-    [parentCode],
+    `
+    insert into master_bom_headers (
+      parent_code,
+      bom_version,
+      effective_date,
+      effective_start_date,
+      effective_end_date,
+      revision_no,
+      reference
+    )
+    values ($1,$2,$3,$4,$5,$6,$7)
+    on conflict (parent_code, revision_no)
+    do update set
+      bom_version = excluded.bom_version,
+      effective_date = excluded.effective_date,
+      effective_start_date = excluded.effective_start_date,
+      effective_end_date = excluded.effective_end_date,
+      reference = excluded.reference
+    returning *
+    `,
+    [
+      parentCodeValue,
+      String(bomVersion || "").trim() || `REV-${normalizedRevisionNo}`,
+      startDate,
+      startDate,
+      endDate,
+      normalizedRevisionNo,
+      String(reference || "").trim() || null,
+    ],
+  );
+  return result.rows[0] || null;
+};
+
+const ensureLegacyBomHeader = async (client, parentCode) => {
+  const parentCodeValue = String(parentCode || "").trim();
+  const result = await client.query(
+    `
+    insert into master_bom_headers (
+      parent_code,
+      bom_version,
+      effective_date,
+      effective_start_date,
+      revision_no,
+      reference
+    )
+    values ($1,'Legacy',current_date,current_date,1,'Auto from legacy BOM')
+    on conflict (parent_code, revision_no)
+    do update set parent_code = excluded.parent_code
+    returning *
+    `,
+    [parentCodeValue],
+  );
+  return result.rows[0] || null;
+};
+
+const getBomChildren = async (client, parentCode, asOfDate = getTodayDateOnly()) => {
+  const result = await client.query(
+    `
+    with active_header as (
+      select h.id, h.parent_code, h.revision_no
+      from master_bom_headers h
+      where h.parent_code = $1
+        and coalesce(h.effective_start_date, h.effective_date, h.created_at::date, current_date) <= $2::date
+        and (h.effective_end_date is null or h.effective_end_date >= $2::date)
+      order by h.revision_no desc nulls last,
+        coalesce(h.effective_start_date, h.effective_date, h.created_at::date, current_date) desc,
+        h.created_at desc,
+        h.id desc
+      limit 1
+    )
+    select
+      b.child_code as child_code,
+      b.quantity as quantity,
+      b.scrap_factor as scrap_factor,
+      b.yield_factor as yield_factor,
+      b.position_code as position_code,
+      b.substitute_material_codes as substitute_material_codes,
+      i.type as child_type
+    from master_bom b
+    join active_header h on h.id = b.header_id
+    join items i on i.code = b.child_code
+    order by b.id asc
+    `,
+    [parentCode, asOfDate],
   );
   return result.rows;
 };
 
-const explodeBom = async (client, parentCode, qty, accumulator, stack = []) => {
+const explodeBom = async (client, parentCode, qty, accumulator, stack = [], asOfDate = getTodayDateOnly()) => {
   if (stack.includes(parentCode)) {
     throw new Error(`BOM cycle detected: ${stack.join(" -> ")} -> ${parentCode}`);
   }
-  const children = await getBomChildren(client, parentCode);
+  const children = await getBomChildren(client, parentCode, asOfDate);
   if (children.length === 0) return;
   for (const child of children) {
-    const baseQty = Number(child.quantity || 0) * qty;
+    const yieldFactor = normalizeYieldFactor(child.yield_factor, 1);
+    const baseQty = (Number(child.quantity || 0) / yieldFactor) * qty;
     const scrapFactor = Number(child.scrap_factor || 0) / 100;
     const requiredQty = baseQty * (1 + scrapFactor);
     if ((child.child_type || "").toLowerCase().includes("raw")) {
-      accumulator[child.child_code] = (accumulator[child.child_code] || 0) + requiredQty;
+      if (!accumulator[child.child_code]) {
+        accumulator[child.child_code] = {
+          requiredQty: 0,
+          positionCodes: new Set(),
+          substituteMaterialCodes: new Set(),
+        };
+      }
+      accumulator[child.child_code].requiredQty += requiredQty;
+      if (child.position_code) {
+        accumulator[child.child_code].positionCodes.add(String(child.position_code).trim());
+      }
+      normalizeSubstituteMaterialCodes(child.substitute_material_codes).forEach((code) => {
+        accumulator[child.child_code].substituteMaterialCodes.add(code);
+      });
     } else {
-      await explodeBom(client, child.child_code, requiredQty, accumulator, [...stack, parentCode]);
+      await explodeBom(client, child.child_code, requiredQty, accumulator, [...stack, parentCode], asOfDate);
     }
   }
 };
@@ -5102,13 +5951,13 @@ const applyProductionConsumption = async (client, productCode, qtyNumber, produc
   const requirements = {};
   const warnings = [];
   const warningSet = new Set();
-  await explodeBom(client, productCode, qtyNumber, requirements);
+  await explodeBom(client, productCode, qtyNumber, requirements, [], getTodayDateOnly());
   if (Object.keys(requirements).length === 0) {
     throw new Error("BOM kosong untuk item ini");
   }
 
-  for (const [itemCode, requiredQty] of Object.entries(requirements)) {
-    let remaining = requiredQty;
+  for (const [itemCode, requirement] of Object.entries(requirements)) {
+    let remaining = Number(requirement?.requiredQty || 0);
     const supplierFilter = typeof supplier === "string" ? supplier.trim() : "";
     const orderClause = await getFifoOrderClause(client, itemCode, "b");
     const orderClauseNoAlias = await getFifoOrderClause(client, itemCode);
@@ -5371,6 +6220,74 @@ const resolveItemRow = async (client, itemValue) => {
   return result.rows[0] || null;
 };
 
+const normalizeProcessScopeValue = (value) => {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized.includes("single")) return "Single";
+  if (normalized.includes("multi")) return "Multi";
+  return "All";
+};
+
+const buildProcessLookupKey = (value) => String(value || "").trim().toLowerCase();
+
+const normalizeRoutingStep = (step, processMap, fallbackSequence = 0) => {
+  if (step == null) return null;
+  const isScalar = typeof step === "string" || typeof step === "number";
+  const rawCode = isScalar ? String(step || "").trim() : String(step.code || step.processCode || "").trim();
+  const rawName = isScalar ? String(step || "").trim() : String(step.name || step.processName || "").trim();
+  const resolved = processMap.get(buildProcessLookupKey(rawCode))
+    || processMap.get(buildProcessLookupKey(rawName))
+    || processMap.get(buildProcessLookupKey(step?.workCenter || step?.work_center || ""))
+    || null;
+  const standardTimeValue = Number(step?.standardTime ?? step?.standard_time ?? resolved?.standard_time ?? 0);
+  const sequenceValue = Number(step?.sequence ?? resolved?.sequence ?? fallbackSequence + 1);
+  const workCenterValue = String(step?.workCenter || step?.work_center || resolved?.work_center || "").trim();
+  const codeValue = String(step?.code || step?.processCode || resolved?.code || rawCode || rawName || "").trim();
+  const nameValue = String(step?.name || step?.processName || resolved?.name || rawName || rawCode || "").trim();
+  if (!codeValue && !nameValue && !workCenterValue && !resolved) return null;
+  return {
+    code: codeValue || nameValue || workCenterValue || `STEP-${fallbackSequence + 1}`,
+    name: nameValue || codeValue || workCenterValue || `Step ${fallbackSequence + 1}`,
+    processType: String(step?.processType || step?.process_type || resolved?.process_type || "").trim(),
+    appliesToLevel: String(step?.appliesToLevel || step?.applies_to_level || resolved?.applies_to_level || "All").trim() || "All",
+    workCenter: workCenterValue || "UNASSIGNED",
+    sequence: Number.isFinite(sequenceValue) ? sequenceValue : fallbackSequence + 1,
+    standardTime: Number.isFinite(standardTimeValue) ? Math.max(0, standardTimeValue) : 0,
+  };
+};
+
+const resolveItemRoutingSteps = (itemRow, processMap) => {
+  if (!itemRow) return [];
+  const routingSource = Array.isArray(itemRow.process_routing) && itemRow.process_routing.length > 0
+    ? itemRow.process_routing
+    : Array.isArray(itemRow.process_flow) && itemRow.process_flow.length > 0
+      ? itemRow.process_flow
+      : [];
+  const normalizedSteps = routingSource
+    .map((step, index) => normalizeRoutingStep(step, processMap, index))
+    .filter(Boolean)
+    .sort((left, right) => {
+      const leftSequence = Number(left.sequence || 0);
+      const rightSequence = Number(right.sequence || 0);
+      if (leftSequence !== rightSequence) return leftSequence - rightSequence;
+      return String(left.code || left.name || "").localeCompare(String(right.code || right.name || ""));
+    });
+  if (normalizedSteps.length > 0) return normalizedSteps;
+  const fallbackCycleTime = Number(itemRow.cycle_time_seconds || itemRow.cycleTimeSeconds || 0);
+  if (!Number.isFinite(fallbackCycleTime) || fallbackCycleTime <= 0) return [];
+  const fallbackWorkCenter = String(itemRow.line_production || itemRow.lineProduction || "UNASSIGNED").trim() || "UNASSIGNED";
+  const fallbackCode = String(itemRow.code || "").trim() || "ITEM-CYCLE";
+  const fallbackName = String(itemRow.name || fallbackCode).trim() || fallbackCode;
+  return [{
+    code: `${fallbackCode}-CYCLE`,
+    name: `${fallbackName} Cycle Time`,
+    processType: "Fallback",
+    appliesToLevel: "All",
+    workCenter: fallbackWorkCenter,
+    sequence: 1,
+    standardTime: fallbackCycleTime,
+  }];
+};
+
 const ensureSubconWarehouse = async (client, vendorRow) => {
   if (!vendorRow?.id) return null;
   const vendorId = vendorRow.id;
@@ -5516,7 +6433,7 @@ const resolveInboundItemInfo = async (client, itemValue) => {
   }
   const result = await client.query(
     `
-    select i.code, i.name, i.pack_qty, ks.lot_qty
+    select i.code, i.name, i.unit, i.pack_qty, ks.lot_qty
     from items i
     left join kanban_settings ks on ks.item_code = i.code
     where i.code = $1 or i.name = $1
@@ -5532,6 +6449,7 @@ const resolveInboundItemInfo = async (client, itemValue) => {
   return {
     itemCode: row.code || itemKey,
     itemName: row.name || itemKey,
+    unit: row.unit || "",
     packQty: Number.isFinite(packQty) ? packQty : 0,
   };
 };
@@ -5759,6 +6677,25 @@ const getScheduleStatusFromActual = ({ requestDate, arrivalDate }) => {
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+const COUNTER_TOKEN_REGEX = /\{\s*COUNTER(?:\s*:\s*(\d+))?\s*\}/i;
+const COUNTER_TOKEN_GLOBAL_REGEX = /\{\s*COUNTER(?:\s*:\s*(\d+))?\s*\}/gi;
+
+const resolveCounterFormatParts = (format, defaultPad) => {
+  const baseFormat = String(format || "");
+  const resolvedFormat = COUNTER_TOKEN_REGEX.test(baseFormat)
+    ? baseFormat
+    : `${baseFormat}/{COUNTER}`;
+  const counterMatch = COUNTER_TOKEN_REGEX.exec(resolvedFormat);
+  const placeholderFormat = resolvedFormat.replace(COUNTER_TOKEN_REGEX, "__COUNTER__");
+  const parts = placeholderFormat.split("__COUNTER__");
+  return {
+    resolvedFormat,
+    counterPad: Number(counterMatch?.[1] || defaultPad),
+    prefix: parts[0] || "",
+    suffix: parts.slice(1).join("__COUNTER__") || "",
+  };
+};
+
 const buildKanbanIdRegex = (format) => {
   const escaped = escapeRegex(String(format || ""));
   const pattern = escaped
@@ -5793,7 +6730,716 @@ const resolveKanbanItemCode = async (client, kanbanId) => {
   const regex = buildKanbanIdRegex(format);
   const match = trimmed.match(regex);
   if (match?.groups?.uniq) return match.groups.uniq;
+  const separatorMatch = trimmed.match(/^(.+?)[-_\/](\d+)(?:[-_\/].*)?$/);
+  if (separatorMatch?.[1]) {
+    const prefixResult = await client.query(
+      "select code from items where code = $1 limit 1",
+      [separatorMatch[1].trim()],
+    );
+    if (prefixResult.rows.length > 0) return prefixResult.rows[0].code;
+  }
+  const lastDash = trimmed.lastIndexOf("-");
+  if (lastDash > 0) {
+    const prefix = trimmed.slice(0, lastDash).trim();
+    const prefixResult = await client.query(
+      "select code from items where code = $1 limit 1",
+      [prefix],
+    );
+    if (prefixResult.rows.length > 0) return prefixResult.rows[0].code;
+  }
   return trimmed;
+};
+
+const resolveKanbanActionMeta = (itemType) => {
+  const text = String(itemType || "").trim().toLowerCase();
+  if (!text) {
+    return {
+      categoryCode: "UNKNOWN",
+      categoryLabel: "Material",
+      actionType: "routing_execution",
+      actionLabel: "Routing Execution",
+      actionHint: "Kategori belum ditentukan, cek routing item.",
+      nextDestination: "Routing Master",
+    };
+  }
+  if (text.includes("raw")) {
+    return {
+      categoryCode: "RM",
+      categoryLabel: "Raw Material",
+      actionType: "issue",
+      actionLabel: "Stock Movement / Issue",
+      actionHint: "Scan ini dipakai untuk issue stok ke line / work order.",
+      nextDestination: "Gudang / Line",
+    };
+  }
+  if (text.includes("indirect") || text.includes("consum")) {
+    return {
+      categoryCode: "IM",
+      categoryLabel: "Indirect Material",
+      actionType: "consumption",
+      actionLabel: "Consumption",
+      actionHint: "Scan ini dipakai untuk pemakaian consumable / indirect.",
+      nextDestination: "Work Center / Department",
+    };
+  }
+  if (text.includes("subcon")) {
+    return {
+      categoryCode: "SUBCON",
+      categoryLabel: "Subcon",
+      actionType: "external_transfer",
+      actionLabel: "External Transfer / Subcon",
+      actionHint: "Scan ini dipakai untuk kirim / terima material subcon.",
+      nextDestination: "Vendor / Subcon",
+    };
+  }
+  if (text.includes("fg") || text.includes("finish") || text.includes("sub assy") || text.includes("subassy") || text.includes("child part") || text === "cp" || text.startsWith("cp")) {
+    const categoryCode = text.includes("sub assy") || text.includes("subassy")
+      ? "SA"
+      : text.includes("child part") || text === "cp" || text.startsWith("cp")
+        ? "CP"
+        : "FG";
+    return {
+      categoryCode,
+      categoryLabel: categoryCode === "SA"
+        ? "Sub-Assy"
+        : categoryCode === "CP"
+          ? "Child Part"
+          : "Finished Goods",
+      actionType: "routing_execution",
+      actionLabel: "Routing Execution",
+      actionHint: "Scan ini mengikuti routing proses aktif item.",
+      nextDestination: "Routing / Work Center",
+    };
+  }
+  return {
+    categoryCode: "MATERIAL",
+    categoryLabel: itemType || "Material",
+    actionType: "routing_execution",
+    actionLabel: "Routing Execution",
+    actionHint: "Kategori tidak dikenali, gunakan routing aktif item.",
+    nextDestination: "Routing / Work Center",
+  };
+};
+
+const normalizeKanbanProcessSnapshot = (routingSteps = []) => (
+  Array.isArray(routingSteps)
+    ? routingSteps
+        .map((step, index) => ({
+          code: String(step?.code || "").trim(),
+          name: String(step?.name || "").trim(),
+          processType: String(step?.processType || step?.process_type || "").trim(),
+          appliesToLevel: String(step?.appliesToLevel || step?.applies_to_level || "All").trim() || "All",
+          workCenter: String(step?.workCenter || step?.work_center || "").trim(),
+          sequence: Number.isFinite(Number(step?.sequence)) ? Number(step.sequence) : index + 1,
+          standardTime: Number.isFinite(Number(step?.standardTime ?? step?.standard_time))
+            ? Number(step?.standardTime ?? step?.standard_time)
+            : 0,
+        }))
+        .filter((step) => step.code || step.name || step.workCenter)
+    : []
+);
+
+const mapKanbanProcessStepRow = (row) => ({
+  id: row.id,
+  sequence: Number(row.sequence || 0),
+  processCode: String(row.process_code || "").trim(),
+  processName: String(row.process_name || "").trim(),
+  processType: String(row.process_type || "").trim(),
+  appliesToLevel: String(row.applies_to_level || "All").trim() || "All",
+  workCenter: String(row.work_center || "").trim(),
+  standardTime: Number(row.standard_time || 0),
+  status: String(row.status || "pending").trim(),
+  startedAt: row.started_at || null,
+  finishedAt: row.finished_at || null,
+  operatorId: row.operator_id || null,
+  notes: row.notes || "",
+  label: String(row.process_name || row.process_code || "").trim() || "-",
+});
+
+const loadKanbanProcessState = async (client, { kanbanId = "", routingSteps = [] } = {}) => {
+  const key = String(kanbanId || "").trim();
+  if (!key) {
+    return {
+      exists: false,
+      card: null,
+      steps: [],
+      currentStep: null,
+      nextStep: null,
+      currentIndex: 0,
+      currentStatus: "idle",
+    };
+  }
+  const cardResult = await client.query(
+    "select * from kanban_process_cards where kanban_id = $1 limit 1",
+    [key],
+  );
+  const card = cardResult.rows[0] || null;
+  const snapshot = normalizeKanbanProcessSnapshot(routingSteps);
+  let stepRows = [];
+  if (card) {
+    const storedSteps = await client.query(
+      "select * from kanban_process_card_steps where kanban_card_id = $1 order by sequence asc",
+      [card.id],
+    );
+    stepRows = storedSteps.rows.map(mapKanbanProcessStepRow);
+  }
+  if (stepRows.length === 0) {
+    stepRows = snapshot.map((step, index) => ({
+      id: null,
+      sequence: Number(step.sequence || index + 1),
+      processCode: String(step.code || "").trim(),
+      processName: String(step.name || step.code || "").trim(),
+      processType: String(step.processType || "").trim(),
+      appliesToLevel: String(step.appliesToLevel || "All").trim() || "All",
+      workCenter: String(step.workCenter || "").trim(),
+      standardTime: Number(step.standardTime || 0),
+      status: index === 0 ? "pending" : "pending",
+      startedAt: null,
+      finishedAt: null,
+      operatorId: null,
+      notes: "",
+      label: String(step.name || step.code || "").trim() || "-",
+    }));
+  }
+  const currentIndexRaw = Number(card?.current_step_index ?? 0);
+  const currentIndex = Number.isFinite(currentIndexRaw) && currentIndexRaw >= 0 ? currentIndexRaw : 0;
+  const currentStatus = String(card?.current_status || (stepRows.length > 0 ? "waiting" : "idle")).trim() || "idle";
+  const currentStep = currentStatus === "done"
+    ? stepRows[stepRows.length - 1] || null
+    : stepRows[currentIndex] || stepRows[0] || null;
+  const nextStep = currentStatus === "done"
+    ? null
+    : stepRows[currentIndex + 1] || null;
+  return {
+    exists: Boolean(card),
+    card,
+    steps: stepRows,
+    currentStep,
+    nextStep,
+    currentIndex,
+    currentStatus,
+  };
+};
+
+const ensureKanbanProcessCard = async (client, { kanbanId = "", itemRow = null, actionMeta = null, routingSteps = [], userId = null, currentPositionLabel = "", targetLabel = "" } = {}) => {
+  const key = String(kanbanId || "").trim();
+  if (!key || !itemRow) {
+    const error = new Error("Kanban ID atau item tidak valid.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const snapshot = normalizeKanbanProcessSnapshot(routingSteps);
+  let cardResult = await client.query(
+    "select * from kanban_process_cards where kanban_id = $1 for update",
+    [key],
+  );
+  let card = cardResult.rows[0] || null;
+  if (!card) {
+    const insertResult = await client.query(
+      `
+      insert into kanban_process_cards
+        (kanban_id, item_code, item_category, action_type, routing_snapshot, current_step_index, current_step_code, current_step_name, current_work_center, current_status, source_location, target_location, last_scanned_at, created_by, updated_by)
+      values ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, $10, $11, now(), $12, $12)
+      returning *
+      `,
+      [
+        key,
+        itemRow.code,
+        actionMeta?.categoryLabel || itemRow.type || "",
+        actionMeta?.actionType || "routing_execution",
+        JSON.stringify(snapshot),
+        snapshot[0]?.code || null,
+        snapshot[0]?.name || null,
+        snapshot[0]?.workCenter || null,
+        snapshot.length > 0 ? "waiting" : (actionMeta?.actionType || "idle"),
+        currentPositionLabel || null,
+        targetLabel || null,
+        userId,
+      ],
+    );
+    card = insertResult.rows[0];
+    if (snapshot.length > 0) {
+      for (const step of snapshot) {
+        await client.query(
+          `
+          insert into kanban_process_card_steps
+            (kanban_card_id, sequence, process_code, process_name, process_type, applies_to_level, work_center, standard_time, status)
+          values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          on conflict (kanban_card_id, sequence) do nothing
+          `,
+          [
+            card.id,
+            step.sequence,
+            step.code || step.name || `STEP-${step.sequence}`,
+            step.name || step.code || `Step ${step.sequence}`,
+            step.processType || null,
+            step.appliesToLevel || "All",
+            step.workCenter || null,
+            Number(step.standardTime || 0),
+            step.sequence === 1 ? "pending" : "pending",
+          ],
+        );
+      }
+      cardResult = await client.query(
+        "select * from kanban_process_cards where id = $1 limit 1",
+        [card.id],
+      );
+      card = cardResult.rows[0] || card;
+    }
+  } else if (snapshot.length > 0) {
+    const existingSnapshot = Array.isArray(card.routing_snapshot) ? card.routing_snapshot : [];
+    if (existingSnapshot.length === 0) {
+      await client.query(
+        "update kanban_process_cards set routing_snapshot = $1, updated_at = now() where id = $2",
+        [JSON.stringify(snapshot), card.id],
+      );
+    }
+    const existingStepCount = await client.query(
+      "select count(*)::int as total from kanban_process_card_steps where kanban_card_id = $1",
+      [card.id],
+    );
+    if (Number(existingStepCount.rows[0]?.total || 0) === 0) {
+      for (const step of snapshot) {
+        await client.query(
+          `
+          insert into kanban_process_card_steps
+            (kanban_card_id, sequence, process_code, process_name, process_type, applies_to_level, work_center, standard_time, status)
+          values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          on conflict (kanban_card_id, sequence) do nothing
+          `,
+          [
+            card.id,
+            step.sequence,
+            step.code || step.name || `STEP-${step.sequence}`,
+            step.name || step.code || `Step ${step.sequence}`,
+            step.processType || null,
+            step.appliesToLevel || "All",
+            step.workCenter || null,
+            Number(step.standardTime || 0),
+            "pending",
+          ],
+        );
+      }
+    }
+  }
+  return loadKanbanProcessState(client, { kanbanId: key, routingSteps: snapshot.length > 0 ? snapshot : routingSteps });
+};
+
+const appendKanbanProcessLog = async (client, { cardId, stepId = null, action, message = "", payload = {}, operatorId = null } = {}) => {
+  if (!cardId || !action) return;
+  await client.query(
+    `
+    insert into kanban_process_card_logs
+      (kanban_card_id, step_id, action, message, payload, operator_id)
+    values ($1, $2, $3, $4, $5, $6)
+    `,
+    [cardId, stepId, action, message || null, JSON.stringify(payload || {}), operatorId || null],
+  );
+};
+
+const startKanbanProcessStep = async (client, { kanbanId = "", itemRow = null, actionMeta = null, routingSteps = [], userId = null, currentPositionLabel = "", targetLabel = "" } = {}) => {
+  const state = await ensureKanbanProcessCard(client, {
+    kanbanId,
+    itemRow,
+    actionMeta,
+    routingSteps,
+    userId,
+    currentPositionLabel,
+    targetLabel,
+  });
+  const card = state.card;
+  const currentStep = state.currentStep;
+  if (!card || !currentStep) {
+    const error = new Error("Routing step tidak ditemukan.");
+    error.statusCode = 404;
+    throw error;
+  }
+  if (String(card.current_status || "").toLowerCase() === "done") {
+    const error = new Error("Kanban sudah selesai diproses.");
+    error.statusCode = 409;
+    throw error;
+  }
+  const stepResult = await client.query(
+    "select * from kanban_process_card_steps where kanban_card_id = $1 and sequence = $2 limit 1",
+    [card.id, currentStep.sequence],
+  );
+  const stepRow = stepResult.rows[0];
+  if (!stepRow) {
+    const error = new Error("Step proses tidak ditemukan.");
+    error.statusCode = 404;
+    throw error;
+  }
+  await client.query(
+    `
+    update kanban_process_card_steps
+    set status = case when status = 'done' then status else 'started' end,
+        started_at = coalesce(started_at, now()),
+        operator_id = coalesce($1, operator_id),
+        notes = coalesce(notes, '')
+    where id = $2
+    `,
+    [userId || null, stepRow.id],
+  );
+  await client.query(
+    `
+    update kanban_process_cards
+    set current_status = 'in_process',
+      current_step_index = $1,
+        current_step_code = $2,
+        current_step_name = $3,
+        current_work_center = $4,
+        last_scanned_at = now(),
+        updated_by = $5,
+        source_location = coalesce(nullif($6, ''), source_location),
+        target_location = coalesce(nullif($7, ''), target_location),
+        updated_at = now()
+    where id = $8
+    `,
+    [
+      state.currentIndex,
+      currentStep.processCode || null,
+      currentStep.processName || null,
+      currentStep.workCenter || null,
+      userId || null,
+      currentPositionLabel || null,
+      targetLabel || null,
+      card.id,
+    ],
+  );
+  await appendKanbanProcessLog(client, {
+    cardId: card.id,
+    stepId: stepRow.id,
+    action: "start_step",
+    message: `Start step ${currentStep.sequence}`,
+    payload: { kanbanId, currentStep, currentPositionLabel, targetLabel },
+    operatorId: userId || null,
+  });
+  return loadKanbanProcessState(client, { kanbanId, routingSteps: state.steps });
+};
+
+const finishKanbanProcessStep = async (client, { kanbanId = "", itemRow = null, actionMeta = null, routingSteps = [], userId = null, currentPositionLabel = "", targetLabel = "" } = {}) => {
+  const state = await ensureKanbanProcessCard(client, {
+    kanbanId,
+    itemRow,
+    actionMeta,
+    routingSteps,
+    userId,
+    currentPositionLabel,
+    targetLabel,
+  });
+  const card = state.card;
+  const currentStep = state.currentStep;
+  if (!card || !currentStep) {
+    const error = new Error("Routing step tidak ditemukan.");
+    error.statusCode = 404;
+    throw error;
+  }
+  const stepResult = await client.query(
+    "select * from kanban_process_card_steps where kanban_card_id = $1 and sequence = $2 limit 1",
+    [card.id, currentStep.sequence],
+  );
+  const stepRow = stepResult.rows[0];
+  if (!stepRow) {
+    const error = new Error("Step proses tidak ditemukan.");
+    error.statusCode = 404;
+    throw error;
+  }
+  await client.query(
+    `
+    update kanban_process_card_steps
+    set status = 'done',
+        started_at = coalesce(started_at, now()),
+        finished_at = now(),
+        operator_id = coalesce($1, operator_id)
+    where id = $2
+    `,
+    [userId || null, stepRow.id],
+  );
+  const nextStepIndex = state.currentIndex + 1;
+  const nextStep = state.steps[nextStepIndex] || null;
+  if (nextStep) {
+    await client.query(
+      `
+      update kanban_process_cards
+      set current_status = 'waiting',
+          current_step_index = $1,
+          current_step_code = $2,
+          current_step_name = $3,
+          current_work_center = $4,
+          last_scanned_at = now(),
+          updated_by = $5,
+          source_location = coalesce(nullif($6, ''), source_location),
+          target_location = coalesce(nullif($7, ''), target_location),
+          updated_at = now()
+      where id = $8
+      `,
+      [
+        nextStepIndex,
+        nextStep.processCode || null,
+        nextStep.processName || null,
+        nextStep.workCenter || null,
+        userId || null,
+        currentPositionLabel || null,
+        targetLabel || null,
+        card.id,
+      ],
+    );
+  } else {
+    await client.query(
+      `
+      update kanban_process_cards
+      set current_status = 'done',
+          current_step_index = $1,
+          current_step_code = $2,
+          current_step_name = $3,
+          current_work_center = $4,
+          last_scanned_at = now(),
+          updated_by = $5,
+          source_location = coalesce(nullif($6, ''), source_location),
+          target_location = coalesce(nullif($7, ''), target_location),
+          updated_at = now()
+      where id = $8
+      `,
+      [
+        state.currentIndex,
+        currentStep.processCode || null,
+        currentStep.processName || null,
+        currentStep.workCenter || null,
+        userId || null,
+        currentPositionLabel || null,
+        targetLabel || null,
+        card.id,
+      ],
+    );
+  }
+  await appendKanbanProcessLog(client, {
+    cardId: card.id,
+    stepId: stepRow.id,
+    action: "finish_step",
+    message: nextStep ? `Finish step ${currentStep.sequence}, advance to ${nextStep.sequence}` : `Finish final step ${currentStep.sequence}`,
+    payload: { kanbanId, currentStep, nextStep, currentPositionLabel, targetLabel },
+    operatorId: userId || null,
+  });
+  return loadKanbanProcessState(client, { kanbanId, routingSteps: state.steps });
+};
+
+const buildKanbanScanPreview = async (client, { kanbanId = "", itemCode = "", qty = "", area = "" } = {}) => {
+  const rawKanbanId = String(kanbanId || "").trim();
+  let resolvedItemCode = String(itemCode || "").trim();
+  if (!resolvedItemCode && rawKanbanId) {
+    resolvedItemCode = await resolveKanbanItemCode(client, rawKanbanId);
+  }
+  const candidateValues = Array.from(new Set([
+    resolvedItemCode,
+    rawKanbanId,
+    String(rawKanbanId || "").replace(/^(.+?)[-_\/](\d+)(?:[-_\/].*)?$/, "$1").trim(),
+  ].map((value) => String(value || "").trim()).filter(Boolean)));
+  const qtyValue = Number(qty);
+  const masterProcessResult = await client.query(
+    "select code, name, process_type, applies_to_level, work_center, sequence, standard_time from master_processes order by coalesce(sequence, 0) asc, code asc",
+  );
+  const processMap = new Map();
+  masterProcessResult.rows.forEach((row) => {
+    const normalized = {
+      code: String(row.code || "").trim(),
+      name: String(row.name || "").trim(),
+      process_type: String(row.process_type || "").trim(),
+      applies_to_level: normalizeProcessScopeValue(row.applies_to_level),
+      work_center: String(row.work_center || "").trim(),
+      sequence: Number(row.sequence || 0),
+      standard_time: Number(row.standard_time || 0),
+    };
+    [normalized.code, normalized.name, normalized.work_center].forEach((key) => {
+      if (key) processMap.set(buildProcessLookupKey(key), normalized);
+    });
+  });
+  const itemResult = await client.query(
+    `
+    select
+      i.code,
+      i.name,
+      i.part_no,
+      i.type,
+      i.unit,
+      i.model,
+      i.location_id,
+      i.location_name,
+      i.line_production,
+      i.cycle_time_seconds,
+      i.process_flow,
+      i.process_routing,
+      ks.lot_qty,
+      ks.min_qty,
+      ks.max_qty,
+      ks.default_supplier,
+      ks.drop_zone,
+      ml.line_description,
+      ml.category as location_category,
+      mw.id as warehouse_id,
+      mw.name as warehouse_name,
+      mw.type as warehouse_type,
+      mw.site as warehouse_site
+    from items i
+    left join kanban_settings ks on ks.item_code = i.code
+    left join master_locations ml on ml.id = i.location_id
+    left join master_warehouses mw on mw.id = ml.warehouse_id
+    where i.code = any($1::text[])
+       or i.part_no = any($1::text[])
+       or i.name = any($1::text[])
+    limit 1
+    `,
+    [candidateValues],
+  );
+  if (itemResult.rows.length === 0) {
+    const error = new Error("Item tidak ditemukan");
+    error.statusCode = 404;
+    throw error;
+  }
+  const itemRow = itemResult.rows[0];
+  const actionMeta = resolveKanbanActionMeta(itemRow.type || itemRow.category || "");
+  const routingSteps = resolveItemRoutingSteps(itemRow, processMap);
+  const currentPositionCode = String(
+    itemRow.drop_zone
+      || itemRow.line_production
+      || itemRow.location_name
+      || itemRow.line_description
+      || itemRow.warehouse_id
+      || itemRow.location_id
+      || "",
+  ).trim();
+  const currentPositionName = String(
+    itemRow.location_name
+      || itemRow.line_description
+      || itemRow.warehouse_name
+      || itemRow.warehouse_site
+      || itemRow.location_category
+      || "",
+  ).trim();
+  const currentPositionLabel = currentPositionCode && currentPositionName
+    ? `${currentPositionCode} (${currentPositionName})`
+    : currentPositionCode || currentPositionName || "-";
+  const currentPositionSource = itemRow.drop_zone
+    ? { key: "kanban_settings.drop_zone", label: "Drop zone kanban" }
+    : itemRow.line_production
+      ? { key: "items.line_production", label: "Line produksi" }
+      : itemRow.location_name
+        ? { key: "items.location_name", label: "Nama lokasi" }
+        : itemRow.line_description
+          ? { key: "master_locations.line_description", label: "Deskripsi lokasi" }
+          : itemRow.location_id
+            ? { key: "items.location_id", label: "Kode lokasi" }
+            : { key: "unknown", label: "Belum ditentukan" };
+  const nextStep = routingSteps[0] || null;
+  const fallbackQty = Number(itemRow.lot_qty || itemRow.min_qty || 0);
+  const resolvedQty = Number.isFinite(qtyValue) && qtyValue > 0 ? qtyValue : fallbackQty;
+  const processState = await loadKanbanProcessState(client, {
+    kanbanId: rawKanbanId || itemRow.code,
+    routingSteps,
+  });
+  const currentProcessStep = processState.currentStep || nextStep || null;
+  const nextProcessStep = processState.exists
+    ? (processState.nextStep || null)
+    : (routingSteps[1] || null);
+  return {
+    ok: true,
+    kanbanId: rawKanbanId || itemRow.code,
+    itemCode: itemRow.code,
+    itemName: itemRow.name,
+    partNo: itemRow.part_no || "",
+    itemLabel: `${itemRow.code} - ${itemRow.name}`,
+    category: itemRow.type || "",
+    itemCategoryCode: actionMeta.categoryCode,
+    itemCategoryLabel: actionMeta.categoryLabel,
+    actionType: actionMeta.actionType,
+    actionLabel: actionMeta.actionLabel,
+    actionHint: actionMeta.actionHint,
+    nextDestination: actionMeta.nextDestination,
+    qty: Number.isFinite(resolvedQty) && resolvedQty > 0 ? resolvedQty : "",
+    currentPosition: {
+      code: currentPositionCode || "-",
+      name: currentPositionName || "-",
+      label: currentPositionLabel,
+      source: currentPositionSource.key,
+      sourceLabel: currentPositionSource.label,
+    },
+    nextProcess: nextProcessStep ? {
+      code: nextProcessStep.code || "",
+      name: nextProcessStep.name || "",
+      label: nextProcessStep.name || nextProcessStep.code || "-",
+      processType: nextProcessStep.processType || "",
+      appliesToLevel: nextProcessStep.appliesToLevel || "All",
+      workCenter: nextProcessStep.workCenter || "",
+      sequence: Number(nextProcessStep.sequence || 0),
+      standardTime: Number(nextProcessStep.standardTime || 0),
+      status: processState.currentStatus || "waiting",
+    } : null,
+    routingSteps: processState.steps.map((step) => ({
+      code: step.code || "",
+      name: step.name || "",
+      label: step.name || step.code || "-",
+      processType: step.processType || "",
+      appliesToLevel: step.appliesToLevel || "All",
+      workCenter: step.workCenter || "",
+      sequence: Number(step.sequence || 0),
+      standardTime: Number(step.standardTime || 0),
+      status: step.status || "pending",
+    })),
+    routeCount: processState.steps.length,
+    currentProcess: currentProcessStep ? {
+      code: currentProcessStep.code || "",
+      name: currentProcessStep.name || "",
+      label: currentProcessStep.name || currentProcessStep.code || "-",
+      processType: currentProcessStep.processType || "",
+      appliesToLevel: currentProcessStep.appliesToLevel || "All",
+      workCenter: currentProcessStep.workCenter || "",
+      sequence: Number(currentProcessStep.sequence || 0),
+      standardTime: Number(currentProcessStep.standardTime || 0),
+      status: processState.currentStatus || "waiting",
+    } : {
+      code: "-",
+      name: actionMeta.actionLabel || actionMeta.categoryLabel || "Aktivitas",
+      label: actionMeta.actionLabel || actionMeta.categoryLabel || "-",
+      processType: actionMeta.actionType || "",
+      appliesToLevel: "All",
+      workCenter: actionMeta.nextDestination || currentPositionLabel || "",
+      sequence: 0,
+      standardTime: 0,
+      status: actionMeta.actionType || "idle",
+    },
+    processState: {
+      exists: processState.exists,
+      status: processState.currentStatus,
+      currentStepIndex: processState.currentIndex,
+      currentStep: processState.currentStep ? {
+        code: processState.currentStep.code || "",
+        name: processState.currentStep.name || "",
+        label: processState.currentStep.name || processState.currentStep.code || "-",
+        processType: processState.currentStep.processType || "",
+        appliesToLevel: processState.currentStep.appliesToLevel || "All",
+        workCenter: processState.currentStep.workCenter || "",
+        sequence: Number(processState.currentStep.sequence || 0),
+        standardTime: Number(processState.currentStep.standardTime || 0),
+        status: processState.currentStatus || "waiting",
+      } : null,
+      nextStep: processState.nextStep ? {
+        code: processState.nextStep.code || "",
+        name: processState.nextStep.name || "",
+        label: processState.nextStep.name || processState.nextStep.code || "-",
+        processType: processState.nextStep.processType || "",
+        appliesToLevel: processState.nextStep.appliesToLevel || "All",
+        workCenter: processState.nextStep.workCenter || "",
+        sequence: Number(processState.nextStep.sequence || 0),
+        standardTime: Number(processState.nextStep.standardTime || 0),
+      } : null,
+      stepsTotal: processState.steps.length,
+    },
+    note: processState.steps.length > 0 || actionMeta.actionType !== "routing_execution"
+      ? actionMeta.actionHint || ""
+      : "Routing aktif belum ditemukan untuk item ini.",
+    scannedAt: new Date().toISOString(),
+    area: String(area || "").trim(),
+    source: rawKanbanId ? "kanban_qr" : "item_code",
+  };
 };
 
 const getDocumentNumberingConfig = async (client) => {
@@ -5814,52 +7460,59 @@ const getQcStatusList = async (client) => {
 };
 
 const buildDocumentNumber = async (client, table, column, format, context = {}) => {
-  await client.query(`lock table ${table} in share row exclusive mode`);
-  const rawDate = context.date ? new Date(context.date) : new Date();
-  const now = Number.isNaN(rawDate.getTime()) ? new Date() : rawDate;
-  const yearFull = String(now.getFullYear());
-  const yearShort = yearFull.slice(-2);
-  const romanMonths = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"];
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const romanMonth = romanMonths[now.getMonth()];
-  const dept = context.dept || "";
-  const supplier = context.supplier || "";
-  const supplierCode = context.supplierCode || supplier || "";
-  const prefixLabel = context.prefix || "";
-  const vendor = context.vendor || context.supplier || "";
+  const managedTransaction = client?.__auditTxOpen !== true;
+  let committed = false;
+  if (managedTransaction) {
+    await client.query("begin");
+  }
+  try {
+    await client.query(`lock table ${table} in share row exclusive mode`);
+    const rawDate = context.date ? new Date(context.date) : new Date();
+    const now = Number.isNaN(rawDate.getTime()) ? new Date() : rawDate;
+    const yearFull = String(now.getFullYear());
+    const yearShort = yearFull.slice(-2);
+    const romanMonths = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"];
+    const month = String(now.getMonth() + 1).padStart(2, "0");
+    const romanMonth = romanMonths[now.getMonth()];
+    const dept = context.dept || "";
+    const supplier = context.supplier || "";
+    const supplierCode = context.supplierCode || supplier || "";
+    const prefixLabel = context.prefix || "";
+    const vendor = context.vendor || context.supplier || "";
 
-  const resolvedFormat = format && format.includes("{COUNTER}")
-    ? format
-    : `${format || ""}/{COUNTER}`;
-  const counterMatch = resolvedFormat.match(/\{COUNTER(?::(\d+))?\}/i);
-  const counterToken = counterMatch?.[0] || "{COUNTER}";
-  const counterPad = Number(counterMatch?.[1] || 4);
+    const formatWithVars = String(format || "")
+      .replaceAll("{PREFIX}", prefixLabel)
+      .replaceAll("{DEPT}", dept)
+      .replaceAll("{YEAR}", yearFull)
+      .replaceAll("{YY}", yearShort)
+      .replaceAll("{ROMAN_MONTH}", romanMonth)
+      .replaceAll("{MONTH}", month)
+      .replaceAll("{SUPPLIER}", supplier)
+      .replaceAll("{SUPPLIER_CODE}", supplierCode)
+      .replaceAll("{VENDOR}", vendor);
+    const { prefix, suffix, counterPad } = resolveCounterFormatParts(formatWithVars, 4);
 
-  const formatWithVars = resolvedFormat
-    .replaceAll("{PREFIX}", prefixLabel)
-    .replaceAll("{DEPT}", dept)
-    .replaceAll("{YEAR}", yearFull)
-    .replaceAll("{YY}", yearShort)
-    .replaceAll("{ROMAN_MONTH}", romanMonth)
-    .replaceAll("{MONTH}", month)
-    .replaceAll("{SUPPLIER}", supplier)
-    .replaceAll("{SUPPLIER_CODE}", supplierCode)
-    .replaceAll("{VENDOR}", vendor);
-
-  const parts = formatWithVars.split(counterToken);
-  const prefix = parts[0] || "";
-  const suffix = parts[1] || "";
-  const pattern = `^${escapeRegex(prefix)}(\\d+)${escapeRegex(suffix)}$`;
-  const maxResult = await client.query(
-    `select max((regexp_match(${column}, $1))[1])::int as max_counter
-     from ${table}
-     where ${column} ~ $1`,
-    [pattern],
-  );
-  const maxCounter = Number(maxResult.rows[0]?.max_counter || 0);
-  const nextCounter = maxCounter + 1;
-  const counterValue = String(nextCounter).padStart(counterPad, "0");
-  return `${prefix}${counterValue}${suffix}`;
+    const pattern = `^${escapeRegex(prefix)}(\\d+)${escapeRegex(suffix)}$`;
+    const maxResult = await client.query(
+      `select max((regexp_match(${column}, $1))[1])::int as max_counter
+       from ${table}
+       where ${column} ~ $1`,
+      [pattern],
+    );
+    const maxCounter = Number(maxResult.rows[0]?.max_counter || 0);
+    const nextCounter = maxCounter + 1;
+    const counterValue = String(nextCounter).padStart(counterPad, "0");
+    const formattedNumber = `${prefix}${counterValue}${suffix}`.replace(COUNTER_TOKEN_GLOBAL_REGEX, counterValue);
+    if (managedTransaction) {
+      await client.query("commit");
+      committed = true;
+    }
+    return formattedNumber;
+  } finally {
+    if (managedTransaction && !committed) {
+      await client.query("rollback").catch(() => {});
+    }
+  }
 };
 
 const requireFormat = (format, label) => {
@@ -5959,16 +7612,8 @@ const resolveVendorSchedule = async (client, supplierValue) => {
 const buildRequestNumber = async (client, format, itemCode) => {
   await client.query("lock table kanban_requests in share row exclusive mode");
   const baseFormat = requireFormat(format, "Request ID format");
-  const resolvedFormat = baseFormat.includes("{COUNTER}")
-    ? baseFormat
-    : `${baseFormat}/{COUNTER}`;
-  const counterMatch = resolvedFormat.match(/\{COUNTER(?::(\d+))?\}/i);
-  const counterToken = counterMatch?.[0] || "{COUNTER}";
-  const counterPad = Number(counterMatch?.[1] || 3);
-  const formatWithVars = resolvedFormat.replaceAll("{ITEM_ID}", String(itemCode || "").trim());
-  const parts = formatWithVars.split(counterToken);
-  const prefix = parts[0] || "";
-  const suffix = parts[1] || "";
+  const formatWithVars = baseFormat.replaceAll("{ITEM_ID}", String(itemCode || "").trim());
+  const { prefix, suffix, counterPad } = resolveCounterFormatParts(formatWithVars, 3);
   const pattern = `^${escapeRegex(prefix)}(\\d+)${escapeRegex(suffix)}$`;
   const maxResult = await client.query(
     `select max((regexp_match(request_code, $1))[1])::int as max_counter
@@ -5979,7 +7624,7 @@ const buildRequestNumber = async (client, format, itemCode) => {
   const maxCounter = Number(maxResult.rows[0]?.max_counter || 0);
   const nextCounter = maxCounter + 1;
   const counterValue = String(nextCounter).padStart(counterPad, "0");
-  return `${prefix}${counterValue}${suffix}`;
+  return `${prefix}${counterValue}${suffix}`.replace(COUNTER_TOKEN_GLOBAL_REGEX, counterValue);
 };
 
 const getFifoOrderClause = async (client, itemCode, alias = "") => {
@@ -6554,7 +8199,7 @@ const enforceActualLocked = (existing, data, allowUnlock = false) => {
   }
 };
 
-const authenticate = (req, res, next) => {
+const authenticate = async (req, res, next) => {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) {
@@ -6562,15 +8207,56 @@ const authenticate = (req, res, next) => {
     return;
   }
   try {
-    req.user = jwt.verify(token, jwtSecret);
+    await revokeExpiredSessions(pool);
+    const payload = jwt.verify(token, jwtSecret);
+    const sessionId = String(payload?.sid || payload?.jti || "").trim();
+    if (!sessionId) {
+      res.status(401).json({ error: "invalid token" });
+      return;
+    }
+    const sessionResult = await pool.query(
+      `
+      select s.*, u.username, u.role, u.permissions, u.supplier_id
+      from auth_sessions s
+      join users u on u.id = s.user_id
+      where s.session_jti = $1
+        and s.status = 'active'
+        and s.revoked_at is null
+        and s.expires_at > now()
+        and coalesce(s.last_activity_at, s.last_seen_at, s.created_at) > now() - make_interval(mins => $2)
+      limit 1
+      `,
+      [sessionId, SESSION_INACTIVITY_TIMEOUT_MINUTES],
+    );
+    if (sessionResult.rows.length === 0) {
+      res.status(401).json({ error: "session tidak aktif, silakan login ulang" });
+      return;
+    }
+    const sessionRow = sessionResult.rows[0];
+    if (String(sessionRow.username || "") !== String(payload.username || "")) {
+      res.status(401).json({ error: "invalid token" });
+      return;
+    }
+    req.user = {
+      id: sessionRow.user_id,
+      username: sessionRow.username,
+      role: sessionRow.role,
+      permissions: sessionRow.permissions || {},
+      supplierId: sessionRow.supplier_id || null,
+      sessionId: sessionRow.session_jti,
+    };
+    await pool.query(
+      "update auth_sessions set last_seen_at = now(), last_activity_at = now() where id = $1",
+      [sessionRow.id],
+    );
     const store = requestContext.getStore();
     if (store) {
       store.userId = req.user?.id || null;
       store.role = req.user?.role || null;
     }
     next();
-  } catch {
-    res.status(401).json({ error: "invalid token" });
+  } catch (error) {
+    res.status(401).json({ error: error?.name === "TokenExpiredError" ? "session expired" : "invalid token" });
   }
 };
 
@@ -6627,6 +8313,239 @@ const requireNotSupplier = (req, res, next) => {
   next();
 };
 
+const getClientIp = (req) => {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return forwarded || req.ip || req.socket?.remoteAddress || "";
+};
+
+const buildDeviceLabel = (req) => {
+  const userAgent = String(req.headers["user-agent"] || "").trim();
+  if (!userAgent) return "Unknown device";
+  if (userAgent.includes("Windows")) return "Windows";
+  if (userAgent.includes("Android")) return "Android";
+  if (userAgent.includes("iPhone") || userAgent.includes("iPad")) return "iPhone/iPad";
+  if (userAgent.includes("Macintosh")) return "Mac";
+  return userAgent.slice(0, 80);
+};
+
+const revokeExpiredSessions = async (client) => {
+  await client.query(
+    `
+    update auth_sessions
+    set status = case
+          when expires_at <= now() then 'expired'
+          else 'revoked'
+        end,
+        revoked_at = coalesce(revoked_at, now()),
+        revoked_reason = coalesce(
+          revoked_reason,
+          case
+            when expires_at <= now() then 'expired'
+            else 'inactive_timeout'
+          end
+        )
+    where status = 'active'
+      and (
+        expires_at <= now()
+        or coalesce(last_activity_at, last_seen_at, created_at) <= now() - make_interval(mins => $1)
+      )
+    `,
+    [SESSION_INACTIVITY_TIMEOUT_MINUTES],
+  );
+};
+
+const upsertNotification = async (client, notification = {}) => {
+  const userId = Number(notification.userId || notification.user_id || 0);
+  const notificationKey = String(notification.key || notification.notificationKey || "").trim();
+  const title = String(notification.title || "").trim();
+  if (!Number.isFinite(userId) || userId <= 0 || !notificationKey || !title) {
+    return null;
+  }
+  const payload = notification.payload && typeof notification.payload === "object"
+    ? notification.payload
+    : {};
+  const status = String(notification.status || "open").trim().toLowerCase() || "open";
+  const result = await client.query(
+    `
+    insert into notifications
+      (user_id, notification_key, module, severity, title, detail, entity_type, entity_id, payload, status, is_read, read_at, resolved_at, updated_at)
+    values
+      ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+       coalesce($11, false),
+       case when $11 then now() else null end,
+       case when $10 = 'resolved' then now() else null end,
+       now())
+    on conflict (user_id, notification_key)
+    do update set
+      module = excluded.module,
+      severity = excluded.severity,
+      title = excluded.title,
+      detail = excluded.detail,
+      entity_type = excluded.entity_type,
+      entity_id = excluded.entity_id,
+      payload = excluded.payload,
+      status = excluded.status,
+      is_read = case
+        when excluded.is_read then true
+        else notifications.is_read
+      end,
+      read_at = case
+        when excluded.is_read then coalesce(notifications.read_at, now())
+        else notifications.read_at
+      end,
+      resolved_at = case
+        when excluded.status = 'resolved' then coalesce(notifications.resolved_at, now())
+        else notifications.resolved_at
+      end,
+      updated_at = now()
+    returning *
+    `,
+    [
+      userId,
+      notificationKey,
+      String(notification.module || "System"),
+      String(notification.severity || "info"),
+      title,
+      String(notification.detail || ""),
+      notification.entityType || notification.entity_type || null,
+      notification.entityId || notification.entity_id || null,
+      payload,
+      status,
+      Boolean(notification.isRead),
+    ],
+  );
+  return result.rows[0] || null;
+};
+
+const markNotificationResolved = async (client, userId, notificationKey) => {
+  const trimmedKey = String(notificationKey || "").trim();
+  if (!trimmedKey) return null;
+  const result = await client.query(
+    `
+    update notifications
+    set status = 'resolved',
+        resolved_at = coalesce(resolved_at, now()),
+        updated_at = now()
+    where user_id = $1 and notification_key = $2
+    returning *
+    `,
+    [userId, trimmedKey],
+  );
+  return result.rows[0] || null;
+};
+
+const recordActivityNotification = async (client, notification = {}) => {
+  const userId = Number(notification.userId || notification.user_id || 0);
+  const title = String(notification.title || "").trim();
+  if (!Number.isFinite(userId) || userId <= 0 || !title) {
+    return null;
+  }
+  const key = String(notification.key || notification.notificationKey || `activity.${crypto.randomUUID()}`).trim();
+  const payload = notification.payload && typeof notification.payload === "object"
+    ? notification.payload
+    : {};
+  const result = await client.query(
+    `
+    insert into notifications
+      (user_id, notification_key, module, severity, title, detail, entity_type, entity_id, payload, status, is_read, read_at, resolved_at, updated_at)
+    values
+      ($1, $2, $3, $4, $5, $6, $7, $8, $9, coalesce($10, 'open'), coalesce($11, false),
+       case when $11 then now() else null end,
+       case when coalesce($10, 'open') = 'resolved' then now() else null end,
+       now())
+    on conflict (user_id, notification_key) do nothing
+    returning *
+    `,
+    [
+      userId,
+      key,
+      String(notification.module || "Activity"),
+      String(notification.severity || "info"),
+      title,
+      String(notification.detail || ""),
+      notification.entityType || notification.entity_type || null,
+      notification.entityId || notification.entity_id || null,
+      payload,
+      String(notification.status || "open").trim().toLowerCase() || "open",
+      Boolean(notification.isRead),
+    ],
+  );
+  return result.rows[0] || null;
+};
+
+const syncOperationalNotificationsForUser = async (client, userRow) => {
+  if (!userRow?.id) return [];
+  const notifications = [];
+  const role = String(userRow.role || "").trim().toLowerCase();
+  const isSupplier = role === "supplier";
+
+  if (!isSupplier) {
+    const masterCounts = await client.query(`
+      select
+        (select count(*)::int from master_plants) as plants,
+        (select count(*)::int from master_areas) as areas,
+        (select count(*)::int from master_deliveries) as deliveries,
+        (select count(*)::int from master_warehouses) as warehouses,
+        (select count(*)::int from master_vendors) as vendors,
+        (select count(*)::int from items) as items,
+        (select count(*)::int from master_locations) as locations
+    `);
+    const master = masterCounts.rows[0] || {};
+    const isMasterEmpty = [
+      Number(master.plants || 0),
+      Number(master.areas || 0),
+      Number(master.deliveries || 0),
+      Number(master.warehouses || 0),
+      Number(master.vendors || 0),
+      Number(master.items || 0),
+      Number(master.locations || 0),
+    ].every((count) => count === 0);
+    if (isMasterEmpty) {
+      const row = await upsertNotification(client, {
+        userId: userRow.id,
+        key: "system.master-empty",
+        module: "Master Ref",
+        severity: "warning",
+        title: "Master referensi belum lengkap.",
+        detail: "Lengkapi data master agar transaksi lancar.",
+        payload: { source: "auth.me" },
+        status: "open",
+        isRead: false,
+      });
+      if (row) notifications.push(row);
+    } else {
+      const row = await markNotificationResolved(client, userRow.id, "system.master-empty");
+      if (row) notifications.push(row);
+    }
+
+    const soResult = await client.query(
+      "select id, period from so_sessions where status = 'OPEN' order by created_at desc limit 1",
+    );
+    const openSession = soResult.rows[0] || null;
+    if (openSession) {
+      const row = await upsertNotification(client, {
+        userId: userRow.id,
+        key: "system.so-open",
+        module: "Stock Opname",
+        severity: "warning",
+        title: `Stock Opname OPEN (${openSession.period}).`,
+        detail: "Hindari input produksi/receiving sampai session selesai.",
+        entityType: "so_session",
+        entityId: String(openSession.id),
+        payload: { period: openSession.period, sessionId: openSession.id },
+        status: "open",
+        isRead: false,
+      });
+      if (row) notifications.push(row);
+    } else {
+      const row = await markNotificationResolved(client, userRow.id, "system.so-open");
+      if (row) notifications.push(row);
+    }
+  }
+
+  return notifications;
+};
+
 const requireMasterRead = requireAnyPermission("viewMaster", "manageMaster", "manageVendors", "manageItems", "importExport");
 const requireManageMaster = requirePermission("manageMaster");
 const requireManageVendors = requireAnyPermission("manageVendors", "manageMaster");
@@ -6664,10 +8583,72 @@ app.post("/api/auth/login", async (req, res) => {
       return;
     }
     const permissions = normalizePermissions(user.permissions, user.role);
+    const now = new Date();
+    await revokeExpiredSessions(pool);
+    const activeSessionResult = await pool.query(
+      `
+      select id, session_jti, device_label, created_at, last_seen_at, last_activity_at, expires_at
+      from auth_sessions
+      where user_id = $1
+        and status = 'active'
+        and revoked_at is null
+        and expires_at > now()
+      order by last_seen_at desc, created_at desc
+      limit 1
+      `,
+      [user.id],
+    );
+    if (activeSessionResult.rows.length > 0) {
+      const activeSession = activeSessionResult.rows[0];
+      res.status(409).json({
+        error: `Akun ${user.username} masih aktif di perangkat lain (${activeSession.device_label || "unknown device"}) dalam 15 menit terakhir. Logout dulu atau tunggu sesi pasif timeout.`,
+      });
+      return;
+    }
+    const sessionJti = crypto.randomUUID();
+    const expiresIn = "12h";
+    const expiresAt = new Date(now.getTime() + 12 * 60 * 60 * 1000);
+    const deviceLabel = buildDeviceLabel(req);
+    const userAgent = String(req.headers["user-agent"] || "").trim();
+    const ipAddress = getClientIp(req);
+    await pool.query(
+      `
+      insert into auth_sessions
+        (user_id, session_jti, status, device_label, user_agent, ip_address, last_seen_at, last_activity_at, expires_at)
+      values ($1, $2, 'active', $3, $4, $5, now(), now(), $6)
+      `,
+      [user.id, sessionJti, deviceLabel, userAgent || null, ipAddress || null, expiresAt],
+    );
+    await Promise.allSettled([
+      upsertNotification(pool, {
+        userId: user.id,
+        key: `session.login.${sessionJti}`,
+        module: "Auth",
+        severity: "info",
+        title: "Login berhasil.",
+        detail: `Login dari ${deviceLabel}.`,
+        entityType: "auth_session",
+        entityId: sessionJti,
+        payload: { ipAddress, userAgent: userAgent || null },
+        status: "open",
+        isRead: false,
+      }),
+      syncOperationalNotificationsForUser(pool, {
+        id: user.id,
+        role: user.role,
+      }),
+    ]);
     const token = jwt.sign(
-      { id: user.id, username: user.username, role: user.role, permissions, supplierId: user.supplier_id || null },
+      {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        permissions,
+        supplierId: user.supplier_id || null,
+        sid: sessionJti,
+      },
       jwtSecret,
-      { expiresIn: "12h" },
+      { expiresIn },
     );
     res.json({
       token,
@@ -6677,6 +8658,8 @@ app.post("/api/auth/login", async (req, res) => {
         role: user.role,
         permissions,
         supplierId: user.supplier_id || null,
+        sessionId: sessionJti,
+        deviceLabel,
       },
     });
   } catch (error) {
@@ -6684,8 +8667,241 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-app.get("/api/auth/me", authenticate, (req, res) => {
-  res.json({ user: req.user });
+app.get("/api/auth/me", authenticate, async (req, res) => {
+  try {
+    await syncOperationalNotificationsForUser(pool, req.user).catch((error) => {
+      console.warn("syncOperationalNotificationsForUser failed:", error.message);
+    });
+    res.json({ user: req.user });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/auth/logout", authenticate, async (req, res) => {
+  try {
+    const sessionId = String(req.user?.sessionId || req.user?.jti || "").trim();
+    if (sessionId) {
+      await upsertNotification(pool, {
+        userId: req.user.id,
+        key: `session.logout.${sessionId}`,
+        module: "Auth",
+        severity: "info",
+        title: "Logout berhasil.",
+        detail: `Sesi ${sessionId} ditutup.`,
+        entityType: "auth_session",
+        entityId: sessionId,
+        payload: { action: "logout" },
+        status: "open",
+        isRead: false,
+      }).catch((error) => {
+        console.warn("logout notification failed:", error.message);
+      });
+      await pool.query(
+        `
+        update auth_sessions
+        set status = 'revoked',
+            revoked_at = now(),
+            revoked_reason = 'logout'
+        where session_jti = $1
+        `,
+        [sessionId],
+      );
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/auth/change-password", authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const currentPassword = String(req.body?.currentPassword || "").trim();
+    const newPassword = String(req.body?.newPassword || "").trim();
+    if (!currentPassword || !newPassword) {
+      res.status(400).json({ error: "password lama dan password baru wajib diisi" });
+      return;
+    }
+    if (newPassword.length < 6) {
+      res.status(400).json({ error: "password baru minimal 6 karakter" });
+      return;
+    }
+    if (currentPassword === newPassword) {
+      res.status(400).json({ error: "password baru harus berbeda dari password lama" });
+      return;
+    }
+
+    await client.query("begin");
+    const userResult = await client.query(
+      "select id, username, password_hash from users where id = $1 limit 1",
+      [req.user.id],
+    );
+    if (userResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "user tidak ditemukan" });
+      return;
+    }
+    const userRow = userResult.rows[0];
+    const valid = await bcrypt.compare(currentPassword, userRow.password_hash);
+    if (!valid) {
+      await client.query("rollback");
+      res.status(400).json({ error: "password lama tidak sesuai" });
+      return;
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await client.query(
+      `
+      update users
+      set password_hash = $1,
+          updated_at = now()
+      where id = $2
+      `,
+      [passwordHash, req.user.id],
+    );
+    await client.query(
+      `
+      update auth_sessions
+      set status = 'revoked',
+          revoked_at = now(),
+          revoked_reason = 'password_changed'
+      where user_id = $1
+        and status = 'active'
+        and revoked_at is null
+        and session_jti <> $2
+      `,
+      [req.user.id, String(req.user?.sessionId || "")],
+    );
+    await client.query("commit");
+    res.json({ ok: true, message: "Password berhasil diubah." });
+  } catch (error) {
+    try {
+      await client.query("rollback");
+    } catch {}
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/notifications", authenticate, async (req, res) => {
+  try {
+    const rawLimit = Number(req.query.limit);
+    const rawOffset = Number(req.query.offset);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 100) : 20;
+    const offset = Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : 0;
+    const status = String(req.query.status || "all").trim().toLowerCase();
+    const unreadOnly = String(req.query.unread || "").trim() === "1";
+    const moduleFilter = String(req.query.module || "").trim();
+    const filters = ["user_id = $1"];
+    const values = [req.user.id];
+    if (status === "open" || status === "resolved") {
+      values.push(status);
+      filters.push(`status = $${values.length}`);
+    }
+    if (moduleFilter && moduleFilter !== "all") {
+      values.push(moduleFilter);
+      filters.push(`lower(module) = lower($${values.length})`);
+    }
+    if (unreadOnly) {
+      filters.push("is_read = false");
+    }
+    const whereClause = `where ${filters.join(" and ")}`;
+    const rowsResult = await pool.query(
+      `
+      select *
+      from notifications
+      ${whereClause}
+      order by created_at desc, id desc
+      limit $${values.length + 1}
+      offset $${values.length + 2}
+      `,
+      [...values, limit, offset],
+    );
+    const countResult = await pool.query(
+      `
+      select count(*)::int as total
+      from notifications
+      ${whereClause}
+      `,
+      values,
+    );
+    const unreadCountResult = await pool.query(
+      `
+      select count(*)::int as unread_count
+      from notifications
+      where user_id = $1 and is_read = false
+      `,
+      [req.user.id],
+    );
+    res.json({
+      rows: rowsResult.rows,
+      total: Number(countResult.rows[0]?.total || 0),
+      unreadCount: Number(unreadCountResult.rows[0]?.unread_count || 0),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/notifications/unread-count", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "select count(*)::int as unread_count from notifications where user_id = $1 and is_read = false",
+      [req.user.id],
+    );
+    res.json({ unreadCount: Number(result.rows[0]?.unread_count || 0) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/notifications/:id/read", authenticate, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const result = await pool.query(
+      `
+      update notifications
+      set is_read = true,
+          read_at = coalesce(read_at, now()),
+          updated_at = now()
+      where id = $1 and user_id = $2
+      returning *
+      `,
+      [id, req.user.id],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "notifikasi tidak ditemukan" });
+      return;
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/notifications/read-all", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      update notifications
+      set is_read = true,
+          read_at = coalesce(read_at, now()),
+          updated_at = now()
+      where user_id = $1 and is_read = false
+      returning id
+      `,
+      [req.user.id],
+    );
+    res.json({ updated: result.rowCount || 0 });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.get("/api/users", authenticate, requireRole("admin"), async (req, res) => {
@@ -6848,15 +9064,79 @@ app.put("/api/users/:id", authenticate, requireRole("admin"), async (req, res) =
   }
 });
 
+app.post("/api/users/:id/reset-password", authenticate, requireRole("admin"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    await client.query("begin");
+    const userResult = await client.query(
+      "select id, username, role from users where id = $1 limit 1",
+      [id],
+    );
+    if (userResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "user tidak ditemukan" });
+      return;
+    }
+    const targetUser = userResult.rows[0];
+    const passwordHash = await bcrypt.hash(DEFAULT_RESET_PASSWORD, 10);
+    await client.query(
+      `
+      update users
+      set password_hash = $1,
+          updated_at = now()
+      where id = $2
+      `,
+      [passwordHash, id],
+    );
+    await client.query(
+      `
+      update auth_sessions
+      set status = 'revoked',
+          revoked_at = now(),
+          revoked_reason = 'password_reset'
+      where user_id = $1
+        and status = 'active'
+        and revoked_at is null
+        and session_jti <> $2
+      `,
+      [id, String(req.user?.sessionId || "")],
+    );
+    await client.query("commit");
+    res.json({
+      ok: true,
+      userId: targetUser.id,
+      username: targetUser.username,
+      defaultPassword: DEFAULT_RESET_PASSWORD,
+      message: `Password user ${targetUser.username} berhasil direset ke default.`,
+    });
+  } catch (error) {
+    try {
+      await client.query("rollback");
+    } catch {}
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/api/schedules", authenticate, requireNotSupplier, async (req, res) => {
   try {
     const whereClauses = [];
     const filterValues = [];
     const q = String(req.query.q || "").trim().toLowerCase();
-    const status = String(req.query.status || "").trim();
+    const statusRaw = String(req.query.status || "").trim();
+    const statusValues = statusRaw
+      ? Array.from(new Set(statusRaw.split(",").map((value) => String(value || "").trim().toLowerCase()).filter(Boolean)))
+      : [];
     const supplier = String(req.query.supplier || "").trim();
     const start = String(req.query.start || "").trim();
     const end = String(req.query.end || "").trim();
+    const status = statusRaw;
     const order = String(req.query.order || "asc").toLowerCase() === "desc" ? "desc" : "asc";
     const rawLimit = Number(req.query.limit);
     const rawOffset = Number(req.query.offset);
@@ -6913,6 +9193,7 @@ app.get("/api/schedules", authenticate, requireNotSupplier, async (req, res) => 
         or lower(coalesce(i.name, '')) like $${filterValues.length}
         or lower(coalesce(i.part_no, '')) like $${filterValues.length}
         or lower(coalesce(s.do_number, '')) like $${filterValues.length}
+        or lower(coalesce(rs.related_do_numbers, '')) like $${filterValues.length}
       )`);
     }
 
@@ -6939,6 +9220,15 @@ app.get("/api/schedules", authenticate, requireNotSupplier, async (req, res) => 
           end
           limit 1
         ) mv on true
+        left join lateral (
+          select
+            string_agg(distinct nullif(trim(rnh.do_number), ''), ' ') as related_do_numbers
+          from receive_note_items rni
+          join receive_note_headers rnh on rnh.id = rni.rn_id
+          where rni.schedule_id = s.id
+            and rni.line_status = 'posted'
+            and nullif(trim(rnh.do_number), '') is not null
+        ) rs on true
         left join items i on lower(i.code) = lower(coalesce(pl.item_code, s.item_code, s.item))
         ${whereSql}
         `,
@@ -6953,7 +9243,10 @@ app.get("/api/schedules", authenticate, requireNotSupplier, async (req, res) => 
         coalesce(s.supplier_id, ph.supplier_id, s.supplier) as supplier_id,
         ph.supplier_id as po_supplier_id,
         i.name as item_name,
-        coalesce(pl.item_code, s.item_code, s.item) as resolved_item_code
+        coalesce(pl.item_code, s.item_code, s.item) as resolved_item_code,
+        rs.related_do_numbers,
+        rl.latest_do_number,
+        rl.latest_arrival_date
       from schedules s
       left join po_headers ph on ph.po_number = s.po_number
       left join po_lines pl on pl.id = s.po_line_id
@@ -6971,6 +9264,28 @@ app.get("/api/schedules", authenticate, requireNotSupplier, async (req, res) => 
           end
           limit 1
       ) mv on true
+      left join lateral (
+        select
+          string_agg(distinct nullif(trim(rnh.do_number), ''), ' ') as related_do_numbers
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        where rni.schedule_id = s.id
+          and rni.line_status = 'posted'
+          and nullif(trim(rnh.do_number), '') is not null
+      ) rs on true
+      left join lateral (
+        select
+          nullif(trim(rnh.do_number), '') as latest_do_number,
+          coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) as latest_arrival_date
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        where rni.schedule_id = s.id
+          and rni.line_status = 'posted'
+        order by coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) desc nulls last,
+                 rnh.id desc,
+                 rni.id desc
+        limit 1
+      ) rl on true
       left join items i on lower(i.code) = lower(coalesce(pl.item_code, s.item_code, s.item))
       ${whereSql}
     `;
@@ -8377,6 +10692,17 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
     const filterValues = [];
     const q = String(req.query.q || "").trim().toLowerCase();
     const status = String(req.query.status || "").trim();
+    const statusRaw = String(req.query.status || "").trim();
+    const statusValues = statusRaw
+      ? Array.from(
+          new Set(
+            statusRaw
+              .split(",")
+              .map((value) => String(value || "").trim().toLowerCase())
+              .filter(Boolean),
+          ),
+        )
+      : [];
     const rawLimit = Number(req.query.limit);
     const rawOffset = Number(req.query.offset);
     const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 5000) : null;
@@ -8392,27 +10718,36 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
         return;
       }
       filterValues.push(requesterSupplierId);
-      whereClauses.push(`ph.supplier_id = $${filterValues.length}`);
+      whereClauses.push(`lower(trim(ph.supplier_id)) = lower(trim($${filterValues.length}))`);
     }
 
     if (q) {
       filterValues.push(`%${q}%`);
       whereClauses.push(`(
-        lower(ph.po_number) like $${filterValues.length}
-        or lower(ph.supplier_id) like $${filterValues.length}
+        lower(trim(ph.po_number)) like $${filterValues.length}
+        or lower(trim(ph.supplier_id)) like $${filterValues.length}
         or lower(coalesce(mv.name, '')) like $${filterValues.length}
       )`);
     }
-    if (status) {
-      filterValues.push(status);
-      whereClauses.push(`ph.status = $${filterValues.length}`);
+    if (statusValues.length > 0) {
+      filterValues.push(statusValues);
+      whereClauses.push(`lower(trim(ph.status)) = any($${filterValues.length}::text[])`);
     }
 
     const whereSql = whereClauses.length ? ` where ${whereClauses.join(" and ")}` : "";
     let total = null;
     if (wantsMeta) {
       const countResult = await pool.query(
-        `select count(*)::int as total from po_headers ph left join master_vendors mv on mv.id = ph.supplier_id${whereSql}`,
+        `
+        select count(*)::int as total
+        from (
+          select lower(trim(ph.po_number)) as po_key
+          from po_headers ph
+          left join master_vendors mv on mv.id = ph.supplier_id
+          ${whereSql}
+          group by lower(trim(ph.po_number))
+        ) po_group
+        `,
         filterValues,
       );
       total = Number(countResult.rows[0]?.total || 0);
@@ -8427,25 +10762,59 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
           coalesce(sum(request_qty), 0)::numeric as scheduled_qty
         from schedules
         group by lower(trim(po_number))
+      ),
+      po_line_remaining as (
+        select
+          pl.id as po_line_id,
+          greatest(
+            coalesce(pl.qty_order, 0)
+            - coalesce(pl.qty_received, 0)
+            - coalesce((
+              select sum(greatest(s.request_qty - s.received_qty, 0))
+              from schedules s
+              where s.po_line_id = pl.id
+                 or (s.po_line_id is null and s.po_number = pl.po_number and lower(trim(coalesce(s.item_code, s.item))) = lower(trim(pl.item_code)))
+            ), 0),
+            0
+          )::numeric as remaining_after_schedule
+        from po_lines pl
       )
       select
-        ph.po_number,
-        to_char(ph.po_date, 'YYYY-MM-DD') as po_date,
-        ph.supplier_id as supplier_code,
-        mv.name as supplier_name,
-        ph.status,
-        coalesce(sum(pl.qty_order), 0) as total_qty_order,
-        coalesce(sum(pl.qty_received), 0) as total_qty_received,
-        count(pl.id)::int as line_count,
+        po_group.po_number,
+        po_group.po_date,
+        po_group.supplier_code,
+        po_group.supplier_name,
+        po_group.status,
+        po_group.total_qty_order,
+        po_group.total_qty_received,
+        po_group.line_count,
         coalesce(spp.schedule_count, 0)::int as schedule_count,
         coalesce(spp.scheduled_qty, 0) as total_qty_scheduled
-      from po_headers ph
-      left join master_vendors mv on mv.id = ph.supplier_id
-      left join po_lines pl on pl.po_number = ph.po_number
-      left join schedule_per_po spp on lower(trim(ph.po_number)) = spp.po_key
-      ${whereSql}
-      group by ph.po_number, ph.po_date, ph.supplier_id, mv.name, ph.status, spp.schedule_count, spp.scheduled_qty
-      order by ph.po_date desc nulls last, ph.po_number desc
+      from (
+        select
+          lower(trim(ph.po_number)) as po_key,
+          min(ph.po_number) as po_number,
+          max(ph.po_date) as po_date,
+          min(ph.supplier_id) as supplier_code,
+          max(mv.name) as supplier_name,
+          case
+            when bool_or(lower(trim(ph.status)) = 'partial') then 'partial'
+            when bool_or(lower(trim(ph.status)) = 'open') then 'open'
+            else lower(trim(coalesce(max(ph.status), 'open')))
+          end as status,
+          coalesce(sum(pl.qty_order), 0) as total_qty_order,
+          coalesce(sum(pl.qty_received), 0) as total_qty_received,
+          coalesce(sum(plr.remaining_after_schedule), 0) as total_qty_remaining,
+          count(pl.id)::int as line_count
+        from po_headers ph
+        left join master_vendors mv on mv.id = ph.supplier_id
+        left join po_lines pl on pl.po_number = ph.po_number
+        left join po_line_remaining plr on plr.po_line_id = pl.id
+        ${whereSql}
+        group by lower(trim(ph.po_number))
+      ) po_group
+      left join schedule_per_po spp on po_group.po_key = spp.po_key
+      order by po_group.po_date desc nulls last, po_group.po_number desc
     `;
     if (limit) {
       values.push(limit);
@@ -9410,7 +11779,7 @@ app.get("/api/kanban/settings", authenticate, async (req, res) => {
   }
 });
 
-app.post("/api/kanban/settings", authenticate, requireRole("admin"), async (req, res) => {
+app.post("/api/kanban/settings", authenticate, requireManageMaster, async (req, res) => {
   try {
     const {
       itemCode,
@@ -9464,9 +11833,124 @@ app.post("/api/kanban/settings", authenticate, requireRole("admin"), async (req,
         isActive,
       ],
     );
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Kanban",
+      severity: "info",
+      title: `Master kanban ${itemCode} disimpan.`,
+      detail: `Lot ${lotValue}, min ${minValue}, max ${maxValue}.`,
+      entityType: "kanban_setting",
+      entityId: String(itemCode),
+      payload: { itemCode, active: isActive, dropZone: dropZoneValue || null },
+    }).catch((error) => console.warn("Kanban notification failed:", error.message));
     res.json(result.rows[0]);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/kanban/settings/generate-from-items", authenticate, requireManageMaster, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const requestedCodes = Array.isArray(req.body?.itemCodes)
+      ? req.body.itemCodes.map((value) => String(value || '').trim()).filter(Boolean)
+      : [];
+    const requestedCodesUnique = Array.from(new Set(requestedCodes));
+    await client.query("begin");
+    const sourceResult = await client.query(
+      requestedCodesUnique.length > 0
+        ? `
+      select
+        i.code as item_code,
+        coalesce(nullif(i.safety_stock, 0), 0)::numeric as min_qty,
+        greatest(coalesce(nullif(i.pack_qty, 0), nullif(i.order_lot_size, 0), 1), 1)::numeric as lot_qty,
+        coalesce(i.lead_time_days, 0)::integer as lead_time_days,
+        nullif(trim(coalesce(i.vendor_id, i.supplier_name, '')), '') as default_supplier,
+        nullif(trim(coalesce(i.line_production, i.location_name, i.location_id, '')), '') as drop_zone,
+        i.type as item_type
+      from items i
+      left join kanban_settings ks on ks.item_code = i.code
+      where i.code is not null
+        and i.code not ilike 'TEST-%'
+        and i.code = any($1::text[])
+        and ks.item_code is null
+      order by i.code asc
+      `
+        : `
+      select
+        i.code as item_code,
+        coalesce(nullif(i.safety_stock, 0), 0)::numeric as min_qty,
+        greatest(coalesce(nullif(i.pack_qty, 0), nullif(i.order_lot_size, 0), 1), 1)::numeric as lot_qty,
+        coalesce(i.lead_time_days, 0)::integer as lead_time_days,
+        nullif(trim(coalesce(i.vendor_id, i.supplier_name, '')), '') as default_supplier,
+        nullif(trim(coalesce(i.line_production, i.location_name, i.location_id, '')), '') as drop_zone,
+        i.type as item_type
+      from items i
+      left join kanban_settings ks on ks.item_code = i.code
+      where i.code is not null
+        and i.code not ilike 'TEST-%'
+        and ks.item_code is null
+      order by i.code asc
+      `,
+      requestedCodesUnique.length > 0 ? [requestedCodesUnique] : [],
+    );
+
+    let createdCount = 0;
+    const createdItems = [];
+    for (const row of sourceResult.rows) {
+      const minQty = Number(row.min_qty || 0);
+      const lotQty = Math.max(1, Number(row.lot_qty || 0));
+      const maxQty = Math.max(minQty, lotQty * 4);
+      const insertResult = await client.query(
+        `
+        insert into kanban_settings
+          (item_code, min_qty, max_qty, lot_qty, lead_time_days, default_supplier, drop_zone, active, updated_at)
+        values ($1,$2,$3,$4,$5,$6,$7,true, now())
+        on conflict (item_code) do nothing
+        returning item_code
+        `,
+        [
+          row.item_code,
+          minQty,
+          maxQty,
+          lotQty,
+          Number(row.lead_time_days || 0),
+          row.default_supplier || null,
+          row.drop_zone || null,
+        ],
+      );
+      if (insertResult.rows.length > 0) {
+        createdCount += 1;
+        createdItems.push({
+          itemCode: row.item_code,
+          itemType: row.item_type || '',
+        });
+      }
+    }
+
+    await client.query("commit");
+    res.json({
+      requested_count: requestedCodesUnique.length,
+      candidate_count: sourceResult.rows.length,
+      created_count: createdCount,
+      skipped_count: Math.max(0, sourceResult.rows.length - createdCount),
+      created_items: createdItems,
+    });
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Kanban",
+      severity: "info",
+      title: "Sinkron master item ke kanban selesai.",
+      detail: `${createdCount} item baru ditambahkan.`,
+      entityType: "kanban_setting",
+      entityId: "generate-from-items",
+      payload: { requestedCount: requestedCodesUnique.length, createdCount },
+    }).catch((error) => console.warn("Kanban notification failed:", error.message));
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -10085,6 +12569,16 @@ app.post("/api/inbound/receipts/drafts/:id/post", authenticate, requirePermissio
     await client.query("commit");
     clearScheduleCache();
     await autoTriggerKanbanRequests(pool, { note: "auto-trigger (inbound draft post)" });
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Inbound",
+      severity: "success",
+      title: `RN ${result?.header?.rn_number || id} diposting.`,
+      detail: "Penerimaan barang berhasil dipindahkan ke stock.",
+      entityType: "receive_note",
+      entityId: String(id),
+      payload: { allowOverReceive, allowPartial },
+    }).catch((error) => console.warn("Inbound notification failed:", error.message));
     res.json(result);
   } catch (error) {
     await client.query("rollback");
@@ -10109,6 +12603,16 @@ app.post("/api/inbound/receipts/:id/reverse", authenticate, requireRole("admin")
     const result = await reverseReceipt(client, id, req.user, req.body || {});
     await client.query("commit");
     clearScheduleCache();
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Inbound",
+      severity: "warning",
+      title: `RN ${result?.header?.rn_number || id} dibatalkan.`,
+      detail: "Posting penerimaan dibalik.",
+      entityType: "receive_note",
+      entityId: String(id),
+      payload: { action: "reverse" },
+    }).catch((error) => console.warn("Inbound notification failed:", error.message));
     res.json(result);
   } catch (error) {
     await client.query("rollback");
@@ -10225,8 +12729,10 @@ app.get("/api/receive-notes", authenticate, async (req, res) => {
           rn.rn_number,
           rn.dn_id,
           rn.schedule_id,
+          s.po_number,
           coalesce(rn.item_code, kr.item_code, s.item_code, s.item) as item_code,
           i.name as item_name,
+          i.unit as item_unit,
           coalesce(rn.doc_qty, s.request_qty) as expected_qty,
           rn.received_qty,
           rn.qc_status,
@@ -10236,6 +12742,7 @@ app.get("/api/receive-notes", authenticate, async (req, res) => {
           rn.source,
           null::text as truck_no,
           null::text as driver_name,
+          u.username as received_by_name,
           dn.dn_number,
           coalesce(dn.supplier, s.supplier) as supplier,
           s.arrival_date,
@@ -10251,14 +12758,17 @@ app.get("/api/receive-notes", authenticate, async (req, res) => {
         left join kanban_requests kr on kr.id = s.request_id
         left join stock_batches sb on sb.schedule_id = rn.schedule_id
         left join items i on i.code = coalesce(rn.item_code, kr.item_code, s.item_code, s.item)
+        left join users u on u.id = rn.received_by
         union all
         select
           rni.id,
           rnh.rn_number,
           rni.origin_dn_id as dn_id,
           rni.schedule_id,
+          coalesce(rnh.po_number, s.po_number, pl.po_number) as po_number,
           rni.item_code,
           i.name as item_name,
+          i.unit as item_unit,
           coalesce(rni.doc_qty, s.request_qty) as expected_qty,
           rni.received_qty,
           coalesce(rni.qc_status, 'ok') as qc_status,
@@ -10268,6 +12778,7 @@ app.get("/api/receive-notes", authenticate, async (req, res) => {
           coalesce(rnh.source, 'DN_MERGE') as source,
           rnh.truck_no,
           rnh.driver_name,
+          coalesce(up.username, uc.username) as received_by_name,
           dn.dn_number,
           coalesce(dn.supplier, rnh.supplier, s.supplier) as supplier,
           rni.arrival_date,
@@ -10282,6 +12793,9 @@ app.get("/api/receive-notes", authenticate, async (req, res) => {
         left join delivery_notes dn on dn.id = rni.origin_dn_id
         left join schedules s on s.id = rni.schedule_id
         left join items i on i.code = rni.item_code
+        left join po_lines pl on pl.id = rni.po_line_id
+        left join users uc on uc.id = rnh.created_by
+        left join users up on up.id = rnh.posted_by
         where rni.line_status = 'posted'
       ) rn_all
       order by received_at desc, id desc
@@ -10290,6 +12804,253 @@ app.get("/api/receive-notes", authenticate, async (req, res) => {
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/receive-notes/actual", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const body = req.body || {};
+    const supplier = String(body.supplier || "").trim();
+    const poNumber = normalizePoNumber(body.poNumber || body.po_number);
+    const doNumber = normalizeDoNumber(body.doNumber || body.do_number);
+    const arrivalDate = String(body.arrivalDate || body.arrival_date || body.documentDate || body.document_date || "").trim();
+    const truckNo = String(body.truckNo || body.truck_no || "").trim();
+    const driverName = String(body.driverName || body.driver_name || "").trim();
+    const remarks = String(body.remarks || "").trim();
+    const allowOverReceive = Boolean(body.allowOverReceive);
+    const rawItems = Array.isArray(body.items) ? body.items : [];
+
+    if (!supplier) {
+      res.status(400).json({ error: "supplier wajib diisi" });
+      return;
+    }
+    if (!poNumber) {
+      res.status(400).json({ error: "poNumber wajib diisi" });
+      return;
+    }
+    if (!doNumber) {
+      res.status(400).json({ error: "doNumber wajib diisi" });
+      return;
+    }
+    if (!arrivalDate) {
+      res.status(400).json({ error: "arrivalDate wajib diisi" });
+      return;
+    }
+    if (rawItems.length === 0) {
+      res.status(400).json({ error: "items wajib diisi" });
+      return;
+    }
+
+    const groupedItems = new Map();
+    for (const row of rawItems) {
+      const poLineId = parsePositiveId(row.poLineId ?? row.po_line_id);
+      const itemCode = normalizeItemCode(row.itemCode || row.item_code || row.partCode || row.part_code || row.item);
+      const qtyValue = Number(row.qty ?? row.receivedQty ?? row.received_qty ?? row.actualQty ?? row.actual_qty ?? 0);
+      if (!poLineId && !itemCode) {
+        res.status(400).json({ error: "poLineId atau itemCode wajib diisi pada setiap baris item." });
+        return;
+      }
+      if (!Number.isFinite(qtyValue) || qtyValue <= 0) {
+        res.status(400).json({ error: `Qty aktual tidak valid untuk ${itemCode || poLineId}.` });
+        return;
+      }
+      const groupKey = poLineId || itemCode;
+      const current = groupedItems.get(groupKey) || {
+        groupKey,
+        poLineId: poLineId || null,
+        itemCode: itemCode || null,
+        qty: 0,
+        itemName: String(row.itemName || row.item_name || "").trim() || null,
+        partNo: String(row.partNo || row.part_no || "").trim() || null,
+        unit: String(row.unit || "").trim() || null,
+        notes: String(row.notes || "").trim() || null,
+      };
+      current.qty += qtyValue;
+      if (!current.poLineId && poLineId) {
+        current.poLineId = poLineId;
+      }
+      if (!current.itemName && String(row.itemName || row.item_name || "").trim()) {
+        current.itemName = String(row.itemName || row.item_name || "").trim();
+      }
+      if (!current.partNo && String(row.partNo || row.part_no || "").trim()) {
+        current.partNo = String(row.partNo || row.part_no || "").trim();
+      }
+      if (!current.unit && String(row.unit || "").trim()) {
+        current.unit = String(row.unit || "").trim();
+      }
+      groupedItems.set(groupKey, current);
+    }
+
+    await client.query("begin");
+
+    const existingHeader = await findActiveReceiptHeaderBySupplierDoNumber(client, {
+      supplier,
+      doNumber,
+      forUpdate: true,
+    });
+    if (existingHeader) {
+      const existingStatus = normalizeReceiptStatus(existingHeader.status);
+      if (existingStatus === "posted" || existingStatus === "reversed") {
+        await client.query("rollback");
+        res.status(409).json({ error: "Nomor surat jalan ini sudah final." });
+        return;
+      }
+      const existingLineResult = await client.query(
+        "select id from receive_note_items where rn_id = $1 limit 1",
+        [existingHeader.id],
+      );
+      if (existingLineResult.rows.length > 0) {
+        await client.query("rollback");
+        res.status(409).json({ error: "Nomor surat jalan aktif sudah dipakai untuk supplier ini." });
+        return;
+      }
+    }
+
+    const headerPayload = {
+      supplier,
+      poNumber,
+      doNumber,
+      documentDate: arrivalDate,
+      remarks: remarks || null,
+      truckNo: truckNo || null,
+      driverName: driverName || null,
+      source: "ACTUAL_DRIVEN",
+    };
+    const header = existingHeader || await createReceiptDraft(client, headerPayload, req.user);
+    if (existingHeader) {
+      const updatedHeaderResult = await client.query(
+        `
+        update receive_note_headers
+        set
+          source = $1,
+          remarks = coalesce($2, remarks),
+          truck_no = coalesce($3, truck_no),
+          driver_name = coalesce($4, driver_name),
+          document_date = coalesce(document_date, $5),
+          po_number = coalesce(po_number, $6)
+        where id = $7
+        returning *
+        `,
+        ["ACTUAL_DRIVEN", remarks || null, truckNo || null, driverName || null, arrivalDate, poNumber, existingHeader.id],
+      );
+      if (updatedHeaderResult.rows[0]) {
+        Object.assign(header, updatedHeaderResult.rows[0]);
+      }
+    }
+
+    const headerLineCountResult = await client.query(
+      "select count(*)::int as line_count from receive_note_items where rn_id = $1",
+      [header.id],
+    );
+    if (Number(headerLineCountResult.rows[0]?.line_count || 0) > 0) {
+      await client.query("rollback");
+      res.status(409).json({ error: "Nomor surat jalan aktif sudah dipakai untuk supplier ini." });
+      return;
+    }
+
+    const nextLineNoResult = await client.query(
+      "select coalesce(max(line_no), 0) + 1 as next_line_no from receive_note_items where rn_id = $1",
+      [header.id],
+    );
+    let nextLineNo = Number(nextLineNoResult.rows[0]?.next_line_no || 1);
+    const allocationSummary = [];
+
+    for (const item of groupedItems.values()) {
+      const allocationResult = await buildActualDrivenReceiptAllocations(client, {
+        supplier,
+        poNumber,
+        poLineId: item.poLineId,
+        itemCode: item.itemCode,
+        qty: item.qty,
+        allowOverReceive,
+      });
+      const itemAllocations = [];
+      for (const allocation of allocationResult.allocations) {
+        const receiptLine = await upsertReceiptDraftLine(client, header.id, {
+          lineNo: nextLineNo,
+          originDnId: null,
+          itemCode: allocation.itemCode || item.itemCode,
+          itemName: allocation.itemName || item.itemName || null,
+          partNo: allocation.partNo || item.partNo || null,
+          unit: allocation.unit || item.unit || null,
+          packQty: Number.isFinite(Number(allocation.packQty)) ? Number(allocation.packQty) : null,
+          docQty: allocation.outstandingQty,
+          receivedQty: allocation.allocatedQty,
+          arrivalDate,
+          notes: item.notes || remarks || null,
+          scheduleId: allocation.scheduleId,
+          poLineId: allocation.poLineId,
+          qcStatus: "ok",
+          matchBasis: allocation.matchBasis,
+          overrideReason: allocation.overrideReason || null,
+        }, req.user);
+        await insertReceiptAllocationAudit(client, {
+          rnId: header.id,
+          rnItemId: receiptLine.id,
+          supplier,
+          doNumber,
+          poNumber: allocation.poNumber || poNumber,
+          sourceType: allocation.allocationType,
+          scheduleId: allocation.scheduleId,
+          poLineId: allocation.poLineId,
+          itemCode: allocation.itemCode || item.itemCode,
+          plannedDate: allocation.plannedDate || allocation.requestDate || allocation.poDate || arrivalDate,
+          requestDate: allocation.requestDate || null,
+          poDate: allocation.poDate || null,
+          availableBefore: allocation.outstandingQty,
+          allocatedQty: allocation.allocatedQty,
+          availableAfter: Math.max(0, Number(allocation.outstandingQty || 0) - Number(allocation.allocatedQty || 0)),
+        }, req.user);
+        itemAllocations.push({
+          allocationType: allocation.allocationType,
+          scheduleId: allocation.scheduleId,
+          poLineId: allocation.poLineId,
+          poNumber: allocation.poNumber,
+          itemCode: allocation.itemCode,
+          allocatedQty: allocation.allocatedQty,
+          outstandingQty: allocation.outstandingQty,
+          requestDate: allocation.requestDate,
+          poDate: allocation.poDate,
+        });
+        nextLineNo += 1;
+      }
+      allocationSummary.push({
+        poLineId: item.poLineId,
+        itemCode: item.itemCode,
+        requestedQty: item.qty,
+        totalAvailable: allocationResult.totalAvailable,
+        totalAllocated: allocationResult.totalAllocated,
+        remainingQty: allocationResult.remainingQty,
+        allocations: itemAllocations,
+      });
+    }
+
+    const postResult = await postReceiptDraft(client, header.id, req.user, {
+      allowOverReceive,
+      allowPartial: false,
+    });
+
+    await client.query("commit");
+    clearScheduleCache();
+    res.json({
+      ok: true,
+      rnId: header.id,
+      rnNumber: header.rn_number,
+      receiptHeaderId: header.id,
+      doNumber,
+      allocationSummary,
+      postResult,
+    });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({
+      error: error.message,
+      validation: error.validation || null,
+      remainingQty: error.remainingQty ?? null,
+    });
+  } finally {
+    client.release();
   }
 });
 
@@ -10383,6 +13144,16 @@ app.post("/api/so-sessions/start", authenticate, requirePermission("editSchedule
       );
     }
     await client.query("commit");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Stock Opname",
+      severity: "info",
+      title: `Stock Opname ${period} dibuka.`,
+      detail: "Session stock opname aktif.",
+      entityType: "so_session",
+      entityId: String(session.id),
+      payload: { period, status: "OPEN" },
+    }).catch((error) => console.warn("SO notification failed:", error.message));
     res.json(session);
   } catch (error) {
     await client.query("rollback");
@@ -10496,6 +13267,16 @@ app.post("/api/so-sessions/:id/upload", authenticate, requirePermission("editSch
     }
     await client.query("commit");
     clearScheduleCache();
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Stock Opname",
+      severity: "info",
+      title: `Input stock opname ${session.period || id} tersimpan.`,
+      detail: `${items.length} item diperbarui.`,
+      entityType: "so_session",
+      entityId: String(id),
+      payload: { itemsCount: items.length, status: session.status === "OPEN" ? "REVIEW" : session.status },
+    }).catch((error) => console.warn("SO notification failed:", error.message));
     res.json({ ok: true });
   } catch (error) {
     await client.query("rollback");
@@ -10592,6 +13373,16 @@ app.post("/api/so-sessions/:id/finalize", authenticate, requirePermission("editS
     }
     await client.query("update so_sessions set status = 'POSTED' where id = $1", [id]);
     await client.query("commit");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Stock Opname",
+      severity: "success",
+      title: `Stock Opname ${session.period || id} diposting.`,
+      detail: `${itemsResult.rows.length} item terposting ke stock.`,
+      entityType: "so_session",
+      entityId: String(id),
+      payload: { status: "POSTED", itemCount: itemsResult.rows.length },
+    }).catch((error) => console.warn("SO notification failed:", error.message));
     res.json({ ok: true });
   } catch (error) {
     await client.query("rollback");
@@ -11682,6 +14473,16 @@ app.post("/api/kanban/requests", authenticate, async (req, res) => {
     }
     await syncKanbanRequestHealthByIds(client, createdRows.map((row) => row.id), { syncPrlDrafts: true });
     await client.query("commit");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Kanban",
+      severity: "info",
+      title: `Request kanban ${requestCode} dibuat.`,
+      detail: `${splitTotal > 1 ? `${splitTotal} split` : "1 request"} untuk item ${itemCode}.`,
+      entityType: "kanban_request",
+      entityId: String(createdRows[0]?.id || ""),
+      payload: { requestCode, itemCode, requestQty: qtyValue, splitTotal, triggerType: normalizedTrigger },
+    }).catch((error) => console.warn("Kanban notification failed:", error.message));
     res.json(splitTotal > 1 ? { requests: createdRows, request: createdRows[0], splitTotal, requestGroup: requestCode } : createdRows[0]);
   } catch (error) {
     await client.query("rollback");
@@ -11965,6 +14766,16 @@ const handleKanbanEmptyScan = async (req, res) => {
 
     if (isScheduleVendor(vendorInfo.role)) {
       await client.query("commit");
+      void recordActivityNotification(pool, {
+        userId: req.user?.id || null,
+        module: "Kanban",
+        severity: "info",
+        title: `Scan kanban konsumsi ${itemCode}.`,
+        detail: `Qty ${qtyValue} diproses sebagai consumption/issue.`,
+        entityType: "kanban_scan",
+        entityId: String(rawKanbanId || itemCode),
+        payload: { itemCode, qty: qtyValue, actionType: "stock_movement" },
+      }).catch((error) => console.warn("Kanban notification failed:", error.message));
       const responsePayload = {
         ok: true,
         updatedLots: consumedBatches,
@@ -12025,6 +14836,16 @@ const handleKanbanEmptyScan = async (req, res) => {
     const requestId = createdRequests[0]?.id || null;
     const requestCreated = createdRequests.length > 0;
     await client.query("commit");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Kanban",
+      severity: "warning",
+      title: `Scan kanban ${itemCode} memicu request baru.`,
+      detail: `${createdRequests.length} request dibuat dari scan.`,
+      entityType: "kanban_scan",
+      entityId: String(rawKanbanId || itemCode),
+      payload: { itemCode, qty: qtyValue, requestGroup: requestCode, requestCount: createdRequests.length },
+    }).catch((error) => console.warn("Kanban notification failed:", error.message));
     const responsePayload = {
       ok: true,
       updatedLots: consumedBatches,
@@ -12065,6 +14886,112 @@ app.post("/api/kanban/scan", authenticate, requirePermission("editSchedules"), (
   if (!req.body) req.body = {};
   req.body.kanbanId = req.body.kanbanId || req.body.kanban_uuid || req.body.kanban_id || null;
   handleKanbanEmptyScan(req, res);
+});
+
+app.post("/api/kanban/scan-preview", authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const body = req.body || {};
+    const preview = await buildKanbanScanPreview(client, {
+      kanbanId: body.kanbanId || body.kanban_uuid || body.kanban_id || "",
+      itemCode: body.itemCode || body.item_code || "",
+      qty: body.qty ?? body.requestQty ?? body.scanQty ?? "",
+      area: body.area || "",
+    });
+    res.json(preview);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/kanban/process/start", authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const body = req.body || {};
+    const preview = await buildKanbanScanPreview(client, {
+      kanbanId: body.kanbanId || body.kanban_uuid || body.kanban_id || "",
+      itemCode: body.itemCode || body.item_code || "",
+      qty: body.qty ?? body.requestQty ?? "",
+      area: body.area || "",
+    });
+    if (preview.actionType !== "routing_execution") {
+      res.status(409).json({ error: "Item ini tidak memakai routing execution." });
+      return;
+    }
+    await client.query("begin");
+    const state = await startKanbanProcessStep(client, {
+      kanbanId: preview.kanbanId,
+      itemRow: { code: preview.itemCode, type: preview.category },
+      actionMeta: preview,
+      routingSteps: preview.routingSteps,
+      userId: req.user?.id || null,
+      currentPositionLabel: preview.currentPosition?.label || "",
+      targetLabel: preview.nextProcess?.workCenter || preview.nextDestination || "",
+    });
+    await client.query("commit");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Kanban",
+      severity: "info",
+      title: `Proses dimulai untuk ${preview.itemCode}.`,
+      detail: `Next: ${preview.nextProcess?.workCenter || preview.nextDestination || "-"}.`,
+      entityType: "kanban_process",
+      entityId: String(preview.kanbanId || ""),
+      payload: { actionType: preview.actionType, nextProcess: preview.nextProcess || null },
+    }).catch((error) => console.warn("Kanban notification failed:", error.message));
+    res.json({ ok: true, state });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/kanban/process/finish", authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const body = req.body || {};
+    const preview = await buildKanbanScanPreview(client, {
+      kanbanId: body.kanbanId || body.kanban_uuid || body.kanban_id || "",
+      itemCode: body.itemCode || body.item_code || "",
+      qty: body.qty ?? body.requestQty ?? "",
+      area: body.area || "",
+    });
+    if (preview.actionType !== "routing_execution") {
+      res.status(409).json({ error: "Item ini tidak memakai routing execution." });
+      return;
+    }
+    await client.query("begin");
+    const state = await finishKanbanProcessStep(client, {
+      kanbanId: preview.kanbanId,
+      itemRow: { code: preview.itemCode, type: preview.category },
+      actionMeta: preview,
+      routingSteps: preview.routingSteps,
+      userId: req.user?.id || null,
+      currentPositionLabel: preview.currentPosition?.label || "",
+      targetLabel: preview.nextProcess?.workCenter || preview.nextDestination || "",
+    });
+    await client.query("commit");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Kanban",
+      severity: "success",
+      title: `Proses selesai untuk ${preview.itemCode}.`,
+      detail: `Lanjut ke ${preview.nextProcess?.workCenter || preview.nextDestination || "-"}.`,
+      entityType: "kanban_process",
+      entityId: String(preview.kanbanId || ""),
+      payload: { actionType: preview.actionType, nextProcess: preview.nextProcess || null },
+    }).catch((error) => console.warn("Kanban notification failed:", error.message));
+    res.json({ ok: true, state });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
 });
 
 app.post("/api/stock/consume", authenticate, requirePermission("editSchedules"), async (req, res) => {
@@ -12151,6 +15078,16 @@ app.post("/api/kanban/requests/:id/approve", authenticate, requirePermission("ed
     await syncKanbanRequestHealthByIds(client, [id], { syncPrlDrafts: true });
     await createKanbanEvent(client, id, "approved", req.user?.id || null, null);
     await client.query("commit");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Kanban",
+      severity: "success",
+      title: `Request ${requestRow.request_code || id} di-approve.`,
+      detail: `Item ${requestRow.item_code} siap diproses berikutnya.`,
+      entityType: "kanban_request",
+      entityId: String(id),
+      payload: { status: "approved", itemCode: requestRow.item_code },
+    }).catch((error) => console.warn("Kanban notification failed:", error.message));
     res.json(result.rows[0]);
   } catch (error) {
     await client.query("rollback");
@@ -12304,6 +15241,16 @@ app.post("/api/kanban/requests/:id/approve-dn", authenticate, requirePermission(
     await syncKanbanRequestHealthByIds(client, [id], { syncPrlDrafts: true });
     await createKanbanEvent(client, id, "dn_created", req.user?.id || null, { dnId: dn.id });
     await client.query("commit");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Kanban",
+      severity: "info",
+      title: `DN untuk request ${requestRow.request_code || id} dibuat.`,
+      detail: `DN ${dn.dn_number || dn.id} tersimpan.`,
+      entityType: "delivery_note",
+      entityId: String(dn.id),
+      payload: { requestId: id, dnNumber: dn.dn_number || null, supplier: supplierValue },
+    }).catch((error) => console.warn("Kanban notification failed:", error.message));
     res.json(dn);
   } catch (error) {
     await client.query("rollback");
@@ -12339,6 +15286,16 @@ app.post("/api/kanban/requests/:id/reject", authenticate, requirePermission("edi
     await syncKanbanRequestHealthByIds(client, [id], { syncPrlDrafts: true });
     await createKanbanEvent(client, id, "rejected", req.user?.id || null, null);
     await client.query("commit");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Kanban",
+      severity: "warning",
+      title: `Request ${result.rows[0]?.request_code || id} ditolak.`,
+      detail: `Item ${result.rows[0]?.item_code || "-"} tidak dilanjutkan.`,
+      entityType: "kanban_request",
+      entityId: String(id),
+      payload: { status: "rejected" },
+    }).catch((error) => console.warn("Kanban notification failed:", error.message));
     res.json(result.rows[0]);
   } catch (error) {
     await client.query("rollback");
@@ -12411,6 +15368,16 @@ app.post("/api/kanban/requests/:id/close", authenticate, requirePermission("edit
     await syncKanbanRequestHealthByIds(client, [id], { syncPrlDrafts: true });
     await createKanbanEvent(client, id, "closed", req.user?.id || null, null);
     await client.query("commit");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Kanban",
+      severity: "info",
+      title: `Request ${result.rows[0]?.request_code || id} ditutup.`,
+      detail: `Status kanban selesai diproses.`,
+      entityType: "kanban_request",
+      entityId: String(id),
+      payload: { status: "closed" },
+    }).catch((error) => console.warn("Kanban notification failed:", error.message));
     res.json(result.rows[0]);
   } catch (error) {
     await client.query("rollback");
@@ -12653,6 +15620,16 @@ app.post("/api/kanban/requests/:id/create-dn", authenticate, requirePermission("
     await syncKanbanRequestHealthByIds(client, [id], { syncPrlDrafts: true });
     await createKanbanEvent(client, id, "dn_created", req.user?.id || null, { dnId: dn.id });
     await client.query("commit");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Kanban",
+      severity: "info",
+      title: `DN ${dn.dn_number || dn.id} dibuat untuk ${requestRow.request_code || id}.`,
+      detail: `Supplier ${supplier}.`,
+      entityType: "delivery_note",
+      entityId: String(dn.id),
+      payload: { requestId: id, supplier, dnNumber: dn.dn_number || null },
+    }).catch((error) => console.warn("Kanban notification failed:", error.message));
     res.json(dn);
   } catch (error) {
     await client.query("rollback");
@@ -13463,8 +16440,32 @@ app.delete("/api/master/vendors/:id", authenticate, requireManageVendors, async 
 
 app.get("/api/master/items", authenticate, requireMasterRead, async (req, res) => {
   try {
+    const bucket = String(req.query.bucket || req.query.category || '').trim().toLowerCase();
+    const search = String(req.query.q || req.query.search || '').trim().toLowerCase();
     const result = await pool.query("select * from items where code not ilike 'TEST-%' order by code");
-    res.json(result.rows);
+    const matchesBucket = (row) => {
+      if (!bucket) return true;
+      const code = String(row.code || '').trim().toUpperCase();
+      const text = [
+        row.type,
+        row.category,
+        code,
+      ].filter(Boolean).join(' ').toLowerCase();
+      const bucketMap = {
+        fg: [/^fg[-_]/i, /\bfg\b/i, /finished\s*goods?/i, /\bbarang\s*jadi\b/i, /final\s*goods?/i],
+        subassy: [/^sa[-_]/i, /^sub[-_]/i, /\bsub[- ]?assy\b/i, /\bsub[- ]?assembly\b/i, /\bsubassy\b/i],
+        cp: [/^cp[-_]/i, /\bcp\b/i, /child\s*part/i, /childpart/i, /component/i],
+        rm: [/^rm[-_]/i, /\brm\b/i, /raw\s*material/i, /raw\b/i, /bahan\s*baku/i],
+        indirect: [/^im[-_]/i, /\bim\b/i, /indirect\s*material/i, /\bindirect\b/i, /consumable/i],
+      };
+      const patterns = bucketMap[bucket] || [];
+      return patterns.some((pattern) => pattern.test(code) || pattern.test(text));
+    };
+    const filteredRows = result.rows.filter((row) => (
+      matchesBucket(row)
+      && (!search || String(row.code || '').toLowerCase().includes(search) || String(row.name || '').toLowerCase().includes(search))
+    ));
+    res.json(filteredRows);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -13532,7 +16533,7 @@ app.post("/api/master/items/:code/image", authenticate, requireManageItems, uplo
 app.post("/api/master/items", authenticate, requireManageItems, async (req, res) => {
   const client = await pool.connect();
   try {
-    const { code, name, partNo, type, unit, model, weight, price, vendorId, locationId, supplierName, locationName, packingName, lineProduction, imageUrl, imageThumbUrl, shelfLifeDays, shelfLifeMonths, movingStatus, isSeasonal, typePack, packQty, leadTimeDays, cycleTimeSeconds, processFlow, suppliers, customers, orderLotSize, maxDeliveryPerRit } = req.body || {};
+    const { code, name, partNo, type, unit, model, weight, price, vendorId, locationId, supplierName, locationName, packingName, lineProduction, imageUrl, imageThumbUrl, shelfLifeDays, shelfLifeMonths, movingStatus, isSeasonal, typePack, packQty, leadTimeDays, cycleTimeSeconds, processFlow, processRouting, suppliers, customers, orderLotSize, maxDeliveryPerRit } = req.body || {};
     if (!code || !name || !type || !unit) {
       res.status(400).json({ error: "code, name, type, unit wajib diisi" });
       return;
@@ -13553,13 +16554,14 @@ app.post("/api/master/items", authenticate, requireManageItems, async (req, res)
     const cycleTimeValue = Number.isFinite(Number(cycleTimeSeconds))
       ? Math.max(0, Number(cycleTimeSeconds))
       : 0;
-    const processFlowValue = Array.isArray(processFlow)
-      ? processFlow.filter((step) => String(step || "").trim())
-      : [];
+    const processFlowValue = toJsonbArray(
+      normalizeJsonArrayInput(processFlow).filter((step) => String(step || "").trim()),
+    );
+    const processRoutingValue = toJsonbArray(processRouting);
     const result = await client.query(
       `
-      insert into items (code, name, part_no, type, unit, model, weight, price, vendor_id, location_id, supplier_name, location_name, packing_name, line_production, image_url, image_thumb_url, shelf_life_days, shelf_life_months, moving_status, is_seasonal, type_pack, pack_qty, lead_time_days, cycle_time_seconds, order_lot_size, max_delivery_per_rit, process_flow)
-      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+      insert into items (code, name, part_no, type, unit, model, weight, price, vendor_id, location_id, supplier_name, location_name, packing_name, line_production, image_url, image_thumb_url, shelf_life_days, shelf_life_months, moving_status, is_seasonal, type_pack, pack_qty, lead_time_days, cycle_time_seconds, order_lot_size, max_delivery_per_rit, process_flow, process_routing)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
       on conflict (code) do update set
         name = excluded.name,
         part_no = excluded.part_no,
@@ -13586,7 +16588,8 @@ app.post("/api/master/items", authenticate, requireManageItems, async (req, res)
         cycle_time_seconds = excluded.cycle_time_seconds,
         order_lot_size = excluded.order_lot_size,
         max_delivery_per_rit = excluded.max_delivery_per_rit,
-        process_flow = excluded.process_flow
+        process_flow = excluded.process_flow,
+        process_routing = excluded.process_routing
       returning *
       `,
       [
@@ -13617,6 +16620,7 @@ app.post("/api/master/items", authenticate, requireManageItems, async (req, res)
         Number.isFinite(orderLotValue) ? Math.max(0, orderLotValue) : 0,
         Number.isFinite(maxDeliveryValue) ? Math.max(0, maxDeliveryValue) : 0,
         processFlowValue,
+        processRoutingValue,
       ],
     );
     await client.query("delete from item_suppliers where item_code = $1", [code]);
@@ -13731,7 +16735,7 @@ app.put("/api/master/items/bulk-update", authenticate, requireManageItems, async
 app.put("/api/master/items/:code", authenticate, requireManageItems, async (req, res) => {
   const client = await pool.connect();
   try {
-    const { name, partNo, type, unit, model, weight, price, vendorId, locationId, supplierName, locationName, packingName, lineProduction, imageUrl, imageThumbUrl, shelfLifeDays, shelfLifeMonths, movingStatus, isSeasonal, typePack, packQty, leadTimeDays, cycleTimeSeconds, processFlow, suppliers, customers, orderLotSize, maxDeliveryPerRit } = req.body || {};
+    const { name, partNo, type, unit, model, weight, price, vendorId, locationId, supplierName, locationName, packingName, lineProduction, imageUrl, imageThumbUrl, shelfLifeDays, shelfLifeMonths, movingStatus, isSeasonal, typePack, packQty, leadTimeDays, cycleTimeSeconds, processFlow, processRouting, suppliers, customers, orderLotSize, maxDeliveryPerRit } = req.body || {};
     const code = req.params.code;
     if (!code || !name || !type || !unit) {
       res.status(400).json({ error: "code, name, type, unit wajib diisi" });
@@ -13753,11 +16757,12 @@ app.put("/api/master/items/:code", authenticate, requireManageItems, async (req,
     const lineProductionValue = lineProduction === undefined ? null : String(lineProduction || "").trim();
     const leadTimeValue = Number.isFinite(Number(leadTimeDays)) ? Math.max(0, Math.round(Number(leadTimeDays))) : 0;
     const cycleTimeValue = Number.isFinite(Number(cycleTimeSeconds)) ? Math.max(0, Number(cycleTimeSeconds)) : 0;
-    const processFlowValue = Array.isArray(processFlow)
-      ? processFlow.filter((step) => String(step || "").trim())
-      : [];
+    const processFlowValue = toJsonbArray(
+      normalizeJsonArrayInput(processFlow).filter((step) => String(step || "").trim()),
+    );
+    const processRoutingValue = toJsonbArray(processRouting);
     const result = await client.query(
-      "update items set name = $1, part_no = $2, type = $3, unit = $4, model = $5, weight = $6, price = $7, vendor_id = $8, location_id = $9, supplier_name = coalesce($10, supplier_name), location_name = coalesce($11, location_name), packing_name = coalesce($12, packing_name), line_production = coalesce($13, line_production), image_url = $14, image_thumb_url = $15, shelf_life_days = $16, shelf_life_months = $17, moving_status = coalesce($18, moving_status), is_seasonal = coalesce($19, is_seasonal), type_pack = $20, pack_qty = $21, lead_time_days = coalesce($22, lead_time_days), cycle_time_seconds = coalesce($23, cycle_time_seconds), order_lot_size = $24, max_delivery_per_rit = $25, process_flow = coalesce($26, process_flow) where code = $27 returning *",
+      "update items set name = $1, part_no = $2, type = $3, unit = $4, model = $5, weight = $6, price = $7, vendor_id = $8, location_id = $9, supplier_name = coalesce($10, supplier_name), location_name = coalesce($11, location_name), packing_name = coalesce($12, packing_name), line_production = coalesce($13, line_production), image_url = $14, image_thumb_url = $15, shelf_life_days = $16, shelf_life_months = $17, moving_status = coalesce($18, moving_status), is_seasonal = coalesce($19, is_seasonal), type_pack = $20, pack_qty = $21, lead_time_days = coalesce($22, lead_time_days), cycle_time_seconds = coalesce($23, cycle_time_seconds), order_lot_size = $24, max_delivery_per_rit = $25, process_flow = coalesce($26, process_flow), process_routing = coalesce($27, process_routing) where code = $28 returning *",
       [
         name,
         partNo || null,
@@ -13785,6 +16790,7 @@ app.put("/api/master/items/:code", authenticate, requireManageItems, async (req,
         Number.isFinite(orderLotValue) ? Math.max(0, orderLotValue) : 0,
         Number.isFinite(maxDeliveryValue) ? Math.max(0, maxDeliveryValue) : 0,
         processFlowValue,
+        processRoutingValue,
         code,
       ],
     );
@@ -14071,7 +17077,7 @@ app.put("/api/master/packings/:code", authenticate, requireManageMaster, async (
 
   app.get("/api/master/processes", authenticate, requireMasterRead, async (req, res) => {
     try {
-      const result = await pool.query("select * from master_processes order by code");
+      const result = await pool.query("select * from master_processes order by coalesce(sequence, 0) asc, code asc");
       res.json(result.rows);
     } catch (error) {
       res.status(500).json({ error: error.message });
@@ -14080,16 +17086,21 @@ app.put("/api/master/packings/:code", authenticate, requireManageMaster, async (
 
   app.post("/api/master/processes", authenticate, requireManageMaster, async (req, res) => {
     try {
-      const { code, name } = req.body || {};
-      if (!code || !name) {
-        res.status(400).json({ error: "code dan name wajib diisi" });
+      const { code, name, processType, process_type, appliesToLevel, applies_to_level, workCenter, work_center, sequence, standardTime, standard_time } = req.body || {};
+      const normalizedCode = String(code || "").trim();
+      const payloadName = String(name || "").trim();
+      const payloadProcessType = String(processType || process_type || payloadName || "").trim();
+      const payloadAppliesToLevel = String(appliesToLevel || applies_to_level || "All").trim() || "All";
+      const payloadWorkCenter = String(workCenter || work_center || "").trim();
+      const payloadSequence = Number.isFinite(Number(sequence)) ? Math.max(0, Math.round(Number(sequence))) : 0;
+      const payloadStandardTime = Number.isFinite(Number(standardTime ?? standard_time)) ? Math.max(0, Number(standardTime ?? standard_time)) : 0;
+      if (!normalizedCode || !payloadName || !payloadProcessType) {
+        res.status(400).json({ error: "code, name, dan processType wajib diisi" });
         return;
       }
-      const normalizedCode = String(code).trim();
-      const payloadName = String(name).trim();
       const result = await pool.query(
-        "insert into master_processes (code, name) values ($1, $2) returning *",
-        [normalizedCode, payloadName],
+        "insert into master_processes (code, name, process_type, applies_to_level, work_center, sequence, standard_time) values ($1, $2, $3, $4, $5, $6, $7) returning *",
+        [normalizedCode, payloadName, payloadProcessType, payloadAppliesToLevel, payloadWorkCenter, payloadSequence, payloadStandardTime],
       );
       res.json(result.rows[0]);
     } catch (error) {
@@ -14100,14 +17111,20 @@ app.put("/api/master/packings/:code", authenticate, requireManageMaster, async (
   app.put("/api/master/processes/:code", authenticate, requireManageMaster, async (req, res) => {
     try {
       const code = req.params.code;
-      const { name } = req.body || {};
-      if (!code || !name) {
-        res.status(400).json({ error: "code dan name wajib diisi" });
+      const { name, processType, process_type, appliesToLevel, applies_to_level, workCenter, work_center, sequence, standardTime, standard_time } = req.body || {};
+      const payloadName = String(name || "").trim();
+      const payloadProcessType = String(processType || process_type || payloadName || "").trim();
+      const payloadAppliesToLevel = String(appliesToLevel || applies_to_level || "All").trim() || "All";
+      const payloadWorkCenter = String(workCenter || work_center || "").trim();
+      const payloadSequence = Number.isFinite(Number(sequence)) ? Math.max(0, Math.round(Number(sequence))) : 0;
+      const payloadStandardTime = Number.isFinite(Number(standardTime ?? standard_time)) ? Math.max(0, Number(standardTime ?? standard_time)) : 0;
+      if (!code || !payloadName || !payloadProcessType) {
+        res.status(400).json({ error: "code, name, dan processType wajib diisi" });
         return;
       }
       const result = await pool.query(
-        "update master_processes set name = $1 where code = $2 returning *",
-        [name, code],
+        "update master_processes set name = $1, process_type = $2, applies_to_level = $3, work_center = $4, sequence = $5, standard_time = $6 where code = $7 returning *",
+        [payloadName, payloadProcessType, payloadAppliesToLevel, payloadWorkCenter, payloadSequence, payloadStandardTime, code],
       );
       if (result.rows.length === 0) {
         res.status(404).json({ error: "process tidak ditemukan" });
@@ -15180,6 +18197,9 @@ app.get("/api/bom/headers", authenticate, requireMasterRead, async (req, res) =>
         h.parent_code,
         h.bom_version,
         h.effective_date,
+        h.effective_start_date,
+        h.effective_end_date,
+        h.revision_no,
         h.reference,
         h.created_at,
         pi.name as parent_name,
@@ -15211,6 +18231,9 @@ app.get("/api/bom/headers/:id", authenticate, requireMasterRead, async (req, res
         h.parent_code,
         h.bom_version,
         h.effective_date,
+        h.effective_start_date,
+        h.effective_end_date,
+        h.revision_no,
         h.reference,
         h.created_at,
         pi.name as parent_name
@@ -15232,10 +18255,15 @@ app.get("/api/bom/headers/:id", authenticate, requireMasterRead, async (req, res
         b.parent_code,
         b.child_code,
         b.quantity,
+        b.scrap_factor,
+        b.yield_factor,
+        b.position_code,
+        b.substitute_material_codes,
         b.component_description,
         ci.name as child_name,
         ci.type as child_type,
-        ci.unit as child_unit
+        ci.unit as child_unit,
+        b.process_routing
       from master_bom b
       join items ci on ci.code = b.child_code
       where b.header_id = $1
@@ -15252,7 +18280,16 @@ app.get("/api/bom/headers/:id", authenticate, requireMasterRead, async (req, res
 app.post("/api/bom/headers", authenticate, requireManageMaster, async (req, res) => {
   const client = await pool.connect();
   try {
-    const { parentCode, bomVersion = "", effectiveDate, reference = "", lines = [] } = req.body || {};
+    const {
+      parentCode,
+      bomVersion = "",
+      effectiveDate,
+      effectiveStartDate,
+      effectiveEndDate,
+      revisionNo = 1,
+      reference = "",
+      lines = [],
+    } = req.body || {};
     const parentCodeValue = String(parentCode || "").trim();
     if (!parentCodeValue) {
       res.status(400).json({ error: "parentCode wajib diisi" });
@@ -15266,6 +18303,10 @@ app.post("/api/bom/headers", authenticate, requireManageMaster, async (req, res)
       .map((line) => ({
         childCode: String(line?.childCode || "").trim(),
         description: String(line?.description || "").trim(),
+        scrapFactor: Number.isFinite(Number(line?.scrapFactor)) ? Number(line.scrapFactor) : 0,
+        yieldFactor: normalizeYieldFactor(line?.yieldFactor, 1),
+        positionCode: String(line?.positionCode || "").trim(),
+        substituteMaterialCodes: normalizeSubstituteMaterialCodes(line?.substituteMaterialCodes),
       }))
       .filter((line) => line.childCode);
     if (cleanedLines.length === 0) {
@@ -15286,20 +18327,14 @@ app.post("/api/bom/headers", authenticate, requireManageMaster, async (req, res)
     }
 
     await client.query("BEGIN");
-    const headerResult = await client.query(
-      `
-      insert into master_bom_headers (parent_code, bom_version, effective_date, reference)
-      values ($1,$2,$3,$4)
-      returning *
-      `,
-      [
-        parentCodeValue,
-        String(bomVersion || "").trim() || null,
-        effectiveDate ? String(effectiveDate).trim() : null,
-        String(reference || "").trim() || null,
-      ],
-    );
-    const header = headerResult.rows[0];
+    const header = await ensureBomHeader(client, {
+      parentCode: parentCodeValue,
+      bomVersion: String(bomVersion || "").trim() || "",
+      revisionNo,
+      effectiveStartDate: effectiveStartDate || effectiveDate || null,
+      effectiveEndDate: effectiveEndDate || null,
+      reference: String(reference || "").trim() || "",
+    });
     const childCodes = cleanedLines.map((line) => line.childCode);
     const itemResult = await client.query(
       `select code, name from items where code = any($1::text[])`,
@@ -15315,13 +18350,43 @@ app.post("/api/bom/headers", authenticate, requireManageMaster, async (req, res)
           parent_code,
           child_code,
           quantity,
+          scrap_factor,
+          yield_factor,
+          position_code,
+          substitute_material_codes,
           component_description
-        ) values ($1,$2,$3,$4,$5)
+        ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
         `,
-        [header.id, parentCodeValue, line.childCode, 1, description],
+        [
+          header.id,
+          parentCodeValue,
+          line.childCode,
+          1,
+          line.scrapFactor,
+          line.yieldFactor,
+          line.positionCode || null,
+          JSON.stringify(line.substituteMaterialCodes || []),
+          description,
+        ],
       );
     }
     await client.query("COMMIT");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "BOM",
+      severity: "info",
+      title: `BOM parent ${parentCodeValue} disimpan.`,
+      detail: `${cleanedLines.length} komponen tersimpan.`,
+      entityType: "bom_header",
+      entityId: String(header.id),
+      payload: {
+        parentCode: parentCodeValue,
+        bomVersion: String(bomVersion || "").trim() || null,
+        revisionNo: normalizePositiveInteger(revisionNo, 1),
+        effectiveStartDate: normalizeDateOnly(effectiveStartDate || effectiveDate),
+        effectiveEndDate: normalizeDateOnly(effectiveEndDate),
+      },
+    }).catch((error) => console.warn("BOM notification failed:", error.message));
     res.json({ header, lineCount: cleanedLines.length });
   } catch (error) {
     await client.query("ROLLBACK");
@@ -15344,10 +18409,14 @@ app.get("/api/bom", authenticate, requireMasterRead, async (req, res) => {
       `
       select
         b.id,
+        b.header_id,
         b.parent_code,
         b.child_code,
         b.quantity,
         b.scrap_factor,
+        b.yield_factor,
+        b.position_code,
+        b.substitute_material_codes,
         b.component_type,
         b.component_description,
         b.model_spec,
@@ -15356,9 +18425,17 @@ app.get("/api/bom", authenticate, requireMasterRead, async (req, res) => {
         b.packing,
         b.cycle_time_seconds,
         b.process_flow,
+        b.process_routing,
         b.cost_rp,
         b.lead_time_days,
         b.assembly_note,
+        h.bom_version,
+        h.revision_no,
+        h.effective_date,
+        h.effective_start_date,
+        h.effective_end_date,
+        h.reference,
+        h.created_at as header_created_at,
         pi.name as parent_name,
         pi.type as parent_type,
         ci.name as child_name,
@@ -15367,10 +18444,11 @@ app.get("/api/bom", authenticate, requireMasterRead, async (req, res) => {
         ci.weight as child_weight,
         ci.model as child_model
       from master_bom b
+      join master_bom_headers h on h.id = b.header_id
       join items pi on pi.code = b.parent_code
       join items ci on ci.code = b.child_code
       ${whereClause}
-      order by pi.code asc, b.id asc
+      order by pi.code asc, h.revision_no desc nulls last, b.id asc
       `,
       values,
     );
@@ -15386,10 +18464,14 @@ app.get("/api/bom/:parentCode", authenticate, requireMasterRead, async (req, res
     const result = await pool.query(
       `select
         b.id,
+        b.header_id,
         b.parent_code,
         b.child_code,
         b.quantity,
         b.scrap_factor,
+        b.yield_factor,
+        b.position_code,
+        b.substitute_material_codes,
         b.component_type,
         b.component_description,
         b.model_spec,
@@ -15398,18 +18480,27 @@ app.get("/api/bom/:parentCode", authenticate, requireMasterRead, async (req, res
         b.packing,
         b.cycle_time_seconds,
         b.process_flow,
+        b.process_routing,
         b.cost_rp,
         b.lead_time_days,
         b.assembly_note,
+        h.bom_version,
+        h.revision_no,
+        h.effective_date,
+        h.effective_start_date,
+        h.effective_end_date,
+        h.reference,
+        h.created_at as header_created_at,
         i.name as child_name,
         i.type as child_type,
         i.unit as child_unit,
         i.weight as child_weight,
         i.model as child_model
        from master_bom b
+       join master_bom_headers h on h.id = b.header_id
        join items i on i.code = b.child_code
        where b.parent_code = $1
-       order by b.id asc`,
+       order by h.revision_no desc nulls last, b.id asc`,
       [parentCode],
     );
     res.json(result.rows);
@@ -15423,6 +18514,12 @@ app.post("/api/bom", authenticate, requireManageMaster, async (req, res) => {
     const {
       parentCode,
       childCode,
+      headerId = null,
+      bomVersion = "",
+      revisionNo = null,
+      effectiveStartDate = null,
+      effectiveEndDate = null,
+      reference = "",
       componentType = "",
       componentDescription = "",
       modelSpec = "",
@@ -15430,10 +18527,13 @@ app.post("/api/bom", authenticate, requireManageMaster, async (req, res) => {
       supplierName = "",
       packing = "",
       assemblyNote = "",
+      positionCode = "",
       cycleTimeSeconds = null,
       processFlow = [],
+      processRouting = [],
       costRp = null,
       leadTimeDays = null,
+      substituteMaterialCodes = [],
     } = req.body || {};
     if (!parentCode || !childCode) {
       res.status(400).json({ error: "parentCode dan childCode wajib diisi" });
@@ -15450,6 +18550,7 @@ app.post("/api/bom", authenticate, requireManageMaster, async (req, res) => {
     const scrapFactor = Number.isFinite(Number(req.body?.scrapFactor))
       ? Number(req.body?.scrapFactor)
       : 0;
+    const yieldFactor = normalizeYieldFactor(req.body?.yieldFactor, 1);
     if (!Number.isFinite(quantity) || quantity <= 0) {
       res.status(400).json({ error: "quantity harus bernilai numerik lebih dari 0" });
       return;
@@ -15458,22 +18559,31 @@ app.post("/api/bom", authenticate, requireManageMaster, async (req, res) => {
       Number.isFinite(Number(cycleTimeSeconds)) && Number(cycleTimeSeconds) >= 0
         ? Number(cycleTimeSeconds)
         : null;
-    const processedFlow = Array.isArray(processFlow)
-      ? processFlow.filter((step) => String(step || "").trim())
-      : [];
+    const processedFlow = toJsonbArray(
+      normalizeJsonArrayInput(processFlow).filter((step) => String(step || "").trim()),
+    );
+    const processedRouting = toJsonbArray(processRouting);
     const costValue = Number.isFinite(Number(costRp)) ? Number(costRp) : 0;
     const leadTimeValue = Number.isFinite(Number(leadTimeDays)) ? Number(leadTimeDays) : 0;
-    const headerResult = await pool.query(
-      `
-      insert into master_bom_headers (parent_code, bom_version, reference)
-      values ($1,'Legacy','Auto from legacy BOM')
-      on conflict (parent_code, bom_version)
-      do update set parent_code = excluded.parent_code
-      returning id
-      `,
-      [parentCode],
-    );
-    const headerId = headerResult.rows[0]?.id || null;
+    const substituteCodes = normalizeSubstituteMaterialCodes(substituteMaterialCodes);
+    const targetHeaderId = Number.isFinite(Number(headerId)) && Number(headerId) > 0
+      ? Number(headerId)
+      : (
+          revisionNo !== null
+          || effectiveStartDate
+          || effectiveEndDate
+          || String(bomVersion || "").trim()
+          || String(reference || "").trim()
+            ? (await ensureBomHeader(pool, {
+                parentCode,
+                bomVersion,
+                revisionNo: normalizePositiveInteger(revisionNo, 1),
+                effectiveStartDate,
+                effectiveEndDate,
+                reference,
+              }))?.id || null
+            : (await ensureLegacyBomHeader(pool, parentCode))?.id || null
+        );
     const result = await pool.query(
       `
       insert into master_bom (
@@ -15482,6 +18592,9 @@ app.post("/api/bom", authenticate, requireManageMaster, async (req, res) => {
         child_code,
         quantity,
         scrap_factor,
+        yield_factor,
+        position_code,
+        substitute_material_codes,
         component_type,
         component_description,
         model_spec,
@@ -15490,18 +18603,22 @@ app.post("/api/bom", authenticate, requireManageMaster, async (req, res) => {
         packing,
         cycle_time_seconds,
         process_flow,
+        process_routing,
         cost_rp,
         lead_time_days,
         assembly_note
-      ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+      ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
       returning *
       `,
       [
-        headerId,
+        targetHeaderId,
         parentCode,
         childCode,
         quantity,
         scrapFactor,
+        yieldFactor,
+        String(positionCode || "").trim() || null,
+        JSON.stringify(substituteCodes),
         componentType,
         componentDescription,
         modelSpec,
@@ -15510,6 +18627,7 @@ app.post("/api/bom", authenticate, requireManageMaster, async (req, res) => {
         packing,
         cycleSeconds,
         processedFlow,
+        processedRouting,
         costValue,
         leadTimeValue,
         String(assemblyNote || "").trim() || null,
@@ -15517,6 +18635,10 @@ app.post("/api/bom", authenticate, requireManageMaster, async (req, res) => {
     );
     res.json(result.rows[0]);
   } catch (error) {
+    if (error?.code === "23505") {
+      res.status(409).json({ error: "Kombinasi parent dan child sudah ada di revisi BOM yang sama." });
+      return;
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -15525,6 +18647,13 @@ app.put("/api/bom/:id", authenticate, requireManageMaster, async (req, res) => {
   try {
     const id = Number(req.params.id);
     const {
+      parentCode: parentCodeInput = "",
+      headerId = null,
+      bomVersion = "",
+      revisionNo = null,
+      effectiveStartDate = null,
+      effectiveEndDate = null,
+      reference = "",
       childCode,
       componentType = "",
       componentDescription = "",
@@ -15533,10 +18662,13 @@ app.put("/api/bom/:id", authenticate, requireManageMaster, async (req, res) => {
       supplierName = "",
       packing = "",
       assemblyNote = "",
+      positionCode = "",
       cycleTimeSeconds = null,
       processFlow = [],
+      processRouting = [],
       costRp = null,
       leadTimeDays = null,
+      substituteMaterialCodes = [],
     } = req.body || {};
     if (!Number.isFinite(id)) {
       res.status(400).json({ error: "id tidak valid" });
@@ -15553,6 +18685,7 @@ app.put("/api/bom/:id", authenticate, requireManageMaster, async (req, res) => {
     const scrapFactor = Number.isFinite(Number(req.body?.scrapFactor))
       ? Number(req.body?.scrapFactor)
       : 0;
+    const yieldFactor = normalizeYieldFactor(req.body?.yieldFactor, 1);
     if (!Number.isFinite(quantity) || quantity <= 0) {
       res.status(400).json({ error: "quantity harus bernilai numerik lebih dari 0" });
       return;
@@ -15561,35 +18694,80 @@ app.put("/api/bom/:id", authenticate, requireManageMaster, async (req, res) => {
       Number.isFinite(Number(cycleTimeSeconds)) && Number(cycleTimeSeconds) >= 0
         ? Number(cycleTimeSeconds)
         : null;
-    const processedFlow = Array.isArray(processFlow)
-      ? processFlow.filter((step) => String(step || "").trim())
-      : [];
+    const processedFlow = toJsonbArray(
+      normalizeJsonArrayInput(processFlow).filter((step) => String(step || "").trim()),
+    );
+    const processedRouting = toJsonbArray(processRouting);
     const costValue = Number.isFinite(Number(costRp)) ? Number(costRp) : 0;
     const leadTimeValue = Number.isFinite(Number(leadTimeDays)) ? Number(leadTimeDays) : 0;
+    const currentResult = await pool.query(
+      `select id, parent_code, header_id from master_bom where id = $1`,
+      [id],
+    );
+    if (currentResult.rows.length === 0) {
+      res.status(404).json({ error: "BOM tidak ditemukan" });
+      return;
+    }
+    const currentRow = currentResult.rows[0];
+    const parentCode = String(parentCodeInput || currentRow.parent_code || "").trim();
+    if (parentCode === childCode) {
+      res.status(400).json({ error: "Parent dan child tidak boleh sama" });
+      return;
+    }
+    const substituteCodes = normalizeSubstituteMaterialCodes(substituteMaterialCodes);
+    const targetHeaderId = Number.isFinite(Number(headerId)) && Number(headerId) > 0
+      ? Number(headerId)
+      : (
+          revisionNo !== null
+          || effectiveStartDate
+          || effectiveEndDate
+          || String(bomVersion || "").trim()
+          || String(reference || "").trim()
+            ? (await ensureBomHeader(pool, {
+                parentCode,
+                bomVersion,
+                revisionNo: normalizePositiveInteger(revisionNo, 1),
+                effectiveStartDate,
+                effectiveEndDate,
+                reference,
+              }))?.id || null
+            : Number(currentRow.header_id || 0) || (await ensureLegacyBomHeader(pool, parentCode))?.id || null
+        );
     const result = await pool.query(
       `
       update master_bom set
-        child_code = $1,
-        quantity = $2,
-        scrap_factor = $3,
-        component_type = $4,
-        component_description = $5,
-        model_spec = $6,
-        line_production = $7,
-        supplier_name = $8,
-        packing = $9,
-        cycle_time_seconds = $10,
-        process_flow = $11,
-        cost_rp = $12,
-        lead_time_days = $13,
-        assembly_note = $14
-      where id = $15
+        header_id = $1,
+        parent_code = $2,
+        child_code = $3,
+        quantity = $4,
+        scrap_factor = $5,
+        yield_factor = $6,
+        position_code = $7,
+        substitute_material_codes = $8,
+        component_type = $9,
+        component_description = $10,
+        model_spec = $11,
+        line_production = $12,
+        supplier_name = $13,
+        packing = $14,
+        cycle_time_seconds = $15,
+        process_flow = $16,
+        process_routing = $17,
+        cost_rp = $18,
+        lead_time_days = $19,
+        assembly_note = $20
+      where id = $21
       returning *
       `,
       [
+        targetHeaderId,
+        parentCode,
         childCode,
         quantity,
         scrapFactor,
+        yieldFactor,
+        String(positionCode || "").trim() || null,
+        JSON.stringify(substituteCodes),
         componentType,
         componentDescription,
         modelSpec,
@@ -15598,18 +18776,29 @@ app.put("/api/bom/:id", authenticate, requireManageMaster, async (req, res) => {
         packing,
         cycleSeconds,
         processedFlow,
+        processedRouting,
         costValue,
         leadTimeValue,
         String(assemblyNote || "").trim() || null,
         id,
       ],
     );
-    if (result.rows.length === 0) {
-      res.status(404).json({ error: "BOM tidak ditemukan" });
-      return;
-    }
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "BOM",
+      severity: "info",
+      title: `Komponen BOM ${parentCode} > ${childCode} disimpan.`,
+      detail: `Qty ${quantity}.`,
+      entityType: "bom_line",
+      entityId: String(result.rows[0]?.id || ""),
+      payload: { parentCode, childCode, quantity, scrapFactor },
+    }).catch((error) => console.warn("BOM notification failed:", error.message));
     res.json(result.rows[0]);
   } catch (error) {
+    if (error?.code === "23505") {
+      res.status(409).json({ error: "Kombinasi parent dan child sudah ada di revisi BOM yang sama." });
+      return;
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -15622,23 +18811,61 @@ app.delete("/api/bom/:id", authenticate, requireManageMaster, async (req, res) =
       return;
     }
     await pool.query("delete from master_bom where id = $1", [id]);
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "BOM",
+      severity: "warning",
+      title: `BOM line ${id} dihapus.`,
+      detail: "Komponen BOM dihapus dari struktur.",
+      entityType: "bom_line",
+      entityId: String(id),
+      payload: { action: "delete" },
+    }).catch((error) => console.warn("BOM notification failed:", error.message));
     res.json({ ok: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
+app.delete("/api/bom/reset-all", authenticate, requireManageMaster, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const headerCountResult = await client.query("select count(*)::int as count from master_bom_headers");
+    const headerCount = Number(headerCountResult.rows[0]?.count || 0);
+    await client.query("delete from master_bom_headers");
+    await client.query("COMMIT");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "BOM",
+      severity: "warning",
+      title: "Semua BOM direset.",
+      detail: `${headerCount} header BOM dihapus.`,
+      entityType: "bom_header",
+      entityId: "reset-all",
+      payload: { deletedHeaders: headerCount },
+    }).catch((error) => console.warn("BOM notification failed:", error.message));
+    res.json({ ok: true, deletedHeaders: headerCount });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/api/production/requirements", authenticate, requirePermission("production"), async (req, res) => {
   const client = await pool.connect();
   try {
-    const { productCode, qty, supplier } = req.query;
+    const { productCode, qty, supplier, asOfDate } = req.query;
     const qtyNumber = Number(qty);
     if (!productCode || !Number.isFinite(qtyNumber) || qtyNumber <= 0) {
       res.status(400).json({ error: "productCode dan qty wajib diisi" });
       return;
     }
+    const asOfDateValue = normalizeDateOnly(asOfDate) || getTodayDateOnly();
     const requirements = {};
-    await explodeBom(client, productCode, qtyNumber, requirements);
+    await explodeBom(client, productCode, qtyNumber, requirements, [], asOfDateValue);
     const itemCodes = Object.keys(requirements);
     if (itemCodes.length === 0) {
       res.status(400).json({ error: "BOM kosong untuk item ini" });
@@ -15691,17 +18918,21 @@ app.get("/api/production/requirements", authenticate, requirePermission("product
         );
 
     const rows = stockResult.rows.map((row) => {
-      const requiredQty = Number(requirements[row.code] || 0);
+      const requirement = requirements[row.code] || {};
+      const requiredQty = Number(requirement.requiredQty || 0);
       const availableQty = Number(row.available_qty || 0);
       return {
         itemCode: row.code,
         itemName: row.name,
         itemUnit: row.unit,
         itemType: row.type,
+        asOfDate: asOfDateValue,
         requiredQty,
         availableQty,
         safetyStock: Number(row.safety_stock || 0),
         shortage: Math.max(requiredQty - availableQty, 0),
+        positionCodes: Array.from(requirement.positionCodes || []),
+        substituteMaterialCodes: Array.from(requirement.substituteMaterialCodes || []),
       };
     });
     res.json(rows);
@@ -16800,7 +20031,7 @@ app.post("/api/subcon/receipts", authenticate, requirePermission("editSchedules"
     const warehouseId = await ensureSubconWarehouse(client, vendorRow);
 
     const requirements = {};
-    await explodeBom(client, productRow.code, qtyNumber, requirements);
+    await explodeBom(client, productRow.code, qtyNumber, requirements, [], receiptDateValue);
     const itemCodes = Object.keys(requirements);
     if (itemCodes.length === 0) {
       throw new Error("BOM kosong untuk item ini");
@@ -16832,7 +20063,7 @@ app.post("/api/subcon/receipts", authenticate, requirePermission("editSchedules"
       const usedQty = Number(usageResult.rows[0]?.used_qty || 0);
       deliveryRemaining = Math.max(0, Number(linkedDelivery.qty || 0) - usedQty);
       deliveryRemainingRm = deliveryRemaining;
-      const requiredRm = Number(requirements[linkedDelivery.item_code] || 0);
+        const requiredRm = Number(requirements[linkedDelivery.item_code]?.requiredQty || 0);
       if (!requiredRm || requiredRm <= 0) {
         res.status(409).json({ error: "BOM FG tidak menggunakan RM dari DO ini" });
         await client.query("rollback");
@@ -16865,8 +20096,8 @@ app.post("/api/subcon/receipts", authenticate, requirePermission("editSchedules"
     const backflushLines = [];
     const shortages = [];
 
-    for (const [itemCode, requiredQtyRaw] of Object.entries(requirements)) {
-      const requiredQty = Number(requiredQtyRaw || 0);
+    for (const [itemCode, requirement] of Object.entries(requirements)) {
+      const requiredQty = Number(requirement?.requiredQty || 0);
       if (!Number.isFinite(requiredQty) || requiredQty <= 0) continue;
       if (linkedDelivery?.item_code === itemCode && deliveryRemainingRm !== null) {
         const allocQty = Math.min(requiredQty, deliveryRemainingRm);
@@ -17583,6 +20814,592 @@ app.get("/api/reports/inventory-value", authenticate, requirePermission("viewRep
     res.json({ totalValue, rows });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/reports/capacity-planning", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const now = new Date();
+    const fallbackMonth = monthKeyByIndex[now.getMonth()];
+    const rawMonth = String(req.query.month || fallbackMonth).toLowerCase();
+    const allowedMonths = new Set(monthKeyByIndex);
+    const monthKey = allowedMonths.has(rawMonth) ? rawMonth : fallbackMonth;
+    const year = Number(req.query.year) || now.getFullYear();
+    const monthIndex = Math.max(0, monthKeyByIndex.indexOf(monthKey));
+    const startDate = formatDateOnly(new Date(year, monthIndex, 1));
+    const endDate = formatDateOnly(new Date(year, monthIndex + 1, 0));
+
+    const [prlResult, itemResult, processResult, bomResult] = await Promise.all([
+      pool.query(
+        `
+        select
+          pr.item_code,
+          coalesce(i.name, pr.description, pr.item_code) as item_name,
+          coalesce(i.type, pr.type_pack, '') as item_type,
+          coalesce(i.process_flow, '[]'::jsonb) as process_flow,
+          coalesce(i.process_routing, '[]'::jsonb) as process_routing,
+          case
+            when (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+              then (pr.months ->> $2)::numeric
+            else 0
+          end as plan_qty
+        from prl_records pr
+        left join items i on i.code = pr.item_code
+        where pr.year = $1
+          and pr.item_code not ilike 'TEST-%'
+          and (
+            case
+              when (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+                then (pr.months ->> $2)::numeric
+              else 0
+            end
+          ) > 0
+        order by pr.item_code asc
+        `,
+        [year, monthKey],
+      ),
+      pool.query(
+        "select code, name, type, line_production, cycle_time_seconds, process_flow, process_routing from items where code not ilike 'TEST-%' order by code asc",
+      ),
+      pool.query(
+        "select code, name, process_type, applies_to_level, work_center, sequence, standard_time from master_processes order by coalesce(sequence, 0) asc, code asc",
+      ),
+      pool.query(
+        "select parent_code, child_code, quantity, scrap_factor from master_bom order by parent_code asc, child_code asc",
+      ),
+    ]);
+
+    const itemMap = new Map();
+    itemResult.rows.forEach((row) => {
+      itemMap.set(String(row.code || "").trim(), row);
+    });
+
+    const demandItemMap = new Map();
+    prlResult.rows.forEach((row) => {
+      demandItemMap.set(String(row.item_code || "").trim(), row);
+    });
+
+    const processMap = new Map();
+    processResult.rows.forEach((row) => {
+      const normalized = {
+        code: String(row.code || "").trim(),
+        name: String(row.name || "").trim(),
+        process_type: String(row.process_type || "").trim(),
+        applies_to_level: normalizeProcessScopeValue(row.applies_to_level),
+        work_center: String(row.work_center || "").trim(),
+        sequence: Number(row.sequence || 0),
+        standard_time: Number(row.standard_time || 0),
+      };
+      [normalized.code, normalized.name].forEach((key) => {
+        if (key) processMap.set(buildProcessLookupKey(key), normalized);
+      });
+    });
+
+    const bomChildrenMap = new Map();
+    bomResult.rows.forEach((row) => {
+      const parentCode = String(row.parent_code || "").trim();
+      const childCode = String(row.child_code || "").trim();
+      if (!parentCode || !childCode) return;
+      if (!bomChildrenMap.has(parentCode)) bomChildrenMap.set(parentCode, []);
+      bomChildrenMap.get(parentCode).push({
+        childCode,
+        quantity: Number(row.quantity || 0),
+        scrapFactor: Number(row.scrap_factor || 0),
+      });
+    });
+
+    const itemStatsMap = new Map();
+
+    const addItemStats = (itemCode, itemRow, quantity) => {
+      const normalizedCode = String(itemCode || "").trim();
+      if (!normalizedCode || !itemRow || quantity <= 0) return;
+      const routingSteps = resolveItemRoutingSteps(itemRow, processMap);
+      if (routingSteps.length === 0) return;
+      const unitLeadTimeSeconds = routingSteps.reduce((sum, step) => sum + Number(step.standardTime || 0), 0);
+      const loadSeconds = unitLeadTimeSeconds * quantity;
+      const existing = itemStatsMap.get(normalizedCode) || {
+        itemCode: normalizedCode,
+        itemName: String(itemRow.name || normalizedCode).trim(),
+        itemType: String(itemRow.type || "").trim(),
+        demandQty: 0,
+        unitLeadTimeSeconds,
+        loadSeconds: 0,
+        routingSteps: [],
+        workCenterLoads: new Map(),
+        workCenterStepCounts: new Map(),
+        workCenterProcessNames: new Map(),
+      };
+      existing.itemName = String(itemRow.name || existing.itemName || normalizedCode).trim();
+      existing.itemType = String(itemRow.type || existing.itemType || "").trim();
+      existing.demandQty += quantity;
+      existing.unitLeadTimeSeconds = Math.max(existing.unitLeadTimeSeconds || 0, unitLeadTimeSeconds);
+      existing.loadSeconds += loadSeconds;
+      if (existing.routingSteps.length === 0) {
+        existing.routingSteps = routingSteps;
+      }
+      routingSteps.forEach((step) => {
+        const workCenter = String(step.workCenter || "UNASSIGNED").trim() || "UNASSIGNED";
+        const stepLoad = Number(step.standardTime || 0) * quantity;
+        existing.workCenterLoads.set(workCenter, (existing.workCenterLoads.get(workCenter) || 0) + stepLoad);
+        existing.workCenterStepCounts.set(workCenter, (existing.workCenterStepCounts.get(workCenter) || 0) + 1);
+        if (!existing.workCenterProcessNames.has(workCenter)) {
+          existing.workCenterProcessNames.set(workCenter, new Set());
+        }
+        existing.workCenterProcessNames.get(workCenter).add(String(step.name || step.code || "").trim());
+      });
+      itemStatsMap.set(normalizedCode, existing);
+    };
+
+    const visitItem = (itemCode, quantity, stack = []) => {
+      const normalizedCode = String(itemCode || "").trim();
+      const qtyValue = Number(quantity || 0);
+      if (!normalizedCode || !Number.isFinite(qtyValue) || qtyValue <= 0) return;
+      if (stack.includes(normalizedCode)) return;
+      const itemRow = itemMap.get(normalizedCode) || demandItemMap.get(normalizedCode) || null;
+      if (itemRow) {
+        addItemStats(normalizedCode, itemRow, qtyValue);
+      }
+      const children = bomChildrenMap.get(normalizedCode) || [];
+      children.forEach((child) => {
+        const childQty = qtyValue * Number(child.quantity || 0) * (1 + (Number(child.scrapFactor || 0) / 100));
+        if (childQty > 0) {
+          visitItem(child.childCode, childQty, [...stack, normalizedCode]);
+        }
+      });
+    };
+
+    prlResult.rows.forEach((row) => {
+      const itemCode = String(row.item_code || "").trim();
+      const planQty = Number(row.plan_qty || 0);
+      if (!itemCode || planQty <= 0) return;
+      visitItem(itemCode, planQty, []);
+    });
+
+    const workCenterMap = new Map();
+    let totalDemandQty = 0;
+    let totalUnitLeadTimeSeconds = 0;
+    itemStatsMap.forEach((stats) => {
+      totalDemandQty += Number(stats.demandQty || 0);
+      totalUnitLeadTimeSeconds += Number(stats.unitLeadTimeSeconds || 0);
+      stats.workCenterLoads.forEach((loadSeconds, workCenter) => {
+        const normalizedWorkCenter = String(workCenter || "UNASSIGNED").trim() || "UNASSIGNED";
+        const existing = workCenterMap.get(normalizedWorkCenter) || {
+          workCenter: normalizedWorkCenter,
+          itemCount: 0,
+          demandQty: 0,
+          processCount: 0,
+          loadSeconds: 0,
+          processNames: new Set(),
+        };
+        existing.itemCount += 1;
+        existing.demandQty += Number(stats.demandQty || 0);
+        existing.processCount += Number(stats.workCenterStepCounts.get(normalizedWorkCenter) || 0);
+        existing.loadSeconds += Number(loadSeconds || 0);
+        const processNames = stats.workCenterProcessNames.get(normalizedWorkCenter) || new Set();
+        processNames.forEach((processName) => existing.processNames.add(processName));
+        workCenterMap.set(normalizedWorkCenter, existing);
+      });
+    });
+
+    const rows = Array.from(itemStatsMap.values())
+      .map((stats) => {
+        const workCenters = Array.from(stats.workCenterLoads.entries())
+          .map(([workCenter, loadSeconds]) => ({
+            workCenter,
+            loadSeconds: Math.round((Number(loadSeconds || 0) + Number.EPSILON) * 100) / 100,
+            loadHours: Math.round(((Number(loadSeconds || 0) / 3600) + Number.EPSILON) * 100) / 100,
+          }))
+          .sort((left, right) => Number(right.loadSeconds || 0) - Number(left.loadSeconds || 0) || String(left.workCenter || "").localeCompare(String(right.workCenter || "")));
+        return {
+          itemCode: stats.itemCode,
+          itemName: stats.itemName,
+          itemType: stats.itemType || "-",
+          demandQty: Math.round((Number(stats.demandQty || 0) + Number.EPSILON) * 100) / 100,
+          unitLeadTimeSeconds: Math.round((Number(stats.unitLeadTimeSeconds || 0) + Number.EPSILON) * 100) / 100,
+          unitLeadTimeHours: Math.round(((Number(stats.unitLeadTimeSeconds || 0) / 3600) + Number.EPSILON) * 100) / 100,
+          loadSeconds: Math.round((Number(stats.loadSeconds || 0) + Number.EPSILON) * 100) / 100,
+          loadHours: Math.round(((Number(stats.loadSeconds || 0) / 3600) + Number.EPSILON) * 100) / 100,
+          routingSummary: stats.routingSteps
+            .map((step) => {
+              const workCenter = String(step.workCenter || "UNASSIGNED").trim() || "UNASSIGNED";
+              const standardTime = Number(step.standardTime || 0);
+              return `${workCenter} ${standardTime}s`;
+            })
+            .join(" → "),
+          workCenters,
+        };
+      })
+      .sort((left, right) => Number(right.loadSeconds || 0) - Number(left.loadSeconds || 0) || String(left.itemCode || "").localeCompare(String(right.itemCode || "")));
+
+    const workCenters = Array.from(workCenterMap.values())
+      .map((stats) => ({
+        workCenter: stats.workCenter,
+        itemCount: stats.itemCount,
+        demandQty: Math.round((Number(stats.demandQty || 0) + Number.EPSILON) * 100) / 100,
+        processCount: stats.processCount,
+        loadSeconds: Math.round((Number(stats.loadSeconds || 0) + Number.EPSILON) * 100) / 100,
+        loadHours: Math.round(((Number(stats.loadSeconds || 0) / 3600) + Number.EPSILON) * 100) / 100,
+        processNames: Array.from(stats.processNames).sort((left, right) => String(left).localeCompare(String(right))),
+      }))
+      .sort((left, right) => Number(right.loadSeconds || 0) - Number(left.loadSeconds || 0) || String(left.workCenter || "").localeCompare(String(right.workCenter || "")));
+
+    const totalLoadSeconds = rows.reduce((sum, row) => sum + Number(row.loadSeconds || 0), 0);
+    const summary = {
+      totalDemandQty: Math.round((Number(totalDemandQty || 0) + Number.EPSILON) * 100) / 100,
+      routedItems: rows.length,
+      workCenters: workCenters.length,
+      totalLoadSeconds: Math.round((totalLoadSeconds + Number.EPSILON) * 100) / 100,
+      totalLoadHours: Math.round(((totalLoadSeconds / 3600) + Number.EPSILON) * 100) / 100,
+      avgUnitLeadTimeHours: rows.length > 0
+        ? Math.round((((totalUnitLeadTimeSeconds / rows.length) / 3600) + Number.EPSILON) * 100) / 100
+        : 0,
+    };
+
+    res.json({
+      period: {
+        monthKey,
+        year,
+        start: startDate,
+        end: endDate,
+        label: `${monthKey.toUpperCase()} ${year}`,
+      },
+      summary,
+      workCenters,
+      rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal memuat laporan capacity planning." });
+  }
+});
+
+app.get("/api/reports/capacity-planning-daily", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const now = new Date();
+    const fallbackMonth = monthKeyByIndex[now.getMonth()];
+    const rawMonth = String(req.query.month || fallbackMonth).toLowerCase();
+    const allowedMonths = new Set(monthKeyByIndex);
+    const monthKey = allowedMonths.has(rawMonth) ? rawMonth : fallbackMonth;
+    const year = Number(req.query.year) || now.getFullYear();
+    const monthIndex = Math.max(0, monthKeyByIndex.indexOf(monthKey));
+    const startDate = formatDateOnly(new Date(year, monthIndex, 1));
+    const endDate = formatDateOnly(new Date(year, monthIndex + 1, 0));
+
+    const [scheduleResult, productionResult, itemResult, processResult, bomResult] = await Promise.all([
+      pool.query(
+        `
+        select
+          coalesce(nullif(s.item_code, ''), nullif(s.item, '')) as item_code,
+          coalesce(s.request_date, current_date) as effective_date,
+          coalesce(s.request_qty, 0)::numeric as qty
+        from schedules s
+        where s.request_date >= $1::date
+          and s.request_date <= $2::date
+          and coalesce(s.request_qty, 0) > 0
+          and coalesce(nullif(s.item_code, ''), nullif(s.item, '')) is not null
+        order by s.request_date asc, coalesce(s.item_code, s.item) asc, s.id asc
+        `,
+        [startDate, endDate],
+      ),
+      pool.query(
+        `
+        select
+          po.product_code as item_code,
+          coalesce(po.production_date, po.created_at::date) as effective_date,
+          coalesce(po.qty, 0)::numeric as qty
+        from production_orders po
+        where coalesce(po.production_date, po.created_at::date) >= $1::date
+          and coalesce(po.production_date, po.created_at::date) <= $2::date
+          and coalesce(po.qty, 0) > 0
+          and coalesce(nullif(po.product_code, ''), nullif(po.product_code, '')) is not null
+        order by coalesce(po.production_date, po.created_at::date) asc, po.product_code asc, po.id asc
+        `,
+        [startDate, endDate],
+      ),
+      pool.query(
+        "select code, name, type, line_production, cycle_time_seconds, process_flow, process_routing from items where code not ilike 'TEST-%' order by code asc",
+      ),
+      pool.query(
+        "select code, name, process_type, applies_to_level, work_center, sequence, standard_time from master_processes order by coalesce(sequence, 0) asc, code asc",
+      ),
+      pool.query(
+        "select parent_code, child_code, quantity, scrap_factor from master_bom order by parent_code asc, child_code asc",
+      ),
+    ]);
+
+    const itemLookupMap = new Map();
+    itemResult.rows.forEach((row) => {
+      const code = String(row.code || "").trim();
+      const name = String(row.name || "").trim();
+      if (code) itemLookupMap.set(buildProcessLookupKey(code), row);
+      if (name) itemLookupMap.set(buildProcessLookupKey(name), row);
+    });
+
+    const processMap = new Map();
+    processResult.rows.forEach((row) => {
+      const normalized = {
+        code: String(row.code || "").trim(),
+        name: String(row.name || "").trim(),
+        process_type: String(row.process_type || "").trim(),
+        applies_to_level: normalizeProcessScopeValue(row.applies_to_level),
+        work_center: String(row.work_center || "").trim(),
+        sequence: Number(row.sequence || 0),
+        standard_time: Number(row.standard_time || 0),
+      };
+      [normalized.code, normalized.name].forEach((key) => {
+        if (key) itemLookupMap.set(`process:${buildProcessLookupKey(key)}`, normalized);
+      });
+    });
+
+    const bomChildrenMap = new Map();
+    bomResult.rows.forEach((row) => {
+      const parentCode = String(row.parent_code || "").trim();
+      const childCode = String(row.child_code || "").trim();
+      if (!parentCode || !childCode) return;
+      if (!bomChildrenMap.has(parentCode)) bomChildrenMap.set(parentCode, []);
+      bomChildrenMap.get(parentCode).push({
+        childCode,
+        quantity: Number(row.quantity || 0),
+        scrapFactor: Number(row.scrap_factor || 0),
+      });
+    });
+
+    const itemStatsMap = new Map();
+    const workCenterMap = new Map();
+    const dailyMap = new Map();
+    const workCenterDailyMap = new Map();
+
+    const resolveItem = (value) => {
+      const key = String(value || "").trim();
+      if (!key) return null;
+      return itemLookupMap.get(buildProcessLookupKey(key)) || null;
+    };
+
+    const ensureItemStats = (itemCode, itemRow) => {
+      const normalizedCode = String(itemCode || "").trim();
+      if (!normalizedCode || !itemRow) return null;
+      if (!itemStatsMap.has(normalizedCode)) {
+        itemStatsMap.set(normalizedCode, {
+          itemCode: normalizedCode,
+          itemName: String(itemRow.name || normalizedCode).trim(),
+          itemType: String(itemRow.type || "").trim(),
+          plannedQty: 0,
+          actualQty: 0,
+          plannedLoadSeconds: 0,
+          actualLoadSeconds: 0,
+          unitLeadTimeSeconds: 0,
+          routingSteps: [],
+          workCenterLoads: new Map(),
+        });
+      }
+      return itemStatsMap.get(normalizedCode);
+    };
+
+    const ensureDailyEntry = (dateKey) => {
+      const normalizedDate = String(dateKey || "").slice(0, 10);
+      if (!normalizedDate) return null;
+      if (!dailyMap.has(normalizedDate)) {
+        dailyMap.set(normalizedDate, {
+          date: normalizedDate,
+          plannedQty: 0,
+          actualQty: 0,
+          plannedLoadSeconds: 0,
+          actualLoadSeconds: 0,
+        });
+      }
+      return dailyMap.get(normalizedDate);
+    };
+
+    const ensureWorkCenterDailyEntry = (dateKey, workCenter) => {
+      const normalizedDate = String(dateKey || "").slice(0, 10);
+      const normalizedWorkCenter = String(workCenter || "UNASSIGNED").trim() || "UNASSIGNED";
+      const mapKey = `${normalizedDate}::${normalizedWorkCenter}`;
+      if (!workCenterDailyMap.has(mapKey)) {
+        workCenterDailyMap.set(mapKey, {
+          date: normalizedDate,
+          workCenter: normalizedWorkCenter,
+          plannedQty: 0,
+          actualQty: 0,
+          plannedLoadSeconds: 0,
+          actualLoadSeconds: 0,
+        });
+      }
+      return workCenterDailyMap.get(mapKey);
+    };
+
+    const recordRoutingLoad = (itemCode, qty, dateKey, source, stack = []) => {
+      const normalizedCode = String(itemCode || "").trim();
+      const quantity = Number(qty || 0);
+      if (!normalizedCode || !Number.isFinite(quantity) || quantity <= 0) return;
+      if (stack.includes(normalizedCode)) return;
+      const itemRow = resolveItem(normalizedCode);
+      if (!itemRow) return;
+
+      const routingSteps = resolveItemRoutingSteps(itemRow, processMap);
+      if (routingSteps.length === 0) return;
+
+      const stats = ensureItemStats(normalizedCode, itemRow);
+      if (!stats) return;
+
+      const unitLeadTimeSeconds = routingSteps.reduce((sum, step) => sum + Number(step.standardTime || 0), 0);
+      const loadSeconds = unitLeadTimeSeconds * quantity;
+      const qtyKey = source === "actual" ? "actualQty" : "plannedQty";
+      const loadKey = source === "actual" ? "actualLoadSeconds" : "plannedLoadSeconds";
+
+      stats.itemName = String(itemRow.name || stats.itemName || normalizedCode).trim();
+      stats.itemType = String(itemRow.type || stats.itemType || "").trim();
+      stats[qtyKey] += quantity;
+      stats[loadKey] += loadSeconds;
+      stats.unitLeadTimeSeconds = Math.max(stats.unitLeadTimeSeconds || 0, unitLeadTimeSeconds);
+      if (stats.routingSteps.length === 0) {
+        stats.routingSteps = routingSteps;
+      }
+
+      routingSteps.forEach((step) => {
+        const workCenter = String(step.workCenter || "UNASSIGNED").trim() || "UNASSIGNED";
+        const stepLoadSeconds = Number(step.standardTime || 0) * quantity;
+        stats.workCenterLoads.set(workCenter, (stats.workCenterLoads.get(workCenter) || 0) + stepLoadSeconds);
+
+        const aggregate = workCenterMap.get(workCenter) || {
+          workCenter,
+          plannedQty: 0,
+          actualQty: 0,
+          plannedLoadSeconds: 0,
+          actualLoadSeconds: 0,
+          processNames: new Set(),
+        };
+        aggregate[qtyKey] += quantity;
+        aggregate[loadKey] += stepLoadSeconds;
+        aggregate.processNames.add(String(step.name || step.code || workCenter).trim());
+        workCenterMap.set(workCenter, aggregate);
+
+        const dailyEntry = ensureDailyEntry(dateKey);
+        if (dailyEntry) {
+          dailyEntry[qtyKey] += quantity;
+          dailyEntry[loadKey] += stepLoadSeconds;
+        }
+        const workCenterDailyEntry = ensureWorkCenterDailyEntry(dateKey, workCenter);
+        if (workCenterDailyEntry) {
+          workCenterDailyEntry[qtyKey] += quantity;
+          workCenterDailyEntry[loadKey] += stepLoadSeconds;
+        }
+      });
+
+      const children = bomChildrenMap.get(normalizedCode) || [];
+      children.forEach((child) => {
+        const childQty = quantity * Number(child.quantity || 0) * (1 + (Number(child.scrapFactor || 0) / 100));
+        if (childQty > 0) {
+          recordRoutingLoad(child.childCode, childQty, dateKey, source, [...stack, normalizedCode]);
+        }
+      });
+    };
+
+    scheduleResult.rows.forEach((row) => {
+      const itemCode = String(row.item_code || "").trim();
+      const dateKey = String(row.effective_date || "").slice(0, 10);
+      const quantity = Number(row.qty || 0);
+      if (!itemCode || !dateKey || quantity <= 0) return;
+      recordRoutingLoad(itemCode, quantity, dateKey, "planned", []);
+    });
+
+    productionResult.rows.forEach((row) => {
+      const itemCode = String(row.item_code || "").trim();
+      const dateKey = String(row.effective_date || "").slice(0, 10);
+      const quantity = Number(row.qty || 0);
+      if (!itemCode || !dateKey || quantity <= 0) return;
+      recordRoutingLoad(itemCode, quantity, dateKey, "actual", []);
+    });
+
+    const rows = Array.from(itemStatsMap.values())
+      .map((stats) => {
+        const workCenters = Array.from(stats.workCenterLoads.entries())
+          .map(([workCenter, loadSeconds]) => ({
+            workCenter,
+            loadHours: Math.round(((Number(loadSeconds || 0) / 3600) + Number.EPSILON) * 100) / 100,
+          }))
+          .sort((left, right) => Number(right.loadHours || 0) - Number(left.loadHours || 0) || String(left.workCenter || "").localeCompare(String(right.workCenter || "")));
+        return {
+          itemCode: stats.itemCode,
+          itemName: stats.itemName,
+          itemType: stats.itemType || "-",
+          plannedQty: Math.round((Number(stats.plannedQty || 0) + Number.EPSILON) * 100) / 100,
+          actualQty: Math.round((Number(stats.actualQty || 0) + Number.EPSILON) * 100) / 100,
+          unitLeadTimeHours: Math.round(((Number(stats.unitLeadTimeSeconds || 0) / 3600) + Number.EPSILON) * 100) / 100,
+          plannedLoadHours: Math.round(((Number(stats.plannedLoadSeconds || 0) / 3600) + Number.EPSILON) * 100) / 100,
+          actualLoadHours: Math.round(((Number(stats.actualLoadSeconds || 0) / 3600) + Number.EPSILON) * 100) / 100,
+          totalLoadHours: Math.round((((Number(stats.plannedLoadSeconds || 0) + Number(stats.actualLoadSeconds || 0)) / 3600) + Number.EPSILON) * 100) / 100,
+          routingSummary: stats.routingSteps
+            .map((step) => `${String(step.workCenter || "UNASSIGNED").trim() || "UNASSIGNED"} ${Number(step.standardTime || 0)}s`)
+            .join(" → "),
+          workCenters,
+        };
+      })
+      .sort((left, right) => Number(right.totalLoadHours || 0) - Number(left.totalLoadHours || 0) || String(left.itemCode || "").localeCompare(String(right.itemCode || "")));
+
+    const workCenters = Array.from(workCenterMap.values())
+      .map((stats) => ({
+        workCenter: stats.workCenter,
+        plannedQty: Math.round((Number(stats.plannedQty || 0) + Number.EPSILON) * 100) / 100,
+        actualQty: Math.round((Number(stats.actualQty || 0) + Number.EPSILON) * 100) / 100,
+        plannedLoadHours: Math.round(((Number(stats.plannedLoadSeconds || 0) / 3600) + Number.EPSILON) * 100) / 100,
+        actualLoadHours: Math.round(((Number(stats.actualLoadSeconds || 0) / 3600) + Number.EPSILON) * 100) / 100,
+        totalLoadHours: Math.round((((Number(stats.plannedLoadSeconds || 0) + Number(stats.actualLoadSeconds || 0)) / 3600) + Number.EPSILON) * 100) / 100,
+        processNames: Array.from(stats.processNames).sort((left, right) => String(left).localeCompare(String(right))),
+      }))
+      .sort((left, right) => Number(right.totalLoadHours || 0) - Number(left.totalLoadHours || 0) || String(left.workCenter || "").localeCompare(String(right.workCenter || "")));
+
+    const dailyRows = Array.from(dailyMap.values())
+      .map((day) => ({
+        date: day.date,
+        plannedQty: Math.round((Number(day.plannedQty || 0) + Number.EPSILON) * 100) / 100,
+        actualQty: Math.round((Number(day.actualQty || 0) + Number.EPSILON) * 100) / 100,
+        plannedLoadHours: Math.round(((Number(day.plannedLoadSeconds || 0) / 3600) + Number.EPSILON) * 100) / 100,
+        actualLoadHours: Math.round(((Number(day.actualLoadSeconds || 0) / 3600) + Number.EPSILON) * 100) / 100,
+        totalLoadHours: Math.round((((Number(day.plannedLoadSeconds || 0) + Number(day.actualLoadSeconds || 0)) / 3600) + Number.EPSILON) * 100) / 100,
+        capacityHours: 0,
+      }))
+      .sort((left, right) => String(left.date || "").localeCompare(String(right.date || "")));
+
+    const workCenterDailyRows = Array.from(workCenterDailyMap.values())
+      .map((day) => ({
+        date: day.date,
+        workCenter: day.workCenter,
+        plannedQty: Math.round((Number(day.plannedQty || 0) + Number.EPSILON) * 100) / 100,
+        actualQty: Math.round((Number(day.actualQty || 0) + Number.EPSILON) * 100) / 100,
+        plannedLoadHours: Math.round(((Number(day.plannedLoadSeconds || 0) / 3600) + Number.EPSILON) * 100) / 100,
+        actualLoadHours: Math.round(((Number(day.actualLoadSeconds || 0) / 3600) + Number.EPSILON) * 100) / 100,
+        totalLoadHours: Math.round((((Number(day.plannedLoadSeconds || 0) + Number(day.actualLoadSeconds || 0)) / 3600) + Number.EPSILON) * 100) / 100,
+      }))
+      .sort((left, right) => String(left.date || "").localeCompare(String(right.date || "")) || String(left.workCenter || "").localeCompare(String(right.workCenter || "")));
+
+    const totalPlannedQty = rows.reduce((sum, row) => sum + Number(row.plannedQty || 0), 0);
+    const totalActualQty = rows.reduce((sum, row) => sum + Number(row.actualQty || 0), 0);
+    const totalPlannedLoadHours = rows.reduce((sum, row) => sum + Number(row.plannedLoadHours || 0), 0);
+    const totalActualLoadHours = rows.reduce((sum, row) => sum + Number(row.actualLoadHours || 0), 0);
+
+    res.json({
+      period: {
+        monthKey,
+        year,
+        start: startDate,
+        end: endDate,
+        label: `${monthKey.toUpperCase()} ${year}`,
+      },
+      summary: {
+        totalPlannedQty: Math.round((Number(totalPlannedQty || 0) + Number.EPSILON) * 100) / 100,
+        totalActualQty: Math.round((Number(totalActualQty || 0) + Number.EPSILON) * 100) / 100,
+        totalPlannedLoadHours: Math.round((Number(totalPlannedLoadHours || 0) + Number.EPSILON) * 100) / 100,
+        totalActualLoadHours: Math.round((Number(totalActualLoadHours || 0) + Number.EPSILON) * 100) / 100,
+        routedItems: rows.length,
+        workCenters: workCenters.length,
+        dates: dailyRows.length,
+      },
+      workCenters,
+      dailyRows,
+      workCenterDailyRows,
+      rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal memuat laporan capacity planning." });
   }
 });
 

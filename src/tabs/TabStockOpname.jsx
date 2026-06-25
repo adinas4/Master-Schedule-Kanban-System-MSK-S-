@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, CheckCircle, Eye, EyeOff, FileSpreadsheet, Play, Printer, Sparkles, Upload } from 'lucide-react';
+import logoPrl from '../assets/kop-mrp.png';
 
 const buildDefaultPeriod = () => {
   const now = new Date();
@@ -14,6 +15,8 @@ const TabStockOpname = (props) => {
     ensureXlsx,
     formatNumber0,
     formatRupiah,
+    masterLocations = [],
+    masterWarehouses = [],
     soOpenSession,
     fetchSoOpenSession,
     ensureAiConfigured,
@@ -36,10 +39,188 @@ const TabStockOpname = (props) => {
   const [finalizing, setFinalizing] = useState(false);
   const [showPrint, setShowPrint] = useState(false);
   const [printMode, setPrintMode] = useState('report');
+  const [blankoScope, setBlankoScope] = useState('warehouse');
+  const [blankoTarget, setBlankoTarget] = useState('');
+  const [tallyScope, setTallyScope] = useState('warehouse');
+  const [tallyTarget, setTallyTarget] = useState('');
   const [aiModalOpen, setAiModalOpen] = useState(false);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState('');
   const [aiResult, setAiResult] = useState(null);
+  const normalizeValue = (value) => String(value ?? '').trim().toLowerCase();
+  const getProcessLocationTypeLabel = (location) => {
+    const raw = String(location?.line_description || location?.lineDescription || '').trim();
+    if (/production\s*line/i.test(raw)) return 'Production Line';
+    if (/work\s*center/i.test(raw)) return 'Work Center';
+    return raw;
+  };
+  const isProcessLocation = (location) => {
+    const typeLabel = getProcessLocationTypeLabel(location);
+    return typeLabel === 'Production Line' || typeLabel === 'Work Center';
+  };
+  const getProcessLocationLabel = (location) => {
+    if (!location) return '-';
+    const typeLabel = getProcessLocationTypeLabel(location);
+    const laneLabel = String(location.fifo_lane || location.fifoLane || '').trim();
+    const labelParts = [location.id, typeLabel, laneLabel].filter(Boolean);
+    return labelParts.join(' - ');
+  };
+  const getWarehouseLocationTypeLabel = (location) => {
+    const raw = String(
+      location?.line_description
+      || location?.lineDescription
+      || location?.type
+      || location?.category
+      || '',
+    ).trim();
+    if (/warehouse/i.test(raw)) return 'Warehouse';
+    return raw;
+  };
+  const getLocationTargetLabel = (location) => {
+    if (!location) return '-';
+    const parts = [location.id, getProcessLocationTypeLabel(location), location.fifo_lane || location.machine_note || ''].filter(Boolean);
+    return parts.join(' - ');
+  };
+  const masterLocationById = useMemo(() => {
+    const map = new Map();
+    (masterLocations || []).forEach((location) => {
+      const key = normalizeValue(location.id);
+      if (key) map.set(key, location);
+    });
+    return map;
+  }, [masterLocations]);
+  const matchAnyValue = (sourceValue, candidates = []) => {
+    const normalizedSource = normalizeValue(sourceValue);
+    if (!normalizedSource) return false;
+    return candidates.some((candidate) => {
+      const normalizedCandidate = normalizeValue(candidate);
+      return normalizedCandidate && normalizedCandidate === normalizedSource;
+    });
+  };
+  const resolveRowLocation = (row) => {
+    const byId = masterLocationById.get(normalizeValue(row.locationId));
+    if (byId) return byId;
+    return (masterLocations || []).find((location) => {
+      const candidates = [
+        location.id,
+        location.line_description,
+        location.lineDescription,
+        location.category,
+      ];
+      return matchAnyValue(row.locationId, candidates)
+        || matchAnyValue(row.locationName, candidates);
+    }) || null;
+  };
+  const resolveRowProcessLocation = (row) => {
+    const rowValue = row.lineProduction || row.locationName || row.locationId || '';
+    return (masterLocations || []).find((location) => {
+      if (!isProcessLocation(location)) return false;
+      const candidates = [
+        location.id,
+        location.line_description,
+        location.lineDescription,
+        location.fifo_lane,
+        location.fifoLane,
+      ];
+      const normalizedRowValue = normalizeValue(rowValue);
+      return candidates
+        .map((candidate) => normalizeValue(candidate))
+        .filter(Boolean)
+        .some((candidate) => normalizedRowValue.includes(candidate));
+    }) || null;
+  };
+  const buildTargetOptions = (scope) => {
+    if (scope === 'wip') {
+      return (masterLocations || [])
+        .filter(isProcessLocation)
+        .map((location) => {
+          const typeLabel = getProcessLocationTypeLabel(location);
+          return {
+            value: `location:${location.id}`,
+            label: getProcessLocationLabel(location),
+            type: typeLabel,
+            source: location,
+          };
+        });
+    }
+
+    const warehouseOptions = (masterWarehouses || []).map((warehouse) => ({
+      value: `warehouse:${warehouse.id}`,
+      label: `Warehouse - ${warehouse.id} - ${warehouse.name}`,
+      type: 'Warehouse',
+      source: warehouse,
+    }));
+    const locationOptions = (masterLocations || [])
+      .filter((location) => getWarehouseLocationTypeLabel(location) === 'Warehouse')
+      .map((location) => ({
+        value: `location:${location.id}`,
+        label: `Location - ${getLocationTargetLabel(location)}`,
+        type: 'Warehouse',
+        source: location,
+      }));
+    return [...warehouseOptions, ...locationOptions];
+  };
+  const filterRowsByTarget = (rowsSource, scope, targetValue) => {
+    if (!targetValue) return rowsSource;
+    const selectedValue = String(targetValue || '').trim();
+    if (!selectedValue) return rowsSource;
+    if (selectedValue.startsWith('warehouse:')) {
+      const warehouseId = selectedValue.replace('warehouse:', '');
+      return rowsSource.filter((row) => {
+        const directLocation = resolveRowLocation(row);
+        if (matchAnyValue(row.locationId, [warehouseId])) return true;
+        if (matchAnyValue(row.locationName, [warehouseId])) return true;
+        if (directLocation && matchAnyValue(directLocation.warehouse_id, [warehouseId])) return true;
+        return false;
+      });
+    }
+    if (scope === 'wip') {
+      const locationId = selectedValue.replace('location:', '');
+      const selectedLocation = masterLocationById.get(normalizeValue(locationId));
+      if (!selectedLocation) return rowsSource;
+      const selectedLabel = getProcessLocationLabel(selectedLocation);
+      return rowsSource.filter((row) => {
+        const rowValue = normalizeValue(row.lineProduction || row.locationName || row.locationId || '');
+        const signatures = [
+          selectedLocation.id,
+          selectedLocation.line_description,
+          selectedLocation.lineDescription,
+          selectedLocation.fifo_lane,
+          selectedLocation.fifoLane,
+          selectedLabel,
+        ]
+          .map((item) => normalizeValue(item))
+          .filter(Boolean);
+        return signatures.some((signature) => rowValue.includes(signature));
+      });
+    }
+    const locationId = selectedValue.replace('location:', '');
+    const selectedLocation = masterLocationById.get(normalizeValue(locationId));
+    return rowsSource.filter((row) => {
+      if (matchAnyValue(row.locationId, [locationId])) return true;
+      if (matchAnyValue(row.locationName, [locationId])) return true;
+      if (!selectedLocation) return false;
+      if (selectedLocation.warehouse_id && resolveRowLocation(row)?.warehouse_id === selectedLocation.warehouse_id) {
+        return true;
+      }
+      return false;
+    });
+  };
+  const blankoTargetOptions = useMemo(() => buildTargetOptions(blankoScope), [blankoScope, masterLocations, masterWarehouses]);
+  const selectedBlankoTarget = useMemo(
+    () => blankoTargetOptions.find((option) => option.value === blankoTarget) || null,
+    [blankoTargetOptions, blankoTarget],
+  );
+  const tallyTargetOptions = useMemo(() => buildTargetOptions(tallyScope), [tallyScope, masterLocations, masterWarehouses]);
+  const selectedTallyTarget = useMemo(
+    () => tallyTargetOptions.find((option) => option.value === tallyTarget) || null,
+    [tallyTargetOptions, tallyTarget],
+  );
+  const printTitle = printMode === 'blanko' ? 'BLANKO STOCK OPNAME' : 'LAPORAN HITUNGAN FISIK';
+  const printScopeLabel = printMode === 'blanko'
+    ? (blankoScope === 'wip' ? 'SO WIP' : 'SO Gudang')
+    : '';
+  const printTargetLabel = printMode === 'blanko' ? (selectedBlankoTarget?.label || '') : '';
 
   const loadSessions = async () => {
     setSessionsLoading(true);
@@ -69,6 +250,8 @@ const TabStockOpname = (props) => {
         itemName: row.item_name || '',
         partNo: row.part_no || '-',
         locationName: row.location_name || row.line_production || row.location_id || '',
+        locationId: row.location_id || '',
+        lineProduction: row.line_production || '',
         unit: row.unit || '',
         snp: Number(row.snp || 0),
         price: Number(row.price || 0),
@@ -105,6 +288,38 @@ const TabStockOpname = (props) => {
     loadItems(selectedSessionId);
   }, [selectedSessionId, sessions]);
 
+  useEffect(() => {
+    if (selectedSessionId) return;
+    if (soOpenSession?.id) {
+      setSelectedSessionId(soOpenSession.id);
+      return;
+    }
+    if (sessions.length > 0) {
+      setSelectedSessionId(sessions[0].id);
+    }
+  }, [sessions, soOpenSession?.id, selectedSessionId]);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return undefined;
+    const body = document.body;
+    const handleAfterPrint = () => {
+      body.classList.remove('stockopname-print-active');
+      document.getElementById('stockopname-print-page-style')?.remove();
+    };
+    if (showPrint) {
+      body.classList.add('stockopname-print-active');
+    } else {
+      body.classList.remove('stockopname-print-active');
+      document.getElementById('stockopname-print-page-style')?.remove();
+    }
+    window.addEventListener('afterprint', handleAfterPrint);
+    return () => {
+      body.classList.remove('stockopname-print-active');
+      document.getElementById('stockopname-print-page-style')?.remove();
+      window.removeEventListener('afterprint', handleAfterPrint);
+    };
+  }, [showPrint]);
+
   const visibleRows = useMemo(() => rows.filter((row) => !row.hidden), [rows]);
 
   const computedRows = useMemo(() => visibleRows.map((row) => {
@@ -135,6 +350,50 @@ const TabStockOpname = (props) => {
     () => computedRows.reduce((sum, row) => sum + Number(row.difference || 0), 0),
     [computedRows],
   );
+  const blankoRows = useMemo(
+    () => filterRowsByTarget(computedRows, blankoScope, selectedBlankoTarget?.value),
+    [computedRows, blankoScope, selectedBlankoTarget, masterLocationById],
+  );
+  const tallyRows = useMemo(
+    () => filterRowsByTarget(computedRows, tallyScope, selectedTallyTarget?.value),
+    [computedRows, tallyScope, selectedTallyTarget, masterLocationById],
+  );
+  const tallyVarianceCount = useMemo(
+    () => tallyRows.filter((row) => row.difference !== 0).length,
+    [tallyRows],
+  );
+  const tallyTotalDiffValue = useMemo(
+    () => tallyRows.reduce((sum, row) => {
+      if (!row.price) return sum;
+      return sum + row.difference * Number(row.price || 0);
+    }, 0),
+    [tallyRows],
+  );
+  const filteredBlankoRows = printMode === 'blanko' ? blankoRows : computedRows;
+  const blankoSectionRows = useMemo(() => {
+    if (printMode !== 'blanko') return [];
+    const grouped = new Map();
+    filteredBlankoRows.forEach((row) => {
+      const resolvedLocation = resolveRowLocation(row);
+      const resolvedProcessLocation = resolveRowProcessLocation(row);
+      let groupLabel = '';
+      if (blankoScope === 'wip') {
+        groupLabel = resolvedProcessLocation
+          ? `WIP - ${getLocationTargetLabel(resolvedProcessLocation)}`
+          : `WIP - ${row.lineProduction || row.locationName || row.locationId || 'Unassigned'}`;
+      } else {
+        groupLabel = resolvedLocation
+          ? `${getWarehouseLocationTypeLabel(resolvedLocation)} - ${getLocationTargetLabel(resolvedLocation)}`
+          : row.locationName || row.locationId || selectedBlankoTarget?.label || 'Warehouse';
+      }
+      const key = normalizeValue(groupLabel) || 'default';
+      if (!grouped.has(key)) {
+        grouped.set(key, { label: groupLabel, rows: [] });
+      }
+      grouped.get(key).rows.push(row);
+    });
+    return Array.from(grouped.values()).sort((left, right) => left.label.localeCompare(right.label, 'id'));
+  }, [printMode, filteredBlankoRows, blankoScope, selectedBlankoTarget, masterLocationById]);
 
   const handleStartSession = async () => {
     const period = String(periodInput || '').trim();
@@ -314,7 +573,8 @@ const TabStockOpname = (props) => {
   };
 
   const handleExportBlankoExcel = async () => {
-    if (!computedRows.length) {
+    const exportSourceRows = selectedBlankoTarget ? blankoRows : computedRows;
+    if (!exportSourceRows.length) {
       setItemsError('Tidak ada item untuk diexport.');
       if (showToastMessage) {
         showToastMessage('Tidak ada item untuk diexport.');
@@ -323,11 +583,13 @@ const TabStockOpname = (props) => {
     }
     const XLSX = await ensureXlsx?.();
     if (!XLSX) return;
-    const exportRows = computedRows.map((row, index) => ({
+    const exportRows = exportSourceRows.map((row, index) => ({
       No: index + 1,
       'Kode Item': row.itemCode,
       'Nama Item': row.itemName || '',
       'Lokasi Virtual': row.locationName || '',
+      'Kategori SO': selectedBlankoTarget ? printScopeLabel : 'Laporan',
+      Target: selectedBlankoTarget ? printTargetLabel : '',
       'SNP (Qty/KBN)': Number(row.snp || 0),
       'Input KBN/Box': '',
       'Input Eceran/Remain': '',
@@ -341,7 +603,20 @@ const TabStockOpname = (props) => {
     XLSX.utils.book_append_sheet(wb, ws, 'Blanko SO');
     const periodTag = selectedSession?.period ? String(selectedSession.period).replace(/\s+/g, '_') : 'SO';
     const dateTag = new Date().toISOString().split('T')[0];
-    XLSX.writeFile(wb, `Blanko_Stock_Opname_${periodTag}_${dateTag}.xlsx`);
+    const scopeTag = selectedBlankoTarget ? normalizeValue(printScopeLabel).replace(/\s+/g, '_') : 'report';
+    XLSX.writeFile(wb, `Blanko_Stock_Opname_${scopeTag}_${periodTag}_${dateTag}.xlsx`);
+  };
+
+  const handlePrintCurrentView = () => {
+    if (typeof document === 'undefined') return;
+    if (!document.getElementById('stockopname-print-page-style')) {
+      const pageStyle = document.createElement('style');
+      pageStyle.id = 'stockopname-print-page-style';
+      pageStyle.textContent = '@page { size: A4 portrait; margin: 8mm 10mm 42mm 10mm; }';
+      document.head.appendChild(pageStyle);
+    }
+    document.body.classList.add('stockopname-print-active');
+    window.requestAnimationFrame(() => window.print());
   };
 
   return (
@@ -479,6 +754,8 @@ const TabStockOpname = (props) => {
               type="button"
               onClick={() => {
                 setPrintMode('blanko');
+                setBlankoScope('warehouse');
+                setBlankoTarget('');
                 setShowPrint(true);
               }}
               className="px-3 py-1.5 text-xs border rounded flex items-center gap-2"
@@ -517,6 +794,62 @@ const TabStockOpname = (props) => {
           </div>
         </div>
 
+        <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+          <div className="grid grid-cols-1 lg:grid-cols-[180px_minmax(0,1fr)_auto] gap-3 items-start lg:items-center">
+            <div>
+              <label className="block text-[10px] uppercase text-slate-400 mb-1">Kategori SO</label>
+              <select
+                className="border rounded px-3 py-2 w-full h-10 text-xs bg-white"
+                value={tallyScope}
+                onChange={(e) => {
+                  const nextScope = e.target.value;
+                  setTallyScope(nextScope);
+                  setTallyTarget('');
+                }}
+              >
+                <option value="warehouse">SO Gudang</option>
+                <option value="wip">SO WIP</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-[10px] uppercase text-slate-400 mb-1">Target</label>
+              <select
+                className="border rounded px-3 py-2 w-full h-10 text-xs bg-white"
+                value={tallyTarget}
+                onChange={(e) => setTallyTarget(e.target.value)}
+              >
+                <option value="">Semua target</option>
+                {tallyTargetOptions.length === 0 && (
+                  <option value="" disabled>Data target belum tersedia</option>
+                )}
+                {tallyTargetOptions.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+              <div className="mt-1 text-[10px] text-slate-500">
+                {tallyScope === 'warehouse'
+                  ? 'Filter tampilan item berdasarkan Warehouse / Location.'
+                  : 'Filter tampilan item berdasarkan Production Line / Work Center.'}
+              </div>
+            </div>
+            <div className="flex flex-wrap lg:flex-nowrap items-center lg:justify-end gap-2 self-center">
+              <button
+                type="button"
+                onClick={() => {
+                  setTallyScope('warehouse');
+                  setTallyTarget('');
+                }}
+                className="px-3 py-2 h-10 text-xs border rounded bg-white whitespace-nowrap"
+              >
+                Reset Filter
+              </button>
+              <div className="px-3 py-2 h-10 flex items-center rounded border border-slate-200 bg-white text-[11px] text-slate-500 whitespace-nowrap">
+                {tallyRows.length} / {computedRows.length} item tampil
+              </div>
+            </div>
+          </div>
+        </div>
+
         {itemsError && <div className="text-xs text-red-600">{itemsError}</div>}
 
         {itemsLoading && <div className="text-xs text-slate-400">Memuat item...</div>}
@@ -542,7 +875,7 @@ const TabStockOpname = (props) => {
                 </tr>
               </thead>
               <tbody>
-                {computedRows.map((row) => {
+                {tallyRows.map((row) => {
                   const diff = row.difference;
                   const diffTone = diff === 0 ? '' : diff > 0 ? 'text-emerald-600' : 'text-rose-600';
                   const isDiff = diff !== 0;
@@ -621,7 +954,7 @@ const TabStockOpname = (props) => {
                     </tr>
                   );
                 })}
-                {computedRows.length === 0 && (
+                {tallyRows.length === 0 && (
                   <tr><td colSpan={showSystemQty ? 11 : 10} className="p-3 text-center text-slate-400">Belum ada item.</td></tr>
                 )}
               </tbody>
@@ -629,44 +962,172 @@ const TabStockOpname = (props) => {
           </div>
         )}
 
-        {computedRows.length > 0 && (
+        {!itemsLoading && !selectedSessionId && (
+          <div className="rounded-lg border border-dashed border-slate-300 bg-white px-4 py-5 text-center text-sm text-slate-500">
+            Pilih session di atas agar item tally muncul.
+          </div>
+        )}
+
+        {tallyRows.length > 0 && (
           <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
-            <div className="text-slate-500">Variance: {varianceCount} item</div>
-            {Math.abs(totalDiffValue) > 0 && (
-              <div className="font-semibold">Total Value Selisih: {formatRupiah(totalDiffValue)}</div>
+            <div className="text-slate-500">Variance: {tallyVarianceCount} item</div>
+            {Math.abs(tallyTotalDiffValue) > 0 && (
+              <div className="font-semibold">Total Value Selisih: {formatRupiah(tallyTotalDiffValue)}</div>
             )}
           </div>
         )}
       </div>
 
       {showPrint && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 print:static print:bg-white print:p-0 print:items-start print:justify-start">
+        <div className="stockopname-print-scope fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 print:static print:bg-white print:p-0 print:items-start print:justify-start">
           <div className="bg-white rounded-xl shadow-2xl w-full max-w-5xl flex flex-col max-h-[90vh] overflow-hidden print:shadow-none print:rounded-none print:max-h-none">
             <div className="p-4 border-b flex justify-between items-center print:hidden">
               <div className="text-sm font-semibold">
                 {printMode === 'blanko' ? 'Blanko Stock Opname' : 'Laporan Hitungan Fisik'}
               </div>
               <div className="flex items-center gap-2">
-                <button onClick={() => window.print()} className="px-3 py-1.5 text-xs border rounded">
+                <button
+                  onClick={handlePrintCurrentView}
+                  className="px-3 py-1.5 text-xs border rounded disabled:opacity-50"
+                  disabled={printMode === 'blanko' && !selectedBlankoTarget}
+                >
                   Print / PDF
                 </button>
                 <button onClick={() => setShowPrint(false)} className="text-slate-500">Tutup</button>
               </div>
             </div>
             <div className="p-4 overflow-y-auto bg-slate-50 print:bg-white print:p-0">
-              <div className="bg-white p-4 text-black">
-                <div className="flex items-start justify-between border-b pb-3 mb-3">
-                  <div>
-                    <div className="text-lg font-bold">
-                      {printMode === 'blanko' ? 'BLANKO STOCK OPNAME' : 'LAPORAN HITUNGAN FISIK'}
+              <div className="bg-white p-4 text-black stockopname-print-sheet">
+                <div className="hidden print:block mb-4">
+                  <div className="rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 shadow-sm">
+                    <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                      <div className="flex items-start gap-3">
+                        <img src={logoPrl} alt="Logo MRP" className="h-12 w-auto object-contain" />
+                        <div>
+                          <div className="text-lg font-bold tracking-wide text-slate-900">{printTitle}</div>
+                          <div className="text-[11px] text-slate-600">Master Schedule &amp; Kanban System (MSK-S)</div>
+                          <div className="mt-1 text-[11px] text-slate-600">
+                            <span className="font-semibold">Period:</span> {selectedSession?.period || '-'}
+                          </div>
+                          <div className="text-[11px] text-slate-600">
+                            <span className="font-semibold">Status:</span> {selectedSession?.status || '-'}
+                          </div>
+                          {printMode === 'blanko' && (
+                            <div className="mt-1 text-[11px] text-slate-700">
+                              <span className="font-semibold">{printScopeLabel}</span>
+                              {printTargetLabel ? ` - ${printTargetLabel}` : ''}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      <div className="text-[11px] text-slate-600 md:text-right">
+                        <div>
+                          <span className="font-semibold">Print Date:</span>{' '}
+                          {new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' })}
+                        </div>
+                        <div>
+                          <span className="font-semibold">Scope:</span>{' '}
+                          {printMode === 'blanko' ? printScopeLabel : 'Laporan Hitungan Fisik'}
+                        </div>
+                        {printMode === 'blanko' && (
+                          <div>
+                            <span className="font-semibold">Target:</span> {printTargetLabel || '-'}
+                          </div>
+                        )}
+                      </div>
                     </div>
+                  </div>
+                </div>
+                <div className="flex items-start justify-between border-b pb-3 mb-3 print:hidden">
+                  <div>
+                    <div className="text-lg font-bold">{printTitle}</div>
                     <div className="text-xs text-slate-600">Period: {selectedSession?.period || '-'}</div>
                     <div className="text-xs text-slate-600">Status: {selectedSession?.status || '-'}</div>
+                    {printMode === 'blanko' && (
+                      <div className="mt-1 text-xs text-slate-600">
+                        <span className="font-semibold">{printScopeLabel}</span>
+                        {printTargetLabel ? ` - ${printTargetLabel}` : ''}
+                      </div>
+                    )}
                   </div>
                   <div className="text-xs text-slate-600 text-right">
                     Print Date: {new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' })}
                   </div>
                 </div>
+                {printMode === 'blanko' && (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 mb-4 print:hidden">
+                    <div className="grid grid-cols-1 md:grid-cols-[220px_1fr] gap-3">
+                      <div>
+                        <label className="block text-[10px] uppercase text-slate-400 mb-1">Kategori SO</label>
+                        <select
+                          className="border rounded px-3 py-2 w-full text-xs bg-white"
+                          value={blankoScope}
+                          onChange={(e) => {
+                            const nextScope = e.target.value;
+                            setBlankoScope(nextScope);
+                            setBlankoTarget('');
+                          }}
+                        >
+                          <option value="warehouse">SO Gudang</option>
+                          <option value="wip">SO WIP</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-[10px] uppercase text-slate-400 mb-1">Target</label>
+                        <select
+                          className="border rounded px-3 py-2 w-full text-xs bg-white"
+                          value={blankoTarget}
+                          onChange={(e) => setBlankoTarget(e.target.value)}
+                        >
+                          <option value="">Pilih target</option>
+                          {blankoTargetOptions.length === 0 && (
+                            <option value="" disabled>Data target belum tersedia</option>
+                          )}
+                          {blankoTargetOptions.map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
+                        <div className="mt-1 text-[10px] text-slate-500">
+                          {blankoScope === 'warehouse'
+                            ? 'Pilih Warehouse atau Location untuk SO Gudang.'
+                            : 'Pilih Production Line atau Work Center untuk SO WIP.'}
+                        </div>
+                      </div>
+                    </div>
+                    {selectedBlankoTarget && (
+                      <div className="mt-3 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-700">
+                        <div className="font-semibold uppercase tracking-wide">Kelompok Target</div>
+                        <div className="mt-1 text-sm font-bold text-slate-900">{printScopeLabel}</div>
+                        <div className="mt-0.5">{printTargetLabel}</div>
+                      </div>
+                    )}
+                    <div className="hidden print:block mt-4 rounded-xl border border-slate-300 bg-slate-50 p-4">
+                      <div className="grid grid-cols-2 gap-4 text-[11px]">
+                        <div>
+                          <div className="uppercase tracking-wide text-slate-400">Kategori SO</div>
+                          <div className="mt-1 font-semibold text-slate-900">{printScopeLabel}</div>
+                        </div>
+                        <div>
+                          <div className="uppercase tracking-wide text-slate-400">Target</div>
+                          <div className="mt-1 font-semibold text-slate-900">{printTargetLabel}</div>
+                        </div>
+                        <div>
+                          <div className="uppercase tracking-wide text-slate-400">Periode</div>
+                          <div className="mt-1 font-semibold text-slate-900">{selectedSession?.period || '-'}</div>
+                        </div>
+                        <div>
+                          <div className="uppercase tracking-wide text-slate-400">Status</div>
+                          <div className="mt-1 font-semibold text-slate-900">{selectedSession?.status || '-'}</div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {printMode === 'blanko' && !selectedBlankoTarget && (
+                  <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                    Pilih target terlebih dahulu sebelum print blanko.
+                  </div>
+                )}
                 <div className="overflow-x-auto">
                   <table className="min-w-full text-[11px] border">
                     <thead className="bg-slate-100">
@@ -687,32 +1148,49 @@ const TabStockOpname = (props) => {
                       </tr>
                     </thead>
                     <tbody>
-                      {computedRows.map((row, index) => (
+                      {printMode === 'blanko' && blankoSectionRows.map((section, sectionIndex) => (
+                        <React.Fragment key={`blanko-section-${section.label}-${sectionIndex}`}>
+                          <tr className="bg-slate-100">
+                            <td colSpan={10} className="p-2 border font-semibold text-slate-700">
+                              {section.label}
+                            </td>
+                          </tr>
+                          {section.rows.map((row, index) => (
+                            <tr key={row.id} className="border-t">
+                              <td className="p-2 border">{index + 1}</td>
+                              <td className="p-2 border font-semibold">{row.itemCode}</td>
+                              <td className="p-2 border">{row.locationName || '-'}</td>
+                              <td className="p-2 border text-right">{formatNumber0(row.snp)}</td>
+                              <td className="p-2 border text-right" />
+                              <td className="p-2 border text-right" />
+                              <td className="p-2 border text-right" />
+                              <td className="p-2 border text-right" />
+                              <td className="p-2 border text-center">-</td>
+                              <td className="p-2 border">-</td>
+                            </tr>
+                          ))}
+                        </React.Fragment>
+                      ))}
+                      {printMode !== 'blanko' && filteredBlankoRows.map((row, index) => (
                         <tr key={row.id} className="border-t">
                           <td className="p-2 border">{index + 1}</td>
                           <td className="p-2 border font-semibold">{row.itemCode}</td>
                           <td className="p-2 border">{row.locationName || '-'}</td>
-                          {printMode !== 'blanko' && (
-                            <td className="p-2 border text-right">{formatNumber0(row.bookQty)}</td>
-                          )}
+                          <td className="p-2 border text-right">{formatNumber0(row.bookQty)}</td>
                           <td className="p-2 border text-right">{formatNumber0(row.snp)}</td>
-                          <td className="p-2 border text-right">{printMode === 'blanko' ? '' : formatNumber0(row.inputBox)}</td>
-                          <td className="p-2 border text-right">{printMode === 'blanko' ? '' : formatNumber0(row.inputLoose)}</td>
-                          <td className="p-2 border text-right">{printMode === 'blanko' ? '' : formatNumber0(row.actualQty)}</td>
-                          <td className="p-2 border text-right">{printMode === 'blanko' ? '' : (row.difference > 0 ? `+${formatNumber0(row.difference)}` : formatNumber0(row.difference))}</td>
-                          <td className="p-2 border text-center">
-                            {printMode === 'blanko'
-                              ? ''
-                              : (row.difference === 0 ? 'Cocok' : 'Selisih')}
-                          </td>
-                          <td className="p-2 border">{printMode === 'blanko' ? '' : (row.reason || '-')}</td>
+                          <td className="p-2 border text-right">{formatNumber0(row.inputBox)}</td>
+                          <td className="p-2 border text-right">{formatNumber0(row.inputLoose)}</td>
+                          <td className="p-2 border text-right">{formatNumber0(row.actualQty)}</td>
+                          <td className="p-2 border text-right">{row.difference > 0 ? `+${formatNumber0(row.difference)}` : formatNumber0(row.difference)}</td>
+                          <td className="p-2 border text-center">{row.difference === 0 ? 'Cocok' : 'Selisih'}</td>
+                          <td className="p-2 border">{row.reason || '-'}</td>
                         </tr>
                       ))}
-                      {computedRows.length === 0 && (
+                      {filteredBlankoRows.length === 0 && (
                         <tr><td colSpan={printMode !== 'blanko' ? 11 : 10} className="p-3 text-center text-slate-400">Belum ada data.</td></tr>
                       )}
                     </tbody>
-                    {computedRows.length > 0 && printMode !== 'blanko' && (
+                    {filteredBlankoRows.length > 0 && printMode !== 'blanko' && (
                       <tfoot>
                         <tr className="bg-slate-50">
                           <td className="p-2 border text-right font-semibold" colSpan="7">Total</td>
@@ -723,6 +1201,17 @@ const TabStockOpname = (props) => {
                       </tfoot>
                     )}
                   </table>
+                </div>
+                <div className="hidden print:block stockopname-signature-bar mt-8">
+                  <div className="grid grid-cols-4 gap-3 text-center text-[11px] text-slate-700">
+                    {['Penghitung', 'Pencatat', 'Checker', 'Approval'].map((label) => (
+                      <div key={label} className="rounded-xl border border-slate-300 bg-white px-3 py-3">
+                        <div className="font-semibold uppercase tracking-wide text-slate-700">{label}</div>
+                        <div className="my-10 border-b border-slate-400" />
+                        <div className="text-[10px] text-slate-500">Nama / Tanda Tangan</div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
             </div>

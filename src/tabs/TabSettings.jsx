@@ -3,6 +3,13 @@ import { Eye, EyeOff, Key, RefreshCw, Save } from 'lucide-react';
 
 const TabSettings = ({ apiFetch, user, aiConfigured, aiStatusLoading, refreshAiConfigStatus }) => {
   const isAdmin = user?.role === 'admin';
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [passwordSaving, setPasswordSaving] = useState(false);
+  const [passwordError, setPasswordError] = useState('');
+  const [passwordStatus, setPasswordStatus] = useState('');
+  const [showPasswordFields, setShowPasswordFields] = useState(false);
   const [geminiApiKey, setGeminiApiKey] = useState('');
   const [geminiModel, setGeminiModel] = useState('');
   const [modelOptions, setModelOptions] = useState([]);
@@ -96,16 +103,122 @@ const TabSettings = ({ apiFetch, user, aiConfigured, aiStatusLoading, refreshAiC
     }
   };
 
-  if (!isAdmin) {
-    return (
-      <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
-        Anda tidak memiliki akses untuk membuka halaman Pengaturan.
-      </div>
-    );
-  }
+  const handleChangePassword = async (event) => {
+    event.preventDefault();
+    setPasswordError('');
+    setPasswordStatus('');
+    if (!currentPassword || !newPassword || !confirmPassword) {
+      setPasswordError('Lengkapi password lama, password baru, dan konfirmasi password.');
+      return;
+    }
+    if (newPassword.length < 6) {
+      setPasswordError('Password baru minimal 6 karakter.');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setPasswordError('Konfirmasi password baru tidak sama.');
+      return;
+    }
+    setPasswordSaving(true);
+    try {
+      const result = await apiFetch('/api/auth/change-password', {
+        method: 'POST',
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmPassword('');
+      setPasswordStatus(result?.message || 'Password berhasil diubah.');
+    } catch (err) {
+      setPasswordError(err.message || 'Gagal mengubah password.');
+    } finally {
+      setPasswordSaving(false);
+    }
+  };
 
   return (
     <div className="space-y-6">
+      <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-semibold text-slate-800 flex items-center gap-2">
+              <Key size={16} /> Ubah Password
+            </div>
+            <div className="text-xs text-slate-500 mt-1">
+              Ganti password akun Anda sendiri. Password baru minimal 6 karakter.
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowPasswordFields((prev) => !prev)}
+            className="px-3 py-2 border rounded-lg text-slate-600 hover:bg-slate-50"
+            title={showPasswordFields ? 'Sembunyikan password' : 'Tampilkan password'}
+          >
+            {showPasswordFields ? <EyeOff size={16} /> : <Eye size={16} />}
+          </button>
+        </div>
+
+        <form onSubmit={handleChangePassword} className="mt-5 grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div>
+            <label className="block text-xs font-semibold text-slate-600 mb-2 uppercase">Password Lama</label>
+            <input
+              type={showPasswordFields ? 'text' : 'password'}
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+              disabled={passwordSaving}
+              placeholder="Masukkan password lama"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-slate-600 mb-2 uppercase">Password Baru</label>
+            <input
+              type={showPasswordFields ? 'text' : 'password'}
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              disabled={passwordSaving}
+              placeholder="Masukkan password baru"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-slate-600 mb-2 uppercase">Konfirmasi Password</label>
+            <input
+              type={showPasswordFields ? 'text' : 'password'}
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              disabled={passwordSaving}
+              placeholder="Ulangi password baru"
+            />
+          </div>
+
+          {passwordError && (
+            <div className="md:col-span-3 rounded-lg bg-red-50 border border-red-100 px-3 py-2 text-xs text-red-600">
+              {passwordError}
+            </div>
+          )}
+
+          {passwordStatus && (
+            <div className="md:col-span-3 rounded-lg bg-emerald-50 border border-emerald-100 px-3 py-2 text-xs text-emerald-700">
+              {passwordStatus}
+            </div>
+          )}
+
+          <div className="md:col-span-3 flex flex-wrap items-center gap-2">
+            <button
+              type="submit"
+              disabled={passwordSaving}
+              className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow hover:bg-indigo-700 disabled:opacity-60"
+            >
+              <Save size={16} />
+              {passwordSaving ? 'Menyimpan...' : 'Ubah Password'}
+            </button>
+          </div>
+        </form>
+      </div>
+
+      {isAdmin && (
       <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -230,6 +343,7 @@ const TabSettings = ({ apiFetch, user, aiConfigured, aiStatusLoading, refreshAiC
           </div>
         </form>
       </div>
+      )}
     </div>
   );
 };

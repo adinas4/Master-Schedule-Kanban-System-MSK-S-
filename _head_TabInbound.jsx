@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+﻿import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Calendar,
   CalendarDays,
@@ -84,6 +84,7 @@ const TabInbound = (props) => {
     canEditSchedules,
     canDeleteRecords,
     isStockOpnameLocked,
+    openBulkReceiveModal,
     selectedScheduleIds,
     filteredSchedules,
     scheduleLoading,
@@ -99,6 +100,7 @@ const TabInbound = (props) => {
     getDisplayOrderQty,
     getTotalOrderQty,
     normalizeQtyByNsp,
+    handleSplitSchedule,
     user,
     ensureXlsx,
     formatExcelDate,
@@ -110,9 +112,22 @@ const TabInbound = (props) => {
     getPoLineRemainingAfterSchedule,
     handleEdit,
     handleDelete,
+    bulkReceiveOpen,
+    closeBulkReceiveModal,
+    bulkReceiveDoNumber,
+    setBulkReceiveDoNumber,
+    bulkReceiveDate,
+    setBulkReceiveDate,
     getRemainingQty,
+    getSplitDecision,
+    bulkReceiveQty,
+    setBulkReceiveQty,
+    bulkReceiveDocQty,
+    setBulkReceiveDocQty,
+    bulkReceiveAllowOver,
+    setBulkReceiveAllowOver,
+    handleBulkReceiveSubmit,
     handlePrintInboundCards,
-    refreshSchedules,
     openInboundCardAdjustModal,
     inboundCardScanOpen,
     setInboundCardScanOpen,
@@ -128,7 +143,6 @@ const TabInbound = (props) => {
     inboundCardAdjustSchedule,
     handleInboundCardAdjustSubmit,
     inboundCardAdjustLoading,
-    openInboundScheduleFromToast,
     masterItems,
     masterVendors,
     showToastMessage,
@@ -150,6 +164,7 @@ const TabInbound = (props) => {
     clearInboundNav,
   } = props;
 
+  const isAdmin = user?.role === 'admin';
   const [noteDrafts, setNoteDrafts] = useState({});
   const [localSearchQuery, setLocalSearchQuery] = useState(searchQuery || '');
   const [inboundSubTab, setInboundSubTab] = useState('schedule');
@@ -226,28 +241,6 @@ const TabInbound = (props) => {
   const [inboundActionOpen, setInboundActionOpen] = useState(false);
   const inboundActionRef = useRef(null);
   const inboundImportRef = useRef(null);
-  const actualReceiveRowSeqRef = useRef(0);
-  const actualReceiveQtyRefs = useRef({});
-  const [showActualReceiveModal, setShowActualReceiveModal] = useState(false);
-  const [actualReceiveSupplier, setActualReceiveSupplier] = useState('');
-  const [actualReceivePoNumber, setActualReceivePoNumber] = useState('');
-  const [actualReceiveDoNumber, setActualReceiveDoNumber] = useState('');
-  const [actualReceiveArrivalDate, setActualReceiveArrivalDate] = useState(() => new Date().toISOString().slice(0, 10));
-  const [actualReceiveTruckNo, setActualReceiveTruckNo] = useState('');
-  const [actualReceiveDriverName, setActualReceiveDriverName] = useState('');
-  const [actualReceiveRemarks, setActualReceiveRemarks] = useState('');
-  const [actualReceiveRows, setActualReceiveRows] = useState([]);
-  const [actualReceivePoDetail, setActualReceivePoDetail] = useState(null);
-  const [actualReceivePoLines, setActualReceivePoLines] = useState([]);
-  const [actualReceivePoAvailableLines, setActualReceivePoAvailableLines] = useState([]);
-  const [actualReceivePoOptions, setActualReceivePoOptions] = useState([]);
-  const [actualReceivePoSearch, setActualReceivePoSearch] = useState('');
-  const [actualReceivePoLoading, setActualReceivePoLoading] = useState(false);
-  const [actualReceivePoOptionsLoading, setActualReceivePoOptionsLoading] = useState(false);
-  const [actualReceivePoError, setActualReceivePoError] = useState('');
-  const [actualReceiveError, setActualReceiveError] = useState('');
-  const [actualReceiveSubmitting, setActualReceiveSubmitting] = useState(false);
-  const [actualReceiveAllowOver, setActualReceiveAllowOver] = useState(false);
   const scrollRef = useRef(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [scrollbarWidth, setScrollbarWidth] = useState(0);
@@ -265,70 +258,6 @@ const TabInbound = (props) => {
   const scheduleEndIndex = Math.min(scheduleTotal, schedulePage * schedulePerPage);
   const poStartIndex = poTotal === 0 ? 0 : (poPage - 1) * poPerPage + 1;
   const poEndIndex = Math.min(poTotal, poPage * poPerPage);
-
-  const createActualReceiveRow = useCallback((overrides = {}) => ({
-    key: overrides.key || `actual-${Date.now()}-${actualReceiveRowSeqRef.current += 1}`,
-    poLineId: overrides.poLineId || '',
-    itemCode: overrides.itemCode || '',
-    qty: overrides.qty ?? '',
-  }), []);
-
-  const getActualReceiveRemainingQty = useCallback((line) => {
-    if (!line) return 0;
-    const qtyOrder = Number(line.qty_order ?? line.qtyOrder ?? 0);
-    const qtyReceived = Number(line.qty_received ?? line.qtyReceived ?? 0);
-    return Number(line.qty_remaining ?? line.qtyRemaining ?? (qtyOrder - qtyReceived));
-  }, []);
-
-  const updateActualReceiveRow = useCallback((rowKey, patch) => {
-    setActualReceiveRows((prev) => prev.map((row) => (row.key === rowKey ? { ...row, ...patch } : row)));
-  }, []);
-
-  const addActualReceiveRow = useCallback(() => {
-    setActualReceiveRows((prev) => [...prev, createActualReceiveRow()]);
-  }, [createActualReceiveRow]);
-
-  const removeActualReceiveRow = useCallback((rowKey) => {
-    setActualReceiveRows((prev) => {
-      const nextRows = prev.filter((row) => row.key !== rowKey);
-      return nextRows.length > 0 ? nextRows : [createActualReceiveRow()];
-    });
-  }, [createActualReceiveRow]);
-
-  const focusActualReceiveQty = useCallback((rowKey) => {
-    if (!rowKey) return;
-    window.requestAnimationFrame(() => {
-      actualReceiveQtyRefs.current[rowKey]?.focus?.();
-    });
-  }, []);
-
-  const resetActualReceiveForm = useCallback(() => {
-    setActualReceiveSupplier('');
-    setActualReceivePoNumber('');
-    setActualReceiveDoNumber('');
-    setActualReceiveArrivalDate(new Date().toISOString().slice(0, 10));
-    setActualReceiveTruckNo('');
-    setActualReceiveDriverName('');
-    setActualReceiveRemarks('');
-    setActualReceiveRows([createActualReceiveRow()]);
-    setActualReceivePoDetail(null);
-    setActualReceivePoLines([]);
-    setActualReceivePoAvailableLines([]);
-    setActualReceivePoOptions([]);
-    setActualReceivePoSearch('');
-    setActualReceivePoLoading(false);
-    setActualReceivePoOptionsLoading(false);
-    setActualReceivePoError('');
-    setActualReceiveError('');
-    setActualReceiveSubmitting(false);
-    setActualReceiveAllowOver(false);
-    actualReceiveQtyRefs.current = {};
-  }, [createActualReceiveRow]);
-
-  const closeActualReceiveModal = useCallback(() => {
-    setShowActualReceiveModal(false);
-    resetActualReceiveForm();
-  }, [resetActualReceiveForm]);
 
   useEffect(() => {
     setLocalSearchQuery(searchQuery || '');
@@ -426,322 +355,6 @@ const TabInbound = (props) => {
     const nextHeight = Math.min(el.scrollHeight, maxHeight);
     el.style.height = `${Math.max(nextHeight, 28)}px`;
   };
-
-  const fetchActualReceivePoOptions = useCallback(async () => {
-    setActualReceivePoOptionsLoading(true);
-    try {
-      const payload = await apiFetch('/api/po?status=open,partial&includeTotal=1');
-      const rows = Array.isArray(payload) ? payload : (payload?.rows || []);
-      setActualReceivePoOptions(rows);
-    } catch (error) {
-      setActualReceivePoOptions([]);
-      setActualReceivePoError(error.message || 'Gagal memuat daftar PO.');
-    } finally {
-      setActualReceivePoOptionsLoading(false);
-    }
-  }, [apiFetch]);
-
-  const loadActualReceivePo = useCallback(async (poNumberOverride = null) => {
-    const poNumber = String(poNumberOverride || actualReceivePoNumber || '').trim();
-    if (!poNumber) {
-      setActualReceivePoError('No PO wajib diisi.');
-      return;
-    }
-    setActualReceivePoLoading(true);
-    setActualReceivePoError('');
-    try {
-      const response = await apiFetch(`/api/po/${encodeURIComponent(poNumber)}`);
-      const detailLines = Array.isArray(response?.lines)
-        ? response.lines
-        : Array.isArray(response?.items)
-          ? response.items
-          : [];
-      setActualReceiveSupplier(response?.header?.supplier_id || response?.header?.supplier_name || '');
-      setActualReceivePoDetail(response || null);
-      const availablePoLines = detailLines.filter((line) => Number(
-        line?.qty_remaining
-        ?? line?.qtyRemaining
-        ?? (Number(line?.qty_order || 0) - Number(line?.qty_received || 0)),
-      ) > 0);
-      setActualReceivePoLines(detailLines);
-      setActualReceivePoAvailableLines(availablePoLines);
-      setActualReceiveRows(
-        availablePoLines.length > 0
-          ? availablePoLines.map((line) => createActualReceiveRow({
-            poLineId: line.id,
-            itemCode: line.item_code || '',
-          }))
-          : [createActualReceiveRow()],
-      );
-    } catch (error) {
-      setActualReceivePoDetail(null);
-      setActualReceivePoLines([]);
-      setActualReceivePoAvailableLines([]);
-      setActualReceivePoError(error.message || 'Gagal memuat PO.');
-    } finally {
-      setActualReceivePoLoading(false);
-    }
-  }, [actualReceivePoNumber, apiFetch, createActualReceiveRow]);
-
-  const openActualReceiveModal = useCallback((prefillPoNumber = '') => {
-    resetActualReceiveForm();
-    setInboundActionOpen(false);
-    setShowActualReceiveModal(true);
-    const nextPoNumber = String(prefillPoNumber || '').trim();
-    if (nextPoNumber) {
-      setActualReceivePoNumber(nextPoNumber);
-      void loadActualReceivePo(nextPoNumber);
-    }
-  }, [loadActualReceivePo, resetActualReceiveForm]);
-
-  const actualReceivePoVisibleOptions = useMemo(() => {
-    const searchKey = String(actualReceivePoSearch || '').trim().toLowerCase();
-    const mergedMap = new Map();
-    const mergeRow = (row) => {
-      if (!row) return;
-      const poNumber = String(row.po_number || '').trim();
-      if (!poNumber) return;
-      const key = poNumber.toLowerCase();
-      const current = mergedMap.get(key) || {
-        ...row,
-        po_number: poNumber,
-        total_qty_remaining: 0,
-      };
-      const nextRemaining = Number(row.total_qty_remaining || 0);
-      current.po_number = current.po_number || poNumber;
-      current.po_date = current.po_date || row.po_date || '';
-      current.supplier_code = current.supplier_code || row.supplier_code || '';
-      current.supplier_name = current.supplier_name || row.supplier_name || '';
-      current.status = current.status || row.status || '';
-      current.total_qty_order = Math.max(Number(current.total_qty_order || 0), Number(row.total_qty_order || 0));
-      current.total_qty_received = Math.max(Number(current.total_qty_received || 0), Number(row.total_qty_received || 0));
-      current.total_qty_scheduled = Math.max(Number(current.total_qty_scheduled || 0), Number(row.total_qty_scheduled || 0));
-      current.schedule_count = Math.max(Number(current.schedule_count || 0), Number(row.schedule_count || 0));
-      current.line_count = Math.max(Number(current.line_count || 0), Number(row.line_count || 0));
-      current.total_qty_remaining = Math.max(Number(current.total_qty_remaining || 0), nextRemaining);
-      mergedMap.set(key, current);
-    };
-
-    (Array.isArray(actualReceivePoOptions) ? actualReceivePoOptions : [])
-      .map((row) => {
-        const totalOrder = Number(row.total_qty_order || 0);
-        const totalReceived = Number(row.total_qty_received || 0);
-        const remainingFromApi = Number(row.total_qty_remaining);
-        return {
-          ...row,
-          po_number: String(row.po_number || '').trim(),
-          total_qty_remaining: Number.isFinite(remainingFromApi)
-            ? Math.max(0, remainingFromApi)
-            : Math.max(0, totalOrder - totalReceived),
-        };
-      })
-      .forEach(mergeRow);
-
-    (() => {
-      const map = new Map();
-      (Array.isArray(filteredSchedules) ? filteredSchedules : []).forEach((schedule) => {
-        const poNumber = String(schedule.poNumber || schedule.po_number || '').trim();
-        if (!poNumber) return;
-        const remainingQty = Number(getRemainingQty(schedule) || 0);
-        const current = map.get(poNumber) || {
-          po_number: poNumber,
-          po_date: schedule.poDate || schedule.po_date || '',
-          supplier_code: schedule.supplier_code || schedule.supplier_id || '',
-          supplier_name: schedule.supplier_name || '',
-          total_qty_remaining: 0,
-        };
-        current.total_qty_remaining += remainingQty;
-        if (!current.supplier_code && (schedule.supplier_code || schedule.supplier_id)) {
-          current.supplier_code = schedule.supplier_code || schedule.supplier_id;
-        }
-        if (!current.supplier_name && schedule.supplier_name) {
-          current.supplier_name = schedule.supplier_name;
-        }
-        if (!current.po_date && (schedule.poDate || schedule.po_date)) {
-          current.po_date = schedule.poDate || schedule.po_date;
-        }
-        map.set(poNumber, current);
-      });
-      Array.from(map.values()).forEach((row) => {
-        mergeRow({
-          ...row,
-          total_qty_remaining: row.total_qty_remaining,
-        });
-      });
-    })();
-
-    const rows = Array.from(mergedMap.values())
-      .sort((left, right) => {
-        const leftDate = String(left.po_date || '');
-        const rightDate = String(right.po_date || '');
-        if (leftDate !== rightDate) return rightDate.localeCompare(leftDate);
-        return String(right.po_number || '').localeCompare(String(left.po_number || ''));
-      });
-
-    if (!searchKey) return rows;
-    return rows.filter((row) => {
-      const searchable = [
-        row.po_number,
-        row.supplier_code,
-        row.supplier_name,
-      ]
-        .map((value) => String(value || '').trim().toLowerCase())
-        .join(' ');
-      return searchable.includes(searchKey);
-    });
-  }, [actualReceivePoOptions, actualReceivePoSearch, filteredSchedules, getRemainingQty]);
-
-  const actualReceiveSelectableLines = useMemo(() => (
-    actualReceiveAllowOver ? actualReceivePoLines : actualReceivePoAvailableLines
-  ), [actualReceiveAllowOver, actualReceivePoAvailableLines, actualReceivePoLines]);
-
-  const handleActualReceiveSubmit = useCallback(async () => {
-    if (actualReceiveSubmitting) return;
-    const supplier = String(actualReceiveSupplier || actualReceivePoDetail?.header?.supplier_id || actualReceivePoDetail?.header?.supplier_name || '').trim();
-    const poNumber = String(actualReceivePoNumber || '').trim();
-    const doNumber = String(actualReceiveDoNumber || '').trim();
-    const arrivalDate = String(actualReceiveArrivalDate || '').trim();
-    const truckNo = String(actualReceiveTruckNo || '').trim();
-    const driverName = String(actualReceiveDriverName || '').trim();
-    const remarks = String(actualReceiveRemarks || '').trim();
-    const poLines = Array.isArray(actualReceivePoLines) ? actualReceivePoLines : [];
-    const availablePoLines = Array.isArray(actualReceivePoAvailableLines) ? actualReceivePoAvailableLines : [];
-    const allowOverReceive = Boolean(actualReceiveAllowOver) && Boolean(canEditSchedules);
-
-    if (!poNumber) {
-      setActualReceiveError('No PO wajib diisi.');
-      return;
-    }
-    if (!supplier) {
-      setActualReceiveError('Supplier wajib diisi.');
-      return;
-    }
-    if (!doNumber) {
-      setActualReceiveError('No SJ / DO wajib diisi.');
-      return;
-    }
-    if (!arrivalDate) {
-      setActualReceiveError('Tanggal kedatangan wajib diisi.');
-      return;
-    }
-    if (poLines.length === 0) {
-      setActualReceiveError('Load PO terlebih dahulu.');
-      return;
-    }
-    if (allowOverReceive ? poLines.length === 0 : availablePoLines.length === 0) {
-      setActualReceiveError('Tidak ada sisa item kontrak yang bisa menerima incoming.');
-      return;
-    }
-
-    const items = [];
-    const selectableLines = allowOverReceive ? poLines : availablePoLines;
-    for (const row of (Array.isArray(actualReceiveRows) ? actualReceiveRows : [])) {
-      const poLineId = Number(row.poLineId || 0);
-      if (!(poLineId > 0)) continue;
-      const matchedLine = selectableLines.find((line) => Number(line.id) === poLineId);
-      if (!matchedLine) {
-        setActualReceiveError(`Item ${row.itemCode || poLineId} tidak valid atau sisa 0.`);
-        return;
-      }
-      items.push({
-        poLineId,
-        itemCode: matchedLine?.item_code || String(row.itemCode || '').trim(),
-        qty: Number(row.qty || 0),
-        itemName: matchedLine?.item_name || '',
-        partNo: matchedLine?.part_no || '',
-        unit: matchedLine?.unit || '',
-      });
-    }
-
-    if (items.length === 0) {
-      setActualReceiveError('Minimal pilih 1 item kontrak PO.');
-      return;
-    }
-    for (const row of items) {
-      if (!(Number(row.qty) > 0)) {
-        setActualReceiveError(`Qty aktual tidak valid untuk ${row.itemCode || row.poLineId}.`);
-        return;
-      }
-      if (!row.itemCode) {
-        setActualReceiveError('Item kontrak PO tidak valid.');
-        return;
-      }
-    }
-
-    setActualReceiveSubmitting(true);
-    setActualReceiveError('');
-    try {
-      const response = await apiFetch('/api/receive-notes/actual', {
-        method: 'POST',
-        body: JSON.stringify({
-          supplier,
-          poNumber,
-          doNumber,
-          arrivalDate,
-          truckNo,
-          driverName,
-          remarks,
-          allowOverReceive,
-          items,
-        }),
-      });
-      await refreshSchedules?.();
-      showToastMessage?.(
-        `Penerimaan aktual ${response?.rnNumber || doNumber} tersimpan.`,
-        'Buka',
-        () => openInboundScheduleFromToast?.(doNumber || poNumber),
-        'success',
-      );
-      closeActualReceiveModal();
-    } catch (error) {
-      setActualReceiveError(error.message || 'Gagal menyimpan penerimaan aktual.');
-    } finally {
-      setActualReceiveSubmitting(false);
-    }
-  }, [
-    actualReceiveArrivalDate,
-    actualReceiveDoNumber,
-    actualReceiveDriverName,
-    actualReceivePoDetail,
-    actualReceivePoNumber,
-    actualReceiveRemarks,
-    actualReceiveRows,
-    actualReceiveSubmitting,
-    actualReceiveSupplier,
-    actualReceiveTruckNo,
-    actualReceivePoAvailableLines,
-    actualReceiveAllowOver,
-    canEditSchedules,
-    apiFetch,
-    closeActualReceiveModal,
-    openInboundScheduleFromToast,
-    refreshSchedules,
-    showToastMessage,
-  ]);
-
-  useEffect(() => {
-    if (!showActualReceiveModal) return;
-    fetchActualReceivePoOptions();
-  }, [fetchActualReceivePoOptions, showActualReceiveModal]);
-
-  useEffect(() => {
-    if (!showActualReceiveModal || !actualReceivePoNumber || actualReceivePoLoading) return;
-    const loadedPoNumber = String(actualReceivePoDetail?.header?.po_number || '').trim();
-    if (loadedPoNumber === String(actualReceivePoNumber || '').trim()) return;
-    loadActualReceivePo(actualReceivePoNumber);
-  }, [
-    actualReceivePoDetail?.header?.po_number,
-    actualReceivePoLoading,
-    actualReceivePoNumber,
-    loadActualReceivePo,
-    showActualReceiveModal,
-  ]);
-
-  useEffect(() => {
-    if (inboundSubTab !== 'schedule' && showActualReceiveModal) {
-      closeActualReceiveModal();
-    }
-  }, [closeActualReceiveModal, inboundSubTab, showActualReceiveModal]);
 
   const canManagePo = canImportExport || canManageItems || canManageVendors || canEditSchedules;
   const poLocked = Boolean(poSelectedMeta?.poNumber);
@@ -1878,7 +1491,7 @@ const TabInbound = (props) => {
                                  checked={poLineRemainingOnly}
                                  onChange={(e) => setPoLineRemainingOnly(e.target.checked)}
                                />
-                               Tampilkan Sisa Tersedia untuk Incoming &gt; 0
+                               Tampilkan Sisa &gt; 0
                              </label>
                            </div>
                            <div className="rounded-2xl border border-slate-200 bg-white/90 overflow-x-auto">
@@ -2133,6 +1746,17 @@ const TabInbound = (props) => {
                               <button
                                 type="button"
                                 onClick={() => {
+                                  openBulkReceiveModal();
+                                  setInboundActionOpen(false);
+                                }}
+                                className="w-full px-4 py-3 text-left hover:bg-slate-50 text-slate-700 flex items-center gap-2 disabled:opacity-60"
+                                disabled={selectedScheduleIds.length === 0 || isStockOpnameLocked}
+                              >
+                                <PackagePlus size={16} /> Input Kedatangan (Batch)
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
                                   setInboundCardScanOpen(true);
                                   setInboundActionOpen(false);
                                 }}
@@ -2150,18 +1774,6 @@ const TabInbound = (props) => {
                                 disabled={selectedScheduleIds.length === 0}
                               >
                                 <Printer size={16} /> Print Kanban Cards
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  openActualReceiveModal();
-                                  setInboundActionOpen(false);
-                                }}
-                                className="w-full px-4 py-3 text-left hover:bg-slate-50 text-slate-700 flex items-center gap-2 disabled:opacity-60"
-                                disabled={isStockOpnameLocked}
-                                title={isStockOpnameLocked ? 'Selesaikan dulu Stock Opname!' : 'Penerimaan aktual'}
-                              >
-                                <PackagePlus size={16} /> Penerimaan Aktual Baru
                               </button>
                             </>
                           )}
@@ -2299,6 +1911,7 @@ const TabInbound = (props) => {
                       <div className="relative" style={{ height: visibleWindow.total * rowHeight }}>
                         {visibleRows.map((item, idx) => {
                           const rowIndex = visibleWindow.startIndex + idx;
+                          const splitDecision = getSplitDecision(item);
                           const noteValue = noteDrafts[item.id] ?? item.notes ?? '';
                           const poStatusMeta = resolvePoStatusMeta(item.poStatus);
                           const scheduleStatusMeta = resolveScheduleStatusMeta(item.status);
@@ -2388,29 +2001,55 @@ const TabInbound = (props) => {
                                     <div>Tgl Tiba: <span className="font-semibold">{item.arrivalDate || '-'}</span></div>
                                     <div>Qty Tiba: <span className="font-semibold">{item.receivedQty || 0}</span></div>
                                   </div>
-                                  {item.actualLocked ? (
-                                    <div className="flex items-center justify-center">
-                                      <button
-                                        type="button"
-                                        onClick={() => user?.role === 'admin' && handleUnlockActual(item)}
-                                        className={`p-1.5 rounded-full border ${
-                                          user?.role === 'admin'
-                                            ? 'border-emerald-200 bg-emerald-50 text-emerald-600 hover:bg-emerald-100'
-                                            : 'border-emerald-100 bg-emerald-50 text-emerald-600'
-                                        }`}
-                                        title={user?.role === 'admin' ? 'Data terkunci. Klik untuk membuka.' : 'Data terkunci.'}
-                                      >
-                                        <Lock size={12} />
-                                      </button>
-                                    </div>
-                                  ) : (
-                                    <div className="flex items-center justify-center">
-                                      <span
-                                        className="p-1.5 rounded-full border border-slate-200 bg-white text-slate-400"
-                                        title="Data terbuka."
-                                      >
-                                        <Unlock size={12} />
-                                      </span>
+                                  {(canEditSchedules || splitDecision?.needsSplit || item.actualLocked) && (
+                                    <div className="flex flex-row flex-wrap items-center justify-center gap-2">
+                                      {canEditSchedules && !item.actualLocked && (
+                                        <button
+                                          type="button"
+                                          onClick={() => openBulkReceiveModal([item.id])}
+                                          className="text-[10px] px-2 py-1 rounded-full border border-teal-200 text-teal-700 bg-teal-50 hover:bg-teal-100 disabled:opacity-60"
+                                          disabled={isStockOpnameLocked}
+                                          title={isStockOpnameLocked ? 'Selesaikan dulu Stock Opname!' : 'Input kedatangan'}
+                                        >
+                                          Input
+                                        </button>
+                                      )}
+                                      {(splitDecision?.needsSplit || item.actualLocked) && (
+                                        <div className="flex items-center gap-2">
+                                          {item.actualLocked ? (
+                                            <button
+                                              type="button"
+                                              onClick={() => user?.role === 'admin' && handleUnlockActual(item)}
+                                              className={`p-1.5 rounded-full border ${
+                                                user?.role === 'admin'
+                                                  ? 'border-emerald-200 bg-emerald-50 text-emerald-600 hover:bg-emerald-100'
+                                                  : 'border-emerald-100 bg-emerald-50 text-emerald-600'
+                                              }`}
+                                              title={user?.role === 'admin' ? 'Data terkunci. Klik untuk membuka.' : 'Data terkunci.'}
+                                            >
+                                              <Lock size={12} />
+                                            </button>
+                                          ) : (
+                                            <span
+                                              className="p-1.5 rounded-full border border-slate-200 bg-white text-slate-400"
+                                              title="Data terbuka."
+                                            >
+                                              <Unlock size={12} />
+                                            </span>
+                                          )}
+                                          {canEditSchedules && splitDecision?.needsSplit && !item.hasSplit && (
+                                            <button
+                                              type="button"
+                                              onClick={() => handleSplitSchedule(item)}
+                                              className="text-[10px] bg-amber-50 text-amber-700 px-2 py-1 rounded-full border border-amber-200 inline-flex items-center gap-1 hover:bg-amber-100 transition"
+                                              title="Split sisa barang"
+                                            >
+                                              <GitFork size={10} />
+                                              {splitDecision.outstanding}
+                                            </button>
+                                          )}
+                                        </div>
+                                      )}
                                     </div>
                                   )}
                                 </div>
@@ -2539,290 +2178,6 @@ const TabInbound = (props) => {
               </div>
             </div>
 
-            {showActualReceiveModal && inboundSubTab === 'schedule' && (
-              <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={closeActualReceiveModal}>
-                <div className="w-full max-w-6xl rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
-                  <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-                    <div>
-                      <div className="text-base font-semibold text-slate-900">FORM: PENERIMAAN AKTUAL</div>
-                      <div className="text-[11px] text-slate-500">Pilih PO lalu supplier dan item terisi otomatis.</div>
-                    </div>
-                    <button onClick={closeActualReceiveModal} className="text-slate-500 hover:text-slate-700">
-                      <XIcon size={18} />
-                    </button>
-                  </div>
-
-                  {isStockOpnameLocked && (
-                    <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
-                      Selesaikan dulu Stock Opname!
-                    </div>
-                  )}
-
-                  <div className="mt-3 space-y-3 text-sm">
-                    <div className="rounded-lg border border-slate-200 bg-sky-50/60 p-3">
-                      <div className="mb-2 rounded bg-sky-200/70 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-slate-700">
-                        BARIS 1: DATA UTAMA KONTRAK & WAKTU
-                      </div>
-                      <div className="grid grid-cols-1 gap-2 md:grid-cols-12">
-                        <div className="md:col-span-5 flex flex-col gap-1">
-                          <label className="text-xs font-semibold text-slate-600">No PO</label>
-                          <div className="flex gap-2">
-                            <select
-                              className="h-[42px] w-full rounded border border-slate-200 bg-white px-3 py-2"
-                              value={actualReceivePoNumber}
-                              onChange={(e) => {
-                                const nextValue = e.target.value;
-                                setActualReceivePoNumber(nextValue);
-                                setActualReceivePoDetail(null);
-                                setActualReceivePoLines([]);
-                                setActualReceiveSupplier('');
-                                setActualReceiveRows([createActualReceiveRow()]);
-                                setActualReceivePoError('');
-                                if (nextValue) {
-                                  void loadActualReceivePo(nextValue);
-                                }
-                              }}
-                              disabled={actualReceivePoOptionsLoading}
-                            >
-                              <option value="">Pilih No PO</option>
-                              {actualReceivePoVisibleOptions.map((row) => (
-                                <option key={row.po_number} value={row.po_number}>
-                                  {row.po_number} | Sisa {formatNumber0(row.total_qty_remaining || 0)}
-                                </option>
-                              ))}
-                            </select>
-                            <button
-                              type="button"
-                              onClick={fetchActualReceivePoOptions}
-                              className="h-[42px] rounded border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 disabled:opacity-60"
-                              disabled={actualReceivePoOptionsLoading}
-                              title="Refresh daftar PO"
-                            >
-                              {actualReceivePoOptionsLoading ? '...' : '↻'}
-                            </button>
-                          </div>
-                        </div>
-                        <div className="md:col-span-5 flex flex-col gap-1">
-                          <label className="text-xs font-semibold text-slate-600">Supplier</label>
-                          <div className="flex h-[42px] items-center rounded border border-slate-200 bg-white px-3 text-slate-700">
-                            {actualReceivePoDetail?.header
-                              ? resolveSupplierLabel(actualReceivePoDetail.header)
-                              : 'Pilih PO untuk memuat supplier'}
-                          </div>
-                        </div>
-                        <div className="md:col-span-2 flex flex-col gap-1">
-                          <label className="text-xs font-semibold text-slate-600">Tgl Tiba</label>
-                          <input
-                            type="date"
-                            className="h-[42px] rounded border border-slate-200 bg-white px-3 py-2"
-                            value={actualReceiveArrivalDate}
-                            onChange={(e) => setActualReceiveArrivalDate(e.target.value)}
-                          />
-                        </div>
-                        <div className="md:col-span-12 flex items-center gap-2 rounded border border-dashed border-slate-300 bg-white px-3 py-2 text-xs text-slate-600">
-                          <input
-                            id="allow-over-receive"
-                            type="checkbox"
-                            checked={actualReceiveAllowOver}
-                            onChange={(e) => setActualReceiveAllowOver(e.target.checked)}
-                            disabled={!canEditSchedules}
-                            className="h-4 w-4 rounded border-slate-300 text-rose-600"
-                          />
-                          <label htmlFor="allow-over-receive" className="font-semibold text-slate-700">
-                            Izinkan incoming over dari sisa PO
-                          </label>
-                          <span className="text-slate-500">
-                            {canEditSchedules ? 'Aktifkan untuk menerima qty melebihi sisa PO pada line terpilih.' : 'Hanya user dengan akses inbound schedule yang dapat mengaktifkan mode ini.'}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="rounded-lg border border-emerald-200 bg-emerald-50/60 p-3">
-                      <div className="mb-2 rounded bg-emerald-200/70 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-emerald-800">
-                        BARIS 2: DATA LOGISTIK & LAPANGAN
-                      </div>
-                      <div className="grid grid-cols-1 gap-2 md:grid-cols-12">
-                        <div className="md:col-span-3 flex flex-col gap-1">
-                          <label className="text-xs font-semibold text-slate-600">No. SJ / DO</label>
-                          <input
-                            className="h-[42px] rounded border border-slate-200 bg-white px-3 py-2"
-                            value={actualReceiveDoNumber}
-                            onChange={(e) => setActualReceiveDoNumber(e.target.value)}
-                            placeholder="Nomor surat jalan"
-                          />
-                        </div>
-                        <div className="md:col-span-3 flex flex-col gap-1">
-                          <label className="text-xs font-semibold text-slate-600">No Polisi</label>
-                          <input
-                            className="h-[42px] rounded border border-slate-200 bg-white px-3 py-2"
-                            value={actualReceiveTruckNo}
-                            onChange={(e) => setActualReceiveTruckNo(e.target.value)}
-                            placeholder="B 1234 XYZ"
-                          />
-                        </div>
-                        <div className="md:col-span-3 flex flex-col gap-1">
-                          <label className="text-xs font-semibold text-slate-600">Nama Sopir</label>
-                          <input
-                            className="h-[42px] rounded border border-slate-200 bg-white px-3 py-2"
-                            value={actualReceiveDriverName}
-                            onChange={(e) => setActualReceiveDriverName(e.target.value)}
-                            placeholder="Nama sopir"
-                          />
-                        </div>
-                        <div className="md:col-span-3 flex flex-col gap-1">
-                          <label className="text-xs font-semibold text-slate-600">Remarks</label>
-                          <input
-                            className="h-[42px] rounded border border-slate-200 bg-white px-3 py-2"
-                            value={actualReceiveRemarks}
-                            onChange={(e) => setActualReceiveRemarks(e.target.value)}
-                            placeholder="Catatan tambahan"
-                          />
-                        </div>
-                      </div>
-                    </div>
-
-                    {actualReceivePoDetail?.header && (
-                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-slate-700">
-                        <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-sky-500 text-white text-[11px]">i</span>
-                        <span className="font-semibold">No PO:</span>
-                        <span>{actualReceivePoDetail.header.po_number}</span>
-                        <span className="font-semibold">| Supplier:</span>
-                        <span>{actualReceivePoDetail.header.supplier_name || actualReceivePoDetail.header.supplier_id || '-'}</span>
-                        <span className="font-semibold">| Status:</span>
-                        <span>{String(actualReceivePoDetail.header.status || '').toUpperCase()}</span>
-                        <span className="font-semibold">| Lines:</span>
-                        <span>{actualReceivePoLines.length} Item Kontrak — Sisa Tersedia untuk Incoming</span>
-                      </div>
-                    )}
-
-                    {actualReceivePoError && <div className="text-xs text-rose-600">{actualReceivePoError}</div>}
-                    {actualReceivePoLines.length > 0 && actualReceivePoAvailableLines.length === 0 && !actualReceiveAllowOver && (
-                      <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
-                        Semua item kontrak pada PO ini sudah habis teralokasi ke schedule. Incoming tidak bisa dilanjutkan.
-                      </div>
-                    )}
-                    {actualReceiveAllowOver && actualReceivePoLines.length > 0 && (
-                      <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
-                        Mode over aktif. Line dengan sisa 0 tetap bisa dipilih untuk incoming tambahan.
-                      </div>
-                    )}
-
-                    <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
-                      <div className="flex items-center justify-between bg-slate-100 px-4 py-2 text-xs font-semibold text-slate-700">
-                        <span>BARIS 3: TABEL DETAIL ITEM KONTRAK PO (FOKUS UTAMA)</span>
-                        <button type="button" onClick={addActualReceiveRow} className="text-xs font-semibold text-slate-900" disabled={actualReceiveSelectableLines.length === 0}>
-                          + Tambah Baris Baru
-                        </button>
-                      </div>
-                      <div className="max-h-[38vh] overflow-y-auto">
-                        <table className="min-w-full text-sm">
-                          <thead className="sticky top-0 bg-white border-b">
-                            <tr className="text-left">
-                              <th className="p-3">Item</th>
-                              <th className="p-3 w-[180px] text-right">Qty Aktual Datang</th>
-                              <th className="p-3">Detail</th>
-                              <th className="p-3 w-[90px] text-center">Aksi</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {(actualReceiveRows || []).map((row, index) => {
-                              const poLines = actualReceiveSelectableLines;
-                              const matchedLine = poLines.find((line) => Number(line.id) === Number(row.poLineId));
-                              return (
-                                <tr key={row.key} className="border-t align-top">
-                                  <td className="p-3">
-                                    <select
-                                      className="w-full rounded border border-slate-200 bg-white px-3 py-2 text-sm"
-                                      value={row.poLineId || ''}
-                                      onChange={(e) => {
-                                        const selectedLine = poLines.find((line) => Number(line.id) === Number(e.target.value));
-                                        const remainingQty = getActualReceiveRemainingQty(selectedLine);
-                                        if (!selectedLine || (!actualReceiveAllowOver && !(remainingQty > 0))) {
-                                          setActualReceiveError('Item dengan sisa 0 tidak bisa dipilih.');
-                                          updateActualReceiveRow(row.key, {
-                                            poLineId: '',
-                                            itemCode: '',
-                                          });
-                                          return;
-                                        }
-                                        updateActualReceiveRow(row.key, {
-                                          poLineId: selectedLine?.id || '',
-                                          itemCode: selectedLine?.item_code || '',
-                                        });
-                                        focusActualReceiveQty(row.key);
-                                      }}
-                                      disabled={poLines.length === 0}
-                                    >
-                                      <option value="">[Pilih item dari PO]</option>
-                                      {poLines.map((line) => (
-                                        <option
-                                          key={line.id}
-                                          value={line.id}
-                                          disabled={!actualReceiveAllowOver && getActualReceiveRemainingQty(line) <= 0}
-                                        >
-                                          {line.line_no}. {line.item_code} - {line.item_name || '-'} (Sisa Tersedia untuk Incoming {formatNumber0(getActualReceiveRemainingQty(line))})
-                                        </option>
-                                      ))}
-                                    </select>
-                                    <div className="mt-1 text-[10px] text-slate-400">Baris {index + 1}</div>
-                                  </td>
-                                  <td className="p-3">
-                                    <input
-                                      ref={(el) => {
-                                        if (el) actualReceiveQtyRefs.current[row.key] = el;
-                                        else delete actualReceiveQtyRefs.current[row.key];
-                                      }}
-                                      type="number"
-                                      min="0"
-                                      step="1"
-                                      className="w-full rounded border border-slate-200 bg-white px-3 py-2 text-right"
-                                      value={row.qty}
-                                      onChange={(e) => updateActualReceiveRow(row.key, { qty: e.target.value })}
-                                    />
-                                  </td>
-                                  <td className="p-3 text-xs text-slate-600">
-                                    <div className="font-semibold text-slate-900">{matchedLine?.item_name || '-'}</div>
-                                    <div>Part Code: {matchedLine?.item_code || '-'}</div>
-                                    <div>Unit: {matchedLine?.unit || '-'}</div>
-                                    <div>Sisa Tersedia untuk Incoming: {formatNumber0(getActualReceiveRemainingQty(matchedLine))}</div>
-                                  </td>
-                                  <td className="p-3 text-center">
-                                    <button
-                                      type="button"
-                                      onClick={() => removeActualReceiveRow(row.key)}
-                                      className="rounded border px-3 py-1.5 text-xs"
-                                    >
-                                      Hapus
-                                    </button>
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-
-                    {actualReceiveError && <div className="text-xs text-rose-600">{actualReceiveError}</div>}
-
-                    <div className="flex justify-end gap-2">
-                      <button onClick={closeActualReceiveModal} className="rounded border px-4 py-2 text-sm">
-                        Batal
-                      </button>
-                      <button
-                        onClick={handleActualReceiveSubmit}
-                        className="rounded bg-emerald-600 px-4 py-2 text-sm text-white disabled:opacity-60"
-                        disabled={actualReceiveSubmitting || isStockOpnameLocked || actualReceiveSelectableLines.length === 0}
-                      >
-                        {actualReceiveSubmitting ? 'Menyimpan...' : 'Simpan Inbound'}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
-
             <div className="mt-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between text-xs text-slate-500 print:hidden">
               <div className="flex items-center gap-2">
                 <span>Tampilkan</span>
@@ -2865,6 +2220,114 @@ const TabInbound = (props) => {
                 Menampilkan {scheduleStartIndex}-{scheduleEndIndex} dari {scheduleTotal} entri
               </div>
             </div>
+
+            {bulkReceiveOpen && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={closeBulkReceiveModal}>
+                <div className="bg-white rounded-2xl shadow-xl border w-full max-w-3xl p-5" onClick={(e) => e.stopPropagation()}>
+                  <div className="flex items-center justify-between mb-4">
+                    <div>
+                      <div className="text-lg font-semibold text-slate-900">Input Kedatangan (Batch)</div>
+                      <div className="text-xs text-slate-500">Isi No. SJ dan Tgl Tiba sekali untuk semua item terpilih.</div>
+                    </div>
+                    <button onClick={closeBulkReceiveModal} className="text-slate-500 hover:text-slate-700">
+                      <XIcon size={18} />
+                    </button>
+                  </div>
+                  {isStockOpnameLocked && (
+                    <div className="mb-3 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">
+                      Selesaikan dulu Stock Opname!
+                    </div>
+                  )}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                    <div className="flex flex-col gap-1">
+                      <label className="text-xs font-semibold text-slate-600">No. SJ / DO</label>
+                      <input
+                        className="border rounded px-3 py-2"
+                        value={bulkReceiveDoNumber}
+                        onChange={(e) => setBulkReceiveDoNumber(e.target.value)}
+                      />
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-xs font-semibold text-slate-600">Tgl Tiba</label>
+                      <input
+                        type="date"
+                        className="border rounded px-3 py-2"
+                        value={bulkReceiveDate}
+                        onChange={(e) => setBulkReceiveDate(e.target.value)}
+                      />
+                    </div>
+                  </div>
+                  {isAdmin && (
+                    <label className="mt-3 inline-flex items-center gap-2 text-xs font-semibold text-slate-600">
+                      <input
+                        type="checkbox"
+                        checked={bulkReceiveAllowOver}
+                        onChange={(e) => setBulkReceiveAllowOver(e.target.checked)}
+                      />
+                      Izinkan Over-Receive
+                    </label>
+                  )}
+                  <div className="mt-4 border rounded-lg overflow-hidden">
+                    <div className="bg-slate-50 px-4 py-2 text-xs font-semibold text-slate-600">Item Terpilih</div>
+                    <div className="max-h-72 overflow-y-auto">
+                      {filteredSchedules.filter((row) => selectedScheduleIds.includes(row.id)).map((row) => {
+                        const remainingQty = getRemainingQty(row);
+                        const inputQty = Number(bulkReceiveQty[row.id] || 0);
+                        const inputDocQty = Number(bulkReceiveDocQty[row.id] || 0);
+                        const itemName = row.itemName || row.item_name || '';
+                        const showName = itemName && !String(row.item || '').toLowerCase().includes(String(itemName).toLowerCase());
+                        return (
+                          <div key={row.id} className="grid grid-cols-1 md:grid-cols-[1.5fr_1fr_1fr_1fr] gap-3 px-4 py-3 border-t text-sm items-center">
+                            <div>
+                              <div className="font-semibold">{row.item}</div>
+                              {showName && <div className="text-xs text-slate-500">{itemName}</div>}
+                              <div className="text-xs text-slate-500">PO {row.poNumber} - {resolveSupplierLabel(row)}</div>
+                            </div>
+                            <div className="text-xs text-slate-600">
+                              Sisa PO: <span className="font-semibold">{remainingQty}</span>
+                            </div>
+                            <div className="flex flex-col gap-1">
+                              <label className="text-xs text-slate-500">Qty Dokumen</label>
+                              <input
+                                type="number"
+                                className="border rounded px-3 py-2 text-sm"
+                                value={bulkReceiveDocQty[row.id] ?? ''}
+                                onChange={(e) => {
+                                  const next = { ...bulkReceiveDocQty, [row.id]: e.target.value };
+                                  setBulkReceiveDocQty(next);
+                                }}
+                              />
+                            </div>
+                            <div className="flex flex-col gap-1">
+                              <label className="text-xs text-slate-500">Qty Tiba</label>
+                              <input
+                                type="number"
+                                className={`border rounded px-3 py-2 text-sm ${(inputQty > remainingQty || inputQty > inputDocQty) ? 'border-amber-400 bg-amber-50' : ''}`}
+                                value={bulkReceiveQty[row.id] ?? ''}
+                                onChange={(e) => {
+                                  const next = { ...bulkReceiveQty, [row.id]: e.target.value };
+                                  setBulkReceiveQty(next);
+                                }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div className="flex justify-end gap-2 mt-4">
+                    <button onClick={closeBulkReceiveModal} className="px-4 py-2 rounded border text-sm">Batal</button>
+                    <button
+                      onClick={handleBulkReceiveSubmit}
+                      className="px-4 py-2 rounded bg-slate-900 text-white text-sm disabled:opacity-60"
+                      disabled={isStockOpnameLocked}
+                    >
+                      Simpan Batch
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {inboundCardScanOpen && (
               <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={() => setInboundCardScanOpen(false)}>
@@ -3183,7 +2646,7 @@ const TabInbound = (props) => {
                         <th className="p-3 text-right">Line</th>
                         <th className="p-3 text-right">Qty Order</th>
                         <th className="p-3 text-right">Qty Received</th>
-                        <th className="p-3 text-right">Sisa Tersedia untuk Incoming</th>
+                        <th className="p-3 text-right">Qty Sisa</th>
                         <th className="p-3 text-right">Aksi</th>
                       </tr>
                     </thead>
@@ -3295,7 +2758,7 @@ const TabInbound = (props) => {
                                             checked={poDetailRemainingOnly}
                                             onChange={(e) => setPoDetailRemainingOnly(e.target.checked)}
                                           />
-                                          Tampilkan Sisa Tersedia untuk Incoming &gt; 0
+                                          Tampilkan Sisa &gt; 0
                                         </label>
                                       </div>
                                        {poLineLoading[row.po_number] ? (
@@ -3695,7 +3158,7 @@ const TabInbound = (props) => {
                         />
                       </div>
                       <div className="flex flex-col gap-1">
-                        <label className="text-xs font-semibold text-slate-600">Sisa Tersedia untuk Incoming Saat Ini</label>
+                        <label className="text-xs font-semibold text-slate-600">Qty Sisa Saat Ini</label>
                         <input
                           className="border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-600 bg-slate-50"
                           value={formatNumber0 ? formatNumber0(poLineEditForm.qtyRemaining || 0) : (poLineEditForm.qtyRemaining || 0)}

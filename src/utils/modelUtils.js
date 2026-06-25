@@ -23,14 +23,10 @@ export const buildModelMap = (models) => {
   return map;
 };
 
-export const formatModelCodes = (modelMap, codes) => {
+export const formatModelCodes = (_modelMap, codes) => {
   if (!codes || codes.length === 0) return '';
   return codes
-    .map((code) => {
-      if (!code) return '';
-      const model = modelMap?.get?.(code);
-      return model ? `${code} (${model.name})` : code;
-    })
+    .map((code) => String(code || '').trim())
     .filter(Boolean)
-    .join(' • ');
+    .join(', ');
 };

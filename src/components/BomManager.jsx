@@ -61,6 +61,8 @@ const bucketAliasPatterns = {
     /\bfinished\s*goods?\b/i,
     /\bbarang\s*jadi\b/i,
     /\bfinal\s*goods?\b/i,
+    /\bfinishd\b/i,
+    /\bfinis(?:h|hd|hed)?\b/i,
   ],
   SUB_ASSY: [
     /\bsub[-\s]*assy\b/i,
@@ -86,6 +88,19 @@ const bucketAliasPatterns = {
     /\bconsumable\b/i,
   ],
 };
+const BOM_BUCKET_META = {
+  FG: { label: 'FG', badgeClass: 'bg-indigo-100 text-indigo-700' },
+  SUB_ASSY: { label: 'Sub-Assy', badgeClass: 'bg-orange-100 text-orange-700' },
+  CP: { label: 'Child Part', badgeClass: 'bg-orange-100 text-orange-700' },
+  RM: { label: 'Raw Material', badgeClass: 'bg-emerald-100 text-emerald-700' },
+  INDIRECT: { label: 'Indirect Material', badgeClass: 'bg-purple-100 text-purple-700' },
+};
+const PROCESS_CONSUMPTION_BASIS_OPTIONS = [
+  { value: 'PER_PCS', label: 'Per PCS Output' },
+  { value: 'PER_MINUTE', label: 'Per Menit Proses' },
+  { value: 'PER_METER_WELD', label: 'Per Meter Weld' },
+  { value: 'PER_BATCH', label: 'Per Batch' },
+];
 const inferBomBucketFromText = (value) => {
   const text = String(value || '').trim();
   if (!text) return '';
@@ -195,7 +210,7 @@ export default function BOMManager({
     return categoryNameByCode.get(raw.toLowerCase()) || raw;
   };
   const bomBucketPatterns = useMemo(() => ({
-    fg: [/^fg[-_]/i, /\bfg\b/i, /finished\s*goods?/i, /finish(ed)?/i],
+    fg: [/^fg[-_]/i, /\bfg\b/i, /finished\s*goods?/i, /finish(ed)?/i, /finishd/i, /\bfinis/i],
     subAssy: [/^sa[-_]/i, /^sub[-_]/i, /\bsub[- ]?assy\b/i, /\bsubassy\b/i],
     childPart: [/^cp[-_]/i, /\bcp\b/i, /child\s*part/i],
     rawMaterial: [/^rm[-_]/i, /\brm\b/i, /raw\s*material/i, /raw\b/i],
@@ -223,6 +238,22 @@ export default function BOMManager({
     const inferredBucket = inferBomBucketFromText(joinedText);
     if (inferredBucket) return inferredBucket;
     return '';
+  };
+  const getBomDisplayMeta = (itemOrValue) => {
+    const bucket = typeof itemOrValue === 'string'
+      ? inferBomBucketFromText(itemOrValue)
+      : getBomItemBucket(itemOrValue);
+    if (bucket && BOM_BUCKET_META[bucket]) {
+      return { bucket, ...BOM_BUCKET_META[bucket] };
+    }
+    const fallbackLabel = typeof itemOrValue === 'string'
+      ? resolveCategoryLabel(itemOrValue)
+      : resolveCategoryLabel(itemOrValue?.type || itemOrValue?.category || '');
+    return {
+      bucket: '',
+      label: fallbackLabel || '-',
+      badgeClass: 'bg-gray-100 text-gray-600',
+    };
   };
   const bomPickerOptions = useMemo(() => {
     const buckets = {
@@ -287,15 +318,36 @@ export default function BOMManager({
   const getProcessDisplayLabel = (proc) => {
     if (!proc) return '';
     const processType = String(proc.process_type || proc.processType || '').trim();
+    const standardTime = Number(proc.standard_time ?? proc.standardTime ?? 0);
+    const processName = String(proc.name || proc.code || '').trim();
     const parts = [
       processType ? `[${processType}]` : '',
-      proc.code,
-      proc.name,
-      proc.work_center || proc.workCenter,
-      proc.sequence !== undefined && proc.sequence !== null ? `Seq ${proc.sequence}` : '',
-      proc.standard_time !== undefined && proc.standard_time !== null && proc.standard_time !== '' ? `${proc.standard_time}s` : '',
+      processName,
+      Number.isFinite(standardTime) && standardTime > 0 ? `CT ${standardTime}s` : '',
     ].filter(Boolean);
     return parts.join(' • ');
+  };
+  const getProcessStandardTime = (value) => {
+    const rawValue = typeof value === 'object' && value !== null
+      ? String(value.code || value.name || '').trim()
+      : String(value || '').trim();
+    if (!rawValue) return 0;
+    const resolved = typeof value === 'object' && value !== null
+      ? value
+      : processMap.get(rawValue) || processMap.get(rawValue.toLowerCase());
+    const standardTime = Number(resolved?.standard_time ?? resolved?.standardTime ?? 0);
+    return Number.isFinite(standardTime) && standardTime > 0 ? standardTime : 0;
+  };
+  const renderProcessCycleTimeBadge = (value, key = '') => {
+    const standardTime = getProcessStandardTime(value);
+    return (
+      <span
+        key={key}
+        className="inline-flex min-w-[66px] items-center justify-center rounded-full border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-600"
+      >
+        {standardTime > 0 ? `CT ${standardTime}s` : 'CT -'}
+      </span>
+    );
   };
   const buildProcessRoutingSnapshot = (codes) => (
     (codes || [])
@@ -334,6 +386,7 @@ export default function BOMManager({
   const fileInputRef = useRef(null);
   const planInputRef = useRef(null);
   const chatScrollRef = useRef(null);
+  const structureTopRef = useRef(null);
   
   // State UI
   const [showDataMenu, setShowDataMenu] = useState(false);
@@ -435,6 +488,11 @@ export default function BOMManager({
     isExisting: false,
     originalCode: '',
   });
+  const createBulkProcessConsumable = (processCode = '') => ({
+    ...createBulkMaterial('INDIRECT MATERIAL'),
+    processCode,
+    consumptionBasis: 'PER_PCS',
+  });
   const createBulkParentDetails = () => ({
     line: '',
     supplier: '',
@@ -469,16 +527,20 @@ export default function BOMManager({
     positionCode: '',
     substituteCodesText: '',
     materials: [createBulkMaterial()],
+    processConsumables: [createBulkProcessConsumable()],
   });
   const [bulkMode, setBulkMode] = useState('multi');
   const [bulkParentCode, setBulkParentCode] = useState('');
   const [bulkParentDetails, setBulkParentDetails] = useState(() => createBulkParentDetails());
   const [bulkParentMaterials, setBulkParentMaterials] = useState([createBulkMaterial()]);
+  const [bulkParentProcessConsumables, setBulkParentProcessConsumables] = useState([createBulkProcessConsumable()]);
   const [bulkChildren, setBulkChildren] = useState([createBulkChild()]);
   const [bulkSaving, setBulkSaving] = useState(false);
   const [revisionAuditParentCode, setRevisionAuditParentCode] = useState('');
   const [revisionAuditHeaderId, setRevisionAuditHeaderId] = useState('');
   const [treeRevisionMode, setTreeRevisionMode] = useState('active');
+  const [showRevisionAuditPanel, setShowRevisionAuditPanel] = useState(false);
+  const [showWhereUsedPanel, setShowWhereUsedPanel] = useState(false);
   const bomProcessOptionsForMode = useMemo(
     () => getProcessOptionsForMode(bulkMode),
     [masterProcesses, bulkMode],
@@ -487,8 +549,47 @@ export default function BOMManager({
     () => getProcessOptionsForMode('all'),
     [masterProcesses],
   );
+  const bomProcessInputOptions = useMemo(() => {
+    const seen = new Set();
+    const options = [];
+    const pushOption = (value) => {
+      const text = String(value || '').trim();
+      if (!text) return;
+      const key = text.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      options.push(text);
+    };
+
+    [...(masterProcesses || [])]
+      .sort((left, right) => {
+        const leftSequence = Number(left?.sequence || 0);
+        const rightSequence = Number(right?.sequence || 0);
+        if (leftSequence !== rightSequence) return leftSequence - rightSequence;
+        return String(left?.code || '').localeCompare(String(right?.code || ''));
+      })
+      .forEach((proc) => {
+        pushOption(proc.code);
+        pushOption(proc.name);
+      });
+
+    [...(masterItemsNormalized || []), ...(bomRelations || [])].forEach((entry) => {
+      [
+        entry?.processes,
+        entry?.process_flow,
+        entry?.processFlow,
+        entry?.process_routing,
+        entry?.processRouting,
+      ].forEach((processList) => {
+        (Array.isArray(processList) ? processList : [processList]).forEach(pushOption);
+      });
+    });
+
+    return options;
+  }, [bomRelations, masterItemsNormalized, masterProcesses]);
 
   const [bomHeader, setBomHeader] = useState(() => normalizeBomHeaderState());
+  const [showBomRevisionFields, setShowBomRevisionFields] = useState(false);
   const [bomLines, setBomLines] = useState([
     { childCode: '', description: '' },
   ]);
@@ -600,7 +701,7 @@ export default function BOMManager({
         uom: item.unit || item.uom || relation.child_unit || '',
         weight: Number(item.weight || 0),
         leadTime: Number(item.lead_time_days || relation.lead_time_days || 0),
-        cycleTime: Number(item.cycle_time_seconds || relation.cycle_time_seconds || 0),
+        cycleTime: Number(relation.cycle_time_seconds || item.cycle_time_seconds || 0),
         processes: mapProcessFlowToCodes(processFlow),
         modelCodes,
         qty: Number(relation.quantity || 1),
@@ -609,11 +710,11 @@ export default function BOMManager({
         yieldFactor: Number(relation.yield_factor || 1),
         positionCode: relation.position_code || '',
         substituteCodesText: formatSubstituteCodes(relation.substitute_material_codes || []),
-        line: item.line_production || item.line || '',
+        line: relation.line_production || item.line_production || item.line || '',
         supplier: item.supplier_name || item.supplier || '',
         customer: getItemCustomerLabel(item.code || relation.child_code || node.code || ''),
-        location: item.location_name || item.location || '',
-        packing: item.packing_name || item.packing || '',
+        location: relation.location_name || item.location_name || item.location || '',
+        packing: relation.packing || item.packing_name || item.packing || '',
       }),
     );
     requestAnimationFrame(() => {
@@ -698,6 +799,24 @@ export default function BOMManager({
   const childPartOptions = useMemo(() => bomPickerOptions.CP, [bomPickerOptions]);
   const rawMaterialOptions = useMemo(() => bomPickerOptions.RM, [bomPickerOptions]);
   const indirectMaterialOptions = useMemo(() => bomPickerOptions.INDIRECT, [bomPickerOptions]);
+  const getBomOptionLabel = (item) => {
+    const unit = item?.unit || item?.uom || '';
+    return [item?.code, item?.name].filter(Boolean).join(' - ') + (unit ? ` (${unit})` : '');
+  };
+  const getMaterialOptionsForType = (typeValue) => (
+    normalizeMaterialType(typeValue, 'RAW MATERIAL') === 'INDIRECT MATERIAL'
+      ? indirectMaterialOptions
+      : rawMaterialOptions
+  );
+  const getCleanProcessCodes = (processCodes = []) => (
+    (processCodes || []).map((code) => String(code || '').trim()).filter(Boolean)
+  );
+  const resolveConsumableProcessCode = (consumable = {}, processCodes = []) => {
+    const current = String(consumable.processCode || '').trim();
+    if (current) return current;
+    const cleaned = getCleanProcessCodes(processCodes);
+    return cleaned.length === 1 ? cleaned[0] : '';
+  };
 
   const getItemByCode = (code) => masterItems.find((item) => item.code === code);
 
@@ -809,6 +928,7 @@ export default function BOMManager({
       await apiFetch('/api/bom/reset-all', { method: 'DELETE' });
       setBulkParentCode('');
       setBulkParentMaterials([createBulkMaterial()]);
+      setBulkParentProcessConsumables([createBulkProcessConsumable()]);
       setBulkChildren([createBulkChild()]);
       setEditingRelation(null);
       await refreshBomRelations();
@@ -832,6 +952,7 @@ export default function BOMManager({
     const derived = deriveParentMaterialsFromRelations(bulkParentCode);
     if (isBulkMaterialListBlank(derived)) return;
     setBulkParentMaterials(derived);
+    setBulkParentProcessConsumables(deriveParentProcessConsumablesFromRelations(bulkParentCode));
   }, [bulkMode, bulkParentCode, activeBomRelations, bulkParentMaterials]);
 
   useEffect(() => {
@@ -920,6 +1041,10 @@ export default function BOMManager({
             assemblyNote: String(newItem.note || '').trim(),
             processFlow: processFlowPayload,
             processRouting: buildProcessRoutingSnapshot(processFlowPayload),
+            lineProduction: String(newItem.line || '').trim(),
+            locationName: String(newItem.location || '').trim(),
+            packing: String(newItem.packing || '').trim(),
+            cycleTimeSeconds: Number(newItem.cycleTime) || 0,
             headerMeta: bomHeader,
             mergeOnDuplicate: !editingRelation?.id,
           });
@@ -1078,7 +1203,7 @@ export default function BOMManager({
           String(proc.code || '').toLowerCase() === stepValue.toLowerCase()
           || String(proc.name || '').toLowerCase() === stepValue.toLowerCase()
         ));
-        return match ? match.code : '';
+        return match ? match.code : stepValue;
       })
       .filter(Boolean)
   );
@@ -1093,13 +1218,22 @@ export default function BOMManager({
 
   const isRawMaterialRelation = (rel) => {
     const typeValue = String(rel.component_type || rel.child_type || '').toLowerCase();
+    if (typeValue.includes('process consumable')) return false;
     const normalized = typeValue.replace(/[^a-z0-9]/g, '');
     const isRawByRelation = typeValue.includes('raw') || normalized === 'rm' || normalized.startsWith('rm');
-    if (isRawByRelation) return true;
+    const isIndirectByRelation = typeValue.includes('indirect') || normalized === 'im' || normalized.startsWith('im');
+    if (isRawByRelation || isIndirectByRelation) return true;
     const childCode = String(rel.child_code || rel.childCode || '').trim();
     const childType = String(itemsByCode.get(childCode)?.type || '').toLowerCase();
     const childNormalized = childType.replace(/[^a-z0-9]/g, '');
-    return childType.includes('raw') || childNormalized === 'rm' || childNormalized.startsWith('rm');
+    return (
+      childType.includes('raw')
+      || childNormalized === 'rm'
+      || childNormalized.startsWith('rm')
+      || childType.includes('indirect')
+      || childNormalized === 'im'
+      || childNormalized.startsWith('im')
+    );
   };
 
   const getExistingMaterialCodesForParent = (parentCode) => {
@@ -1122,20 +1256,60 @@ export default function BOMManager({
     const materials = (activeBomRelations || [])
       .filter((rel) => String(rel.parent_code || rel.parentCode || '').trim() === normalizedCode)
       .filter(isRawMaterialRelation)
-      .map((rel) => ({
-        id: rel.id ? `rel-${rel.id}` : `${Date.now()}-${Math.random()}`,
-        code: rel.child_code || rel.childCode || '',
-        name: rel.child_name || rel.component_description || '',
-        uom: rel.child_unit || rel.uom || 'PCS',
-        qty: Number(rel.quantity) || 1,
-        scrap: Number(rel.scrap_factor) || 0,
-        yieldFactor: Number(rel.yield_factor || 1) || 1,
-        positionCode: rel.position_code || '',
-        substituteCodesText: formatSubstituteCodes(rel.substitute_material_codes || []),
-        isExisting: true,
-        originalCode: rel.child_code || rel.childCode || '',
-      }));
+      .map((rel) => {
+        const childCode = rel.child_code || rel.childCode || '';
+        const childItem = itemsByCode.get(String(childCode || '').trim());
+        const childBucket = getBomItemBucket(childItem);
+        const relationType = normalizeMaterialType(
+          rel.component_type || rel.componentType || rel.child_type || (childBucket === 'INDIRECT' ? 'INDIRECT MATERIAL' : 'RAW MATERIAL'),
+          childBucket === 'INDIRECT' ? 'INDIRECT MATERIAL' : 'RAW MATERIAL',
+        );
+        return {
+          id: rel.id ? `rel-${rel.id}` : `${Date.now()}-${Math.random()}`,
+          code: childCode,
+          name: rel.child_name || rel.component_description || childItem?.name || '',
+          uom: rel.child_unit || rel.uom || childItem?.unit || childItem?.uom || 'PCS',
+          qty: Number(rel.quantity) || 1,
+          scrap: Number(rel.scrap_factor) || 0,
+          yieldFactor: Number(rel.yield_factor || 1) || 1,
+          positionCode: rel.position_code || '',
+          substituteCodesText: formatSubstituteCodes(rel.substitute_material_codes || []),
+          type: relationType,
+          isExisting: true,
+          originalCode: childCode,
+        };
+      });
     return materials.length ? materials : [createBulkMaterial()];
+  };
+
+  const deriveParentProcessConsumablesFromRelations = (parentCode) => {
+    const normalizedCode = String(parentCode || '').trim();
+    if (!normalizedCode) return [createBulkProcessConsumable()];
+    const consumables = (activeBomRelations || [])
+      .filter((rel) => String(rel.parent_code || rel.parentCode || '').trim() === normalizedCode)
+      .filter((rel) => String(rel.component_type || '').toUpperCase() === 'PROCESS CONSUMABLE')
+      .map((rel) => {
+        const childCode = rel.child_code || rel.childCode || '';
+        const childItem = itemsByCode.get(String(childCode || '').trim());
+        const childBucket = getBomItemBucket(childItem);
+        return {
+          id: rel.id ? `rel-cons-${rel.id}` : `${Date.now()}-${Math.random()}`,
+          code: childCode,
+          name: rel.child_name || rel.component_description || childItem?.name || '',
+          uom: rel.child_unit || rel.uom || childItem?.unit || childItem?.uom || 'PCS',
+          qty: Number(rel.quantity) || 1,
+          scrap: Number(rel.scrap_factor) || 0,
+          yieldFactor: Number(rel.yield_factor || 1) || 1,
+          positionCode: rel.position_code || '',
+          substituteCodesText: formatSubstituteCodes(rel.substitute_material_codes || []),
+          type: childBucket === 'RM' ? 'RAW MATERIAL' : 'INDIRECT MATERIAL',
+          processCode: rel.process_code || rel.processCode || '',
+          consumptionBasis: rel.consumption_basis || rel.consumptionBasis || 'PER_PCS',
+          isExisting: true,
+          originalCode: childCode,
+        };
+      });
+    return consumables.length ? consumables : [createBulkProcessConsumable()];
   };
 
   const addBulkParentMaterial = () => {
@@ -1150,10 +1324,29 @@ export default function BOMManager({
     });
   };
 
+  const updateBulkParentProcessConsumable = (materialIndex, patch) => {
+    setBulkParentProcessConsumables((prev) => {
+      const next = [...prev];
+      next[materialIndex] = { ...next[materialIndex], ...patch };
+      return next;
+    });
+  };
+
   const removeBulkParentMaterial = (materialIndex) => {
     setBulkParentMaterials((prev) => {
       const next = prev.filter((_, idx) => idx !== materialIndex);
       return next.length > 0 ? next : [createBulkMaterial()];
+    });
+  };
+
+  const addBulkParentProcessConsumable = (processCode = '') => {
+    setBulkParentProcessConsumables((prev) => [...prev, createBulkProcessConsumable(processCode)]);
+  };
+
+  const removeBulkParentProcessConsumable = (materialIndex) => {
+    setBulkParentProcessConsumables((prev) => {
+      const next = prev.filter((_, idx) => idx !== materialIndex);
+      return next.length > 0 ? next : [createBulkProcessConsumable()];
     });
   };
 
@@ -1230,6 +1423,18 @@ export default function BOMManager({
     });
   };
 
+  const updateBulkProcessConsumable = (childIndex, materialIndex, patch) => {
+    setBulkChildren((prev) => {
+      const next = [...prev];
+      const child = { ...next[childIndex] };
+      const processConsumables = [...(child.processConsumables || [])];
+      processConsumables[materialIndex] = { ...processConsumables[materialIndex], ...patch };
+      child.processConsumables = processConsumables;
+      next[childIndex] = child;
+      return next;
+    });
+  };
+
   const addBulkChild = () => {
     setBulkChildren((prev) => [...prev, createBulkChild()]);
   };
@@ -1248,12 +1453,33 @@ export default function BOMManager({
     });
   };
 
+  const addBulkProcessConsumable = (childIndex, processCode = '') => {
+    setBulkChildren((prev) => {
+      const next = [...prev];
+      const child = { ...next[childIndex] };
+      child.processConsumables = [...(child.processConsumables || []), createBulkProcessConsumable(processCode)];
+      next[childIndex] = child;
+      return next;
+    });
+  };
+
   const removeBulkMaterial = (childIndex, materialIndex) => {
     setBulkChildren((prev) => {
       const next = [...prev];
       const child = { ...next[childIndex] };
       child.materials = (child.materials || []).filter((_, idx) => idx !== materialIndex);
       if (child.materials.length === 0) child.materials = [createBulkMaterial()];
+      next[childIndex] = child;
+      return next;
+    });
+  };
+
+  const removeBulkProcessConsumable = (childIndex, materialIndex) => {
+    setBulkChildren((prev) => {
+      const next = [...prev];
+      const child = { ...next[childIndex] };
+      child.processConsumables = (child.processConsumables || []).filter((_, idx) => idx !== materialIndex);
+      if (child.processConsumables.length === 0) child.processConsumables = [createBulkProcessConsumable()];
       next[childIndex] = child;
       return next;
     });
@@ -1401,22 +1627,9 @@ export default function BOMManager({
     updateBulkParentModelRow(modelIndex, value);
   };
 
-  const handleBulkChildCodeBlur = (index) => {
-    const child = bulkChildren[index];
-    if (!child) return;
-    const codeValue = String(child.code || '').trim();
-    if (!codeValue) return;
-    const existing = masterItemsByCode.get(codeValue);
-    if (!existing) return;
+  const getBulkChildPatchFromMaster = (existing, child = {}) => {
     if (getBomItemBucket(existing) !== 'CP') {
-      alert('Child Part hanya boleh memilih item kategori CP.');
-      updateBulkChild(index, {
-        code: '',
-        name: '',
-        uom: 'PCS',
-        type: 'CP',
-      });
-      return;
+      return null;
     }
     const parsedModels = parseModelCodes(existing.model || '');
     const existingProcessFlow = Array.isArray(existing.process_flow) && existing.process_flow.length
@@ -1425,7 +1638,7 @@ export default function BOMManager({
         ? existing.processes
         : [];
     const processCodes = mapProcessFlowToCodes(existingProcessFlow);
-    updateBulkChild(index, {
+    return {
       code: existing.code,
       name: existing.name || child.name,
       uom: existing.unit || existing.uom || child.uom,
@@ -1440,7 +1653,144 @@ export default function BOMManager({
       packing: existing.packing_name || existing.packing || child.packing,
       modelCodes: parsedModels.length ? parsedModels : child.modelCodes,
       processCodes: processCodes.length ? processCodes : child.processCodes,
-    });
+    };
+  };
+
+  const handleBulkChildSelect = (index, value) => {
+    const codeValue = String(value || '').trim();
+    if (!codeValue) {
+      updateBulkChild(index, { code: '', name: '', uom: 'PCS', type: 'CP' });
+      return;
+    }
+    const child = bulkChildren[index] || {};
+    const existing = masterItemsByCode.get(codeValue);
+    if (!existing) {
+      alert('Child Part wajib dipilih dari Master Ref Item.');
+      updateBulkChild(index, { code: '', name: '', uom: 'PCS', type: 'CP' });
+      return;
+    }
+    const patch = getBulkChildPatchFromMaster(existing, child);
+    if (!patch) {
+      alert('Child Part hanya boleh memilih item kategori CP.');
+      updateBulkChild(index, { code: '', name: '', uom: 'PCS', type: 'CP' });
+      return;
+    }
+    updateBulkChild(index, patch);
+  };
+
+  const handleBulkChildCodeBlur = (index) => {
+    const child = bulkChildren[index];
+    if (!child) return;
+    const codeValue = String(child.code || '').trim();
+    if (!codeValue) return;
+    handleBulkChildSelect(index, codeValue);
+  };
+
+  const buildMaterialPatchFromMaster = (existing, material = {}) => ({
+    code: existing.code,
+    name: existing.name || material.name,
+    uom: existing.unit || existing.uom || material.uom,
+  });
+
+  const handleBulkMaterialSelect = (childIndex, materialIndex, value) => {
+    const codeValue = String(value || '').trim();
+    if (!codeValue) {
+      updateBulkMaterial(childIndex, materialIndex, { code: '', name: '', uom: 'PCS' });
+      return;
+    }
+    const material = bulkChildren[childIndex]?.materials?.[materialIndex] || {};
+    const existing = masterItemsByCode.get(codeValue);
+    if (!existing) {
+      alert('Material wajib dipilih dari Master Ref Item.');
+      updateBulkMaterial(childIndex, materialIndex, { code: '', name: '', uom: 'PCS' });
+      return;
+    }
+    const targetBucket = getMaterialBucketForType(material.type);
+    if (getBomItemBucket(existing) !== targetBucket) {
+      alert(`Material hanya boleh memilih kategori ${targetBucket === 'INDIRECT' ? 'Indirect Material' : 'Raw Material'} sesuai tipe yang dipilih.`);
+      updateBulkMaterial(childIndex, materialIndex, { code: '', name: '', uom: 'PCS' });
+      return;
+    }
+    updateBulkMaterial(childIndex, materialIndex, buildMaterialPatchFromMaster(existing, material));
+  };
+
+  const handleBulkParentMaterialSelect = (materialIndex, value) => {
+    const codeValue = String(value || '').trim();
+    if (!codeValue) {
+      updateBulkParentMaterial(materialIndex, { code: '', name: '', uom: 'PCS' });
+      return;
+    }
+    const material = bulkParentMaterials[materialIndex] || {};
+    const existing = masterItemsByCode.get(codeValue);
+    if (!existing) {
+      alert('Material wajib dipilih dari Master Ref Item.');
+      updateBulkParentMaterial(materialIndex, { code: '', name: '', uom: 'PCS' });
+      return;
+    }
+    const targetBucket = getMaterialBucketForType(material.type);
+    if (getBomItemBucket(existing) !== targetBucket) {
+      alert(`Material hanya boleh memilih kategori ${targetBucket === 'INDIRECT' ? 'Indirect Material' : 'Raw Material'} sesuai tipe yang dipilih.`);
+      updateBulkParentMaterial(materialIndex, { code: '', name: '', uom: 'PCS' });
+      return;
+    }
+    updateBulkParentMaterial(materialIndex, buildMaterialPatchFromMaster(existing, material));
+  };
+
+  const handleBulkProcessConsumableSelect = (childIndex, materialIndex, value) => {
+    const codeValue = String(value || '').trim();
+    if (!codeValue) {
+      updateBulkProcessConsumable(childIndex, materialIndex, { code: '', name: '', uom: 'PCS' });
+      return;
+    }
+    const material = bulkChildren[childIndex]?.processConsumables?.[materialIndex] || {};
+    const existing = masterItemsByCode.get(codeValue);
+    if (!existing) {
+      alert('Consumable proses wajib dipilih dari Master Ref Item.');
+      updateBulkProcessConsumable(childIndex, materialIndex, { code: '', name: '', uom: 'PCS' });
+      return;
+    }
+    const targetBucket = getMaterialBucketForType(material.type);
+    if (getBomItemBucket(existing) !== targetBucket) {
+      alert(`Consumable proses harus kategori ${targetBucket === 'INDIRECT' ? 'Indirect Material' : 'Raw Material'} sesuai tipe.`);
+      updateBulkProcessConsumable(childIndex, materialIndex, { code: '', name: '', uom: 'PCS' });
+      return;
+    }
+    updateBulkProcessConsumable(childIndex, materialIndex, buildMaterialPatchFromMaster(existing, material));
+  };
+
+  const handleBulkParentProcessConsumableSelect = (materialIndex, value) => {
+    const codeValue = String(value || '').trim();
+    if (!codeValue) {
+      updateBulkParentProcessConsumable(materialIndex, { code: '', name: '', uom: 'PCS' });
+      return;
+    }
+    const material = bulkParentProcessConsumables[materialIndex] || {};
+    const existing = masterItemsByCode.get(codeValue);
+    if (!existing) {
+      alert('Consumable proses wajib dipilih dari Master Ref Item.');
+      updateBulkParentProcessConsumable(materialIndex, { code: '', name: '', uom: 'PCS' });
+      return;
+    }
+    const targetBucket = getMaterialBucketForType(material.type);
+    if (getBomItemBucket(existing) !== targetBucket) {
+      alert(`Consumable proses harus kategori ${targetBucket === 'INDIRECT' ? 'Indirect Material' : 'Raw Material'} sesuai tipe.`);
+      updateBulkParentProcessConsumable(materialIndex, { code: '', name: '', uom: 'PCS' });
+      return;
+    }
+    updateBulkParentProcessConsumable(materialIndex, buildMaterialPatchFromMaster(existing, material));
+  };
+
+  const getMasterSummaryText = (item) => {
+    if (!item) return 'Pilih item dari Master Ref untuk melihat ringkasan master.';
+    const meta = getBomDisplayMeta(item);
+    const parts = [
+      meta.label,
+      item.unit || item.uom ? `UOM ${item.unit || item.uom}` : '',
+      item.line_production || item.line ? `Line ${item.line_production || item.line}` : '',
+      item.location_name || item.location ? `Lokasi ${item.location_name || item.location}` : '',
+      item.packing_name || item.packing ? `Packing ${item.packing_name || item.packing}` : '',
+    ].filter(Boolean);
+    return parts.join(' • ') || 'Data master belum lengkap.';
   };
 
   const hydrateBulkParentDetails = (codeValue) => {
@@ -1487,9 +1837,10 @@ export default function BOMManager({
     const codeValue = String(value || '').trim();
     setBulkParentCode(codeValue);
     syncBomHeaderForParent(codeValue, { parentCode: codeValue });
+    hydrateBulkParentDetails(codeValue);
     if (bulkMode === 'single') {
-      hydrateBulkParentDetails(codeValue);
       setBulkParentMaterials(deriveParentMaterialsFromRelations(codeValue));
+      setBulkParentProcessConsumables(deriveParentProcessConsumablesFromRelations(codeValue));
     }
   };
 
@@ -1501,6 +1852,7 @@ export default function BOMManager({
     syncBomHeaderForParent(parentCode, { parentCode });
     hydrateBulkParentDetails(parentCode);
     setBulkParentMaterials(deriveParentMaterialsFromRelations(parentCode));
+    setBulkParentProcessConsumables(deriveParentProcessConsumablesFromRelations(parentCode));
     setIsFormOpen(true);
     requestAnimationFrame(() => {
       formTopRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1545,12 +1897,86 @@ export default function BOMManager({
       alert(`Gagal menghapus relasi BOM: ${error.message || 'Unknown error'}`);
     }
   };
+  const openWhereUsed = (code = '') => {
+    setShowWhereUsedPanel(true);
+    setWhereUsedCode(String(code || '').trim());
+  };
+  const handleDeleteBomStructure = async (item) => {
+    const parentCode = String(item?.code || '').trim();
+    if (!parentCode) {
+      alert('Parent BOM tidak valid.');
+      return;
+    }
+    if (!allowEdit) {
+      alert('Anda tidak memiliki akses untuk mengubah Master BOM.');
+      return;
+    }
+    if (!apiFetch) {
+      alert('API belum tersedia untuk menghapus struktur BOM.');
+      return;
+    }
+    const relationsToDelete = (bomRelations || []).filter(
+      (relation) => String(relation.parent_code || '').trim() === parentCode && Number(relation.id || 0) > 0,
+    );
+    if (relationsToDelete.length === 0) {
+      alert(`Parent ${parentCode} belum punya struktur BOM yang bisa dihapus.`);
+      return;
+    }
+    const confirmed = window.confirm([
+      `Hapus seluruh struktur BOM untuk parent ${parentCode}?`,
+      '',
+      `Total relasi: ${relationsToDelete.length} line`,
+      'Semua revisi/line parent ini akan ikut terhapus.',
+      '',
+      'Aksi ini tidak menghapus master item.',
+    ].join('\n'));
+    if (!confirmed) return;
+    try {
+      for (const relation of relationsToDelete) {
+        await apiFetch(`/api/bom/${relation.id}`, { method: 'DELETE' });
+      }
+      if (selectedParent?.code === parentCode) {
+        setSelectedParent(null);
+        setEditingRelation(null);
+        resetNewItem({ parentId: '', type: 'FG' });
+      }
+      await syncMasterRefContext();
+      alert(`Struktur BOM ${parentCode} berhasil dihapus.`);
+    } catch (error) {
+      alert(`Gagal menghapus struktur BOM: ${error.message || 'Unknown error'}`);
+    }
+  };
+  const focusStructureView = () => {
+    setViewMode('tree');
+    requestAnimationFrame(() => {
+      structureTopRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  };
+  const openRevisionInStructure = (header) => {
+    if (!header) return;
+    setRevisionAuditParentCode(String(header.parentCode || '').trim());
+    setRevisionAuditHeaderId(String(header.headerId || ''));
+    setTreeRevisionMode('selected');
+    setShowRevisionAuditPanel(false);
+    focusStructureView();
+  };
+  const openParentInStructure = (parentCode) => {
+    const normalizedParentCode = String(parentCode || '').trim();
+    if (!normalizedParentCode) return;
+    setRevisionAuditParentCode(normalizedParentCode);
+    setTreeRevisionMode('active');
+    setShowWhereUsedPanel(false);
+    focusStructureView();
+  };
 
   const handleBulkModeChange = (mode) => {
     setBulkMode(mode);
-    if (mode === 'single' && bulkParentCode) {
+    if (bulkParentCode) {
       hydrateBulkParentDetails(bulkParentCode);
+    }
+    if (mode === 'single' && bulkParentCode) {
       setBulkParentMaterials(deriveParentMaterialsFromRelations(bulkParentCode));
+      setBulkParentProcessConsumables(deriveParentProcessConsumablesFromRelations(bulkParentCode));
     }
   };
 
@@ -1559,23 +1985,7 @@ export default function BOMManager({
     if (!material) return;
     const codeValue = String(material.code || '').trim();
     if (!codeValue) return;
-    const existing = masterItemsByCode.get(codeValue);
-    if (!existing) return;
-    const targetBucket = getMaterialBucketForType(material.type);
-    if (getBomItemBucket(existing) !== targetBucket) {
-      alert(`Material Code hanya boleh memilih item kategori ${targetBucket === 'INDIRECT' ? 'INDIRECT' : 'RM'} sesuai tipe yang dipilih.`);
-      updateBulkMaterial(childIndex, materialIndex, {
-        code: '',
-        name: '',
-        uom: 'PCS',
-      });
-      return;
-    }
-    updateBulkMaterial(childIndex, materialIndex, {
-      code: existing.code,
-      name: existing.name || material.name,
-      uom: existing.unit || existing.uom || material.uom,
-    });
+    handleBulkMaterialSelect(childIndex, materialIndex, codeValue);
   };
 
   const getMaterialBucketForType = (typeValue) => {
@@ -1591,7 +2001,7 @@ export default function BOMManager({
     const currentCode = String(material?.code || '').trim();
     if (currentCode) {
       const existing = masterItemsByCode.get(currentCode);
-      if (!existing || getBomItemBucket(existing) !== targetBucket) {
+      if (existing && getBomItemBucket(existing) !== targetBucket) {
         updateBulkMaterial(childIndex, materialIndex, {
           type: nextType,
           code: '',
@@ -1613,22 +2023,7 @@ export default function BOMManager({
     if (!material) return;
     const codeValue = String(material.code || '').trim();
     if (!codeValue) return;
-    const existing = masterItemsByCode.get(codeValue);
-    if (!existing) return;
-    if (getBomItemBucket(existing) !== 'RM') {
-      alert('Material Code hanya boleh memilih item kategori RM (Raw Material).');
-      updateBulkParentMaterial(materialIndex, {
-        code: '',
-        name: '',
-        uom: 'PCS',
-      });
-      return;
-    }
-    updateBulkParentMaterial(materialIndex, {
-      code: existing.code,
-      name: existing.name || material.name,
-      uom: existing.unit || existing.uom || material.uom,
-    });
+    handleBulkParentMaterialSelect(materialIndex, codeValue);
   };
 
   const handleBulkSave = async (event) => {
@@ -1679,13 +2074,15 @@ export default function BOMManager({
         for (const material of aggregateDraftMaterials(bulkParentMaterials || [])) {
           const materialCode = String(material.code || '').trim();
           if (!materialCode) continue;
+          const materialType = normalizeMaterialType(material.type, 'RAW MATERIAL');
+          const targetBucket = getMaterialBucketForType(materialType);
           const existingMaterial = masterItemsByCode.get(materialCode);
           if (!existingMaterial) {
             alert(`Material ${materialCode} belum ada di Master Ref Item.`);
             return;
           }
-          if (getBomItemBucket(existingMaterial) !== 'RM') {
-            alert(`Material ${materialCode} harus berkategori RM.`);
+          if (getBomItemBucket(existingMaterial) !== targetBucket) {
+            alert(`Material ${materialCode} harus berkategori ${targetBucket === 'INDIRECT' ? 'Indirect Material' : 'Raw Material'}.`);
             return;
           }
           const materialRelKey = `${parentCode}__${materialCode}`;
@@ -1697,12 +2094,16 @@ export default function BOMManager({
             yieldFactor: Number(material.yieldFactor) || 1,
             positionCode: String(material.positionCode || '').trim(),
             substituteMaterialCodes: parseSubstituteCodes(material.substituteCodesText),
-            componentType: 'RAW MATERIAL',
-            componentDescription: existingMaterial?.name || materialCode,
+            componentType: materialType,
+            componentDescription: String(material.name || existingMaterial?.name || materialCode).trim(),
             modelSpec: '',
             assemblyNote: '',
             processFlow: parentProcessCodes,
             processRouting: buildProcessRoutingSnapshot(parentProcessCodes),
+            lineProduction: String(bulkParentDetails.line || '').trim(),
+            locationName: String(bulkParentDetails.location || '').trim(),
+            packing: String(bulkParentDetails.packing || '').trim(),
+            cycleTimeSeconds: Number(bulkParentDetails.cycleTime) || 0,
             headerMeta,
           };
           await upsertBomRelation({
@@ -1710,9 +2111,55 @@ export default function BOMManager({
             quantity: Number(material.qty) || 1,
           });
         }
+        for (const consumable of aggregateDraftMaterials(bulkParentProcessConsumables || [])) {
+          const materialCode = String(consumable.code || '').trim();
+          if (!materialCode) continue;
+          const processCode = resolveConsumableProcessCode(consumable, parentProcessCodes);
+          if (!processCode) {
+            alert(`Process Consumable ${materialCode} wajib memilih proses.`);
+            return;
+          }
+          const materialType = normalizeMaterialType(consumable.type, 'INDIRECT MATERIAL');
+          const targetBucket = getMaterialBucketForType(materialType);
+          const existingMaterial = masterItemsByCode.get(materialCode);
+          if (!existingMaterial) {
+            alert(`Consumable proses ${materialCode} belum ada di Master Ref Item.`);
+            return;
+          }
+          if (getBomItemBucket(existingMaterial) !== targetBucket) {
+            alert(`Consumable proses ${materialCode} harus berkategori ${targetBucket === 'INDIRECT' ? 'Indirect Material' : 'Raw Material'}.`);
+            return;
+          }
+          await upsertBomRelation({
+            parentCode,
+            childCode: materialCode,
+            quantity: Number(consumable.qty) || 1,
+            scrapFactor: Number(consumable.scrap) || 0,
+            yieldFactor: Number(consumable.yieldFactor) || 1,
+            positionCode: String(consumable.positionCode || '').trim(),
+            substituteMaterialCodes: parseSubstituteCodes(consumable.substituteCodesText),
+            componentType: 'PROCESS CONSUMABLE',
+            componentDescription: String(consumable.name || existingMaterial?.name || materialCode).trim(),
+            modelSpec: '',
+            assemblyNote: `Process consumable ${processCode} (${consumable.consumptionBasis || 'PER_PCS'})`,
+            processCode,
+            consumptionBasis: String(consumable.consumptionBasis || 'PER_PCS').trim(),
+            processFlow: parentProcessCodes,
+            processRouting: buildProcessRoutingSnapshot(parentProcessCodes),
+            lineProduction: String(bulkParentDetails.line || '').trim(),
+            locationName: String(bulkParentDetails.location || '').trim(),
+            packing: String(bulkParentDetails.packing || '').trim(),
+            cycleTimeSeconds: Number(bulkParentDetails.cycleTime) || 0,
+            headerMeta,
+          });
+        }
       } else {
         const parentItem = masterItemsByCode.get(parentCode);
-        if (parentItem && getBomItemBucket(parentItem) !== 'SUB_ASSY') {
+        if (!parentItem) {
+          alert('Parent utama belum terdaftar di master item.');
+          return;
+        }
+        if (getBomItemBucket(parentItem) !== 'SUB_ASSY') {
           alert('Mode Multi-Level hanya boleh memakai parent kategori Sub-Assy.');
           return;
         }
@@ -1745,6 +2192,10 @@ export default function BOMManager({
             assemblyNote: childNote,
             processFlow: childProcessCodes,
             processRouting: buildProcessRoutingSnapshot(childProcessCodes),
+            lineProduction: String(child.line || '').trim(),
+            locationName: String(child.location || '').trim(),
+            packing: String(child.packing || '').trim(),
+            cycleTimeSeconds: Number(child.cycleTime) || 0,
             headerMeta,
           };
           await upsertBomRelation({
@@ -1775,11 +2226,15 @@ export default function BOMManager({
               positionCode: String(material.positionCode || '').trim(),
               substituteMaterialCodes: parseSubstituteCodes(material.substituteCodesText),
               componentType: materialType,
-              componentDescription: existingMaterial?.name || materialCode,
+              componentDescription: String(material.name || existingMaterial?.name || materialCode).trim(),
               modelSpec: '',
               assemblyNote: '',
               processFlow: childProcessCodes,
               processRouting: buildProcessRoutingSnapshot(childProcessCodes),
+              lineProduction: String(child.line || '').trim(),
+              locationName: String(child.location || '').trim(),
+              packing: String(child.packing || '').trim(),
+              cycleTimeSeconds: Number(child.cycleTime) || 0,
               headerMeta: buildBomHeaderPayload(bomHeader, childCode),
             };
             await upsertBomRelation({
@@ -1787,11 +2242,54 @@ export default function BOMManager({
               quantity: Number(material.qty) || 1,
             });
           }
+          for (const consumable of child.processConsumables || []) {
+            const materialCode = String(consumable.code || '').trim();
+            if (!materialCode) continue;
+            const processCode = resolveConsumableProcessCode(consumable, childProcessCodes);
+            if (!processCode) {
+              alert(`Process Consumable ${materialCode} wajib memilih proses.`);
+              return;
+            }
+            const materialType = normalizeMaterialType(consumable.type, 'INDIRECT MATERIAL');
+            const targetBucket = getMaterialBucketForType(materialType);
+            const existingMaterial = masterItemsByCode.get(materialCode);
+            if (!existingMaterial) {
+              alert(`Consumable proses ${materialCode} belum ada di Master Ref Item.`);
+              return;
+            }
+            if (getBomItemBucket(existingMaterial) !== targetBucket) {
+              alert(`Consumable proses ${materialCode} harus berkategori ${targetBucket === 'INDIRECT' ? 'Indirect Material' : 'Raw Material'}.`);
+              return;
+            }
+            await upsertBomRelation({
+              parentCode: childCode,
+              childCode: materialCode,
+              quantity: Number(consumable.qty) || 1,
+              scrapFactor: Number(consumable.scrap) || 0,
+              yieldFactor: Number(consumable.yieldFactor) || 1,
+              positionCode: String(consumable.positionCode || '').trim(),
+              substituteMaterialCodes: parseSubstituteCodes(consumable.substituteCodesText),
+              componentType: 'PROCESS CONSUMABLE',
+              componentDescription: String(consumable.name || existingMaterial?.name || materialCode).trim(),
+              modelSpec: '',
+              assemblyNote: `Process consumable ${processCode} (${consumable.consumptionBasis || 'PER_PCS'})`,
+              processCode,
+              consumptionBasis: String(consumable.consumptionBasis || 'PER_PCS').trim(),
+              processFlow: childProcessCodes,
+              processRouting: buildProcessRoutingSnapshot(childProcessCodes),
+              lineProduction: String(child.line || '').trim(),
+              locationName: String(child.location || '').trim(),
+              packing: String(child.packing || '').trim(),
+              cycleTimeSeconds: Number(child.cycleTime) || 0,
+              headerMeta: buildBomHeaderPayload(bomHeader, childCode),
+            });
+          }
         }
       }
       await refreshBomRelations();
       if (bulkMode === 'single') {
         setBulkParentMaterials([createBulkMaterial()]);
+        setBulkParentProcessConsumables([createBulkProcessConsumable()]);
         setBulkParentDetails(createBulkParentDetails());
       } else {
         setBulkChildren([createBulkChild()]);
@@ -2008,10 +2506,14 @@ export default function BOMManager({
     const normalizedChild = String(childCode || '').trim();
     const qtyNumber = Number(quantity || 0);
     const headerPayload = buildBomHeaderPayload(headerMeta || bomHeader, normalizedParent);
+    const payloadComponentType = String(payload.componentType || '').trim().toUpperCase();
+    const payloadProcessCode = String(payload.processCode || '').trim();
     const existing = bomRelations.find((rel) => (
       String(rel.parent_code || '').trim() === normalizedParent
       && String(rel.child_code || '').trim() === normalizedChild
       && relationMatchesHeader(rel, headerPayload)
+      && String(rel.component_type || '').trim().toUpperCase() === payloadComponentType
+      && String(rel.process_code || rel.processCode || '').trim() === payloadProcessCode
       && Number(rel.id) !== Number(relationId)
     ));
     if (!relationId && existing) {
@@ -2071,8 +2573,14 @@ export default function BOMManager({
     materials.forEach((material) => {
       const code = String(material?.code || '').trim();
       if (!code) return;
-      if (!map.has(code)) {
-        map.set(code, {
+      const key = [
+        code,
+        String(material?.processCode || '').trim(),
+        String(material?.consumptionBasis || '').trim(),
+        String(material?.componentType || '').trim(),
+      ].join('__');
+      if (!map.has(key)) {
+        map.set(key, {
           ...material,
           code,
           qty: Number(material?.qty) || 0,
@@ -2081,7 +2589,7 @@ export default function BOMManager({
         });
         return;
       }
-      const current = map.get(code);
+      const current = map.get(key);
       current.qty = Number(current.qty || 0) + (Number(material?.qty) || 0);
       current.scrap = Math.max(Number(current.scrap || 0), Number(material?.scrap) || 0);
       current.yieldFactor = Number(material?.yieldFactor) || Number(current.yieldFactor || 1) || 1;
@@ -2103,6 +2611,7 @@ export default function BOMManager({
           scrap: Number(child?.scrap) || 0,
           yieldFactor: Number(child?.yieldFactor) || 1,
           materials: Array.isArray(child?.materials) ? [...child.materials] : [],
+          processConsumables: Array.isArray(child?.processConsumables) ? [...child.processConsumables] : [],
         });
         return;
       }
@@ -2113,10 +2622,15 @@ export default function BOMManager({
       current.positionCode = current.positionCode || child?.positionCode || '';
       current.substituteCodesText = current.substituteCodesText || child?.substituteCodesText || '';
       current.materials = [...(current.materials || []), ...(Array.isArray(child?.materials) ? child.materials : [])];
+      current.processConsumables = [
+        ...(current.processConsumables || []),
+        ...(Array.isArray(child?.processConsumables) ? child.processConsumables : []),
+      ];
     });
     return Array.from(map.values()).map((child) => ({
       ...child,
       materials: aggregateDraftMaterials(child.materials || []),
+      processConsumables: aggregateDraftMaterials(child.processConsumables || []),
     }));
   };
 
@@ -2228,9 +2742,8 @@ export default function BOMManager({
   };
 
   const getBomNodeMeta = (node, level, hasChildren) => {
-    const categoryLabel = resolveCategoryLabel(node.category);
-    const typeText = [node.type, categoryLabel].filter(Boolean).join(' ').toLowerCase();
-    if (typeText.includes('indirect')) {
+    const bucket = getBomItemBucket(node);
+    if (bucket === 'INDIRECT') {
       return {
         kind: 'indirect',
         label: 'Indirect Material',
@@ -2240,7 +2753,7 @@ export default function BOMManager({
         iconClass: 'text-purple-600',
       };
     }
-    if (typeText.includes('raw')) {
+    if (bucket === 'RM') {
       return {
         kind: 'raw',
         label: 'Raw Material',
@@ -2250,7 +2763,7 @@ export default function BOMManager({
         iconClass: 'text-emerald-600',
       };
     }
-    if (level === 0 || typeText.includes('fg') || typeText.includes('finish')) {
+    if (level === 0 || bucket === 'FG') {
       return {
         kind: 'fg',
         label: 'FG',
@@ -2260,7 +2773,7 @@ export default function BOMManager({
         iconClass: 'text-indigo-600',
       };
     }
-    if (typeText.includes('sub-assy') || typeText.includes('sub assy') || typeText.includes('subassy')) {
+    if (bucket === 'SUB_ASSY') {
       return {
         kind: 'assy',
         label: 'Sub-Assy',
@@ -2270,7 +2783,7 @@ export default function BOMManager({
         iconClass: 'text-orange-500',
       };
     }
-    if (typeText.includes('cp') || typeText.includes('child part') || typeText.includes('childpart') || typeText.includes('wip') || hasChildren) {
+    if (bucket === 'CP' || hasChildren) {
       return {
         kind: 'assy',
         label: 'Child Part',
@@ -2296,6 +2809,7 @@ export default function BOMManager({
     const relation = node.relation;
     const categoryLabel = resolveCategoryLabel(node.category);
     const meta = getBomNodeMeta(node, level, hasChildren);
+    const processSnapshots = buildProcessRoutingSnapshot(node.processes || []);
     const isLeafRaw = meta.kind === 'raw' && !hasChildren;
     const displayLevel = level + 1;
     const hasNextSibling = !isLast;
@@ -2403,9 +2917,25 @@ export default function BOMManager({
                 </span>
               )}
             </div>
+            {processSnapshots.length > 0 && (
+              <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-gray-400">
+                <span>Proses:</span>
+                {processSnapshots.map((proc, procIdx) => (
+                  <span
+                    key={`${node.code || 'node'}-proc-${proc.code || procIdx}`}
+                    className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-slate-600"
+                  >
+                    <span className="max-w-[180px] truncate">{proc.name || proc.code}</span>
+                    {Number(proc.standardTime || 0) > 0 && (
+                      <span className="font-semibold text-slate-500">{proc.standardTime}s</span>
+                    )}
+                  </span>
+                ))}
+              </div>
+            )}
             {relation && (
               <div className="text-[10px] text-gray-400 mt-1">
-                Qty/Use: {Number(relation.quantity || 0)} • Yield: {Number(relation.yield_factor || 1)} • Scrap: {Number(relation.scrap_factor || 0)}%
+                Qty/Use: {Number(relation.quantity || 0)} • Cycle Time: {Number(relation.cycle_time_seconds || node.cycle_time_seconds || 0)}s • Yield: {Number(relation.yield_factor || 1)} • Scrap: {Number(relation.scrap_factor || 0)}%
               </div>
             )}
             {relation && (relation.position_code || (relation.substitute_material_codes || []).length > 0 || relation.revision_no) && (
@@ -2434,7 +2964,7 @@ export default function BOMManager({
             {(meta.kind === 'assy' || meta.kind === 'raw' || meta.kind === 'indirect') && (
               <button
                 type="button"
-                onClick={() => setWhereUsedCode(node.code)}
+                onClick={() => openWhereUsed(node.code)}
                 className="h-6 px-1.5 sm:px-2 inline-flex items-center gap-1 rounded-md border border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100"
                 title="Where Used"
               >
@@ -2764,7 +3294,10 @@ export default function BOMManager({
       const revisionNo = Number(draft.revisionNo || 1) || 1;
       const effectiveStartDate = String(draft.effectiveStartDate || todayDateInput).trim() || todayDateInput;
       const effectiveEndDate = String(draft.effectiveEndDate || '').trim();
-      const key = `${parentCode}::${childCode}::${revisionNo}::${effectiveStartDate}::${effectiveEndDate}`;
+      const componentType = String(draft.componentType || '').trim();
+      const processCode = String(draft.processCode || '').trim();
+      const consumptionBasis = String(draft.consumptionBasis || '').trim();
+      const key = `${parentCode}::${childCode}::${revisionNo}::${effectiveStartDate}::${effectiveEndDate}::${componentType}::${processCode}::${consumptionBasis}`;
       if (!aggregatedMap.has(key)) {
         aggregatedMap.set(key, {
           parentCode,
@@ -2777,6 +3310,9 @@ export default function BOMManager({
           revisionNo,
           effectiveStartDate,
           effectiveEndDate,
+          componentType,
+          processCode,
+          consumptionBasis,
           bomVersion: String(draft.bomVersion || '').trim(),
           reference: String(draft.reference || '').trim(),
         });
@@ -2789,6 +3325,8 @@ export default function BOMManager({
       current.yieldFactor = Number(draft.yieldFactor || 1) || Number(current.yieldFactor || 1) || 1;
       current.positionCode = current.positionCode || String(draft.positionCode || '').trim();
       current.substituteCodesText = current.substituteCodesText || String(draft.substituteCodesText || '').trim();
+      current.processCode = current.processCode || String(draft.processCode || '').trim();
+      current.consumptionBasis = current.consumptionBasis || String(draft.consumptionBasis || '').trim();
     });
 
     if (validationErrors.length > 0) {
@@ -2821,10 +3359,14 @@ export default function BOMManager({
           yieldFactor: Number(relation.yieldFactor || 1) || 1,
           positionCode: String(relation.positionCode || '').trim(),
           substituteMaterialCodes: parseSubstituteCodes(relation.substituteCodesText),
-          componentType: childItem.type || '',
+          componentType: relation.componentType || childItem.type || '',
           componentDescription: childItem.name || relation.childCode,
           modelSpec: childItem.model || '',
-          assemblyNote: '',
+          assemblyNote: relation.componentType === 'PROCESS CONSUMABLE'
+            ? `Process consumable ${relation.processCode || ''} (${relation.consumptionBasis || 'PER_PCS'})`
+            : '',
+          processCode: relation.processCode || '',
+          consumptionBasis: relation.consumptionBasis || '',
           processFlow: processCodes,
           processRouting: buildProcessRoutingSnapshot(processCodes),
           headerMeta: normalizeBomHeaderState({
@@ -2858,14 +3400,35 @@ export default function BOMManager({
 
       const relationDrafts = [];
       const rootCodes = new Set();
+      const normalizeHeader = (value) => String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+      const headerRowIndex = rows.findIndex((row) => {
+        const texts = Array.from(row.children || []).map((cell) => normalizeHeader(cell.textContent || cell.innerText || ''));
+        return texts.includes('parentcode') && (texts.includes('kodeitem') || texts.includes('itemcode'));
+      });
+      const headerCells = headerRowIndex >= 0 ? Array.from(rows[headerRowIndex].children || []) : [];
+      const headerMap = new Map();
+      headerCells.forEach((cell, idx) => {
+        const key = normalizeHeader(cell.textContent || cell.innerText || '');
+        if (key) headerMap.set(key, idx);
+      });
+      const pickCellText = (cells, names, fallbackIdx) => {
+        for (const name of names) {
+          const idx = headerMap.get(normalizeHeader(name));
+          if (Number.isInteger(idx) && idx >= 0 && idx < cells.length) {
+            return cells[idx]?.innerText?.trim() || cells[idx]?.textContent?.trim() || '';
+          }
+        }
+        return cells[fallbackIdx]?.innerText?.trim() || cells[fallbackIdx]?.textContent?.trim() || '';
+      };
 
-      for (let i = 1; i < rows.length; i++) { // Skip header
+      for (let i = headerRowIndex >= 0 ? headerRowIndex + 1 : 1; i < rows.length; i++) { // Skip header
         const cells = rows[i].querySelectorAll('td');
-        if (cells.length < 15) continue; 
+        if (cells.length < 4) continue; 
         
-        const getText = (idx) => cells[idx]?.innerText?.trim() || '';
-        const pCode = getText(1);
-        const code = getText(2);
+        const getText = (names, fallbackIdx) => pickCellText(cells, names, fallbackIdx);
+        const pCode = getText(['Parent Code', 'Parent'], headerMap.size ? -1 : 1);
+        const code = getText(['Kode Item', 'Item Code', 'Child Code', 'Code'], headerMap.size ? -1 : 2);
+        const rowType = getText(['Row Type', 'Line Type'], -1).toUpperCase();
         
         if (!code) continue;
 
@@ -2877,16 +3440,21 @@ export default function BOMManager({
         relationDrafts.push({
           parentCode: pCode,
           childCode: code,
-          qty: parseFloat(getText(6)) || 0,
-          scrap: parseFloat(getText(9)) || 0,
-          revisionNo: parseInt(getText(15), 10) || 1,
-          effectiveStartDate: getText(16) || todayDateInput,
-          effectiveEndDate: getText(17) || '',
-          yieldFactor: parseFloat(getText(18)) || 1,
-          positionCode: getText(19) || '',
-          substituteCodesText: getText(20) || '',
-          bomVersion: getText(21) || '',
-          reference: getText(22) || '',
+          qty: parseFloat(getText(['Qty (Use)', 'Qty Use', 'Qty', 'Quantity'], headerMap.size ? -1 : 6)) || 0,
+          scrap: parseFloat(getText(['Scrap %', 'Scrap'], headerMap.size ? -1 : 9)) || 0,
+          revisionNo: parseInt(getText(['Revision No', 'Revision'], headerMap.size ? -1 : 15), 10) || 1,
+          effectiveStartDate: getText(['Effective Start', 'Effective Start Date'], headerMap.size ? -1 : 16) || todayDateInput,
+          effectiveEndDate: getText(['Effective End', 'Effective End Date'], headerMap.size ? -1 : 17) || '',
+          yieldFactor: parseFloat(getText(['Yield Factor', 'Yield'], headerMap.size ? -1 : 18)) || 1,
+          positionCode: getText(['Position Code', 'Position'], headerMap.size ? -1 : 19) || '',
+          substituteCodesText: getText(['Substitute Codes', 'Substitutes'], headerMap.size ? -1 : 20) || '',
+          componentType: rowType === 'PROCESS_CONSUMABLE'
+            ? 'PROCESS CONSUMABLE'
+            : getText(['Component Type', 'Tipe', 'Type'], headerMap.size ? -1 : 5),
+          processCode: getText(['Process Code', 'Proses Consumable', 'Process'], -1),
+          consumptionBasis: getText(['Consumption Basis', 'Basis Konsumsi', 'Basis'], -1),
+          bomVersion: getText(['BOM Version', 'Version'], headerMap.size ? -1 : 21) || '',
+          reference: getText(['Reference', 'Ref'], headerMap.size ? -1 : 22) || '',
         });
       }
       await finalizeImport(relationDrafts, Array.from(rootCodes));
@@ -2903,11 +3471,14 @@ export default function BOMManager({
         const relation = node.relation || null;
         rows.push({
           level,
+          rowType: relation?.component_type === 'PROCESS CONSUMABLE'
+            ? 'PROCESS_CONSUMABLE'
+            : (relation ? 'COMPONENT' : 'ROOT'),
           parentCode: relation?.parent_code || '-',
           code: node.code || '',
           name: node.name || '',
           model: node.model || '',
-          type: node.type || '',
+          type: relation?.component_type || node.type || '',
           qty: relation ? Number(relation.quantity || 0) : 1,
           uom: node.unit || node.uom || '',
           weight: Number(node.weight || 0),
@@ -2917,6 +3488,8 @@ export default function BOMManager({
           processes: Array.isArray(node.processes) ? node.processes : [],
           cycleTime: Number(node.cycle_time_seconds || 0),
           packing: node.packing_name || node.packing || '',
+          processCode: relation?.process_code || '',
+          consumptionBasis: relation?.consumption_basis || '',
           revisionNo: Number(relation?.revision_no || 1) || 1,
           effectiveStartDate: relation?.effective_start_date || relation?.effective_date || '',
           effectiveEndDate: relation?.effective_end_date || '',
@@ -2936,9 +3509,9 @@ export default function BOMManager({
     <table border="1">
       <thead>
         <tr style="background-color:#eee; font-weight:bold;">
-          <th>Level</th><th>Parent Code</th><th>Kode Item</th><th>Nama Item</th><th>Model</th><th>Tipe</th>
+          <th>Level</th><th>Row Type</th><th>Parent Code</th><th>Kode Item</th><th>Nama Item</th><th>Model</th><th>Tipe</th>
           <th>Qty (Use)</th><th>UOM</th><th>Berat (Kg)</th><th>Scrap %</th><th>Lead Time</th>
-          <th>Line</th><th>Process List</th><th>Cycle Time</th><th>Packing</th>
+          <th>Line</th><th>Process List</th><th>Process Code</th><th>Consumption Basis</th><th>Cycle Time (s)</th><th>Packing</th>
           <th>Revision No</th><th>Effective Start</th><th>Effective End</th><th>Yield Factor</th><th>Position Code</th><th>Substitute Codes</th><th>BOM Version</th><th>Reference</th>
         </tr>
       </thead>
@@ -2947,12 +3520,13 @@ export default function BOMManager({
        const procStr = item.processes ? item.processes.join(' | ') : '';
        tableHTML += `<tr>
          <td>${item.level}</td>
+         <td>${item.rowType}</td>
          <td>${item.parentCode}</td>
          <td style="mso-number-format:'\@'">${item.code}</td>
          <td>${item.name}</td><td>${item.model}</td><td>${item.type}</td>
          <td>${item.qty}</td><td>${item.uom}</td>
          <td>${item.weight}</td><td>${item.scrap}</td><td>${item.leadTime}</td>
-         <td>${item.line}</td><td>${procStr}</td><td>${item.cycleTime}</td><td>${item.packing}</td>
+         <td>${item.line}</td><td>${procStr}</td><td>${item.processCode}</td><td>${item.consumptionBasis}</td><td>${item.cycleTime}</td><td>${item.packing}</td>
          <td>${item.revisionNo}</td><td>${item.effectiveStartDate}</td><td>${item.effectiveEndDate}</td><td>${item.yieldFactor}</td><td>${item.positionCode}</td><td>${item.substituteCodesText}</td><td>${item.bomVersion}</td><td>${item.reference}</td>
        </tr>`;
     });
@@ -2964,6 +3538,7 @@ export default function BOMManager({
     const sampleRows = [
       {
         level: 0,
+        rowType: 'ROOT',
         parentCode: '-',
         code: 'FG-EXAMPLE-001',
         name: 'ASSY PEDAL COMPLETE',
@@ -2978,9 +3553,12 @@ export default function BOMManager({
         processes: ['ASSY', 'FINAL CHECK'],
         cycleTime: 60,
         packing: 'BOX',
+        processCode: '',
+        consumptionBasis: '',
       },
       {
         level: 1,
+        rowType: 'COMPONENT',
         parentCode: 'FG-EXAMPLE-001',
         code: 'SUB-EXAMPLE-001',
         name: 'SUB ASSY PEDAL',
@@ -2995,9 +3573,12 @@ export default function BOMManager({
         processes: ['WELDING', 'GRINDING'],
         cycleTime: 45,
         packing: 'RACK',
+        processCode: '',
+        consumptionBasis: '',
       },
       {
         level: 2,
+        rowType: 'COMPONENT',
         parentCode: 'SUB-EXAMPLE-001',
         code: 'CP-EXAMPLE-001',
         name: 'BRACKET LH',
@@ -3012,9 +3593,12 @@ export default function BOMManager({
         processes: ['BLANKING', 'BENDING'],
         cycleTime: 12,
         packing: 'BIN',
+        processCode: '',
+        consumptionBasis: '',
       },
       {
         level: 2,
+        rowType: 'COMPONENT',
         parentCode: 'SUB-EXAMPLE-001',
         code: 'CP-EXAMPLE-002',
         name: 'BRACKET RH',
@@ -3029,9 +3613,12 @@ export default function BOMManager({
         processes: ['BLANKING', 'BENDING'],
         cycleTime: 12,
         packing: 'BIN',
+        processCode: '',
+        consumptionBasis: '',
       },
       {
         level: 2,
+        rowType: 'COMPONENT',
         parentCode: 'SUB-EXAMPLE-001',
         code: 'CP-EXAMPLE-003',
         name: 'PLATE STOPPER',
@@ -3046,9 +3633,12 @@ export default function BOMManager({
         processes: ['BLANKING', 'PIERCING'],
         cycleTime: 10,
         packing: 'BIN',
+        processCode: '',
+        consumptionBasis: '',
       },
       {
         level: 3,
+        rowType: 'MATERIAL',
         parentCode: 'CP-EXAMPLE-001',
         code: 'RM-EXAMPLE-001',
         name: 'SHEET SPHC 2.0T',
@@ -3063,9 +3653,12 @@ export default function BOMManager({
         processes: [],
         cycleTime: 0,
         packing: 'SHEET',
+        processCode: '',
+        consumptionBasis: '',
       },
       {
         level: 3,
+        rowType: 'MATERIAL',
         parentCode: 'CP-EXAMPLE-001',
         code: 'RM-EXAMPLE-002',
         name: 'BOLT M8X20',
@@ -3080,9 +3673,52 @@ export default function BOMManager({
         processes: [],
         cycleTime: 0,
         packing: 'BAG',
+        processCode: '',
+        consumptionBasis: '',
       },
       {
         level: 3,
+        rowType: 'PROCESS_CONSUMABLE',
+        parentCode: 'SUB-EXAMPLE-001',
+        code: 'IM-WIRE-001',
+        name: 'WELDING WIRE CO2',
+        model: '',
+        type: 'PROCESS CONSUMABLE',
+        qty: 0.03,
+        uom: 'KG',
+        weight: 0,
+        scrap: 0,
+        leadTime: 1,
+        line: 'WELDING',
+        processes: ['WELDING', 'GRINDING'],
+        processCode: 'WELDING',
+        consumptionBasis: 'PER_PCS',
+        cycleTime: 0,
+        packing: 'ROLL',
+      },
+      {
+        level: 3,
+        rowType: 'PROCESS_CONSUMABLE',
+        parentCode: 'SUB-EXAMPLE-001',
+        code: 'IM-GAS-001',
+        name: 'CO2 GAS WELDING',
+        model: '',
+        type: 'PROCESS CONSUMABLE',
+        qty: 0.12,
+        uom: 'M3',
+        weight: 0,
+        scrap: 0,
+        leadTime: 1,
+        line: 'WELDING',
+        processes: ['WELDING', 'GRINDING'],
+        processCode: 'WELDING',
+        consumptionBasis: 'PER_PCS',
+        cycleTime: 0,
+        packing: 'CYLINDER',
+      },
+      {
+        level: 3,
+        rowType: 'MATERIAL',
         parentCode: 'CP-EXAMPLE-002',
         code: 'RM-EXAMPLE-003',
         name: 'SHEET SPHC 2.0T RH',
@@ -3097,9 +3733,12 @@ export default function BOMManager({
         processes: [],
         cycleTime: 0,
         packing: 'SHEET',
+        processCode: '',
+        consumptionBasis: '',
       },
       {
         level: 3,
+        rowType: 'MATERIAL',
         parentCode: 'CP-EXAMPLE-003',
         code: 'RM-EXAMPLE-004',
         name: 'PLATE SPCC 1.6T',
@@ -3114,9 +3753,12 @@ export default function BOMManager({
         processes: [],
         cycleTime: 0,
         packing: 'SHEET',
+        processCode: '',
+        consumptionBasis: '',
       },
       {
         level: 3,
+        rowType: 'MATERIAL',
         parentCode: 'CP-EXAMPLE-003',
         code: 'RM-EXAMPLE-005',
         name: 'SPRING STOPPER',
@@ -3131,9 +3773,12 @@ export default function BOMManager({
         processes: [],
         cycleTime: 0,
         packing: 'BAG',
+        processCode: '',
+        consumptionBasis: '',
       },
       {
         level: '',
+        rowType: '',
         parentCode: '',
         code: '',
         name: '',
@@ -3148,9 +3793,12 @@ export default function BOMManager({
         processes: [],
         cycleTime: '',
         packing: '',
+        processCode: '',
+        consumptionBasis: '',
       },
       {
         level: '',
+        rowType: '',
         parentCode: '',
         code: '',
         name: '',
@@ -3165,15 +3813,17 @@ export default function BOMManager({
         processes: [],
         cycleTime: '',
         packing: '',
+        processCode: '',
+        consumptionBasis: '',
       },
     ];
     const buildRow = (row) => {
       const processes = Array.isArray(row.processes) ? row.processes.join(' | ') : row.processes || '';
       return `
         <tr>
-          <td>${row.level}</td><td>${row.parentCode}</td><td>${row.code}</td><td>${row.name}</td><td>${row.model}</td><td>${row.type}</td>
+          <td>${row.level}</td><td>${row.rowType || ''}</td><td>${row.parentCode}</td><td>${row.code}</td><td>${row.name}</td><td>${row.model}</td><td>${row.type}</td>
           <td>${row.qty}</td><td>${row.uom}</td><td>${row.weight}</td><td>${row.scrap}</td><td>${row.leadTime}</td>
-          <td>${row.line}</td><td>${processes}</td><td>${row.cycleTime}</td><td>${row.packing}</td>
+          <td>${row.line}</td><td>${processes}</td><td>${row.processCode || ''}</td><td>${row.consumptionBasis || ''}</td><td>${row.cycleTime}</td><td>${row.packing}</td>
           <td>${row.revisionNo || 1}</td><td>${row.effectiveStartDate || todayDateInput}</td><td>${row.effectiveEndDate || ''}</td><td>${row.yieldFactor || 1}</td><td>${row.positionCode || ''}</td><td>${row.substituteCodesText || ''}</td><td>${row.bomVersion || ''}</td><td>${row.reference || ''}</td>
         </tr>`;
     };
@@ -3182,13 +3832,13 @@ export default function BOMManager({
     <head><meta charset="UTF-8"></head><body>
     <table border="1">
       <thead>
-        <tr><th colspan="23" style="background-color:#dbeafe; text-align:left;">PETUNJUK: Import hanya membentuk relasi BOM. Kode Parent dan Child wajib sudah terdaftar di Master Ref Item.</th></tr>
-        <tr><th colspan="23" style="background-color:#ecfccb; text-align:left;">CATATAN: Qty akan dikalkulasi dengan Yield Factor. Isi Position Code untuk titik pasang, dan Substitute Codes untuk material alternatif.</th></tr>
-        <tr><th colspan="23" style="background-color:#fef3c7; text-align:left;">CONTOH: SUB-EXAMPLE-001 punya 3 Child Part. RM-EXAMPLE-001 dan RM-EXAMPLE-002 masuk ke CP-EXAMPLE-001 karena Parent Code = CP-EXAMPLE-001.</th></tr>
+        <tr><th colspan="26" style="background-color:#dbeafe; text-align:left;">PETUNJUK: Import hanya membentuk relasi BOM. Kode Parent dan Kode Item wajib sudah terdaftar di Master Ref Item.</th></tr>
+        <tr><th colspan="26" style="background-color:#ecfccb; text-align:left;">ROW TYPE: ROOT untuk parent utama, COMPONENT untuk CP/Sub-Assy, MATERIAL untuk RM, PROCESS_CONSUMABLE untuk wire/gas/glue proses.</th></tr>
+        <tr><th colspan="26" style="background-color:#fef3c7; text-align:left;">PROCESS_CONSUMABLE wajib isi Process Code dan Consumption Basis. Kolom Cycle Time memakai satuan detik (s). Contoh: WELDING wire 0.03 KG PER_PCS, gas 0.12 M3 PER_PCS.</th></tr>
         <tr style="background-color:#eee; font-weight:bold;">
-          <th>Level</th><th>Parent Code</th><th>Kode Item</th><th>Nama Item</th><th>Model</th><th>Tipe</th>
+          <th>Level</th><th>Row Type</th><th>Parent Code</th><th>Kode Item</th><th>Nama Item</th><th>Model</th><th>Tipe</th>
           <th>Qty (Use)</th><th>UOM</th><th>Berat (Kg)</th><th>Scrap %</th><th>Lead Time</th>
-          <th>Line</th><th>Process List</th><th>Cycle Time</th><th>Packing</th>
+          <th>Line</th><th>Process List</th><th>Process Code</th><th>Consumption Basis</th><th>Cycle Time (s)</th><th>Packing</th>
           <th>Revision No</th><th>Effective Start</th><th>Effective End</th><th>Yield Factor</th><th>Position Code</th><th>Substitute Codes</th><th>BOM Version</th><th>Reference</th>
         </tr>
       </thead>
@@ -3339,6 +3989,24 @@ export default function BOMManager({
              {showDataMenu && (
                <div className="absolute top-full right-0 mt-2 w-56 bg-white shadow-xl rounded-lg border border-gray-100 z-50 py-1 text-xs font-medium">
                  <input type="file" ref={fileInputRef} className="hidden" accept=".xls,.xml" onChange={handleFileUpload} />
+                 <button
+                   onClick={() => {
+                     setShowRevisionAuditPanel(true);
+                     setShowDataMenu(false);
+                   }}
+                   className="w-full text-left px-4 py-2 hover:bg-indigo-50 flex gap-2"
+                 >
+                   <LayoutDashboard size={14}/> Audit Revisi BOM
+                 </button>
+                 <button
+                   onClick={() => {
+                     setShowWhereUsedPanel(true);
+                     setShowDataMenu(false);
+                   }}
+                   className="w-full text-left px-4 py-2 hover:bg-indigo-50 flex gap-2"
+                 >
+                   <BookOpenText size={14}/> Where Used
+                 </button>
                  <button onClick={exportImportTemplate} className="w-full text-left px-4 py-2 hover:bg-indigo-50 flex gap-2"><FileSpreadsheet size={14}/> Download Template Relasi .xls</button>
                  {allowEdit && (
                    <button onClick={() => { fileInputRef.current.click(); setShowDataMenu(false); }} className="w-full text-left px-4 py-2 hover:bg-indigo-50 flex gap-2"><Upload size={14}/> Import Relasi BOM .xls</button>
@@ -3350,7 +4018,6 @@ export default function BOMManager({
            
            <div className="h-6 w-px bg-gray-300 mx-1"></div>
            
-           <button onClick={() => setShowForecastModal(true)} className="p-2 bg-white text-indigo-600 rounded-lg hover:bg-indigo-50 border border-indigo-100 shadow-sm" title="Forecast"><Calculator size={18}/></button>
            {allowEdit && (
              <button onClick={() => setShowAiModal(true)} className="p-2 bg-white text-purple-600 rounded-lg hover:bg-purple-50 border border-purple-100 shadow-sm" title="AI Generate"><Sparkles size={18}/></button>
            )}
@@ -3401,7 +4068,7 @@ export default function BOMManager({
                       onChange={(e) => setNewItem({ ...newItem, type: e.target.value })}
                       disabled={isCurrentFormMasterLocked}
                     >
-                      <option value="FG">Finished Good (FG)</option>
+                      <option value="FG">FG</option>
                     </select>
                   </div>
                   <div>
@@ -3451,11 +4118,11 @@ export default function BOMManager({
                   <div>
                     <div className="text-[10px] font-bold text-indigo-400 uppercase border-b border-indigo-100 pb-1 mb-2">Parameter Umum</div>
                     <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
-                      <div><label className="block text-[10px] text-gray-500 mb-1">Line Produksi</label><input list="bom-line-options" type="text" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(isCurrentFormMasterLocked)}`} placeholder="Line A" value={newItem.line} onChange={e=>setNewItem({...newItem, line:e.target.value})} readOnly={isCurrentFormMasterLocked}/></div>
+                      <div><label className="block text-[10px] text-gray-500 mb-1">Line Produksi</label><input list="bom-line-options" type="text" className="w-full p-2 border rounded text-xs bg-white" placeholder="Line A" value={newItem.line} onChange={e=>setNewItem({...newItem, line:e.target.value})}/></div>
                       <div><label className="block text-[10px] text-gray-500 mb-1">Customer</label><input list="bom-customer-options" type="text" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(true)}`} placeholder="Customer" value={currentFormCustomerLabel || newItem.customer} onChange={e=>setNewItem({...newItem, customer:e.target.value})} readOnly/></div>
-                      <div><label className="block text-[10px] text-gray-500 mb-1">Storage Location (Gudang/Area)</label><input list="bom-location-options" type="text" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(isCurrentFormMasterLocked)}`} placeholder="Gudang / Area" value={newItem.location} onChange={e=>setNewItem({...newItem, location:e.target.value})} readOnly={isCurrentFormMasterLocked}/></div>
-                      <div><label className="block text-[10px] text-gray-500 mb-1">Packing</label><input list="bom-packing-options" type="text" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(isCurrentFormMasterLocked)}`} placeholder="Box" value={newItem.packing} onChange={e=>setNewItem({...newItem, packing:e.target.value})} readOnly={isCurrentFormMasterLocked}/></div>
-                      <div><label className="block text-[10px] text-gray-500 mb-1">Cycle Time (s)</label><input type="number" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(isCurrentFormMasterLocked)}`} value={newItem.cycleTime} onChange={e=>setNewItem({...newItem, cycleTime:e.target.value})} readOnly={isCurrentFormMasterLocked}/></div>
+                      <div><label className="block text-[10px] text-gray-500 mb-1">Storage Location (Gudang/Area)</label><input list="bom-location-options" type="text" className="w-full p-2 border rounded text-xs bg-white" placeholder="Gudang / Area" value={newItem.location} onChange={e=>setNewItem({...newItem, location:e.target.value})}/></div>
+                      <div><label className="block text-[10px] text-gray-500 mb-1">Packing</label><input list="bom-packing-options" type="text" className="w-full p-2 border rounded text-xs bg-white" placeholder="Box" value={newItem.packing} onChange={e=>setNewItem({...newItem, packing:e.target.value})}/></div>
+                      <div><label className="block text-[10px] text-gray-500 mb-1">Cycle Time (s)</label><input type="number" className="w-full p-2 border rounded text-xs bg-white" value={newItem.cycleTime} onChange={e=>setNewItem({...newItem, cycleTime:e.target.value})}/></div>
                     </div>
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -3498,21 +4165,25 @@ export default function BOMManager({
                       </div>
                       <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
                         {bomProcessOptionsAll.length === 0 && (
-                          <div className="text-[10px] text-gray-400">Master process masih kosong.</div>
+                          <div className="text-[10px] text-gray-400">Master process masih kosong. Tambahkan dulu di Master Ref Process.</div>
                         )}
                         {newItem.processes.map((proc, idx) => (
                           <div key={idx} className="flex gap-1 items-center">
                             <span className="text-[10px] text-gray-400 w-4">{idx+1}.</span>
                             <select
-                              className={`flex-1 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none ${getLockedFieldClass(isCurrentFormMasterLocked)}`}
+                              className="flex-1 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none bg-white"
                               value={proc || ''}
                               onChange={(e) => handleProcessChange(idx, e.target.value)}
-                              disabled={isCurrentFormMasterLocked}
                             >
                               <option value="">- Pilih proses -</option>
-                              {bomProcessOptionsAll.map((processItem) => (
-                                <option key={`route-proc-${processItem.code}`} value={processItem.code}>
-                                  {getProcessDisplayLabel(processItem)}
+                              {String(proc || '').trim() && !bomProcessOptionsAll.some((item) => String(item.code || '').trim() === String(proc || '').trim()) && (
+                                <option value={proc}>
+                                  {proc} (Custom)
+                                </option>
+                              )}
+                              {bomProcessOptionsAll.map((item) => (
+                                <option key={`proc-opt-${item.code}`} value={item.code}>
+                                  {getProcessDisplayLabel(item)}
                                 </option>
                               ))}
                             </select>
@@ -3556,10 +4227,15 @@ export default function BOMManager({
                     <div className="text-sm font-semibold text-slate-700">
                     {bulkMode === 'single'
                       ? 'Input Single-Level (FG -> Raw Material)'
-                      : 'Input Multi-Level (FG -> Child Part -> Raw / Indirect)'}
+                      : 'Input Multi-Level (Sub-Assy -> Child Part -> Raw / Indirect)'}
                     </div>
                     {bulkMode === 'multi' && (
-                    <button type="button" onClick={addBulkChild} className="text-xs px-3 py-1.5 rounded border text-indigo-600 hover:text-indigo-700">
+                    <button
+                      type="button"
+                      onClick={addBulkChild}
+                      disabled={!bulkParentCode}
+                      className="text-xs px-3 py-1.5 rounded border text-indigo-600 hover:text-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
                       + Tambah Child Part
                     </button>
                   )}
@@ -3575,67 +4251,63 @@ export default function BOMManager({
                       >
                         <option value="">-- Pilih Parent --</option>
                         {(bulkMode === 'single' ? parentOptionsSingle : parentOptionsMulti).map(item => (
-                          <option key={`bulk-parent-${item.code}`} value={item.code}>{item.code} - {item.name}</option>
+                          <option key={`bulk-parent-${item.code}`} value={item.code}>{getBomOptionLabel(item)}</option>
                         ))}
                       </select>
                       {!bomLoading && (bulkMode === 'single' ? parentOptionsSingle : parentOptionsMulti).length === 0 && (
                         <div className="mt-1 text-[10px] text-amber-600">
                           {bulkMode === 'single'
-                            ? 'Tidak ada FG yang belum dipakai sebagai parent BOM.'
-                            : 'Tidak ada Sub-Assy yang belum dipakai sebagai parent BOM.'}
+                            ? 'Tidak ada FG di Master Ref Item.'
+                            : 'Tidak ada Sub-Assy di Master Ref Item.'}
                         </div>
                       )}
+                      <div className="mt-2 rounded border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-600">
+                        <span className="font-semibold text-slate-700">Master Ref:</span> {getMasterSummaryText(bulkParentMasterItem)}
+                      </div>
                     </div>
                   </div>
-                  <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
-                    <div>
-                      <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Revision No</label>
-                      <input
-                        type="number"
-                        min="1"
-                        className="w-full p-2 border border-gray-300 rounded text-xs"
-                        value={bomHeader.revisionNo}
-                        onChange={(e) => setBomHeader((prev) => ({ ...prev, revisionNo: e.target.value, headerId: null }))}
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Effective Start</label>
-                      <input
-                        type="date"
-                        className="w-full p-2 border border-gray-300 rounded text-xs"
-                        value={bomHeader.effectiveStartDate || ''}
-                        onChange={(e) => setBomHeader((prev) => ({ ...prev, effectiveStartDate: e.target.value, headerId: null }))}
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Effective End</label>
-                      <input
-                        type="date"
-                        className="w-full p-2 border border-gray-300 rounded text-xs"
-                        value={bomHeader.effectiveEndDate || ''}
-                        onChange={(e) => setBomHeader((prev) => ({ ...prev, effectiveEndDate: e.target.value, headerId: null }))}
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">BOM Version</label>
-                      <input
-                        type="text"
-                        className="w-full p-2 border border-gray-300 rounded text-xs"
-                        placeholder="Opsional"
-                        value={bomHeader.bomVersion || ''}
-                        onChange={(e) => setBomHeader((prev) => ({ ...prev, bomVersion: e.target.value, headerId: null }))}
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Reference</label>
-                      <input
-                        type="text"
-                        className="w-full p-2 border border-gray-300 rounded text-xs"
-                        placeholder="Doc / ECO / Note"
-                        value={bomHeader.reference || ''}
-                        onChange={(e) => setBomHeader((prev) => ({ ...prev, reference: e.target.value, headerId: null }))}
-                      />
-                    </div>
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                    <button
+                      type="button"
+                      onClick={() => setShowBomRevisionFields((prev) => !prev)}
+                      className="text-xs font-semibold text-indigo-600 hover:text-indigo-800"
+                    >
+                      {showBomRevisionFields ? 'Sembunyikan Revisi / ECO' : '+ Revisi / ECO'}
+                    </button>
+                    {showBomRevisionFields && (
+                      <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div>
+                          <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Revision No</label>
+                          <input
+                            type="number"
+                            min="1"
+                            className="w-full p-2 border border-gray-300 rounded text-xs bg-white"
+                            value={bomHeader.revisionNo}
+                            onChange={(e) => setBomHeader((prev) => ({ ...prev, revisionNo: e.target.value, headerId: null }))}
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">BOM Version</label>
+                          <input
+                            type="text"
+                            className="w-full p-2 border border-gray-300 rounded text-xs bg-white"
+                            placeholder="Opsional"
+                            value={bomHeader.bomVersion || ''}
+                            onChange={(e) => setBomHeader((prev) => ({ ...prev, bomVersion: e.target.value, headerId: null }))}
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Reference</label>
+                          <input
+                            type="text"
+                            className="w-full p-2 border border-gray-300 rounded text-xs bg-white"
+                            placeholder="Doc / ECO / Note"
+                            value={bomHeader.reference || ''}
+                            onChange={(e) => setBomHeader((prev) => ({ ...prev, reference: e.target.value, headerId: null }))}
+                          />
+                        </div>
+                      </div>
+                    )}
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                     <div className="md:col-span-2">
@@ -3659,7 +4331,7 @@ export default function BOMManager({
                             checked={bulkMode === 'multi'}
                             onChange={() => handleBulkModeChange('multi')}
                           />
-                          <span>BOM Multi-Level (Sub-Assy)</span>
+                          <span>BOM Multi-Level (Sub-Assy → CP → Material)</span>
                         </label>
                       </div>
                     </div>
@@ -3668,16 +4340,125 @@ export default function BOMManager({
                   {bulkMode === 'single' ? (
                     <div className="space-y-4">
                       <div className="border border-gray-200 rounded-lg p-3 bg-white">
-                        <div className="text-xs font-semibold text-slate-600">Detail Parent Utama</div>
-                        <div className="mt-3 bg-gray-50 p-4 rounded-lg border border-gray-200 space-y-4">
+                        <div className="text-xs font-semibold text-slate-600">Struktur Parent (data master dikunci)</div>
+                        <div className="mt-2 rounded border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-600">
+                          {getMasterSummaryText(bulkParentMasterItem)}
+                        </div>
+                        <div className="mt-3 rounded-lg border border-indigo-100 bg-indigo-50/40 p-3">
+                          <div className="text-[10px] font-bold text-indigo-500 uppercase border-b border-indigo-100 pb-1 mb-2 flex justify-between">
+                            <span>Proses BOM Parent</span>
+                            <button type="button" onClick={addBulkParentProcess} className="text-indigo-600 hover:text-indigo-800 text-[9px] flex items-center gap-1">+ Tambah Proses</button>
+                          </div>
+                          <div className="space-y-2">
+                            {(bulkParentDetails.processCodes || ['']).map((procCode, procIdx) => (
+                              <div key={`parent-visible-proc-${procIdx}`} className="flex gap-2 items-center">
+                                <span className="text-[10px] text-gray-400 w-4">{procIdx + 1}.</span>
+                                <select
+                                  className="flex-1 min-w-0 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none bg-white"
+                                  value={procCode || ''}
+                                  onChange={(e) => updateBulkParentProcess(procIdx, e.target.value)}
+                                >
+                                  <option value="">- Pilih proses -</option>
+                                  {String(procCode || '').trim() && !bomProcessOptionsForMode.some((item) => String(item.code || '').trim() === String(procCode || '').trim()) && (
+                                    <option value={procCode}>
+                                      {procCode} (Custom)
+                                    </option>
+                                  )}
+                                  {bomProcessOptionsForMode.map((item) => (
+                                    <option key={`parent-visible-proc-opt-${item.code}`} value={item.code}>
+                                      {getProcessDisplayLabel(item)}
+                                    </option>
+                                  ))}
+                                </select>
+                                {renderProcessCycleTimeBadge(procCode, `parent-ct-${procIdx}`)}
+                                {(bulkParentDetails.processCodes || []).length > 1 && (
+                                  <button type="button" onClick={() => removeBulkParentProcess(procIdx)} className="text-red-400 hover:text-red-600">
+                                    <X size={12}/>
+                                  </button>
+                                )}
+                              </div>
+                            ))}
+                            {bomProcessOptionsForMode.length === 0 && (
+                              <div className="text-[10px] text-gray-400">Master process masih kosong. Tambahkan dulu di Master Ref Process.</div>
+                            )}
+                          </div>
+                        </div>
+                        <div className="mt-3 rounded-lg border border-purple-100 bg-purple-50/40 p-3">
+                          <div className="flex items-center justify-between text-[10px] font-bold text-purple-600 uppercase border-b border-purple-100 pb-1 mb-2">
+                            <span>Consumable Proses (Wire / Gas / Glue)</span>
+                            <button type="button" onClick={() => addBulkParentProcessConsumable(getCleanProcessCodes(bulkParentDetails.processCodes)[0] || '')} className="text-purple-600 hover:text-purple-800 text-[9px] flex items-center gap-1">+ Tambah Consumable</button>
+                          </div>
+                          <div className="space-y-2">
+                            {(bulkParentProcessConsumables || []).map((consumable, consIdx) => {
+                              const parentProcessCodes = getCleanProcessCodes(bulkParentDetails.processCodes);
+                              const resolvedProcessCode = resolveConsumableProcessCode(consumable, parentProcessCodes);
+                              return (
+                              <div key={`parent-cons-${consumable.id || consIdx}`} className="grid grid-cols-1 md:grid-cols-8 gap-2 items-end">
+                                <div className="md:col-span-2">
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Mengacu Proses</label>
+                                  {parentProcessCodes.length > 1 ? (
+                                    <select className="w-full p-2 border border-gray-300 rounded text-xs bg-white" value={resolvedProcessCode} onChange={(e) => updateBulkParentProcessConsumable(consIdx, { processCode: e.target.value })}>
+                                      <option value="">- Pilih proses -</option>
+                                      {parentProcessCodes.map((procCode) => (
+                                        <option key={`parent-cons-proc-${consIdx}-${procCode}`} value={procCode}>{getProcessNodeLabel(procCode)}</option>
+                                      ))}
+                                    </select>
+                                  ) : (
+                                    <div className="w-full p-2 border border-gray-200 rounded text-xs bg-gray-50 text-gray-600">
+                                      {resolvedProcessCode ? getProcessNodeLabel(resolvedProcessCode) : 'Pilih proses BOM dulu'}
+                                    </div>
+                                  )}
+                                </div>
+                                <div>
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Tipe</label>
+                                  <select className="w-full p-2 border border-gray-300 rounded text-xs bg-white" value={normalizeMaterialType(consumable.type, 'INDIRECT MATERIAL')} onChange={(e) => updateBulkParentProcessConsumable(consIdx, { type: normalizeMaterialType(e.target.value, 'INDIRECT MATERIAL'), code: '', name: '', uom: 'PCS' })}>
+                                    <option value="INDIRECT MATERIAL">Indirect</option>
+                                    <option value="RAW MATERIAL">Raw</option>
+                                  </select>
+                                </div>
+                                <div className="md:col-span-2">
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Consumable</label>
+                                  <select className="w-full p-2 border border-gray-300 rounded text-xs bg-white" value={consumable.code || ''} onChange={(e) => handleBulkParentProcessConsumableSelect(consIdx, e.target.value)}>
+                                    <option value="">- Pilih material -</option>
+                                    {getMaterialOptionsForType(consumable.type).map((item) => (
+                                      <option key={`parent-cons-mat-${consIdx}-${item.code}`} value={item.code}>{getBomOptionLabel(item)}</option>
+                                    ))}
+                                  </select>
+                                </div>
+                                <div>
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Qty Konsumsi</label>
+                                  <input type="number" step="0.0001" className="w-full p-2 border border-gray-300 rounded text-xs text-right bg-white" value={consumable.qty} onChange={(e) => updateBulkParentProcessConsumable(consIdx, { qty: e.target.value })}/>
+                                </div>
+                                <div>
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">UOM</label>
+                                  <input className="w-full p-2 border border-gray-300 rounded text-xs bg-gray-50 text-gray-600" value={consumable.uom} readOnly/>
+                                </div>
+                                <div>
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Basis</label>
+                                  <select className="w-full p-2 border border-gray-300 rounded text-xs bg-white" value={consumable.consumptionBasis || 'PER_PCS'} onChange={(e) => updateBulkParentProcessConsumable(consIdx, { consumptionBasis: e.target.value })}>
+                                    {PROCESS_CONSUMPTION_BASIS_OPTIONS.map((basis) => (
+                                      <option key={`parent-basis-${basis.value}`} value={basis.value}>{basis.label}</option>
+                                    ))}
+                                  </select>
+                                </div>
+                                <div className="flex justify-end">
+                                  {(bulkParentProcessConsumables || []).length > 1 && (
+                                    <button type="button" onClick={() => removeBulkParentProcessConsumable(consIdx)} className="text-xs text-rose-600 hover:text-rose-700">Hapus</button>
+                                  )}
+                                </div>
+                              </div>
+                            )})}
+                          </div>
+                        </div>
+                        <div className="hidden">
                           <div>
                             <div className="text-[10px] font-bold text-indigo-400 uppercase border-b border-indigo-100 pb-1 mb-2">Parameter Umum</div>
                             <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
-                              <div><label className="block text-[10px] text-gray-500 mb-1">Line Produksi</label><input list="bom-line-options" type="text" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(isBulkParentMasterLocked)}`} placeholder="Line A" value={bulkParentDetails.line} onChange={e=>updateBulkParentDetails({ line: e.target.value })} readOnly={isBulkParentMasterLocked}/></div>
+                              <div><label className="block text-[10px] text-gray-500 mb-1">Line Produksi</label><input list="bom-line-options" type="text" className="w-full p-2 border rounded text-xs bg-white" placeholder="Line A" value={bulkParentDetails.line} onChange={e=>updateBulkParentDetails({ line: e.target.value })}/></div>
                               <div><label className="block text-[10px] text-gray-500 mb-1">Customer</label><input list="bom-customer-options" type="text" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(true)}`} placeholder="Customer" value={bulkParentCustomerLabel || bulkParentDetails.customer} onChange={e=>updateBulkParentDetails({ customer: e.target.value })} readOnly/></div>
-                              <div><label className="block text-[10px] text-gray-500 mb-1">Storage Location (Gudang/Area)</label><input list="bom-location-options" type="text" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(isBulkParentMasterLocked)}`} placeholder="Gudang / Area" value={bulkParentDetails.location} onChange={e=>updateBulkParentDetails({ location: e.target.value })} readOnly={isBulkParentMasterLocked}/></div>
-                              <div><label className="block text-[10px] text-gray-500 mb-1">Packing</label><input list="bom-packing-options" type="text" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(isBulkParentMasterLocked)}`} placeholder="Box" value={bulkParentDetails.packing} onChange={e=>updateBulkParentDetails({ packing: e.target.value })} readOnly={isBulkParentMasterLocked}/></div>
-                              <div><label className="block text-[10px] text-gray-500 mb-1">Cycle Time (s)</label><input type="number" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(isBulkParentMasterLocked)}`} value={bulkParentDetails.cycleTime} onChange={e=>updateBulkParentDetails({ cycleTime: e.target.value })} readOnly={isBulkParentMasterLocked}/></div>
+                              <div><label className="block text-[10px] text-gray-500 mb-1">Storage Location (Gudang/Area)</label><input list="bom-location-options" type="text" className="w-full p-2 border rounded text-xs bg-white" placeholder="Gudang / Area" value={bulkParentDetails.location} onChange={e=>updateBulkParentDetails({ location: e.target.value })}/></div>
+                              <div><label className="block text-[10px] text-gray-500 mb-1">Packing</label><input list="bom-packing-options" type="text" className="w-full p-2 border rounded text-xs bg-white" placeholder="Box" value={bulkParentDetails.packing} onChange={e=>updateBulkParentDetails({ packing: e.target.value })}/></div>
+                              <div><label className="block text-[10px] text-gray-500 mb-1">Cycle Time (s)</label><input type="number" className="w-full p-2 border rounded text-xs bg-white" value={bulkParentDetails.cycleTime} onChange={e=>updateBulkParentDetails({ cycleTime: e.target.value })}/></div>
                             </div>
                           </div>
                           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -3726,15 +4507,19 @@ export default function BOMManager({
                                   <div key={`parent-proc-${procIdx}`} className="flex gap-2 items-center">
                                     <span className="text-[10px] text-gray-400 w-4">{procIdx + 1}.</span>
                                     <select
-                                      className={`flex-1 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none ${getLockedFieldClass(isBulkParentMasterLocked)}`}
+                                      className="flex-1 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none bg-white"
                                       value={procCode || ''}
                                       onChange={(e) => updateBulkParentProcess(procIdx, e.target.value)}
-                                      disabled={isBulkParentMasterLocked}
                                     >
-                                      <option value="">- Pilih Process -</option>
-                                      {bomProcessOptionsForMode.map((proc) => (
-                                        <option key={`parent-proc-${proc.code}`} value={proc.code}>
-                                          {getProcessDisplayLabel(proc)}
+                                      <option value="">- Pilih proses -</option>
+                                      {String(procCode || '').trim() && !bomProcessOptionsForMode.some((item) => String(item.code || '').trim() === String(procCode || '').trim()) && (
+                                        <option value={procCode}>
+                                          {procCode} (Custom)
+                                        </option>
+                                      )}
+                                      {bomProcessOptionsForMode.map((item) => (
+                                        <option key={`parent-proc-opt-${item.code}`} value={item.code}>
+                                          {getProcessDisplayLabel(item)}
                                         </option>
                                       ))}
                                     </select>
@@ -3746,14 +4531,14 @@ export default function BOMManager({
                                   </div>
                                 ))}
                                 {bomProcessOptionsForMode.length === 0 && (
-                                  <div className="text-[10px] text-gray-400">Master process masih kosong.</div>
+                                  <div className="text-[10px] text-gray-400">Master process masih kosong. Tambahkan dulu di Master Ref Process.</div>
                                 )}
                               </div>
                             </div>
                           </div>
                         </div>
 
-                        <div className="mt-3">
+                        <div className="hidden">
                           <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Catatan Khusus (Per Assembly)</label>
                           <textarea
                             rows={2}
@@ -3766,21 +4551,22 @@ export default function BOMManager({
 
                         <div className="mt-3 bg-slate-50 border border-slate-200 rounded-lg p-3">
                           <div className="flex items-center justify-between text-[10px] font-bold text-slate-500 uppercase border-b border-slate-200 pb-1 mb-2">
-                            <span>{bulkMode === 'single' ? 'Material (Raw) untuk Parent Ini' : 'Material (Raw / Indirect) untuk Child Ini'}</span>
+                            <span>{bulkMode === 'single' ? 'Material (Raw / Indirect) untuk Parent Ini' : 'Material (Raw / Indirect) untuk Child Ini'}</span>
                             <button type="button" onClick={addBulkParentMaterial} className="text-indigo-600 hover:text-indigo-800 text-[9px] flex items-center gap-1">+ Tambah Material</button>
+                          </div>
+                          <div className="mb-2 text-[10px] text-slate-500">
+                            Material wajib dipilih dari Master Ref Item. Qty adalah pemakaian per 1 parent.
                           </div>
                           {(() => {
                             const existingCodes = getExistingMaterialCodesForParent(bulkParentCode);
                             return (
                           <div className="space-y-2">
                             {(bulkParentMaterials || []).map((material, matIdx) => (
-                              <div key={`parent-mat-${material.id || matIdx}`} className="grid grid-cols-1 md:grid-cols-8 gap-2 items-end">
+                              <div key={`parent-mat-${material.id || matIdx}`} className="grid grid-cols-1 gap-2 items-end md:grid-cols-7">
                                 <div className="md:col-span-2">
-                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Material Code</label>
-                                  <input
-                                    list="bom-material-rm-options"
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Material</label>
+                                  <select
                                     className={`w-full p-2 border border-gray-300 rounded text-xs ${material.isExisting ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''}`}
-                                    placeholder="Kode Material"
                                     value={material.code}
                                     onChange={(e) => {
                                       if (material.isExisting) return;
@@ -3790,11 +4576,22 @@ export default function BOMManager({
                                       if (normalizedCode && existingCodes.has(normalizedCode) && !(material.isExisting && originalCode === normalizedCode)) {
                                         alert('Material ini sudah ada di BOM.');
                                       }
-                                      updateBulkParentMaterial(matIdx, { code: nextCode });
+                                      handleBulkParentMaterialSelect(matIdx, nextCode);
                                     }}
-                                    onBlur={() => handleBulkParentMaterialCodeBlur(matIdx)}
-                                    readOnly={material.isExisting}
-                                  />
+                                    disabled={material.isExisting}
+                            >
+                              <option value="">- Pilih material -</option>
+                              {material.code && !getMaterialOptionsForType(material.type).some((item) => String(item.code || '').trim() === String(material.code || '').trim()) && (
+                                <option value={material.code}>
+                                  {material.code}{material.name ? ` - ${material.name}` : ''}
+                                </option>
+                              )}
+                              {getMaterialOptionsForType(material.type).map((item) => (
+                                <option key={`parent-material-${material.id || matIdx}-${item.code}`} value={item.code}>
+                                  {getBomOptionLabel(item)}
+                                      </option>
+                                    ))}
+                                  </select>
                                 </div>
                                 <div className="md:col-span-2">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Nama Material</label>
@@ -3802,11 +4599,7 @@ export default function BOMManager({
                                     className={`w-full p-2 border border-gray-300 rounded text-xs ${material.isExisting ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''}`}
                                     placeholder="Nama material"
                                     value={material.name}
-                                    onChange={(e) => {
-                                      if (material.isExisting) return;
-                                      updateBulkParentMaterial(matIdx, { name: e.target.value });
-                                    }}
-                                    readOnly={material.isExisting}
+                                    readOnly
                                   />
                                 </div>
                                 <div>
@@ -3823,10 +4616,10 @@ export default function BOMManager({
                                   <input
                                     className="w-full p-2 border border-gray-300 rounded text-xs"
                                     value={material.uom}
-                                    onChange={(e) => updateBulkParentMaterial(matIdx, { uom: e.target.value })}
+                                    readOnly
                                   />
                                 </div>
-                                <div>
+                                <div className="hidden">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Yield</label>
                                   <input
                                     type="number"
@@ -3837,7 +4630,7 @@ export default function BOMManager({
                                     onChange={(e) => updateBulkParentMaterial(matIdx, { yieldFactor: e.target.value })}
                                   />
                                 </div>
-                                <div>
+                                <div className="hidden">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Posisi</label>
                                   <input
                                     className="w-full p-2 border border-gray-300 rounded text-xs"
@@ -3846,7 +4639,7 @@ export default function BOMManager({
                                     onChange={(e) => updateBulkParentMaterial(matIdx, { positionCode: e.target.value })}
                                   />
                                 </div>
-                                <div className="md:col-span-2">
+                                <div className="hidden">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Substitusi</label>
                                   <input
                                     className="w-full p-2 border border-gray-300 rounded text-xs"
@@ -3854,6 +4647,27 @@ export default function BOMManager({
                                     value={material.substituteCodesText || ''}
                                     onChange={(e) => updateBulkParentMaterial(matIdx, { substituteCodesText: e.target.value })}
                                   />
+                                </div>
+                                <div>
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Tipe</label>
+                                  <select
+                                    className={`w-full p-2 border border-gray-300 rounded text-xs bg-white ${material.isExisting ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''}`}
+                                    value={normalizeMaterialType(material.type, 'RAW MATERIAL')}
+                                    onChange={(e) => {
+                                      const nextType = normalizeMaterialType(e.target.value, 'RAW MATERIAL');
+                                      const currentMaterial = masterItemsByCode.get(String(material.code || '').trim());
+                                      const targetBucket = getMaterialBucketForType(nextType);
+                                      if (currentMaterial && getBomItemBucket(currentMaterial) !== targetBucket) {
+                                        updateBulkParentMaterial(matIdx, { type: nextType, code: '', name: '', uom: 'PCS' });
+                                        return;
+                                      }
+                                      updateBulkParentMaterial(matIdx, { type: nextType });
+                                    }}
+                                    disabled={material.isExisting}
+                                  >
+                                    <option value="RAW MATERIAL">Raw Material</option>
+                                    <option value="INDIRECT MATERIAL">Indirect Material</option>
+                                  </select>
                                 </div>
                                 <div className="flex justify-end items-center gap-2">
                                   <span className={`px-2 py-0.5 rounded-full text-[9px] font-semibold inline-flex items-center gap-1 ${material.isExisting ? 'bg-gray-200 text-gray-600' : 'bg-emerald-100 text-emerald-700'}`}>
@@ -3874,11 +4688,16 @@ export default function BOMManager({
                         </div>
                       </div>
                     </div>
+                  ) : !bulkParentCode ? (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-xs text-amber-700">
+                      Pilih parent kategori Sub-Assy dulu. Setelah parent dipilih, input CP, proses, dan material akan aktif.
+                    </div>
                   ) : (
                   <div className="space-y-4">
                     {bulkChildren.map((child, childIdx) => {
                       const childMasterLocked = Boolean(masterItemsByCode.get(String(child.code || '').trim()));
                       const childCustomerLabel = getItemCustomerLabel(child.code);
+                      const childSelected = Boolean(String(child.code || '').trim());
                       return (
                       <div key={child.id} className="border border-gray-200 rounded-lg p-3 bg-white">
                         <div className="flex items-center justify-between mb-2">
@@ -3891,26 +4710,35 @@ export default function BOMManager({
                         </div>
                         <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
                           <div className="md:col-span-2">
-                            <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Child Code (Sub-Assy)</label>
-                            <input
-                              list="bom-child-part-options"
+                            <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Child Part (CP)</label>
+                            <select
                               className="w-full p-2 border border-gray-300 rounded text-xs"
-                              placeholder="Kode Child Part"
                               value={child.code}
-                              onChange={(e) => updateBulkChild(childIdx, { code: e.target.value })}
-                              onBlur={() => handleBulkChildCodeBlur(childIdx)}
-                            />
+                              onChange={(e) => handleBulkChildSelect(childIdx, e.target.value)}
+                            >
+                              <option value="">- Pilih CP dari Master Ref -</option>
+                              {child.code && !childPartOptions.some((item) => String(item.code || '').trim() === String(child.code || '').trim()) && (
+                                <option value={child.code}>
+                                  {child.code}{child.name ? ` - ${child.name}` : ''}
+                                </option>
+                              )}
+                              {childPartOptions.map((item) => (
+                                <option key={`bulk-child-${child.id}-${item.code}`} value={item.code}>
+                                  {getBomOptionLabel(item)}
+                                </option>
+                              ))}
+                            </select>
                           </div>
                           <div>
                             <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Nama Child</label>
                             <input
-                              className="w-full p-2 border border-gray-300 rounded text-xs"
+                              className="w-full p-2 border border-gray-300 rounded text-xs bg-gray-50 text-gray-600"
                               placeholder="Nama komponen"
                               value={child.name}
-                              onChange={(e) => updateBulkChild(childIdx, { name: e.target.value })}
+                              readOnly
                             />
                           </div>
-                          <div>
+                          <div className="hidden">
                             <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Tipe Child (Master Category)</label>
                             <select
                               className={`w-full p-2 border border-gray-300 rounded text-xs ${getLockedFieldClass(childMasterLocked)}`}
@@ -3923,15 +4751,126 @@ export default function BOMManager({
                           </div>
                         </div>
 
-                        <div className="mt-3 bg-gray-50 p-4 rounded-lg border border-gray-200 space-y-4">
+                        <div className="mt-2 rounded border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-600">
+                          <span className="font-semibold text-slate-700">Master Ref:</span> {getMasterSummaryText(masterItemsByCode.get(String(child.code || '').trim()))}
+                        </div>
+                        <div className="mt-3 rounded-lg border border-indigo-100 bg-indigo-50/40 p-3">
+                          <div className="text-[10px] font-bold text-indigo-500 uppercase border-b border-indigo-100 pb-1 mb-2 flex justify-between">
+                            <span>Proses BOM per CP</span>
+                            <button type="button" onClick={() => addBulkProcess(childIdx)} disabled={!childSelected} className="text-indigo-600 hover:text-indigo-800 text-[9px] flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed">+ Tambah Proses</button>
+                          </div>
+                          <div className="space-y-2">
+                            {(child.processCodes || ['']).map((procCode, procIdx) => (
+                              <div key={`child-visible-proc-${child.id}-${procIdx}`} className="flex gap-2 items-center">
+                                <span className="text-[10px] text-gray-400 w-4">{procIdx + 1}.</span>
+                                <select
+                                  className="flex-1 min-w-0 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none bg-white"
+                                  value={procCode || ''}
+                                  onChange={(e) => updateBulkProcess(childIdx, procIdx, e.target.value)}
+                                  disabled={!childSelected}
+                                >
+                                  <option value="">- Pilih proses -</option>
+                                  {String(procCode || '').trim() && !bomProcessOptionsForMode.some((item) => String(item.code || '').trim() === String(procCode || '').trim()) && (
+                                    <option value={procCode}>
+                                      {procCode} (Custom)
+                                    </option>
+                                  )}
+                                  {bomProcessOptionsForMode.map((item) => (
+                                    <option key={`child-visible-proc-opt-${child.id}-${item.code}`} value={item.code}>
+                                      {getProcessDisplayLabel(item)}
+                                    </option>
+                                  ))}
+                                </select>
+                                {renderProcessCycleTimeBadge(procCode, `child-ct-${child.id}-${procIdx}`)}
+                                {(child.processCodes || []).length > 1 && (
+                                  <button type="button" onClick={() => removeBulkProcess(childIdx, procIdx)} className="text-red-400 hover:text-red-600">
+                                    <X size={12}/>
+                                  </button>
+                                )}
+                              </div>
+                            ))}
+                            {bomProcessOptionsForMode.length === 0 && (
+                              <div className="text-[10px] text-gray-400">Master process masih kosong. Tambahkan dulu di Master Ref Process.</div>
+                            )}
+                          </div>
+                        </div>
+                        <div className="mt-3 rounded-lg border border-purple-100 bg-purple-50/40 p-3">
+                          <div className="flex items-center justify-between text-[10px] font-bold text-purple-600 uppercase border-b border-purple-100 pb-1 mb-2">
+                            <span>Consumable Proses CP (Wire / Gas / Glue)</span>
+                            <button type="button" onClick={() => addBulkProcessConsumable(childIdx, getCleanProcessCodes(child.processCodes)[0] || '')} disabled={!childSelected} className="text-purple-600 hover:text-purple-800 text-[9px] flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed">+ Tambah Consumable</button>
+                          </div>
+                          <div className="space-y-2">
+                            {(child.processConsumables || []).map((consumable, consIdx) => {
+                              const childProcessCodes = getCleanProcessCodes(child.processCodes);
+                              const resolvedProcessCode = resolveConsumableProcessCode(consumable, childProcessCodes);
+                              return (
+                              <div key={`child-cons-${child.id}-${consumable.id || consIdx}`} className="grid grid-cols-1 md:grid-cols-8 gap-2 items-end">
+                                <div className="md:col-span-2">
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Mengacu Proses</label>
+                                  {childProcessCodes.length > 1 ? (
+                                    <select className="w-full p-2 border border-gray-300 rounded text-xs bg-white disabled:bg-gray-100 disabled:text-gray-400" value={resolvedProcessCode} onChange={(e) => updateBulkProcessConsumable(childIdx, consIdx, { processCode: e.target.value })} disabled={!childSelected}>
+                                      <option value="">- Pilih proses -</option>
+                                      {childProcessCodes.map((procCode) => (
+                                        <option key={`child-cons-proc-${child.id}-${consIdx}-${procCode}`} value={procCode}>{getProcessNodeLabel(procCode)}</option>
+                                      ))}
+                                    </select>
+                                  ) : (
+                                    <div className="w-full p-2 border border-gray-200 rounded text-xs bg-gray-50 text-gray-600">
+                                      {resolvedProcessCode ? getProcessNodeLabel(resolvedProcessCode) : 'Pilih proses BOM dulu'}
+                                    </div>
+                                  )}
+                                </div>
+                                <div>
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Tipe</label>
+                                  <select className="w-full p-2 border border-gray-300 rounded text-xs bg-white disabled:bg-gray-100 disabled:text-gray-400" value={normalizeMaterialType(consumable.type, 'INDIRECT MATERIAL')} onChange={(e) => updateBulkProcessConsumable(childIdx, consIdx, { type: normalizeMaterialType(e.target.value, 'INDIRECT MATERIAL'), code: '', name: '', uom: 'PCS' })} disabled={!childSelected}>
+                                    <option value="INDIRECT MATERIAL">Indirect</option>
+                                    <option value="RAW MATERIAL">Raw</option>
+                                  </select>
+                                </div>
+                                <div className="md:col-span-2">
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Consumable</label>
+                                  <select className="w-full p-2 border border-gray-300 rounded text-xs bg-white disabled:bg-gray-100 disabled:text-gray-400" value={consumable.code || ''} onChange={(e) => handleBulkProcessConsumableSelect(childIdx, consIdx, e.target.value)} disabled={!childSelected}>
+                                    <option value="">- Pilih material -</option>
+                                    {getMaterialOptionsForType(consumable.type).map((item) => (
+                                      <option key={`child-cons-mat-${child.id}-${consIdx}-${item.code}`} value={item.code}>{getBomOptionLabel(item)}</option>
+                                    ))}
+                                  </select>
+                                </div>
+                                <div>
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Qty Konsumsi</label>
+                                  <input type="number" step="0.0001" className="w-full p-2 border border-gray-300 rounded text-xs text-right bg-white disabled:bg-gray-100 disabled:text-gray-400" value={consumable.qty} onChange={(e) => updateBulkProcessConsumable(childIdx, consIdx, { qty: e.target.value })} disabled={!childSelected}/>
+                                </div>
+                                <div>
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">UOM</label>
+                                  <input className="w-full p-2 border border-gray-300 rounded text-xs bg-gray-50 text-gray-600" value={consumable.uom} readOnly/>
+                                </div>
+                                <div>
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Basis</label>
+                                  <select className="w-full p-2 border border-gray-300 rounded text-xs bg-white disabled:bg-gray-100 disabled:text-gray-400" value={consumable.consumptionBasis || 'PER_PCS'} onChange={(e) => updateBulkProcessConsumable(childIdx, consIdx, { consumptionBasis: e.target.value })} disabled={!childSelected}>
+                                    {PROCESS_CONSUMPTION_BASIS_OPTIONS.map((basis) => (
+                                      <option key={`child-basis-${child.id}-${basis.value}`} value={basis.value}>{basis.label}</option>
+                                    ))}
+                                  </select>
+                                </div>
+                                <div className="flex justify-end">
+                                  {(child.processConsumables || []).length > 1 && (
+                                    <button type="button" onClick={() => removeBulkProcessConsumable(childIdx, consIdx)} className="text-xs text-rose-600 hover:text-rose-700">Hapus</button>
+                                  )}
+                                </div>
+                              </div>
+                            )})}
+                          </div>
+                        </div>
+
+                        <div className="hidden">
                           <div>
                             <div className="text-[10px] font-bold text-indigo-400 uppercase border-b border-indigo-100 pb-1 mb-2">Parameter Umum</div>
                             <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
-                              <div><label className="block text-[10px] text-gray-500 mb-1">Line Produksi</label><input list="bom-line-options" type="text" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(childMasterLocked)}`} placeholder="Line A" value={child.line} onChange={e=>updateBulkChild(childIdx, { line: e.target.value })} readOnly={childMasterLocked}/></div>
+                              <div><label className="block text-[10px] text-gray-500 mb-1">Line Produksi</label><input list="bom-line-options" type="text" className="w-full p-2 border rounded text-xs bg-white" placeholder="Line A" value={child.line} onChange={e=>updateBulkChild(childIdx, { line: e.target.value })}/></div>
                               <div><label className="block text-[10px] text-gray-500 mb-1">Customer</label><input list="bom-customer-options" type="text" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(true)}`} placeholder="Customer" value={childCustomerLabel || child.customer} onChange={e=>updateBulkChild(childIdx, { customer: e.target.value })} readOnly/></div>
-                              <div><label className="block text-[10px] text-gray-500 mb-1">Storage Location (Gudang/Area)</label><input list="bom-location-options" type="text" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(childMasterLocked)}`} placeholder="Gudang / Area" value={child.location} onChange={e=>updateBulkChild(childIdx, { location: e.target.value })} readOnly={childMasterLocked}/></div>
-                              <div><label className="block text-[10px] text-gray-500 mb-1">Packing</label><input list="bom-packing-options" type="text" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(childMasterLocked)}`} placeholder="Box" value={child.packing} onChange={e=>updateBulkChild(childIdx, { packing: e.target.value })} readOnly={childMasterLocked}/></div>
-                              <div><label className="block text-[10px] text-gray-500 mb-1">Cycle Time (s)</label><input type="number" className={`w-full p-2 border rounded text-xs ${getLockedFieldClass(childMasterLocked)}`} value={child.cycleTime} onChange={e=>updateBulkChild(childIdx, { cycleTime: e.target.value })} readOnly={childMasterLocked}/></div>
+                              <div><label className="block text-[10px] text-gray-500 mb-1">Storage Location (Gudang/Area)</label><input list="bom-location-options" type="text" className="w-full p-2 border rounded text-xs bg-white" placeholder="Gudang / Area" value={child.location} onChange={e=>updateBulkChild(childIdx, { location: e.target.value })}/></div>
+                              <div><label className="block text-[10px] text-gray-500 mb-1">Packing</label><input list="bom-packing-options" type="text" className="w-full p-2 border rounded text-xs bg-white" placeholder="Box" value={child.packing} onChange={e=>updateBulkChild(childIdx, { packing: e.target.value })}/></div>
+                              <div><label className="block text-[10px] text-gray-500 mb-1">Cycle Time (s)</label><input type="number" className="w-full p-2 border rounded text-xs bg-white" value={child.cycleTime} onChange={e=>updateBulkChild(childIdx, { cycleTime: e.target.value })}/></div>
                             </div>
                           </div>
                           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -3980,18 +4919,23 @@ export default function BOMManager({
                                   <div key={`proc-${child.id}-${procIdx}`} className="flex gap-2 items-center">
                                     <span className="text-[10px] text-gray-400 w-4">{procIdx + 1}.</span>
                                     <select
-                                      className={`flex-1 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none ${getLockedFieldClass(childMasterLocked)}`}
+                                      className="flex-1 min-w-0 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none bg-white"
                                       value={procCode || ''}
                                       onChange={(e) => updateBulkProcess(childIdx, procIdx, e.target.value)}
-                                      disabled={childMasterLocked}
                                     >
-                                      <option value="">- Pilih Process -</option>
-                                      {bomProcessOptionsForMode.map((proc) => (
-                                        <option key={`proc-${proc.code}`} value={proc.code}>
-                                          {getProcessDisplayLabel(proc)}
+                                      <option value="">- Pilih proses -</option>
+                                      {String(procCode || '').trim() && !bomProcessOptionsForMode.some((item) => String(item.code || '').trim() === String(procCode || '').trim()) && (
+                                        <option value={procCode}>
+                                          {procCode} (Custom)
+                                        </option>
+                                      )}
+                                      {bomProcessOptionsForMode.map((item) => (
+                                        <option key={`child-proc-opt-${item.code}`} value={item.code}>
+                                          {getProcessDisplayLabel(item)}
                                         </option>
                                       ))}
                                     </select>
+                                    {renderProcessCycleTimeBadge(procCode, `child-edit-ct-${child.id}-${procIdx}`)}
                                     {!childMasterLocked && (child.processCodes || []).length > 1 && (
                                       <button type="button" onClick={() => removeBulkProcess(childIdx, procIdx)} className="text-red-400 hover:text-red-600">
                                         <X size={12}/>
@@ -4000,14 +4944,14 @@ export default function BOMManager({
                                   </div>
                                 ))}
                                 {bomProcessOptionsForMode.length === 0 && (
-                                  <div className="text-[10px] text-gray-400">Master process masih kosong.</div>
+                                  <div className="text-[10px] text-gray-400">Master process masih kosong. Tambahkan dulu di Master Ref Process.</div>
                                 )}
                               </div>
                             </div>
                           </div>
                         </div>
 
-                        <div className="mt-3">
+                        <div className="hidden">
                           <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Catatan Khusus (Per Assembly)</label>
                           <textarea
                             rows={2}
@@ -4018,16 +4962,16 @@ export default function BOMManager({
                           />
                         </div>
 
-                        <div className="grid grid-cols-2 md:grid-cols-7 gap-3 mt-3">
-                          <div className="bg-blue-50 p-2 rounded border border-blue-100"><label className="text-[9px] font-bold text-blue-700 block">QTY / USE</label><input type="number" step="0.01" className="w-full p-1 text-right text-xs bg-white border border-blue-200 rounded" value={child.qty} onChange={e=>updateBulkChild(childIdx, { qty: e.target.value })}/></div>
-                          <div className="bg-blue-50 p-2 rounded border border-blue-100"><label className="text-[9px] font-bold text-blue-700 block">SATUAN</label><input type="text" className={`w-full p-1 text-xs border border-blue-200 rounded ${getLockedFieldClass(childMasterLocked)}`} value={child.uom} onChange={e=>updateBulkChild(childIdx, { uom: e.target.value })} readOnly={childMasterLocked}/></div>
-                          <div className="bg-blue-50 p-2 rounded border border-blue-100"><label className="text-[9px] font-bold text-blue-700 block">BERAT (KG)</label><input type="number" step="0.01" className={`w-full p-1 text-right text-xs border border-blue-200 rounded ${getLockedFieldClass(childMasterLocked)}`} value={child.weight} onChange={e=>updateBulkChild(childIdx, { weight: e.target.value })} readOnly={childMasterLocked}/></div>
-                          <div className="bg-yellow-50 p-2 rounded border border-yellow-100"><label className="text-[9px] font-bold text-yellow-700 block">SCRAP %</label><input type="number" step="0.1" className="w-full p-1 text-right text-xs bg-white border border-yellow-200 rounded" value={child.scrap} onChange={e=>updateBulkChild(childIdx, { scrap: e.target.value })}/></div>
-                          <div className="bg-emerald-50 p-2 rounded border border-emerald-100"><label className="text-[9px] font-bold text-emerald-700 block">YIELD</label><input type="number" step="0.01" min="0.01" className="w-full p-1 text-right text-xs bg-white border border-emerald-200 rounded" value={child.yieldFactor ?? 1} onChange={e=>updateBulkChild(childIdx, { yieldFactor: e.target.value })}/></div>
-                          <div className="bg-slate-50 p-2 rounded border border-slate-200"><label className="text-[9px] font-bold text-slate-700 block">POSITION</label><input type="text" className="w-full p-1 text-xs bg-white border border-slate-200 rounded" value={child.positionCode || ''} onChange={e=>updateBulkChild(childIdx, { positionCode: e.target.value })}/></div>
-                          <div className="bg-red-50 p-2 rounded border border-red-100"><label className="text-[9px] font-bold text-red-700 block">LEAD TIME</label><input type="number" className={`w-full p-1 text-right text-xs border border-red-200 rounded ${getLockedFieldClass(childMasterLocked)}`} value={child.leadTime} onChange={e=>updateBulkChild(childIdx, { leadTime: e.target.value })} readOnly={childMasterLocked}/></div>
+                        <div className="grid grid-cols-2 md:grid-cols-2 gap-3 mt-3">
+                          <div className="bg-blue-50 p-2 rounded border border-blue-100"><label className="text-[9px] font-bold text-blue-700 block">QTY / USE</label><input type="number" step="0.01" className="w-full p-1 text-right text-xs bg-white border border-blue-200 rounded disabled:bg-gray-100 disabled:text-gray-400" value={child.qty} onChange={e=>updateBulkChild(childIdx, { qty: e.target.value })} disabled={!childSelected}/></div>
+                          <div className="bg-blue-50 p-2 rounded border border-blue-100"><label className="text-[9px] font-bold text-blue-700 block">SATUAN</label><input type="text" className="w-full p-1 text-xs border border-blue-200 rounded bg-gray-50 text-gray-600" value={child.uom} readOnly/></div>
+                          <div className="hidden"><input type="number" step="0.01" value={child.weight} onChange={e=>updateBulkChild(childIdx, { weight: e.target.value })}/></div>
+                          <div className="hidden"><input type="number" step="0.1" value={child.scrap} onChange={e=>updateBulkChild(childIdx, { scrap: e.target.value })}/></div>
+                          <div className="hidden"><input type="number" step="0.01" min="0.01" value={child.yieldFactor ?? 1} onChange={e=>updateBulkChild(childIdx, { yieldFactor: e.target.value })}/></div>
+                          <div className="hidden"><input type="text" value={child.positionCode || ''} onChange={e=>updateBulkChild(childIdx, { positionCode: e.target.value })}/></div>
+                          <div className="hidden"><input type="number" value={child.leadTime} onChange={e=>updateBulkChild(childIdx, { leadTime: e.target.value })}/></div>
                         </div>
-                        <div className="mt-2">
+                        <div className="hidden">
                           <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Substitute Material Codes</label>
                           <input
                             className="w-full p-2 border border-gray-300 rounded text-xs"
@@ -4040,49 +4984,65 @@ export default function BOMManager({
                         <div className="mt-3 bg-slate-50 border border-slate-200 rounded-lg p-3">
                           <div className="flex items-center justify-between text-[10px] font-bold text-slate-500 uppercase border-b border-slate-200 pb-1 mb-2">
                             <span>{bulkMode === 'single' ? 'Material (Raw) untuk Parent Ini' : 'Material (Raw / Indirect) untuk Child Ini'}</span>
-                            <button type="button" onClick={() => addBulkMaterial(childIdx)} className="text-indigo-600 hover:text-indigo-800 text-[9px] flex items-center gap-1">+ Tambah Material</button>
+                            <button type="button" onClick={() => addBulkMaterial(childIdx)} disabled={!childSelected} className="text-indigo-600 hover:text-indigo-800 text-[9px] flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed">+ Tambah Material</button>
                           </div>
+                          {bulkMode === 'multi' && (
+                            <div className="mb-2 text-[10px] text-slate-500">
+                              Pilih material dari Master Ref Item. Isi qty sesuai pemakaian per 1 child part; UOM mengikuti master (PCS/KG/dll).
+                            </div>
+                          )}
                           <div className="space-y-2">
                             {(child.materials || []).map((material, matIdx) => (
-                              <div key={`mat-${material.id}`} className={`grid grid-cols-1 gap-2 items-end ${bulkMode === 'multi' ? 'md:grid-cols-9' : 'md:grid-cols-8'}`}>
+                              <div key={`mat-${material.id}`} className="grid grid-cols-1 gap-2 items-end md:grid-cols-7">
                                 <div className="md:col-span-2">
-                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Material Code</label>
-                                  <input
-                                    list={bulkMode === 'multi' ? getBulkMaterialListId(material) : 'bom-material-rm-options'}
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Material</label>
+                                  <select
                                     className="w-full p-2 border border-gray-300 rounded text-xs"
-                                    placeholder="Kode Material"
                                     value={material.code}
-                                    onChange={(e) => updateBulkMaterial(childIdx, matIdx, { code: e.target.value })}
-                                    onBlur={() => handleBulkMaterialCodeBlur(childIdx, matIdx)}
-                                  />
+                                    onChange={(e) => handleBulkMaterialSelect(childIdx, matIdx, e.target.value)}
+                                    disabled={!childSelected}
+                                  >
+                                    <option value="">- Pilih material -</option>
+                                    {material.code && !getMaterialOptionsForType(material.type).some((item) => String(item.code || '').trim() === String(material.code || '').trim()) && (
+                                      <option value={material.code}>
+                                        {material.code}{material.name ? ` - ${material.name}` : ''}
+                                      </option>
+                                    )}
+                                    {getMaterialOptionsForType(material.type).map((item) => (
+                                      <option key={`child-material-${child.id}-${material.id}-${item.code}`} value={item.code}>
+                                        {getBomOptionLabel(item)}
+                                      </option>
+                                    ))}
+                                  </select>
                                 </div>
                                 <div className="md:col-span-2">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Nama Material</label>
                                   <input
-                                    className="w-full p-2 border border-gray-300 rounded text-xs"
+                                    className="w-full p-2 border border-gray-300 rounded text-xs bg-gray-50 text-gray-600"
                                     placeholder="Nama material"
                                     value={material.name}
-                                    onChange={(e) => updateBulkMaterial(childIdx, matIdx, { name: e.target.value })}
+                                    readOnly
                                   />
                                 </div>
                                 <div>
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Qty</label>
                                   <input
                                     type="number"
-                                    className="w-full p-2 border border-gray-300 rounded text-xs text-right"
+                                    className="w-full p-2 border border-gray-300 rounded text-xs text-right disabled:bg-gray-100 disabled:text-gray-400"
                                     value={material.qty}
                                     onChange={(e) => updateBulkMaterial(childIdx, matIdx, { qty: e.target.value })}
+                                    disabled={!childSelected}
                                   />
                                 </div>
                                 <div>
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">UOM</label>
                                   <input
-                                    className="w-full p-2 border border-gray-300 rounded text-xs"
+                                    className="w-full p-2 border border-gray-300 rounded text-xs bg-gray-50 text-gray-600"
                                     value={material.uom}
-                                    onChange={(e) => updateBulkMaterial(childIdx, matIdx, { uom: e.target.value })}
+                                    readOnly
                                   />
                                 </div>
-                                <div>
+                                <div className="hidden">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Yield</label>
                                   <input
                                     type="number"
@@ -4093,7 +5053,7 @@ export default function BOMManager({
                                     onChange={(e) => updateBulkMaterial(childIdx, matIdx, { yieldFactor: e.target.value })}
                                   />
                                 </div>
-                                <div>
+                                <div className="hidden">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Posisi</label>
                                   <input
                                     className="w-full p-2 border border-gray-300 rounded text-xs"
@@ -4102,7 +5062,7 @@ export default function BOMManager({
                                     onChange={(e) => updateBulkMaterial(childIdx, matIdx, { positionCode: e.target.value })}
                                   />
                                 </div>
-                                <div className="md:col-span-2">
+                                <div className="hidden">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Substitusi</label>
                                   <input
                                     className="w-full p-2 border border-gray-300 rounded text-xs"
@@ -4118,6 +5078,7 @@ export default function BOMManager({
                                       className="w-full p-2 border border-gray-300 rounded text-xs bg-white"
                                       value={normalizeMaterialType(material.type, 'RAW MATERIAL')}
                                       onChange={(e) => handleBulkMaterialTypeChange(childIdx, matIdx, e.target.value)}
+                                      disabled={!childSelected}
                                     >
                                       <option value="RAW MATERIAL">Raw Material</option>
                                       <option value="INDIRECT MATERIAL">Indirect Material</option>
@@ -4155,7 +5116,7 @@ export default function BOMManager({
               </datalist>
               <datalist id="bom-org-options">
                 {[...masterPlants, ...masterAreas, ...masterWarehouses].map((entry, idx) => (
-                  <option key={`org-${entry.id || idx}`} value={getLabel(entry)} />
+                  <option key={`org-${idx}-${entry.id || entry.code || getLabel(entry)}`} value={getLabel(entry)} />
                 ))}
               </datalist>
               <datalist id="bom-line-options">
@@ -4186,6 +5147,11 @@ export default function BOMManager({
                   <option key={`packing-${packing.code || packing.id || idx}`} value={getLabel(packing)} />
                 ))}
               </datalist>
+              <datalist id="bom-process-options">
+                {bomProcessInputOptions.map((processValue, idx) => (
+                  <option key={`process-${idx}`} value={processValue} />
+                ))}
+              </datalist>
               <datalist id="bom-child-part-options">
                 {childPartOptions.map((item, idx) => (
                   <option key={`bom-child-part-${item.code || idx}`} value={item.code} label={item.name} />
@@ -4206,12 +5172,24 @@ export default function BOMManager({
         </div>
         )}
 
-        <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
-          <div className="p-4 border-b border-gray-100 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+        {showRevisionAuditPanel && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-sm">
+            <div className="w-full max-w-6xl max-h-[90vh] overflow-y-auto rounded-2xl border border-slate-200 bg-white shadow-2xl">
+          <div className="p-4 border-b border-gray-100 flex items-start justify-between gap-3">
             <div>
               <div className="text-sm font-bold text-slate-800">Audit Revisi BOM</div>
-              <div className="text-[11px] text-slate-500">Lihat semua revisi per parent, tentukan revisi aktif, lalu audit line detailnya.</div>
+              <div className="text-[11px] text-slate-500">Lihat semua revisi per parent, tentukan revisi aktif, lalu klik untuk buka struktur BOM utama.</div>
             </div>
+            <button
+              type="button"
+              onClick={() => setShowRevisionAuditPanel(false)}
+              className="shrink-0 rounded-lg border border-slate-200 p-2 text-slate-500 hover:bg-slate-50"
+              title="Tutup"
+            >
+              <X size={16} />
+            </button>
+          </div>
+          <div className="p-4 border-b border-gray-100 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
             <div className="flex gap-2 items-center">
               <input
                 list="bom-revision-parent-options"
@@ -4228,6 +5206,7 @@ export default function BOMManager({
                 onClick={() => {
                   const preferred = String(bulkParentCode || selectedParent?.code || bomHeader.parentCode || '').trim();
                   if (!preferred) return;
+                  setShowRevisionAuditPanel(true);
                   setRevisionAuditParentCode(preferred);
                   setRevisionAuditHeaderId('');
                 }}
@@ -4295,6 +5274,17 @@ export default function BOMManager({
                           onClick={() => {
                             const targetHeader = revisionAuditHeaders.find((header) => Number(header.headerId) === Number(revisionAuditSelectedHeaderId));
                             if (!targetHeader) return;
+                            openRevisionInStructure(targetHeader);
+                          }}
+                          className="px-3 py-2 rounded border border-amber-200 bg-white text-xs font-semibold text-amber-700 hover:bg-amber-50"
+                        >
+                          Buka Struktur BOM
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const targetHeader = revisionAuditHeaders.find((header) => Number(header.headerId) === Number(revisionAuditSelectedHeaderId));
+                            if (!targetHeader) return;
                             setBomHeader(normalizeBomHeaderState({
                               parentCode: targetHeader.parentCode,
                               bomVersion: targetHeader.bomVersion || '',
@@ -4349,7 +5339,7 @@ export default function BOMManager({
                               <td className="p-2 text-right font-mono">{Number(line.scrap_factor || 0)}</td>
                               <td className="p-2">{line.position_code || '-'}</td>
                               <td className="p-2">{formatSubstituteCodes(line.substitute_material_codes || []) || '-'}</td>
-                              <td className="p-2">{line.component_type || line.child_type || '-'}</td>
+                              <td className="p-2">{getBomDisplayMeta(line.component_type || line.child_type || '').label}</td>
                               <td className="p-2">{line.assembly_note || '-'}</td>
                             </tr>
                           ))}
@@ -4361,14 +5351,28 @@ export default function BOMManager({
               </div>
             )}
           </div>
-        </div>
+            </div>
+          </div>
+        )}
 
-        <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
-          <div className="p-4 border-b border-gray-100 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+        {showWhereUsedPanel && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-sm">
+            <div className="w-full max-w-5xl max-h-[90vh] overflow-y-auto rounded-2xl border border-slate-200 bg-white shadow-2xl">
+          <div className="p-4 border-b border-gray-100 flex items-start justify-between gap-3">
             <div>
               <div className="text-sm font-bold text-slate-800">Where Used</div>
-              <div className="text-[11px] text-slate-500">Menampilkan parent yang memakai CP/RM/Indirect tertentu.</div>
+              <div className="text-[11px] text-slate-500">Cari parent yang memakai CP/RM/Indirect, lalu klik untuk buka struktur BOM utama.</div>
             </div>
+            <button
+              type="button"
+              onClick={() => setShowWhereUsedPanel(false)}
+              className="shrink-0 rounded-lg border border-slate-200 p-2 text-slate-500 hover:bg-slate-50"
+              title="Tutup"
+            >
+              <X size={16} />
+            </button>
+          </div>
+          <div className="p-4 border-b border-gray-100 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
             <div className="flex gap-2 items-center">
               <input
                 list="bom-where-used-options"
@@ -4379,7 +5383,7 @@ export default function BOMManager({
               />
               <button
                 type="button"
-                onClick={() => setWhereUsedCode(currentFormCode)}
+                onClick={() => openWhereUsed(currentFormCode)}
                 className="px-3 py-2 rounded border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50"
               >
                 Pakai kode form
@@ -4417,6 +5421,7 @@ export default function BOMManager({
                         <th className="p-2 text-left">Substitusi</th>
                         <th className="p-2 text-center">Rev</th>
                         <th className="p-2 text-left">Note</th>
+                        <th className="p-2 text-center">Aksi</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -4424,7 +5429,7 @@ export default function BOMManager({
                         <tr key={`where-used-row-${row.id}-${row.parentCode}`} className="border-t border-slate-100">
                           <td className="p-2 font-mono text-indigo-700">{row.parentCode}</td>
                           <td className="p-2">{row.parentName}</td>
-                          <td className="p-2">{row.parentType}</td>
+                          <td className="p-2">{getBomDisplayMeta(row.parentType || '').label}</td>
                           <td className="p-2 text-right font-mono">{row.qtyUse}</td>
                           <td className="p-2 text-right font-mono">{row.yieldFactor}</td>
                           <td className="p-2 text-right font-mono">{row.scrap}</td>
@@ -4432,6 +5437,15 @@ export default function BOMManager({
                           <td className="p-2">{row.substituteCodes || '-'}</td>
                           <td className="p-2 text-center font-mono">{row.revisionNo}</td>
                           <td className="p-2">{row.note || '-'}</td>
+                          <td className="p-2 text-center">
+                            <button
+                              type="button"
+                              onClick={() => openParentInStructure(row.parentCode)}
+                              className="rounded border border-amber-200 px-2 py-1 text-[10px] font-semibold text-amber-700 hover:bg-amber-50"
+                            >
+                              Buka Struktur
+                            </button>
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -4440,10 +5454,12 @@ export default function BOMManager({
               </div>
             )}
           </div>
-        </div>
+            </div>
+          </div>
+        )}
 
         {/* --- DATA VIEW --- */}
-        <div className="bg-white border border-gray-200 rounded-xl shadow-sm flex-1 flex flex-col overflow-hidden min-h-[500px]">
+        <div ref={structureTopRef} className="bg-white border border-gray-200 rounded-xl shadow-sm flex-1 flex flex-col overflow-hidden min-h-[500px]">
           {viewMode === 'tree' ? (
             <div className="flex-1 flex flex-col">
                <div className="flex items-center justify-between p-3 bg-gray-50 font-bold text-[10px] text-gray-500 border-b border-gray-200 uppercase tracking-wider sticky top-0 z-10">
@@ -4518,27 +5534,22 @@ export default function BOMManager({
                 <thead className="bg-gray-50 text-gray-600 font-bold border-b border-gray-200 sticky top-0 z-10 shadow-sm">
                   <tr>
                     <th className="p-3">Kode</th><th className="p-3">Nama</th><th className="p-3">Tipe</th>
-                    <th className="p-3">Model</th><th className="p-3">Line</th><th className="p-3">Supplier</th>
+                    <th className="p-3">Model</th><th className="p-3">Line</th><th className="p-3 text-right">Cycle Time</th><th className="p-3">Supplier</th>
                     <th className="p-3 text-right">Qty</th><th className="p-3 text-center">Aksi</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
-                      {filteredItems.map(i => (
+                      {filteredItems.map(i => {
+                    const typeMeta = getBomDisplayMeta(i);
+                    const itemCode = String(i.code || '').trim();
+                    const canDeleteStructure = configuredParentCodes.has(itemCode);
+                    const canManageAsSingleLevel = typeMeta.bucket === 'FG';
+                    return (
                     <tr key={i.id || i.code} className="hover:bg-indigo-50 transition-colors">
                       <td className="p-3 font-medium text-indigo-700">{i.code}</td>
                       <td className="p-3">{i.name}</td>
                       <td className="p-3">
-                        <span className={`px-2 py-1 rounded text-[10px] font-bold ${
-                          String(i.type || '').toLowerCase().includes('fg')
-                            ? 'bg-indigo-100 text-indigo-700'
-                            : String(i.type || '').toLowerCase().includes('sub') || String(i.type || '').toLowerCase().includes('cp')
-                              ? 'bg-orange-100 text-orange-700'
-                              : String(i.type || '').toLowerCase().includes('raw')
-                                ? 'bg-emerald-100 text-emerald-700'
-                                : String(i.type || '').toLowerCase().includes('indirect')
-                                  ? 'bg-purple-100 text-purple-700'
-                                  : 'bg-gray-100 text-gray-600'
-                        }`}>{i.type}</span>
+                        <span className={`px-2 py-1 rounded text-[10px] font-bold ${typeMeta.badgeClass}`}>{typeMeta.label}</span>
                       </td>
                       <td className="p-3">
                         {formatModelCodes(modelMap, i.modelCodes) || i.model || '-'}
@@ -4548,10 +5559,22 @@ export default function BOMManager({
                           </div>
                         )}
                       </td>
-                      <td className="p-3">{i.line}</td><td className="p-3">{i.supplier}</td>
+                      <td className="p-3">{i.line}</td>
+                      <td className="p-3 text-right font-mono">{Number(i.cycle_time_seconds || i.cycleTime || 0)} s</td>
+                      <td className="p-3">{i.supplier}</td>
                       <td className="p-3 text-right font-mono">{i.qty} {i.uom}</td>
                       <td className="p-3 text-center flex justify-center gap-2">
-                        {allowEdit && i.type === 'FG' && (
+                        {allowEdit && (
+                          <button
+                            type="button"
+                            onClick={() => handleSelectParent(i)}
+                            className="text-slate-500 hover:text-slate-700"
+                            title="Edit / Kelola BOM"
+                          >
+                            <Pencil size={14} />
+                          </button>
+                        )}
+                        {allowEdit && canManageAsSingleLevel && (
                           <button
                             type="button"
                             onClick={() => openSingleLevelBomEditor(i)}
@@ -4561,10 +5584,20 @@ export default function BOMManager({
                             <Layers size={14} />
                           </button>
                         )}
-                        <button onClick={() => setWhereUsedCode(i.code)} className="text-sky-500 hover:text-sky-700" title="Where Used"><BookOpenText size={14}/></button>
+                        <button onClick={() => openWhereUsed(i.code)} className="text-sky-500 hover:text-sky-700" title="Where Used"><BookOpenText size={14}/></button>
+                        {allowEdit && canDeleteStructure && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteBomStructure(i)}
+                            className="text-rose-500 hover:text-rose-700"
+                            title="Hapus Struktur BOM"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        )}
                       </td>
                     </tr>
-                  ))}
+                  )})}
                 </tbody>
               </table>
             </div>

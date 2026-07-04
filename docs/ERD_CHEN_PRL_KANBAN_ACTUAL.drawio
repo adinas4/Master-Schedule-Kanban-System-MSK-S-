@@ -1,0 +1,259 @@
+<mxfile host="app.diagrams.net" modified="2026-07-01T00:00:00.000Z" agent="Codex" version="24.7.7">
+  <diagram id="erd-actual" name="ERD Actual SQL">
+    <mxGraphModel dx="2400" dy="1800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2800" pageHeight="2200" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="note1" value="ERD Chen format - atribut aktual dari server/index.js&#xa;PRL = prl_records, Kanban Board = kanban_requests + kanban_cards, FIFO = stock_batches + inventory_ledgers" style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1240" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Entities -->
+        <mxCell id="items" value="items&#xa;code (PK)&#xa;name&#xa;part_no&#xa;type&#xa;unit&#xa;model&#xa;weight&#xa;price&#xa;vendor_id&#xa;location_id&#xa;supplier_name&#xa;location_name&#xa;packing_name&#xa;line_production&#xa;image_url&#xa;image_thumb_url&#xa;cycle&#xa;shelf_life_days&#xa;shelf_life_months&#xa;moving_status&#xa;is_seasonal&#xa;safety_stock&#xa;lead_time_days&#xa;cycle_time_seconds&#xa;order_lot_size&#xa;max_delivery_per_rit&#xa;pack_qty&#xa;process_flow&#xa;process_routing&#xa;created_at" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="40" y="110" width="280" height="420" as="geometry" />
+        </mxCell>
+
+        <mxCell id="master_vendors" value="master_vendors&#xa;id (PK)&#xa;name&#xa;type&#xa;role&#xa;email&#xa;lead_time_days&#xa;daily_capacity_qty&#xa;cycle&#xa;rit&#xa;delivery_time&#xa;delivery_schedule&#xa;subcon_warehouse_id&#xa;actual_lead_time_days&#xa;actual_lead_time_updated_at" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="380" y="110" width="280" height="280" as="geometry" />
+        </mxCell>
+
+        <mxCell id="po_headers" value="po_headers&#xa;po_number (PK)&#xa;po_date&#xa;supplier_id (FK)&#xa;status&#xa;remarks&#xa;created_at&#xa;updated_at" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="700" y="110" width="250" height="190" as="geometry" />
+        </mxCell>
+
+        <mxCell id="po_lines" value="po_lines&#xa;id (PK)&#xa;po_number (FK)&#xa;line_no&#xa;item_code (FK)&#xa;qty_order&#xa;qty_received&#xa;qty_remaining" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="700" y="330" width="250" height="200" as="geometry" />
+        </mxCell>
+
+        <mxCell id="schedules" value="schedules&#xa;id (PK)&#xa;po_number&#xa;supplier&#xa;item&#xa;item_code&#xa;request_date&#xa;delivery_time&#xa;request_qty&#xa;arrival_date&#xa;received_qty&#xa;do_number&#xa;status&#xa;notes&#xa;has_split&#xa;is_split_result&#xa;actual_locked&#xa;dn_id (FK)&#xa;request_id (FK)&#xa;created_at&#xa;updated_at" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="700" y="560" width="290" height="330" as="geometry" />
+        </mxCell>
+
+        <mxCell id="kanban_settings" value="kanban_settings&#xa;item_code (PK/FK)&#xa;min_qty&#xa;max_qty&#xa;lot_qty&#xa;lead_time_days&#xa;default_supplier&#xa;drop_zone&#xa;active&#xa;created_at&#xa;updated_at" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#d5e8d4;strokeColor=#82b366;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="40" y="560" width="280" height="220" as="geometry" />
+        </mxCell>
+
+        <mxCell id="prl_records" value="prl_records&#xa;id (PK)&#xa;item_code (FK)&#xa;year&#xa;part_no&#xa;description&#xa;model&#xa;qty_per_kanban&#xa;uom&#xa;type_pack&#xa;volume&#xa;months&#xa;status&#xa;source_type&#xa;source_ref&#xa;suggested_qty&#xa;approved_qty&#xa;approved_by&#xa;approved_at&#xa;due_date&#xa;priority_score&#xa;created_at&#xa;updated_at" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#d5e8d4;strokeColor=#82b366;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="40" y="820" width="280" height="360" as="geometry" />
+        </mxCell>
+
+        <mxCell id="kanban_requests" value="kanban_requests&#xa;id (PK)&#xa;item_code (FK)&#xa;request_code&#xa;request_group&#xa;split_index&#xa;split_total&#xa;request_qty&#xa;trigger_type&#xa;status&#xa;created_by&#xa;approved_by&#xa;dn_id (FK)&#xa;schedule_id (FK)&#xa;notes&#xa;sla_due_at&#xa;exception_code&#xa;exception_note&#xa;created_at&#xa;updated_at" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#fff2cc;strokeColor=#d6b656;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="380" y="420" width="280" height="360" as="geometry" />
+        </mxCell>
+
+        <mxCell id="kanban_cards" value="kanban_cards&#xa;id (PK)&#xa;dn_id (FK)&#xa;item_code (FK)&#xa;request_id (FK)&#xa;card_seq&#xa;total_cards&#xa;card_qty&#xa;card_uid&#xa;lot_batch&#xa;created_at" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#fff2cc;strokeColor=#d6b656;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="380" y="820" width="280" height="220" as="geometry" />
+        </mxCell>
+
+        <mxCell id="delivery_notes" value="delivery_notes&#xa;id (PK)&#xa;dn_number&#xa;request_id (FK)&#xa;supplier&#xa;supplier_id&#xa;planned_date&#xa;status&#xa;remarks&#xa;cycle&#xa;rit&#xa;delivery_time&#xa;created_at" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#f8cecc;strokeColor=#b85450;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="110" width="280" height="250" as="geometry" />
+        </mxCell>
+
+        <mxCell id="delivery_note_items" value="delivery_note_items&#xa;id (PK)&#xa;dn_id (FK)&#xa;request_id (FK)&#xa;item_code&#xa;item_name&#xa;part_no&#xa;unit&#xa;pack_qty&#xa;type_pack&#xa;request_qty&#xa;drop_zone&#xa;created_at" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#f8cecc;strokeColor=#b85450;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="390" width="280" height="260" as="geometry" />
+        </mxCell>
+
+        <mxCell id="receive_notes" value="receive_notes&#xa;id (PK)&#xa;rn_number&#xa;dn_id (FK)&#xa;schedule_id (FK)&#xa;item_code&#xa;received_qty&#xa;qc_status&#xa;status&#xa;received_at&#xa;notes&#xa;received_by&#xa;source" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#e1d5e7;strokeColor=#9673a6;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="680" width="280" height="230" as="geometry" />
+        </mxCell>
+
+        <mxCell id="receive_note_headers" value="receive_note_headers&#xa;id (PK)&#xa;rn_number&#xa;supplier&#xa;remarks&#xa;truck_no&#xa;driver_name&#xa;created_by&#xa;created_at&#xa;status&#xa;source&#xa;do_number&#xa;document_date&#xa;po_number&#xa;duplicate_status&#xa;posting_error&#xa;validated_at&#xa;validated_by&#xa;posted_at&#xa;posted_by&#xa;reversed_at&#xa;reversed_by&#xa;reversal_of&#xa;idempotency_key" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#e1d5e7;strokeColor=#9673a6;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="940" width="280" height="350" as="geometry" />
+        </mxCell>
+
+        <mxCell id="receive_note_items" value="receive_note_items&#xa;id (PK)&#xa;rn_id (FK)&#xa;origin_dn_id (FK)&#xa;item_code (FK)&#xa;item_name&#xa;part_no&#xa;unit&#xa;pack_qty&#xa;doc_qty&#xa;received_qty&#xa;drop_zone&#xa;line_no&#xa;schedule_id&#xa;qc_status&#xa;line_status&#xa;arrival_date&#xa;notes&#xa;production_date&#xa;created_at" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#e1d5e7;strokeColor=#9673a6;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="1320" width="280" height="320" as="geometry" />
+        </mxCell>
+
+        <mxCell id="stock_batches" value="stock_batches&#xa;id (PK)&#xa;item_code (FK)&#xa;qty_in&#xa;qty_out&#xa;arrival_date&#xa;do_number&#xa;batch_no&#xa;production_date&#xa;expired_date&#xa;schedule_id (FK)&#xa;created_at" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1380" y="110" width="260" height="250" as="geometry" />
+        </mxCell>
+
+        <mxCell id="stock_movements" value="stock_movements&#xa;id (PK)&#xa;item_code (FK)&#xa;batch_id (FK)&#xa;qty&#xa;direction&#xa;reason&#xa;source_ref_type&#xa;source_ref_id&#xa;source_ref_line_id&#xa;created_at" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1380" y="390" width="260" height="240" as="geometry" />
+        </mxCell>
+
+        <mxCell id="inventory_ledgers" value="inventory_ledgers&#xa;id (PK)&#xa;date&#xa;item_id (FK)&#xa;transaction_type&#xa;reference_doc&#xa;qty_in&#xa;qty_out&#xa;balance&#xa;user_id&#xa;remarks&#xa;batch_id&#xa;kanban_id&#xa;source_ref_type&#xa;source_ref_id&#xa;source_ref_line_id" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;spacingLeft=8;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1380" y="660" width="260" height="300" as="geometry" />
+        </mxCell>
+
+        <mxCell id="legend" value="Aturan baca&#xa;1) PRL bukan sumber trigger; trigger berasal dari konsumsi / kanban kosong / inbound.&#xa;2) PRL menyimpan target dan shortage.&#xa;3) kanban_requests = kartu kerja aktif.&#xa;4) stock_batches + inventory_ledgers = FIFO aktual." style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1700" width="1600" height="120" as="geometry" />
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" value="maps to" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="170" y="560" width="110" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e1a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="items" target="e1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e1b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e1" target="kanban_settings">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e2" value="drives" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="170" y="940" width="110" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e2a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="prl_records" target="e2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e2" target="kanban_requests">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e2c" value="planned for" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="160" y="780" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e2d" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="items" target="e2c">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2e" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e2c" target="prl_records">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e3" value="supplies" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="560" y="70" width="110" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e3a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="master_vendors" target="e3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e3" target="po_headers">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e4" value="contains" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="770" y="260" width="110" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e4a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="po_headers" target="e4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e4" target="po_lines">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e5" value="feeds" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="770" y="500" width="110" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e5a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="po_lines" target="e5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e5" target="schedules">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e5c" value="request_id" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="520" y="760" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e5d" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="kanban_requests" target="e5c">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5e" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e5c" target="schedules">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e6" value="creates" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="950" y="170" width="110" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e6a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="kanban_requests" target="e6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e6" target="delivery_notes">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e7" value="contains" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="1110" y="310" width="110" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e7a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="delivery_notes" target="e7">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e7" target="delivery_note_items">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e8" value="receives as" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="1110" y="610" width="110" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e8a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="delivery_notes" target="e8">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e8" target="receive_notes">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e9" value="details" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="1110" y="930" width="110" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e9a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="receive_note_headers" target="e9">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e9" target="receive_note_items">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e10" value="materializes" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="450" y="1080" width="130" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e10a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="delivery_notes" target="e10">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e10" target="kanban_cards">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e11" value="logs inventory" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="1450" y="320" width="130" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e11a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="items" target="e11">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e11" target="stock_movements">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e12" value="updates FIFO" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="1450" y="620" width="130" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e12a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="receive_notes" target="e12">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e12" target="stock_batches">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e13" value="updates ledger" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="1450" y="790" width="130" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e13a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="receive_notes" target="e13">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e13b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e13" target="inventory_ledgers">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e14" value="ordered item" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="540" y="400" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e14a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="items" target="e14">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e14b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e14" target="po_lines">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e15" value="logged by" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="1450" y="940" width="130" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e15a" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="items" target="e15">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e15b" style="endArrow=none;startArrow=none;html=1;orthogonalLoop=1;rounded=0;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="e15" target="inventory_ledgers">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

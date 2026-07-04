@@ -189,16 +189,22 @@ const TabInventory = (props) => {
       const kanbanId = String(item.kanbanId || '').toLowerCase();
       const itemCode = String(item.itemCode || '').toLowerCase();
       const itemName = String(item.itemName || '').toLowerCase();
-      const category = String(item.category || '').toLowerCase();
-      const supplier = String(item.supplier || '').toLowerCase();
-      const location = String(item.location || '').toLowerCase();
+      const category = String(item.categoryCode || item.category || '').toLowerCase();
+      const categoryLabel = String(item.categoryLabel || '').toLowerCase();
+      const supplier = String(item.supplierCode || item.supplier || '').toLowerCase();
+      const supplierName = String(item.supplierName || '').toLowerCase();
+      const location = String(item.locationCode || item.location || '').toLowerCase();
+      const locationName = String(item.locationName || '').toLowerCase();
       const matchesSearch = !query
         || kanbanId.includes(query)
         || itemCode.includes(query)
         || itemName.includes(query)
         || category.includes(query)
+        || categoryLabel.includes(query)
         || supplier.includes(query)
-        || location.includes(query);
+        || supplierName.includes(query)
+        || location.includes(query)
+        || locationName.includes(query);
 
       if (!matchesSearch) return false;
 
@@ -761,12 +767,12 @@ const TabInventory = (props) => {
                     </div>
                       <div className="mt-3">
                         <div className="font-medium text-sm">{item.itemName}</div>
-                        <div className="text-xs text-slate-500">{item.category}</div>
+                        <div className="text-xs text-slate-500">{item.categoryCode || item.category || '-'}</div>
                       </div>
                       <div className="grid grid-cols-2 gap-2 text-sm mt-3">
                         <div>
                           <div className="text-xs text-slate-500">Location</div>
-                          <div className="font-medium">{item.location}</div>
+                          <div className="font-medium">{item.locationCode || item.location || '-'}</div>
                         </div>
                         <div>
                           <div className="text-xs text-slate-500">On Hand</div>
@@ -796,8 +802,8 @@ const TabInventory = (props) => {
                         </div>
                       </div>
                       <div className="flex justify-between items-center mt-3 pt-3 border-t">
-                        <div className="text-xs text-slate-500">
-                          <div>Supplier: {item.supplier}</div>
+                      <div className="text-xs text-slate-500">
+                          <div>Supplier: {item.supplierCode || item.supplier || '-'}</div>
                           <div>Lead Time: {item.leadTime} days</div>
                         </div>
                         <div className="flex gap-2">
@@ -852,8 +858,8 @@ const TabInventory = (props) => {
                           <div className="font-medium">{item.itemCode}</div>
                           <div className="text-[10px] text-slate-500">{item.itemName}</div>
                         </td>
-                        <td className="p-2">{item.category}</td>
-                        <td className="p-2">{item.location}</td>
+                        <td className="p-2">{item.categoryCode || item.category || '-'}</td>
+                        <td className="p-2">{item.locationCode || item.location || '-'}</td>
                         <td className="p-2">
                           <span className={`${item.available <= item.minQty ? 'text-red-600' : 'text-emerald-600'} font-semibold`}>
                             {Number(item.onHand || 0).toLocaleString('id-ID')} {item.uom}
@@ -867,7 +873,7 @@ const TabInventory = (props) => {
                         </td>
                         <td className="p-2">{item.minQty} / {item.maxQty}</td>
                         <td className="p-2">{item.noOfCards} x {item.kanbanQty}</td>
-                        <td className="p-2">{item.supplier}</td>
+                        <td className="p-2">{item.supplierCode || item.supplier || '-'}</td>
                         <td className="p-2">{item.leadTime} days</td>
                         <td className="p-2">
                           <span className={`px-2 py-0.5 rounded-full text-xs border ${getInventoryStatusBadge(item.status)}`}>{item.status}</span>
@@ -924,7 +930,7 @@ const TabInventory = (props) => {
                     <div className="grid grid-cols-2 gap-3 text-sm">
                       <div className="border rounded-lg p-3">
                         <div className="text-xs text-slate-500">Location</div>
-                        <div className="font-semibold">{inventoryDetailItem.location}</div>
+                        <div className="font-semibold">{inventoryDetailItem.locationCode || inventoryDetailItem.location || '-'}</div>
                       </div>
                       <div className="border rounded-lg p-3">
                         <div className="text-xs text-slate-500">On Hand</div>
@@ -946,7 +952,7 @@ const TabInventory = (props) => {
                       </div>
                       <div className="border rounded-lg p-3">
                         <div className="text-xs text-slate-500">Supplier</div>
-                        <div className="font-semibold">{inventoryDetailItem.supplier}</div>
+                        <div className="font-semibold">{inventoryDetailItem.supplierCode || inventoryDetailItem.supplier || '-'}</div>
                       </div>
                     </div>
 

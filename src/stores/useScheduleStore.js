@@ -364,6 +364,84 @@ export const useScheduleStore = ({
     alert(message);
   };
 
+  const parseScheduleQtyConflict = (message) => {
+    const text = String(message || '');
+    const rowMatch = text.match(/Baris\s+(\d+)/i);
+    const remainingMatch = text.match(/Sisa tersedia:\s*([0-9.,]+)/i);
+    if (!rowMatch || !remainingMatch) return null;
+    const requestedMatch = text.match(/Qty diminta:\s*([0-9.,]+)/i);
+    const rowNumber = Number(rowMatch[1]);
+    const requestQty = Number(String(requestedMatch?.[1] || '').replace(/,/g, ''));
+    const remaining = Number(String(remainingMatch[1] || '').replace(/,/g, ''));
+    if (!Number.isFinite(rowNumber) || rowNumber <= 0) return null;
+    if (!Number.isFinite(remaining) || remaining < 0) return null;
+    return {
+      rowIndex: rowNumber - 1,
+      requestQty: Number.isFinite(requestQty) ? requestQty : null,
+      remaining,
+    };
+  };
+
+  const retryCreateSchedulesWithQtyClamp = async (createFn, rows) => {
+    let workingRows = Array.isArray(rows) ? rows.map((row) => ({ ...row })) : [];
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const created = await createFn(workingRows);
+        return { created, adjusted: attempt > 0 };
+      } catch (error) {
+        const conflict = parseScheduleQtyConflict(error?.message);
+        if (!conflict) throw error;
+        const currentRow = workingRows[conflict.rowIndex];
+        if (!currentRow) throw error;
+        const currentQty = Number(currentRow.requestQty || 0);
+        if (!Number.isFinite(conflict.remaining) || conflict.remaining < 0) throw error;
+        if (currentQty <= conflict.remaining) throw error;
+        const nextRows = workingRows
+          .map((row, index) => (
+            index === conflict.rowIndex
+              ? { ...row, requestQty: conflict.remaining }
+              : row
+          ))
+          .filter((row) => Number(row.requestQty || 0) > 0);
+        if (nextRows.length === workingRows.length && Number(conflict.remaining) === currentQty) {
+          throw error;
+        }
+        workingRows = nextRows;
+      }
+    }
+    throw new Error('Gagal membuat jadwal setelah penyesuaian qty.');
+  };
+
+  const formatQtyLabel = (value) => {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return '-';
+    return new Intl.NumberFormat('id-ID', { maximumFractionDigits: 0 }).format(numeric);
+  };
+
+  const buildSplitScheduleSuccessMessage = ({ poNumber = '', itemCode = '', createdItems = [], sourceCount = 1 }) => {
+    const rows = Array.isArray(createdItems) ? createdItems : [];
+    const count = rows.length;
+    const normalizedPoNumber = String(poNumber || '').trim() || '-';
+    const normalizedItemCode = String(itemCode || '').trim();
+    if (count <= 0) {
+      return 'Jadwal berhasil disimpan.';
+    }
+    if (count === 1) {
+      return `Berhasil membuat 1 jadwal untuk PO ${normalizedPoNumber}.`;
+    }
+    const totalQty = rows.reduce((sum, row) => sum + Number(row?.requestQty || 0), 0);
+    const qtyBreakdown = rows
+      .map((row, index) => {
+        const qty = formatQtyLabel(row?.requestQty);
+        const dateLabel = row?.requestDate ? formatDateID(row.requestDate) : '-';
+        return `${index + 1}) ${qty} (${dateLabel})`;
+      })
+      .join(', ');
+    const itemLabel = normalizedItemCode ? ` untuk item ${normalizedItemCode}` : '';
+    const sourceLabel = sourceCount > 1 ? ` dari ${sourceCount} item` : '';
+    return `PO ${normalizedPoNumber} otomatis dipecah menjadi ${count} jadwal${itemLabel}${sourceLabel}. Total qty ${formatQtyLabel(totalQty)}. Pembagian: ${qtyBreakdown}.`;
+  };
+
   const resolvePoLineIdValue = (line) => {
     const raw = line?.poLineId ?? line?.lineId ?? line?.id ?? null;
     const num = Number(raw);
@@ -864,10 +942,23 @@ export const useScheduleStore = ({
           return;
         }
         try {
-          const createdItems = await createSchedulesBulk(payloadLines);
+          const { created: createdItems, adjusted } = await retryCreateSchedulesWithQtyClamp(createSchedulesBulk, payloadLines);
           setSchedules([...schedules, ...createdItems]);
           await refreshSchedules({ page: schedulePage, perPage: schedulePerPage, silent: true });
-          alert(`Berhasil membuat ${createdItems.length} jadwal!`);
+          const message = buildSplitScheduleSuccessMessage({
+            poNumber: newPlan.poNumber,
+            itemCode: selectedLines.length === 1 ? selectedLines[0]?.item : '',
+            createdItems,
+            sourceCount: selectedLines.length,
+          });
+          if (showToastMessage) {
+            showToastMessage(message, '', null, 'success');
+            if (adjusted) {
+              showToastMessage('Qty jadwal disesuaikan otomatis ke sisa PO yang tersedia.', '', null, 'info');
+            }
+          } else {
+            alert(message);
+          }
         } catch (error) {
           await handleCreateScheduleError(error, "Create Multi Error:");
           return;
@@ -921,30 +1012,41 @@ export const useScheduleStore = ({
           return;
         }
         try {
-          const createdItems = await createSchedulesBulk(newItems);
+          const { created: createdItems, adjusted } = await retryCreateSchedulesWithQtyClamp(createSchedulesBulk, newItems);
           setSchedules([...schedules, ...createdItems]);
           await refreshSchedules({ page: schedulePage, perPage: schedulePerPage, silent: true });
-          alert(`Berhasil membuat ${createdItems.length} jadwal!`);
+          const message = buildSplitScheduleSuccessMessage({
+            poNumber: newPlan.poNumber,
+            itemCode: newPlan.item,
+            createdItems,
+          });
+          if (showToastMessage) {
+            showToastMessage(message, '', null, 'success');
+            if (adjusted) {
+              showToastMessage('Qty jadwal disesuaikan otomatis ke sisa PO yang tersedia.', '', null, 'info');
+            }
+          } else {
+            alert(message);
+          }
         } catch (error) {
           await handleCreateScheduleError(error, "Create Bulk Error:");
           return;
         }
       } else {
+        const candidate = {
+          ...newPlan,
+          itemCode: newPlan.item,
+          poLineId: resolvePoLineIdValue(selectedLines[0]),
+          requestQty: normalizedRequestQty,
+          arrivalDate: '',
+          receivedQty: 0,
+          status: 'Pending',
+          notes: '',
+          hasSplit: false,
+          isSplitResult: false,
+          actualLocked: false,
+        };
         try {
-          const singleLineId = resolvePoLineIdValue(selectedLines[0]);
-          const candidate = {
-            ...newPlan,
-            itemCode: newPlan.item,
-            poLineId: singleLineId,
-            requestQty: normalizedRequestQty,
-            arrivalDate: '',
-            receivedQty: 0,
-            status: 'Pending',
-            notes: '',
-            hasSplit: false,
-            isSplitResult: false,
-            actualLocked: false,
-          };
           if (isDuplicateSchedule(candidate)) {
             alert("Jadwal duplikat terdeteksi (PO, Supplier, Item, Tanggal, Jam).");
             return;
@@ -953,6 +1055,20 @@ export const useScheduleStore = ({
           setSchedules([...schedules, createdItem]);
           await refreshSchedules({ page: schedulePage, perPage: schedulePerPage, silent: true });
         } catch (error) {
+          const conflict = parseScheduleQtyConflict(error?.message);
+          if (conflict && Number.isFinite(conflict.remaining) && conflict.remaining > 0) {
+            try {
+              const createdItem = await createSchedule({ ...candidate, requestQty: conflict.remaining });
+              setSchedules([...schedules, createdItem]);
+              await refreshSchedules({ page: schedulePage, perPage: schedulePerPage, silent: true });
+              if (showToastMessage) {
+                showToastMessage('Qty jadwal disesuaikan otomatis ke sisa PO yang tersedia.', '', null, 'info');
+              }
+            } catch (retryError) {
+              await handleCreateScheduleError(retryError, "Create Error Retry:");
+            }
+            return;
+          }
           await handleCreateScheduleError(error, "Create Error:");
           return;
         }

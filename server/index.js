@@ -390,6 +390,24 @@ const defaultPermissionsByRole = {
     resetAll: false,
     production: true,
   },
+  production: {
+    viewReport: false,
+    viewScorecard: false,
+    viewMaster: false,
+    manageMaster: false,
+    manageVendors: false,
+    manageItems: false,
+    viewPrl: false,
+    prlProcess: false,
+    prlImport: false,
+    editSchedules: false,
+    deleteRecords: false,
+    importExport: false,
+    useAI: false,
+    manageUsers: false,
+    resetAll: false,
+    production: true,
+  },
   purchasing: {
     viewReport: true,
     viewScorecard: true,
@@ -464,9 +482,29 @@ const defaultPermissionsByRole = {
   },
 };
 
-const allowedRoles = new Set(["admin", "ppic", "warehouse", "purchasing", "management", "user", "supplier"]);
+const allowedRoles = new Set(["admin", "ppic", "warehouse", "production", "purchasing", "management", "user", "supplier"]);
 
 const normalizePermissions = (input, role) => {
+  if (String(role || "").trim().toLowerCase() === "production") {
+    return {
+      viewReport: false,
+      viewScorecard: false,
+      viewMaster: false,
+      manageMaster: false,
+      manageVendors: false,
+      manageItems: false,
+      viewPrl: false,
+      prlProcess: false,
+      prlImport: false,
+      editSchedules: false,
+      deleteRecords: false,
+      importExport: false,
+      useAI: false,
+      manageUsers: false,
+      resetAll: false,
+      production: true,
+    };
+  }
   const base = defaultPermissionsByRole[role] || defaultPermissionsByRole.user;
   const normalized = { ...base };
   if (input && typeof input === "object") {
@@ -994,6 +1032,16 @@ const ensureSchema = async () => {
     );
   `);
   await pool.query(`
+    alter table master_bom_headers
+    add column if not exists bom_version text,
+    add column if not exists effective_date date,
+    add column if not exists effective_start_date date,
+    add column if not exists effective_end_date date,
+    add column if not exists revision_no integer,
+    add column if not exists reference text,
+    add column if not exists created_at timestamptz not null default now();
+  `);
+  await pool.query(`
     DO $$
     BEGIN
       IF NOT EXISTS (
@@ -1105,6 +1153,14 @@ const ensureSchema = async () => {
   await pool.query(`
     alter table master_bom
     add column if not exists substitute_material_codes jsonb not null default '[]'::jsonb;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists process_code text;
+  `);
+  await pool.query(`
+    alter table master_bom
+    add column if not exists consumption_basis text;
   `);
   await pool.query(`
     insert into master_bom_headers (parent_code, bom_version, reference)
@@ -1432,6 +1488,25 @@ const ensureSchema = async () => {
       max_qty numeric not null default 0,
       lot_qty numeric not null default 0,
       lead_time_days integer not null default 0,
+      safety_factor numeric not null default 0,
+      regular_kanban numeric not null default 2,
+      safety_hours numeric not null default 48,
+      work_hours numeric not null default 24,
+      cycle_x numeric not null default 1,
+      cycle_y numeric not null default 4,
+      cycle_z numeric not null default 4,
+      calculated_regular_kanban integer,
+      calculated_safety_kanban integer,
+      calculated_hourly_demand numeric,
+      calculated_safety_parts numeric,
+      calculated_max_qty numeric,
+      calculated_card_count integer,
+      calculated_prl_qty numeric,
+      calculated_daily_demand numeric,
+      calculated_working_days integer,
+      calculated_prl_year integer,
+      calculated_prl_month text,
+      calculated_at timestamptz,
       default_supplier text,
       drop_zone text,
       active boolean not null default true,
@@ -1443,6 +1518,29 @@ const ensureSchema = async () => {
   await pool.query(`
     alter table kanban_settings
     add column if not exists drop_zone text;
+  `);
+
+  await pool.query(`
+    alter table kanban_settings
+    add column if not exists safety_factor numeric not null default 0,
+    add column if not exists regular_kanban numeric not null default 2,
+    add column if not exists safety_hours numeric not null default 48,
+    add column if not exists work_hours numeric not null default 24,
+    add column if not exists cycle_x numeric not null default 1,
+    add column if not exists cycle_y numeric not null default 4,
+    add column if not exists cycle_z numeric not null default 4,
+    add column if not exists calculated_regular_kanban integer,
+    add column if not exists calculated_safety_kanban integer,
+    add column if not exists calculated_hourly_demand numeric,
+    add column if not exists calculated_safety_parts numeric,
+    add column if not exists calculated_max_qty numeric,
+    add column if not exists calculated_card_count integer,
+    add column if not exists calculated_prl_qty numeric,
+    add column if not exists calculated_daily_demand numeric,
+    add column if not exists calculated_working_days integer,
+    add column if not exists calculated_prl_year integer,
+    add column if not exists calculated_prl_month text,
+    add column if not exists calculated_at timestamptz;
   `);
 
   await pool.query(`
@@ -6371,6 +6469,76 @@ const getBomParentsForRm = async (client, rmCode) => {
   });
 };
 
+const isKanbanBomFallbackEligibleType = (itemType) => {
+  const text = String(itemType || "").trim().toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes("raw material")
+    || /\brm\b/.test(text)
+    || text.includes("child part")
+    || /\bcp\b/.test(text)
+    || text.includes("indirect")
+    || text.includes("consum")
+    || text.includes("component")
+    || text.includes("subcon")
+  );
+};
+
+const isPrlParentCandidateType = (itemType) => {
+  const text = String(itemType || "").trim().toLowerCase();
+  if (!text) return false;
+  return text.includes("fg") || text.includes("finish") || text.includes("sub assy") || text.includes("subassy") || text.includes("sub-assy");
+};
+
+const resolveKanbanBomDemandMap = async (client, rootDemandRows, asOfDate = getTodayDateOnly()) => {
+  const demandMap = new Map();
+  const childrenCache = new Map();
+
+  const getChildrenCached = async (parentCode) => {
+    const code = String(parentCode || "").trim();
+    if (!code) return [];
+    if (childrenCache.has(code)) return childrenCache.get(code);
+    const rows = await getBomChildren(client, code, asOfDate);
+    childrenCache.set(code, rows);
+    return rows;
+  };
+
+  const visit = async (parentCode, qty, stack = []) => {
+    const code = String(parentCode || "").trim();
+    const parentQty = Number(qty || 0);
+    if (!code || !Number.isFinite(parentQty) || parentQty <= 0) return;
+    if (stack.includes(code)) {
+      throw new Error(`BOM cycle detected: ${stack.join(" -> ")} -> ${code}`);
+    }
+    const children = await getChildrenCached(code);
+    if (children.length === 0) return;
+    for (const child of children) {
+      const yieldFactor = normalizeYieldFactor(child.yield_factor, 1);
+      const baseQty = (Number(child.quantity || 0) / yieldFactor) * parentQty;
+      const scrapFactor = Number(child.scrap_factor || 0) / 100;
+      const requiredQty = baseQty * (1 + scrapFactor);
+      if (!Number.isFinite(requiredQty) || requiredQty <= 0) continue;
+      const childCode = String(child.child_code || "").trim();
+      if (!childCode) continue;
+      const grandChildren = await getChildrenCached(childCode);
+      if (grandChildren.length === 0) {
+        demandMap.set(childCode, (demandMap.get(childCode) || 0) + requiredQty);
+      } else {
+        await visit(childCode, requiredQty, [...stack, code]);
+      }
+    }
+  };
+
+  for (const row of Array.isArray(rootDemandRows) ? rootDemandRows : []) {
+    const parentCode = String(row?.item_code || "").trim();
+    const parentQty = Number(row?.prl_qty || 0);
+    if (!parentCode || !Number.isFinite(parentQty) || parentQty <= 0) continue;
+    await visit(parentCode, parentQty, []);
+  }
+
+  return demandMap;
+};
+
 const normalizeDoNumber = (value) => {
   const trimmed = typeof value === "string" ? value.trim() : "";
   return trimmed === "" ? null : trimmed;
@@ -6704,6 +6872,8 @@ const buildKanbanIdRegex = (format) => {
     .replace(/\{MODEL\}/gi, "[A-Za-z0-9_-]+")
     .replace(/\{PART_NO\}/gi, "[A-Za-z0-9_-]+")
     .replace(/\{UNIQ\}/gi, "(?<uniq>[A-Za-z0-9._-]+)")
+    .replace(/\{SEQ(?::\\d+)?\}/gi, "(?<seq>\\d+)")
+    .replace(/\{TOTAL(?::\\d+)?\}/gi, "(?<total>\\d+)")
     .replace(/\{YEAR\}/gi, "\\d{4}")
     .replace(/\{YY\}/gi, "\\d{2}")
     .replace(/\{MONTH\}/gi, "\\d{2}")
@@ -6712,50 +6882,166 @@ const buildKanbanIdRegex = (format) => {
   return new RegExp(`^${pattern}$`, "i");
 };
 
+const extractKanbanIdToken = (value) => {
+  return String(value || "").trim();
+};
+
+const extractKanbanItemCodeCandidates = (value) => {
+  const trimmed = extractKanbanIdToken(value);
+  if (!trimmed) return [];
+  const candidates = [];
+  const seen = new Set();
+  const pushCandidate = (candidate) => {
+    const text = String(candidate || "").trim();
+    if (!text || seen.has(text)) return;
+    seen.add(text);
+    candidates.push(text);
+  };
+
+  pushCandidate(trimmed);
+  const directMatch = trimmed.match(/^KB-([A-Za-z0-9_-]+)-(.+)$/i);
+  if (directMatch) {
+    const parts = String(directMatch[2] || "")
+      .split("-")
+      .map((part) => part.trim())
+      .filter(Boolean);
+    for (let endIndex = parts.length; endIndex >= 1; endIndex -= 1) {
+      pushCandidate(parts.slice(0, endIndex).join("-"));
+    }
+  }
+
+  const genericParts = trimmed
+    .split(/[-_/]+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (genericParts.length >= 2) {
+    for (let endIndex = genericParts.length - 1; endIndex >= 1; endIndex -= 1) {
+      pushCandidate(genericParts.slice(0, endIndex).join("-"));
+    }
+  }
+
+  return candidates;
+};
+
 const getMasterConfigRow = async (client) => {
   const result = await client.query("select * from master_config where id = 1");
   return result.rows[0] || null;
 };
 
 const resolveKanbanItemCode = async (client, kanbanId) => {
-  const trimmed = String(kanbanId || "").trim();
+  const trimmed = extractKanbanIdToken(kanbanId);
   if (!trimmed) return "";
+  if (/[:|,;]/.test(trimmed)) return "";
   const directResult = await client.query(
     "select code from items where code = $1 limit 1",
     [trimmed],
   );
   if (directResult.rows.length > 0) return directResult.rows[0].code;
   const config = await getMasterConfigRow(client);
-  const format = config?.kanban_id_format || "KB-{CATEGORY}-{UNIQ}";
+  const format = config?.kanban_id_format || "KB-{CATEGORY}-{UNIQ}-{TOTAL:02}-{SEQ:02}";
   const regex = buildKanbanIdRegex(format);
   const match = trimmed.match(regex);
   if (match?.groups?.uniq) return match.groups.uniq;
-  const separatorMatch = trimmed.match(/^(.+?)[-_\/](\d+)(?:[-_\/].*)?$/);
-  if (separatorMatch?.[1]) {
+  for (const candidate of extractKanbanItemCodeCandidates(trimmed)) {
     const prefixResult = await client.query(
       "select code from items where code = $1 limit 1",
-      [separatorMatch[1].trim()],
-    );
-    if (prefixResult.rows.length > 0) return prefixResult.rows[0].code;
-  }
-  const lastDash = trimmed.lastIndexOf("-");
-  if (lastDash > 0) {
-    const prefix = trimmed.slice(0, lastDash).trim();
-    const prefixResult = await client.query(
-      "select code from items where code = $1 limit 1",
-      [prefix],
+      [candidate],
     );
     if (prefixResult.rows.length > 0) return prefixResult.rows[0].code;
   }
   return trimmed;
 };
 
-const resolveKanbanActionMeta = (itemType) => {
+const resolveKanbanCardScanMeta = async (client, kanbanId, itemCode) => {
+  const trimmed = extractKanbanIdToken(kanbanId);
+  const code = String(itemCode || "").trim();
+  const empty = {
+    kanbanId: trimmed,
+    cardSeq: null,
+    printedTotal: null,
+    effectiveCardCount: null,
+    overPrl: false,
+    warning: null,
+  };
+  if (!trimmed || !code) return empty;
+  const config = await getMasterConfigRow(client);
+  const format = config?.kanban_id_format || "KB-{CATEGORY}-{UNIQ}-{TOTAL:02}-{SEQ:02}";
+  const match = trimmed.match(buildKanbanIdRegex(format));
+  const cardSeq = Number(match?.groups?.seq || 0);
+  const printedTotal = Number(match?.groups?.total || 0);
+  if (!Number.isFinite(cardSeq) || cardSeq <= 0) return empty;
+  const { year, monthKey } = getCurrentPrlPeriod();
+  const workingDays = await getWorkingDaysForPrlPeriod(client, year, monthKey);
+  const result = await client.query(
+    `
+    select
+      case
+        when coalesce(pr.status ->> $2, '') in ('active', 'manual')
+          and (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+          and ks.lot_qty > 0
+          and $3::integer > 0
+          then ceil(
+              ((((pr.months ->> $2)::numeric / $3::numeric) / coalesce(nullif(ks.work_hours, 0), 24))
+                * coalesce(nullif(ks.cycle_x, 0), 1)
+                * coalesce(nullif(ks.cycle_y, 0), 4))
+              / ks.lot_qty
+            )::integer
+            + ceil(
+              ((((pr.months ->> $2)::numeric / $3::numeric) / coalesce(nullif(ks.work_hours, 0), 24))
+                * coalesce(nullif(ks.safety_hours, 0), 48))
+              / ks.lot_qty
+            )::integer
+        when ks.calculated_prl_year = $1
+          and ks.calculated_prl_month = $2
+          and ks.calculated_card_count is not null
+          then ks.calculated_card_count
+        when ks.lot_qty > 0
+          then ceil(coalesce(ks.max_qty, 0) / ks.lot_qty)::integer
+        else null
+      end as effective_card_count
+    from kanban_settings ks
+    left join prl_records pr on pr.item_code = ks.item_code and pr.year = $1
+    where ks.item_code = $4
+    limit 1
+    `,
+    [year, monthKey, workingDays, code],
+  );
+  const effectiveCardCount = Number(result.rows[0]?.effective_card_count || 0);
+  const overPrl = effectiveCardCount > 0 && cardSeq > effectiveCardCount;
+  return {
+    kanbanId: trimmed,
+    cardSeq,
+    printedTotal: Number.isFinite(printedTotal) && printedTotal > 0 ? printedTotal : null,
+    effectiveCardCount: effectiveCardCount > 0 ? effectiveCardCount : null,
+    overPrl,
+    warning: overPrl
+      ? `Kartu ${cardSeq} di luar target Kanban Edar aktif (${effectiveCardCount}). Ditandai Over PRL.`
+      : null,
+  };
+};
+
+const resolveKanbanMasterCategoryMeta = async (client, itemType) => {
   const text = String(itemType || "").trim().toLowerCase();
+  const result = await client.query("select code, name from master_categories order by code");
+  const rows = result.rows || [];
+  const matched = rows.find((category) => {
+    const code = String(category.code || "").trim().toLowerCase();
+    const name = String(category.name || "").trim().toLowerCase();
+    return text && (text === code || text === name);
+  });
+  const fallback = rows[0] || null;
+  return matched || fallback || null;
+};
+
+const resolveKanbanActionMeta = async (client, itemType) => {
+  const text = String(itemType || "").trim().toLowerCase();
+  const masterCategory = await resolveKanbanMasterCategoryMeta(client, itemType);
+  const masterCategoryCode = String(masterCategory?.code || "").trim();
+  const masterCategoryLabel = String(masterCategory?.name || masterCategoryCode || "").trim();
   if (!text) {
     return {
-      categoryCode: "UNKNOWN",
-      categoryLabel: "Material",
+      categoryCode: masterCategoryCode || "UNKNOWN",
+      categoryLabel: masterCategoryLabel || "Material",
       actionType: "routing_execution",
       actionLabel: "Routing Execution",
       actionHint: "Kategori belum ditentukan, cek routing item.",
@@ -6764,8 +7050,8 @@ const resolveKanbanActionMeta = (itemType) => {
   }
   if (text.includes("raw")) {
     return {
-      categoryCode: "RM",
-      categoryLabel: "Raw Material",
+      categoryCode: masterCategoryCode || "UNKNOWN",
+      categoryLabel: masterCategoryLabel || "Raw Material",
       actionType: "issue",
       actionLabel: "Stock Movement / Issue",
       actionHint: "Scan ini dipakai untuk issue stok ke line / work order.",
@@ -6774,8 +7060,8 @@ const resolveKanbanActionMeta = (itemType) => {
   }
   if (text.includes("indirect") || text.includes("consum")) {
     return {
-      categoryCode: "IM",
-      categoryLabel: "Indirect Material",
+      categoryCode: masterCategoryCode || "UNKNOWN",
+      categoryLabel: masterCategoryLabel || "Indirect Material",
       actionType: "consumption",
       actionLabel: "Consumption",
       actionHint: "Scan ini dipakai untuk pemakaian consumable / indirect.",
@@ -6784,8 +7070,8 @@ const resolveKanbanActionMeta = (itemType) => {
   }
   if (text.includes("subcon")) {
     return {
-      categoryCode: "SUBCON",
-      categoryLabel: "Subcon",
+      categoryCode: masterCategoryCode || "UNKNOWN",
+      categoryLabel: masterCategoryLabel || "Subcon",
       actionType: "external_transfer",
       actionLabel: "External Transfer / Subcon",
       actionHint: "Scan ini dipakai untuk kirim / terima material subcon.",
@@ -6793,18 +7079,9 @@ const resolveKanbanActionMeta = (itemType) => {
     };
   }
   if (text.includes("fg") || text.includes("finish") || text.includes("sub assy") || text.includes("subassy") || text.includes("child part") || text === "cp" || text.startsWith("cp")) {
-    const categoryCode = text.includes("sub assy") || text.includes("subassy")
-      ? "SA"
-      : text.includes("child part") || text === "cp" || text.startsWith("cp")
-        ? "CP"
-        : "FG";
     return {
-      categoryCode,
-      categoryLabel: categoryCode === "SA"
-        ? "Sub-Assy"
-        : categoryCode === "CP"
-          ? "Child Part"
-          : "Finished Goods",
+      categoryCode: masterCategoryCode || "UNKNOWN",
+      categoryLabel: masterCategoryLabel || itemType || "Material",
       actionType: "routing_execution",
       actionLabel: "Routing Execution",
       actionHint: "Scan ini mengikuti routing proses aktif item.",
@@ -6812,8 +7089,8 @@ const resolveKanbanActionMeta = (itemType) => {
     };
   }
   return {
-    categoryCode: "MATERIAL",
-    categoryLabel: itemType || "Material",
+    categoryCode: masterCategoryCode || "UNKNOWN",
+    categoryLabel: masterCategoryLabel || itemType || "Material",
     actionType: "routing_execution",
     actionLabel: "Routing Execution",
     actionHint: "Kategori tidak dikenali, gunakan routing aktif item.",
@@ -7296,7 +7573,7 @@ const buildKanbanScanPreview = async (client, { kanbanId = "", itemCode = "", qt
     throw error;
   }
   const itemRow = itemResult.rows[0];
-  const actionMeta = resolveKanbanActionMeta(itemRow.type || itemRow.category || "");
+  const actionMeta = await resolveKanbanActionMeta(client, itemRow.type || itemRow.category || "");
   const routingSteps = resolveItemRoutingSteps(itemRow, processMap);
   const currentPositionCode = String(
     itemRow.drop_zone
@@ -7332,6 +7609,8 @@ const buildKanbanScanPreview = async (client, { kanbanId = "", itemCode = "", qt
   const nextStep = routingSteps[0] || null;
   const fallbackQty = Number(itemRow.lot_qty || itemRow.min_qty || 0);
   const resolvedQty = Number.isFinite(qtyValue) && qtyValue > 0 ? qtyValue : fallbackQty;
+  const prlPlan = await loadPrlKanbanCirculationState(client, itemRow.code, { requestQty: resolvedQty });
+  const cardMeta = await resolveKanbanCardScanMeta(client, rawKanbanId || itemRow.code, itemRow.code);
   const processState = await loadKanbanProcessState(client, {
     kanbanId: rawKanbanId || itemRow.code,
     routingSteps,
@@ -7355,6 +7634,9 @@ const buildKanbanScanPreview = async (client, { kanbanId = "", itemCode = "", qt
     actionHint: actionMeta.actionHint,
     nextDestination: actionMeta.nextDestination,
     qty: Number.isFinite(resolvedQty) && resolvedQty > 0 ? resolvedQty : "",
+    prlPlan,
+    cardMeta,
+    scanWarnings: [cardMeta.warning].filter(Boolean),
     currentPosition: {
       code: currentPositionCode || "-",
       name: currentPositionName || "-",
@@ -7589,6 +7871,18 @@ const normalizeDeliverySchedule = (input) => {
     .filter((row) => row.rit !== "" || row.time || row.cycle);
 };
 
+const parseCycleParts = (value) => {
+  const parts = String(value || "")
+    .split(/[-\/x×,;\s]+/i)
+    .map((part) => Number(String(part || "").trim()))
+    .filter((num) => Number.isFinite(num) && num > 0);
+  return {
+    x: parts[0] || null,
+    y: parts[1] || null,
+    z: parts[2] || null,
+  };
+};
+
 const resolveVendorSchedule = async (client, supplierValue) => {
   const trimmed = String(supplierValue || "").trim();
   if (!trimmed) return [];
@@ -7607,6 +7901,12 @@ const resolveVendorSchedule = async (client, supplierValue) => {
   };
   const legacySchedule = normalizeDeliverySchedule([legacy]);
   return legacySchedule;
+};
+
+const resolveVendorCycleParts = async (client, supplierValue) => {
+  const rows = await resolveVendorSchedule(client, supplierValue);
+  const withCycle = rows.find((row) => String(row?.cycle || "").trim());
+  return parseCycleParts(withCycle?.cycle);
 };
 
 const buildRequestNumber = async (client, format, itemCode) => {
@@ -7665,9 +7965,11 @@ const KANBAN_PRL_SOURCE_PREFIX = "KANBAN-STOCK-GAP:";
 const getCurrentPrlPeriod = (referenceDate = new Date()) => {
   const parsed = referenceDate instanceof Date ? referenceDate : new Date(referenceDate || Date.now());
   const safeDate = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+  const monthKey = PRL_MONTH_KEYS[safeDate.getMonth()] || PRL_MONTH_KEYS[new Date().getMonth()];
   return {
     year: safeDate.getFullYear(),
-    monthKey: PRL_MONTH_KEYS[safeDate.getMonth()] || PRL_MONTH_KEYS[new Date().getMonth()],
+    monthKey,
+    monthLabel: monthKey.toUpperCase(),
   };
 };
 
@@ -7692,6 +7994,616 @@ const parseNumericJsonValue = (value) => {
 };
 
 const getPrlMonthStatus = (status, monthKey) => String(status?.[monthKey] || "").trim().toLowerCase();
+
+const getPrlPeriodBounds = (year, monthKey) => {
+  const monthIndex = PRL_MONTH_KEYS.indexOf(monthKey);
+  const safeIndex = monthIndex >= 0 ? monthIndex : new Date().getMonth();
+  const start = new Date(Number(year), safeIndex, 1);
+  const end = new Date(Number(year), safeIndex + 1, 1);
+  return {
+    startDate: formatDateOnlyLocal(start),
+    endDate: formatDateOnlyLocal(end),
+  };
+};
+
+const countWeekdaysInMonth = (year, monthKey) => {
+  const monthIndex = PRL_MONTH_KEYS.indexOf(String(monthKey || "").toLowerCase());
+  if (monthIndex < 0) return 22;
+  const targetYear = Number(year) || new Date().getFullYear();
+  const date = new Date(targetYear, monthIndex, 1);
+  let days = 0;
+  while (date.getMonth() === monthIndex) {
+    const day = date.getDay();
+    if (day !== 0 && day !== 6) days += 1;
+    date.setDate(date.getDate() + 1);
+  }
+  return days > 0 ? days : 22;
+};
+
+const resolveWorkingDaysValue = (workingDaysConfig, year, monthKey) => {
+  const config = toPlainObject(workingDaysConfig);
+  const yearKey = String(year || "");
+  const month = String(monthKey || "").toLowerCase();
+  const monthUpper = month.toUpperCase();
+  const yearConfig = toPlainObject(config[yearKey]);
+  const sources = [yearConfig, config];
+  for (const source of sources) {
+    const value = source[monthUpper] ?? source[month] ?? source[monthKey];
+    const num = Number(value);
+    if (Number.isFinite(num) && num > 0) return Math.floor(num);
+  }
+  return null;
+};
+
+const getWorkingDaysForPrlPeriod = async (client, year, monthKey) => {
+  const result = await client.query("select working_days from master_config where id = 1");
+  const configured = resolveWorkingDaysValue(result.rows[0]?.working_days, year, monthKey);
+  return configured || countWeekdaysInMonth(year, monthKey);
+};
+
+const recalculateKanbanFromReleasedPrl = async (client, { year, monthKey, itemCodes = null } = {}) => {
+  const targetYear = Number(year) || new Date().getFullYear();
+  const targetMonth = String(monthKey || "").toLowerCase();
+  if (!PRL_MONTH_KEYS.includes(targetMonth)) {
+    return { updated: 0, workingDays: 0 };
+  }
+  const workingDays = await getWorkingDaysForPrlPeriod(client, targetYear, targetMonth);
+  const filteredCodes = Array.isArray(itemCodes)
+    ? Array.from(new Set(itemCodes.map((code) => String(code || "").trim()).filter(Boolean)))
+    : [];
+  const fullRebuild = filteredCodes.length === 0;
+  const directDemandResult = await client.query(
+    `
+    select
+      pr.item_code,
+      case
+        when (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+          then (pr.months ->> $2)::numeric
+        else 0
+      end as prl_qty,
+      i.type as item_type,
+      exists (
+        select 1
+        from master_bom_headers h
+        where h.parent_code = pr.item_code
+      ) as is_parent_item
+    from prl_records pr
+    join items i on i.code = pr.item_code
+    where pr.year = $1
+      and coalesce(pr.status ->> $2, '') in ('active', 'manual')
+    `,
+    [targetYear, targetMonth],
+  );
+  const directDemandMap = new Map();
+  const activeRootRows = [];
+  for (const row of directDemandResult.rows || []) {
+    const itemCode = String(row.item_code || "").trim();
+    if (!itemCode) continue;
+    const prlQty = Number(row.prl_qty || 0);
+    const isParentItem = Boolean(row.is_parent_item) || isPrlParentCandidateType(row.item_type);
+    if (isParentItem) {
+      directDemandMap.set(itemCode, prlQty);
+    }
+    if (prlQty > 0 && isParentItem) {
+      activeRootRows.push({ item_code: itemCode, prl_qty: prlQty });
+    }
+  }
+  const bomDemandMap = await resolveKanbanBomDemandMap(client, activeRootRows, getTodayDateOnly());
+  const settingsResult = await client.query(
+    `
+    select
+      ks.item_code,
+      ks.lot_qty,
+      ks.work_hours,
+      ks.cycle_x,
+      ks.cycle_y,
+      ks.safety_hours,
+      i.type as item_type,
+      exists (
+        select 1
+        from master_bom_headers h
+        where h.parent_code = ks.item_code
+      ) as is_parent_item
+    from kanban_settings ks
+    join items i on i.code = ks.item_code
+    order by ks.item_code asc
+    `,
+  );
+  const targetCodes = fullRebuild ? null : new Set(filteredCodes);
+  const stagedRows = [];
+  for (const row of settingsResult.rows || []) {
+    const itemCode = String(row.item_code || "").trim();
+    if (!itemCode) continue;
+    if (targetCodes && !targetCodes.has(itemCode)) continue;
+
+    const isParentItem = Boolean(row.is_parent_item) || isPrlParentCandidateType(row.item_type);
+    const hasDirectPrl = isParentItem && directDemandMap.has(itemCode);
+    const directQty = hasDirectPrl ? Number(directDemandMap.get(itemCode) || 0) : null;
+    const bomQty = Number(bomDemandMap.get(itemCode) || 0);
+    const bomEligible = !hasDirectPrl && bomQty > 0 && isKanbanBomFallbackEligibleType(row.item_type);
+    const effectiveQty = hasDirectPrl ? directQty : (bomEligible ? bomQty : null);
+
+    if (fullRebuild && effectiveQty === null) {
+      continue;
+    }
+
+    const lotQty = Number(row.lot_qty || 0);
+    const workHours = Number(row.work_hours || 0) > 0 ? Number(row.work_hours || 0) : 24;
+    const cycleX = Number(row.cycle_x || 0) > 0 ? Number(row.cycle_x || 0) : 1;
+    const cycleY = Number(row.cycle_y || 0) > 0 ? Number(row.cycle_y || 0) : 4;
+    const safetyHours = Number(row.safety_hours || 0) > 0 ? Number(row.safety_hours || 0) : 48;
+
+    let dailyDemand = null;
+    let hourlyDemand = null;
+    let regularKanban = null;
+    let safetyKanban = null;
+    let safetyParts = null;
+    let cardCount = null;
+    let maxQty = null;
+
+    if (effectiveQty !== null && Number.isFinite(lotQty) && lotQty > 0 && workingDays > 0) {
+      dailyDemand = effectiveQty / workingDays;
+      hourlyDemand = dailyDemand / workHours;
+      regularKanban = Math.ceil(((hourlyDemand * cycleX * cycleY)) / lotQty);
+      safetyKanban = Math.ceil(((hourlyDemand * safetyHours)) / lotQty);
+      safetyParts = hourlyDemand * safetyHours;
+      cardCount = regularKanban + safetyKanban;
+      maxQty = cardCount * lotQty;
+    }
+
+    stagedRows.push({
+      itemCode,
+      hasDemand: effectiveQty !== null,
+      prlQty: effectiveQty,
+      dailyDemand,
+      hourlyDemand,
+      regularKanban,
+      safetyKanban,
+      safetyParts,
+      cardCount,
+      maxQty,
+    });
+  }
+
+  if (fullRebuild) {
+    await client.query(
+      `
+      update kanban_settings
+      set
+        calculated_prl_qty = null,
+        calculated_daily_demand = null,
+        calculated_hourly_demand = null,
+        calculated_regular_kanban = null,
+        calculated_safety_kanban = null,
+        calculated_safety_parts = null,
+        calculated_working_days = null,
+        calculated_card_count = null,
+        calculated_max_qty = null,
+        calculated_prl_year = null,
+        calculated_prl_month = null,
+        calculated_at = null,
+        updated_at = now()
+      where calculated_prl_year = $1
+        and calculated_prl_month = $2
+      `,
+      [targetYear, targetMonth],
+    );
+  }
+
+  if (stagedRows.length === 0) {
+    return { updated: 0, workingDays };
+  }
+
+  const itemCodesArray = stagedRows.map((row) => row.itemCode);
+  const hasDemandArray = stagedRows.map((row) => Boolean(row.hasDemand));
+  const prlQtyArray = stagedRows.map((row) => row.prlQty);
+  const dailyDemandArray = stagedRows.map((row) => row.dailyDemand);
+  const hourlyDemandArray = stagedRows.map((row) => row.hourlyDemand);
+  const regularKanbanArray = stagedRows.map((row) => row.regularKanban);
+  const safetyKanbanArray = stagedRows.map((row) => row.safetyKanban);
+  const safetyPartsArray = stagedRows.map((row) => row.safetyParts);
+  const cardCountArray = stagedRows.map((row) => row.cardCount);
+  const maxQtyArray = stagedRows.map((row) => row.maxQty);
+
+  const result = await client.query(
+    `
+    with staged as (
+      select *
+      from unnest(
+        $4::text[],
+        $5::boolean[],
+        $6::numeric[],
+        $7::numeric[],
+        $8::numeric[],
+        $9::integer[],
+        $10::integer[],
+        $11::numeric[],
+        $12::integer[],
+        $13::numeric[]
+      ) as s(
+        item_code,
+        has_demand,
+        prl_qty,
+        daily_demand,
+        hourly_demand,
+        regular_kanban,
+        safety_kanban,
+        safety_parts,
+        card_count,
+        max_qty
+      )
+    )
+    update kanban_settings ks
+    set
+      calculated_prl_qty = case when s.has_demand then s.prl_qty else null end,
+      calculated_daily_demand = case when s.has_demand then s.daily_demand else null end,
+      calculated_hourly_demand = case when s.has_demand then s.hourly_demand else null end,
+      calculated_regular_kanban = case when s.has_demand then s.regular_kanban else null end,
+      calculated_safety_kanban = case when s.has_demand then s.safety_kanban else null end,
+      calculated_safety_parts = case when s.has_demand then s.safety_parts else null end,
+      calculated_working_days = case when s.has_demand then $3::integer else null end,
+      calculated_card_count = case when s.has_demand then s.card_count else null end,
+      calculated_max_qty = case when s.has_demand then s.max_qty else null end,
+      calculated_prl_year = case when s.has_demand then $1::integer else null end,
+      calculated_prl_month = case when s.has_demand then $2::text else null end,
+      calculated_at = case when s.has_demand then now() else null end,
+      updated_at = now()
+    from staged s
+    where s.item_code = ks.item_code
+    `,
+    [
+      targetYear,
+      targetMonth,
+      workingDays,
+      itemCodesArray,
+      hasDemandArray,
+      prlQtyArray,
+      dailyDemandArray,
+      hourlyDemandArray,
+      regularKanbanArray,
+      safetyKanbanArray,
+      safetyPartsArray,
+      cardCountArray,
+      maxQtyArray,
+    ],
+  );
+  return { updated: result.rowCount, workingDays };
+};
+
+const loadPrlKanbanCirculationState = async (client, itemCode, options = {}) => {
+  const code = String(itemCode || "").trim();
+  const { year, monthKey } = getCurrentPrlPeriod(options.referenceDate);
+  const monthLabel = String(monthKey || "").toUpperCase();
+  const requestedQty = Number(options.requestQty || 0);
+  const emptyState = {
+    year,
+    monthKey,
+    monthLabel,
+    prlId: null,
+    status: "missing",
+    plannedQty: 0,
+    usedQty: 0,
+    remainingQty: 0,
+    requestQty: requestedQty > 0 ? requestedQty : 0,
+    eligible: false,
+    overPrl: false,
+    reason: "missing_prl",
+    notice: `PRL ${monthLabel} ${year} belum ada untuk item ${code}. Consumption dicatat tanpa order ulang.`,
+  };
+  if (!code) return emptyState;
+
+  const prlResult = await client.query(
+    `
+    select
+      pr.id,
+      pr.months,
+      pr.status,
+      i.type as item_type,
+      exists (
+        select 1
+        from master_bom_headers h
+        where h.parent_code = pr.item_code
+      ) as is_parent_item
+    from prl_records pr
+    join items i on i.code = pr.item_code
+    where pr.item_code = $1
+      and pr.year = $2
+    limit 1
+    `,
+    [code, year],
+  );
+  const prlRow = prlResult.rows[0] || null;
+  const isParentItem = Boolean(prlRow?.is_parent_item) || isPrlParentCandidateType(prlRow?.item_type);
+  if (prlRow && !isParentItem) {
+    const kanbanResult = await client.query(
+      `
+      select
+        ks.calculated_prl_qty,
+        ks.calculated_prl_year,
+        ks.calculated_prl_month,
+        ks.calculated_card_count,
+        ks.calculated_max_qty,
+        ks.calculated_working_days,
+        ks.calculated_regular_kanban,
+        ks.calculated_safety_kanban,
+        ks.calculated_safety_parts,
+        ks.lot_qty,
+        ks.work_hours,
+        ks.cycle_x,
+        ks.cycle_y,
+        ks.cycle_z,
+        ks.safety_hours,
+        i.type as item_type
+      from kanban_settings ks
+      join items i on i.code = ks.item_code
+      where ks.item_code = $1
+      limit 1
+      `,
+      [code],
+    );
+    const kanbanRow = kanbanResult.rows[0] || null;
+    const hasCalculatedDemand = Boolean(kanbanRow)
+      && Number(kanbanRow.calculated_prl_year || 0) === year
+      && String(kanbanRow.calculated_prl_month || "").toLowerCase() === monthKey
+      && kanbanRow.calculated_prl_qty !== null
+      && kanbanRow.calculated_prl_qty !== undefined;
+    if (!hasCalculatedDemand) return emptyState;
+    const plannedQty = Number(kanbanRow.calculated_prl_qty || 0);
+    const { startDate, endDate } = getPrlPeriodBounds(year, monthKey);
+    const usedResult = await client.query(
+      `
+      select coalesce(sum(request_qty), 0)::numeric as used_qty
+      from kanban_requests
+      where item_code = $1
+        and coalesce(status, '') <> 'rejected'
+        and created_at::date >= $2::date
+        and created_at::date < $3::date
+      `,
+      [code, startDate, endDate],
+    );
+    const usedQty = Number(usedResult.rows[0]?.used_qty || 0);
+    const remainingQty = Math.max(plannedQty - usedQty, 0);
+    const requestQty = requestedQty > 0 ? requestedQty : remainingQty;
+    const overPrl = requestQty > 0 && requestQty > remainingQty;
+    if (plannedQty <= 0) {
+      return {
+        ...emptyState,
+        prlId: null,
+        status: "active",
+        plannedQty,
+        usedQty,
+        remainingQty,
+        requestQty,
+        eligible: requestQty > 0,
+        overPrl: requestQty > 0,
+        reason: "zero_plan",
+        notice: `Demand Kanban ${monthLabel} ${year} untuk item ${code} bernilai 0. Request dicatat sebagai Over PRL.`,
+      };
+    }
+    if (remainingQty <= 0) {
+      return {
+        ...emptyState,
+        prlId: null,
+        status: "active",
+        plannedQty,
+        usedQty,
+        remainingQty: 0,
+        requestQty,
+        eligible: requestQty > 0,
+        overPrl: requestQty > 0,
+        reason: "prl_completed",
+        notice: `Demand Kanban ${monthLabel} ${year} untuk item ${code} sudah terpenuhi. Request dicatat sebagai Over PRL.`,
+      };
+    }
+    return {
+      year,
+      monthKey,
+      monthLabel,
+      prlId: null,
+      status: "active",
+      plannedQty,
+      usedQty,
+      remainingQty,
+      requestQty,
+      eligible: requestQty > 0,
+      overPrl,
+      reason: overPrl ? "over_prl" : (requestQty > 0 ? "available" : "prl_completed"),
+      notice: requestQty > 0
+        ? (overPrl
+          ? `Request ${requestQty} melebihi sisa demand Kanban ${monthLabel} ${year} (${remainingQty}). Ditandai Over PRL.`
+          : `Demand Kanban ${monthLabel} ${year} masih tersedia ${remainingQty}.`)
+        : `Demand Kanban ${monthLabel} ${year} sudah terpenuhi. Consumption dicatat tanpa order ulang.`,
+    };
+  }
+  if (!prlRow) {
+    const kanbanResult = await client.query(
+      `
+      select
+        ks.calculated_prl_qty,
+        ks.calculated_prl_year,
+        ks.calculated_prl_month,
+        ks.calculated_card_count,
+        ks.calculated_max_qty,
+        ks.calculated_working_days,
+        ks.calculated_regular_kanban,
+        ks.calculated_safety_kanban,
+        ks.calculated_safety_parts,
+        ks.lot_qty,
+        ks.work_hours,
+        ks.cycle_x,
+        ks.cycle_y,
+        ks.cycle_z,
+        ks.safety_hours,
+        i.type as item_type
+      from kanban_settings ks
+      join items i on i.code = ks.item_code
+      where ks.item_code = $1
+      limit 1
+      `,
+      [code],
+    );
+    const kanbanRow = kanbanResult.rows[0] || null;
+    const hasCalculatedDemand = Boolean(kanbanRow)
+      && Number(kanbanRow.calculated_prl_year || 0) === year
+      && String(kanbanRow.calculated_prl_month || "").toLowerCase() === monthKey
+      && kanbanRow.calculated_prl_qty !== null
+      && kanbanRow.calculated_prl_qty !== undefined;
+    if (!hasCalculatedDemand) return emptyState;
+
+    const plannedQty = Number(kanbanRow.calculated_prl_qty || 0);
+    const { startDate, endDate } = getPrlPeriodBounds(year, monthKey);
+    const usedResult = await client.query(
+      `
+      select coalesce(sum(request_qty), 0)::numeric as used_qty
+      from kanban_requests
+      where item_code = $1
+        and coalesce(status, '') <> 'rejected'
+        and created_at::date >= $2::date
+        and created_at::date < $3::date
+      `,
+      [code, startDate, endDate],
+    );
+    const usedQty = Number(usedResult.rows[0]?.used_qty || 0);
+    const remainingQty = Math.max(plannedQty - usedQty, 0);
+    const requestQty = requestedQty > 0 ? requestedQty : remainingQty;
+    const overPrl = requestQty > 0 && requestQty > remainingQty;
+    if (plannedQty <= 0) {
+      return {
+        ...emptyState,
+        prlId: null,
+        status: "active",
+        plannedQty,
+        usedQty,
+        remainingQty,
+        requestQty,
+        eligible: requestQty > 0,
+        overPrl: requestQty > 0,
+        reason: "zero_plan",
+        notice: `Demand Kanban ${monthLabel} ${year} untuk item ${code} bernilai 0. Request dicatat sebagai Over PRL.`,
+      };
+    }
+    if (remainingQty <= 0) {
+      return {
+        ...emptyState,
+        prlId: null,
+        status: "active",
+        plannedQty,
+        usedQty,
+        remainingQty: 0,
+        requestQty,
+        eligible: requestQty > 0,
+        overPrl: requestQty > 0,
+        reason: "prl_completed",
+        notice: `Demand Kanban ${monthLabel} ${year} untuk item ${code} sudah terpenuhi. Request dicatat sebagai Over PRL.`,
+      };
+    }
+    return {
+      year,
+      monthKey,
+      monthLabel,
+      prlId: null,
+      status: "active",
+      plannedQty,
+      usedQty,
+      remainingQty,
+      requestQty,
+      eligible: requestQty > 0,
+      overPrl,
+      reason: overPrl ? "over_prl" : (requestQty > 0 ? "available" : "prl_completed"),
+      notice: requestQty > 0
+        ? (overPrl
+          ? `Request ${requestQty} melebihi sisa demand Kanban ${monthLabel} ${year} (${remainingQty}). Ditandai Over PRL.`
+          : `Demand Kanban ${monthLabel} ${year} masih tersedia ${remainingQty}.`)
+        : `Demand Kanban ${monthLabel} ${year} sudah terpenuhi. Consumption dicatat tanpa order ulang.`,
+    };
+  }
+
+  const months = toPlainObject(prlRow.months);
+  const status = toPlainObject(prlRow.status);
+  const plannedQty = parseNumericJsonValue(months[monthKey]);
+  const statusKey = getPrlMonthStatus(status, monthKey);
+  const activeStatuses = new Set(["active", "manual"]);
+  const { startDate, endDate } = getPrlPeriodBounds(year, monthKey);
+  const usedResult = await client.query(
+    `
+    select coalesce(sum(request_qty), 0)::numeric as used_qty
+    from kanban_requests
+    where item_code = $1
+      and coalesce(status, '') <> 'rejected'
+      and created_at::date >= $2::date
+      and created_at::date < $3::date
+    `,
+    [code, startDate, endDate],
+  );
+  const usedQty = Number(usedResult.rows[0]?.used_qty || 0);
+  const remainingQty = Math.max(plannedQty - usedQty, 0);
+  const requestQty = requestedQty > 0 ? requestedQty : remainingQty;
+  const overPrl = requestQty > 0 && requestQty > remainingQty;
+
+  if (plannedQty <= 0) {
+    return {
+      ...emptyState,
+      prlId: prlRow.id,
+      status: statusKey || "empty",
+      plannedQty,
+      usedQty,
+      remainingQty,
+      requestQty,
+      eligible: activeStatuses.has(statusKey) && requestQty > 0,
+      overPrl: activeStatuses.has(statusKey) && requestQty > 0,
+      reason: "zero_plan",
+      notice: `PRL ${monthLabel} ${year} untuk item ${code} bernilai 0. Request dicatat sebagai Over PRL.`,
+    };
+  }
+  if (!activeStatuses.has(statusKey)) {
+    return {
+      ...emptyState,
+      prlId: prlRow.id,
+      status: statusKey || "draft",
+      plannedQty,
+      usedQty,
+      remainingQty,
+      requestQty: 0,
+      reason: "inactive_prl",
+      notice: `PRL ${monthLabel} ${year} untuk item ${code} belum dirilis. Consumption dicatat tanpa order ulang.`,
+    };
+  }
+  if (remainingQty <= 0) {
+    return {
+      ...emptyState,
+      prlId: prlRow.id,
+      status: statusKey,
+      plannedQty,
+      usedQty,
+      remainingQty: 0,
+      requestQty,
+      eligible: requestQty > 0,
+      overPrl: requestQty > 0,
+      reason: "prl_completed",
+      notice: `PRL ${monthLabel} ${year} untuk item ${code} sudah terpenuhi. Request dicatat sebagai Over PRL.`,
+    };
+  }
+
+  return {
+    year,
+    monthKey,
+    monthLabel,
+    prlId: prlRow.id,
+    status: statusKey,
+    plannedQty,
+    usedQty,
+    remainingQty,
+    requestQty,
+    eligible: requestQty > 0,
+    overPrl,
+    reason: overPrl ? "over_prl" : (requestQty > 0 ? "available" : "prl_completed"),
+    notice: requestQty > 0
+      ? (overPrl
+        ? `Request ${requestQty} melebihi sisa PRL ${monthLabel} ${year} (${remainingQty}). Ditandai Over PRL.`
+        : `PRL ${monthLabel} ${year} masih tersedia ${remainingQty}.`)
+      : `PRL ${monthLabel} ${year} untuk item ${code} sudah terpenuhi. Consumption dicatat tanpa order ulang.`,
+  };
+};
 
 const buildKanbanSlaDueAt = (row) => {
   const statusKey = String(row?.status || "").trim().toLowerCase();
@@ -7734,6 +8646,12 @@ const buildKanbanException = (row) => {
   const statusKey = String(row?.status || "").trim().toLowerCase();
   if (!KANBAN_ACTIVE_STATUSES.has(statusKey)) {
     return { code: null, note: null };
+  }
+  if (String(row?.exception_code || "").trim().toUpperCase() === "OVER_PRL") {
+    return {
+      code: "OVER_PRL",
+      note: row?.exception_note || "Request melebihi sisa PRL bulan berjalan.",
+    };
   }
   const requestQty = Number(row?.request_qty || 0);
   const stockQty = Number(row?.stock_qty || 0);
@@ -7778,6 +8696,8 @@ const loadKanbanHealthRowsByIds = async (client, requestIds) => {
       kr.schedule_id,
       kr.created_at,
       kr.updated_at,
+      kr.exception_code,
+      kr.exception_note,
       coalesce(ks.lead_time_days, i.lead_time_days, 0) as lead_time_days,
       coalesce(s.stock_qty, 0) as stock_qty
     from kanban_requests kr
@@ -7805,9 +8725,9 @@ const syncKanbanShortagePrlDraftsByItemCodes = async (client, itemCodes, options
   }
 
   const { year, monthKey } = getCurrentPrlPeriod(options.referenceDate);
-  const aggregateResult = await client.query(
-    `
-    with stock as (
+    const aggregateResult = await client.query(
+      `
+      with stock as (
       select item_code, sum(qty_in - qty_out)::numeric as stock_qty
       from stock_batches
       group by item_code
@@ -7845,10 +8765,10 @@ const syncKanbanShortagePrlDraftsByItemCodes = async (client, itemCodes, options
   const aggregateByItemCode = new Map(
     (aggregateResult.rows || []).map((row) => [row.item_code, row]),
   );
-  const existingResult = await client.query(
-    `
-    select *
-    from prl_records
+    const existingResult = await client.query(
+      `
+      select *
+      from prl_records
     where year = $1
       and item_code = any($2::text[])
     `,
@@ -7857,11 +8777,53 @@ const syncKanbanShortagePrlDraftsByItemCodes = async (client, itemCodes, options
   const existingByItemCode = new Map(
     (existingResult.rows || []).map((row) => [row.item_code, row]),
   );
+  const parentResult = await client.query(
+    `
+    select
+      i.code as item_code,
+      i.type,
+      exists (
+        select 1
+        from master_bom_headers h
+        where h.parent_code = i.code
+      ) as is_parent_item
+    from items i
+    where i.code = any($1::text[])
+    `,
+    [normalizedItemCodes],
+  );
+  const parentByItemCode = new Map(
+    (parentResult.rows || []).map((row) => [row.item_code, row]),
+  );
 
   let synced = 0;
   let cleared = 0;
 
   for (const itemCode of normalizedItemCodes) {
+    const parentRow = parentByItemCode.get(itemCode) || null;
+    const isParentItem = Boolean(parentRow?.is_parent_item) || isPrlParentCandidateType(parentRow?.type);
+    if (!isParentItem) {
+      const existing = existingByItemCode.get(itemCode) || null;
+      if (existing) {
+        await client.query(
+          `
+          update prl_records
+          set
+            months = '{}'::jsonb,
+            status = '{}'::jsonb,
+            source_ref = null,
+            suggested_qty = 0,
+            due_date = null,
+            priority_score = 0,
+            updated_at = now()
+          where id = $1
+          `,
+          [existing.id],
+        );
+      }
+      cleared += 1;
+      continue;
+    }
     const existing = existingByItemCode.get(itemCode) || null;
     const summary = aggregateByItemCode.get(itemCode) || null;
     if (summary) {
@@ -8081,89 +9043,141 @@ const syncKanbanRequestHealthByIds = async (client, requestIds, options = {}) =>
   return result.rows || [];
 };
 
-const autoTriggerKanbanRequests = async (client, options = {}) => {
-  const settingsResult = await client.query(
-    `
-    select
-      ks.item_code,
-      ks.min_qty,
-      ks.lot_qty,
-      ks.default_supplier,
-      mv.role as vendor_role,
-      coalesce(s.stock_qty, 0) as stock_qty,
-      i.order_lot_size,
-      i.max_delivery_per_rit
-    from kanban_settings ks
-    left join items i on i.code = ks.item_code
-    left join (
-      select item_code, sum(qty_in - qty_out)::numeric as stock_qty
-      from stock_batches
-      group by item_code
-    ) s on s.item_code = ks.item_code
-    left join master_vendors mv on mv.id = ks.default_supplier or mv.name = ks.default_supplier
-    where ks.active = true
-    `,
-  );
-  if (settingsResult.rows.length === 0) return [];
-  const config = await getMasterConfigRow(client);
-  const requestIdFormat = requireFormat(config?.request_id_format, "Request ID format");
-
-  const activeResult = await client.query(
-    "select distinct item_code from kanban_requests where status not in ('closed','rejected')",
-  );
-  const activeSet = new Set(activeResult.rows.map((row) => row.item_code));
-  const created = [];
-
-  for (const row of settingsResult.rows) {
-    const itemCode = row.item_code;
-    if (isScheduleVendor(row.vendor_role)) {
-      continue;
+const autoTriggerKanbanRequests = async (source, options = {}) => {
+  const ownsClient = typeof source?.release !== "function";
+  const client = ownsClient ? await source.connect() : source;
+  let beganTransaction = false;
+  try {
+    if (client.__auditTxOpen !== true) {
+      await client.query("begin");
+      beganTransaction = true;
     }
-    const minQty = Number(row.min_qty || 0);
-    const stockQty = Number(row.stock_qty || 0);
-    if (stockQty >= minQty) continue;
-    if (activeSet.has(itemCode)) continue;
 
-    const orderLotSize = Number(row.order_lot_size || 0);
-    const lotQty = Number(row.lot_qty || 0);
-    const baseLot = orderLotSize > 0 ? orderLotSize : lotQty;
-    const rawRequestQty = baseLot > 0 ? baseLot : Math.max(minQty - stockQty, 0);
-    if (rawRequestQty <= 0) continue;
-    const resolvedPackQty = lotQty > 0 ? lotQty : await resolveItemPackQty(client, itemCode);
-    const requestQty = normalizeQtyByPack(rawRequestQty, resolvedPackQty);
-    if (requestQty <= 0) continue;
+    const settingsResult = await client.query(
+      `
+      select
+        ks.item_code,
+        ks.min_qty,
+        ks.lot_qty,
+        ks.default_supplier,
+        mv.role as vendor_role,
+        coalesce(s.stock_qty, 0) as stock_qty,
+        i.order_lot_size,
+        i.max_delivery_per_rit
+      from kanban_settings ks
+      left join items i on i.code = ks.item_code
+      left join (
+        select item_code, sum(qty_in - qty_out)::numeric as stock_qty
+        from stock_batches
+        group by item_code
+      ) s on s.item_code = ks.item_code
+      left join master_vendors mv on mv.id = ks.default_supplier or mv.name = ks.default_supplier
+      where ks.active = true
+      `,
+    );
+    if (settingsResult.rows.length === 0) {
+      if (beganTransaction) {
+        await client.query("commit");
+      }
+      return [];
+    }
+    const config = await getMasterConfigRow(client);
+    const requestIdFormat = requireFormat(config?.request_id_format, "Request ID format");
 
-    const requestCode = await buildRequestNumber(client, requestIdFormat, itemCode);
-    const maxDeliveryPerRit = Number(row.max_delivery_per_rit || 0);
-    const splitQtys = splitRequestQtyByMax(requestQty, maxDeliveryPerRit, resolvedPackQty);
-    const splitTotal = splitQtys.length || 1;
-    let splitIndex = 1;
-    for (const qtySplit of splitQtys) {
-      const splitCode = splitTotal > 1 && splitIndex > 1 ? `${requestCode}-${splitIndex}/${splitTotal}` : requestCode;
-      const result = await client.query(
-        `
-        insert into kanban_requests (item_code, request_code, request_group, split_index, split_total, request_qty, trigger_type, status, notes)
-        values ($1, $2, $3, $4, $5, $6, 'stock_min', 'requested', $7)
-        returning *
-        `,
-        [itemCode, splitCode, requestCode, splitIndex, splitTotal, qtySplit, options.note || "auto-trigger"],
-      );
-      const request = result.rows[0];
-      await createKanbanEvent(
-        client,
-        request.id,
-        "auto_trigger",
-        options.userId || null,
-        { stockQty, minQty, requestQty: qtySplit, splitIndex, splitTotal, requestGroup: requestCode, maxDeliveryPerRit },
-      );
-      created.push(request);
-      splitIndex += 1;
+    const activeResult = await client.query(
+      "select distinct item_code from kanban_requests where status not in ('closed','rejected')",
+    );
+    const activeSet = new Set(activeResult.rows.map((row) => row.item_code));
+    const created = [];
+
+    for (const row of settingsResult.rows) {
+      const itemCode = row.item_code;
+      if (isScheduleVendor(row.vendor_role)) {
+        continue;
+      }
+      const minQty = Number(row.min_qty || 0);
+      const stockQty = Number(row.stock_qty || 0);
+      if (stockQty >= minQty) continue;
+      if (activeSet.has(itemCode)) continue;
+
+      const orderLotSize = Number(row.order_lot_size || 0);
+      const lotQty = Number(row.lot_qty || 0);
+      const baseLot = orderLotSize > 0 ? orderLotSize : lotQty;
+      const rawRequestQty = baseLot > 0 ? baseLot : Math.max(minQty - stockQty, 0);
+      if (rawRequestQty <= 0) continue;
+      const resolvedPackQty = lotQty > 0 ? lotQty : await resolveItemPackQty(client, itemCode);
+      const requestQty = normalizeQtyByPack(rawRequestQty, resolvedPackQty);
+      if (requestQty <= 0) continue;
+
+      const requestCode = await buildRequestNumber(client, requestIdFormat, itemCode);
+      const maxDeliveryPerRit = Number(row.max_delivery_per_rit || 0);
+      const splitQtys = splitRequestQtyByMax(requestQty, maxDeliveryPerRit, resolvedPackQty);
+      const splitTotal = splitQtys.length || 1;
+      let splitIndex = 1;
+      for (const qtySplit of splitQtys) {
+        const splitCode = splitTotal > 1 && splitIndex > 1 ? `${requestCode}-${splitIndex}/${splitTotal}` : requestCode;
+        const result = await client.query(
+          `
+          insert into kanban_requests (item_code, request_code, request_group, split_index, split_total, request_qty, trigger_type, status, notes)
+          values ($1, $2, $3, $4, $5, $6, 'stock_min', 'requested', $7)
+          returning *
+          `,
+          [itemCode, splitCode, requestCode, splitIndex, splitTotal, qtySplit, options.note || "auto-trigger"],
+        );
+        const request = result.rows[0];
+        await createKanbanEvent(
+          client,
+          request.id,
+          "auto_trigger",
+          options.userId || null,
+          { stockQty, minQty, requestQty: qtySplit, splitIndex, splitTotal, requestGroup: requestCode, maxDeliveryPerRit },
+        );
+        created.push(request);
+        splitIndex += 1;
+      }
+    }
+
+    await syncKanbanRequestHealthByIds(client, created.map((row) => row.id), { syncPrlDrafts: true });
+    if (created.length > 0) {
+      const requestCodes = [...new Set(created.map((row) => String(row.request_code || "").trim()).filter(Boolean))];
+      const itemCodes = [...new Set(created.map((row) => String(row.item_code || "").trim()).filter(Boolean))];
+      const totalQty = created.reduce((sum, row) => sum + Number(row.request_qty || 0), 0);
+      await recordInternalKanbanNotification(client, {
+        key: `kanban.auto-trigger.${requestCodes[0] || created[0].id}`,
+        referenceKey: requestCodes[0] || created[0].id,
+        title: `Auto-trigger Kanban: ${created.length} order dibuat.`,
+        detail: itemCodes.length > 0
+          ? `Item ${itemCodes.slice(0, 3).join(", ")}${itemCodes.length > 3 ? "..." : ""}`
+          : "Ada request kanban otomatis baru yang perlu ditinjau.",
+        entityType: "kanban_request",
+        entityId: String(created[0].id),
+        severity: "warning",
+        payload: {
+          requestIds: created.map((row) => row.id),
+          requestCodes,
+          itemCodes,
+          totalCreated: created.length,
+          totalQty,
+          sourceNote: String(options.note || "auto-trigger").trim(),
+          triggerType: "stock_min",
+        },
+      });
+    }
+
+    if (beganTransaction) {
+      await client.query("commit");
+    }
+    return created;
+  } catch (error) {
+    if (beganTransaction) {
+      await client.query("rollback").catch(() => {});
+    }
+    throw error;
+  } finally {
+    if (ownsClient) {
+      client.release();
     }
   }
-
-  await syncKanbanRequestHealthByIds(client, created.map((row) => row.id), { syncPrlDrafts: true });
-
-  return created;
 };
 
 const enforceActualLocked = (existing, data, allowUnlock = false) => {
@@ -8306,7 +9320,7 @@ const requireSupplier = (req, res, next) => {
 };
 
 const requireNotSupplier = (req, res, next) => {
-  if (req.user?.role === "supplier") {
+  if (req.user?.role === "supplier" || req.user?.role === "production") {
     res.status(403).json({ error: "forbidden" });
     return;
   }
@@ -8471,6 +9485,32 @@ const recordActivityNotification = async (client, notification = {}) => {
     ],
   );
   return result.rows[0] || null;
+};
+
+const recordInternalKanbanNotification = async (client, notification = {}) => {
+  const recipientsResult = await client.query(
+    "select id from users where coalesce(role, '') <> 'supplier' order by id asc",
+  );
+  if (recipientsResult.rows.length === 0) return [];
+
+  const createdRows = [];
+  for (const recipient of recipientsResult.rows) {
+    const row = await recordActivityNotification(client, {
+      userId: recipient.id,
+      key: notification.key || `kanban.auto-trigger.${notification.referenceKey || notification.entityId || crypto.randomUUID()}`,
+      module: "Kanban",
+      severity: notification.severity || "warning",
+      title: notification.title,
+      detail: notification.detail || "",
+      entityType: notification.entityType || "kanban_request",
+      entityId: notification.entityId || null,
+      payload: notification.payload || {},
+      status: notification.status || "open",
+      isRead: false,
+    });
+    if (row) createdRows.push(row);
+  }
+  return createdRows;
 };
 
 const syncOperationalNotificationsForUser = async (client, userRow) => {
@@ -9637,7 +10677,7 @@ app.post("/api/schedules", authenticate, requirePermission("editSchedules"), asy
       const packQty = await resolveItemPackQty(client, data.item);
       data.requestQty = normalizeScheduleQtyByPack(data.requestQty, packQty, remaining);
     }
-    if (data.requestQty > remaining) {
+    if (remaining <= 0) {
       const error = new Error(buildScheduleQtyConflictMessage({
         poNumber: data.poNumber,
         itemCode: data.itemCode || data.item,
@@ -9648,6 +10688,7 @@ app.post("/api/schedules", authenticate, requirePermission("editSchedules"), asy
       error.statusCode = 409;
       throw error;
     }
+    data.requestQty = Math.min(data.requestQty, remaining);
     data.poLineId = poLine.id;
     await ensureUniqueDoNumber(client, data);
     await client.query("begin");
@@ -9809,18 +10850,10 @@ app.post("/api/schedules/bulk", authenticate, requireAnyPermission("editSchedule
         const packQty = await resolveItemPackQty(client, data.item);
         data.requestQty = normalizeScheduleQtyByPack(data.requestQty, packQty, remaining);
       }
-      if (data.requestQty > remaining) {
-        const error = new Error(buildScheduleQtyConflictMessage({
-          poNumber: data.poNumber,
-          itemCode: data.itemCode || data.item || poLine?.item_code,
-          requestQty: data.requestQty,
-          remaining,
-          requestDate: data.requestDate,
-          rowNumber: index + 1,
-        }));
-        error.statusCode = 409;
-        throw error;
+      if (remaining <= 0) {
+        continue;
       }
+      data.requestQty = Math.min(data.requestQty, remaining);
       data.poLineId = poLine.id;
       await ensureUniqueDoNumber(client, data);
       const nextStatus = getScheduleStatusFromActual({
@@ -10865,6 +11898,13 @@ app.get("/api/po/:poNumber", authenticate, requireAnyPermission("manageVendors",
         i.part_no,
         i.pack_qty,
         (
+          select prl.qty_per_kanban
+          from prl_records prl
+          where prl.item_code = pl.item_code
+          order by prl.year desc nulls last, prl.updated_at desc nulls last, prl.id desc
+          limit 1
+        ) as qty_per_kanban,
+        (
           select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
           from schedules s
           where s.po_line_id = pl.id
@@ -10921,6 +11961,13 @@ app.get("/api/po-lines", authenticate, requireAnyPermission("manageVendors", "ma
         i.unit,
         i.part_no,
         i.pack_qty,
+        (
+          select prl.qty_per_kanban
+          from prl_records prl
+          where prl.item_code = pl.item_code
+          order by prl.year desc nulls last, prl.updated_at desc nulls last, prl.id desc
+          limit 1
+        ) as qty_per_kanban,
         (
           select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
           from schedules s
@@ -11754,6 +12801,7 @@ app.get("/api/search", authenticate, requireNotSupplier, async (req, res) => {
 
 app.get("/api/kanban/settings", authenticate, async (req, res) => {
   try {
+    const { year: prlYear, monthKey: prlMonthKey, monthLabel: prlMonthLabel } = getCurrentPrlPeriod();
     const result = await pool.query(
       `
       select
@@ -11762,16 +12810,150 @@ app.get("/api/kanban/settings", authenticate, async (req, res) => {
         ks.max_qty,
         ks.lot_qty,
         ks.lead_time_days,
+        ks.safety_factor,
+        ks.regular_kanban,
+        ks.safety_hours,
+        ks.work_hours,
+        ks.cycle_x,
+        ks.cycle_y,
+        ks.cycle_z,
+        ks.calculated_max_qty,
+        ks.calculated_card_count,
+        ks.calculated_prl_qty,
+        ks.calculated_daily_demand,
+        ks.calculated_hourly_demand,
+        ks.calculated_regular_kanban,
+        ks.calculated_safety_kanban,
+        ks.calculated_safety_parts,
+        ks.calculated_working_days,
+        ks.calculated_prl_year,
+        ks.calculated_prl_month,
+        ks.calculated_at,
         ks.default_supplier,
         ks.drop_zone,
         ks.active,
         i.name as item_name,
         i.unit as item_unit,
-        i.type as item_type
+        i.type as item_type,
+        $1::integer as prl_year,
+        $2::text as prl_month_key,
+        $3::text as prl_month_label,
+        case
+          when coalesce(pr.status ->> $2, '') in ('active', 'manual')
+            and (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+            then (pr.months ->> $2)::numeric
+          when ks.calculated_prl_year = $1
+            and ks.calculated_prl_month = $2
+            and ks.calculated_prl_qty is not null
+            then ks.calculated_prl_qty
+          else null
+        end as effective_prl_qty,
+        case
+          when coalesce(pr.status ->> $2, '') in ('active', 'manual')
+            and (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+            then (pr.months ->> $2)::numeric
+          else null
+        end as prl_month_qty,
+        case
+          when coalesce(pr.status ->> $2, '') in ('active', 'manual')
+            and (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+            and ks.lot_qty > 0
+            and $4::integer > 0
+            then (
+              ceil(
+                ((((pr.months ->> $2)::numeric / $4::numeric) / coalesce(nullif(ks.work_hours, 0), 24))
+                  * coalesce(nullif(ks.cycle_x, 0), 1)
+                  * coalesce(nullif(ks.cycle_y, 0), 4))
+                / ks.lot_qty
+              )::integer
+              + ceil(
+                ((((pr.months ->> $2)::numeric / $4::numeric) / coalesce(nullif(ks.work_hours, 0), 24))
+                  * coalesce(nullif(ks.safety_hours, 0), 48))
+                / ks.lot_qty
+              )::integer
+            ) * ks.lot_qty
+          when ks.calculated_prl_year = $1
+            and ks.calculated_prl_month = $2
+            and ks.calculated_max_qty is not null
+            then ks.calculated_max_qty
+          else ks.max_qty
+        end as effective_max_qty,
+        case
+          when coalesce(pr.status ->> $2, '') in ('active', 'manual')
+            and (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+            and ks.lot_qty > 0
+            and $4::integer > 0
+            then ceil(
+                ((((pr.months ->> $2)::numeric / $4::numeric) / coalesce(nullif(ks.work_hours, 0), 24))
+                  * coalesce(nullif(ks.cycle_x, 0), 1)
+                  * coalesce(nullif(ks.cycle_y, 0), 4))
+                / ks.lot_qty
+              )::integer
+              + ceil(
+                ((((pr.months ->> $2)::numeric / $4::numeric) / coalesce(nullif(ks.work_hours, 0), 24))
+                  * coalesce(nullif(ks.safety_hours, 0), 48))
+                / ks.lot_qty
+              )::integer
+          when ks.calculated_prl_year = $1
+            and ks.calculated_prl_month = $2
+            and ks.calculated_card_count is not null
+            then ks.calculated_card_count
+          else null
+        end as effective_card_count,
+        case
+          when coalesce(pr.status ->> $2, '') in ('active', 'manual')
+            and (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+            and ks.lot_qty > 0
+            and $4::integer > 0
+            then ceil(
+              ((((pr.months ->> $2)::numeric / $4::numeric) / coalesce(nullif(ks.work_hours, 0), 24))
+                * coalesce(nullif(ks.cycle_x, 0), 1)
+                * coalesce(nullif(ks.cycle_y, 0), 4))
+              / ks.lot_qty
+            )::integer
+          else ks.calculated_regular_kanban
+        end as effective_regular_kanban,
+        case
+          when coalesce(pr.status ->> $2, '') in ('active', 'manual')
+            and (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+            and ks.lot_qty > 0
+            and $4::integer > 0
+            then ceil(
+              ((((pr.months ->> $2)::numeric / $4::numeric) / coalesce(nullif(ks.work_hours, 0), 24))
+                * coalesce(nullif(ks.safety_hours, 0), 48))
+              / ks.lot_qty
+            )::integer
+          else ks.calculated_safety_kanban
+        end as effective_safety_kanban,
+        case
+          when coalesce(pr.status ->> $2, '') in ('active', 'manual')
+            and (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+            and $4::integer > 0
+            then ((pr.months ->> $2)::numeric / $4::numeric) / coalesce(nullif(ks.work_hours, 0), 24)
+          else ks.calculated_hourly_demand
+        end as effective_hourly_demand,
+        case
+          when coalesce(pr.status ->> $2, '') in ('active', 'manual')
+            and (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+            and $4::integer > 0
+            then (((pr.months ->> $2)::numeric / $4::numeric) / coalesce(nullif(ks.work_hours, 0), 24)) * coalesce(nullif(ks.safety_hours, 0), 48)
+          else ks.calculated_safety_parts
+        end as effective_safety_parts,
+        case when $4::integer > 0 then $4::integer else null end as effective_working_days,
+        case
+          when coalesce(pr.status ->> $2, '') in ('active', 'manual')
+            and (pr.months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
+            and $4::integer > 0
+            then (pr.months ->> $2)::numeric / $4::numeric
+          else null
+        end as effective_daily_demand,
+        coalesce(pr.status ->> $2, '') as prl_month_status
       from kanban_settings ks
       join items i on i.code = ks.item_code
+      left join prl_records pr on pr.item_code = ks.item_code and pr.year = $1
       order by ks.item_code asc
       `,
+      [prlYear, prlMonthKey, prlMonthLabel, await getWorkingDaysForPrlPeriod(pool, prlYear, prlMonthKey)],
     );
     res.json(result.rows);
   } catch (error) {
@@ -11787,6 +12969,13 @@ app.post("/api/kanban/settings", authenticate, requireManageMaster, async (req, 
       maxQty,
       lotQty,
       leadTimeDays,
+      safetyFactor,
+      regularKanban,
+      safetyHours,
+      workHours,
+      cycleX,
+      cycleY,
+      cycleZ,
       defaultSupplier,
       dropZone,
       lineCode,
@@ -11802,20 +12991,44 @@ app.post("/api/kanban/settings", authenticate, requireManageMaster, async (req, 
     const maxValue = Number.isFinite(Number(maxQty)) ? Number(maxQty) : 0;
     const lotValue = Number.isFinite(Number(lotQty)) ? Number(lotQty) : 0;
     const leadTimeValue = Number.isFinite(Number(leadTimeDays)) ? Number(leadTimeDays) : 0;
+    const safetyFactorValue = Number.isFinite(Number(safetyFactor)) ? Math.max(0, Number(safetyFactor)) : 0;
+    const regularKanbanValue = Number.isFinite(Number(regularKanban)) ? Math.max(0, Number(regularKanban)) : 2;
+    const safetyHoursValue = Number.isFinite(Number(safetyHours)) ? Math.max(0, Number(safetyHours)) : 48;
+    const workHoursValue = Number.isFinite(Number(workHours)) && Number(workHours) > 0 ? Number(workHours) : 24;
+    const supplierFallbackResult = await pool.query(
+      "select vendor_id, supplier_name from items where code = $1 limit 1",
+      [itemCode],
+    );
+    const supplierForCycle = defaultSupplier || supplierFallbackResult.rows[0]?.vendor_id || supplierFallbackResult.rows[0]?.supplier_name || "";
+    const vendorCycle = await resolveVendorCycleParts(pool, supplierForCycle);
+    const cycleXValue = Number.isFinite(Number(cycleX)) && Number(cycleX) > 0 ? Number(cycleX) : (vendorCycle.x || 1);
+    const cycleYValue = Number.isFinite(Number(cycleY)) && Number(cycleY) > 0 ? Number(cycleY) : (vendorCycle.y || 4);
+    const cycleZValue = Number.isFinite(Number(cycleZ)) && Number(cycleZ) > 0 ? Number(cycleZ) : (vendorCycle.z || 4);
     const isActive = typeof active === "boolean" ? active : true;
+    if (isActive && lotValue <= 0) {
+      res.status(400).json({ error: "lotQty wajib lebih dari 0 untuk kanban aktif" });
+      return;
+    }
     const dropZoneValue = String(
       dropZone ?? lineCode ?? drop_zone ?? line_code ?? "",
     ).trim();
     const result = await pool.query(
       `
       insert into kanban_settings
-        (item_code, min_qty, max_qty, lot_qty, lead_time_days, default_supplier, drop_zone, active, updated_at)
-      values ($1,$2,$3,$4,$5,$6,$7,$8, now())
+        (item_code, min_qty, max_qty, lot_qty, lead_time_days, safety_factor, regular_kanban, safety_hours, work_hours, cycle_x, cycle_y, cycle_z, default_supplier, drop_zone, active, updated_at)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15, now())
       on conflict (item_code) do update set
         min_qty = excluded.min_qty,
         max_qty = excluded.max_qty,
         lot_qty = excluded.lot_qty,
         lead_time_days = excluded.lead_time_days,
+        safety_factor = excluded.safety_factor,
+        regular_kanban = excluded.regular_kanban,
+        safety_hours = excluded.safety_hours,
+        work_hours = excluded.work_hours,
+        cycle_x = excluded.cycle_x,
+        cycle_y = excluded.cycle_y,
+        cycle_z = excluded.cycle_z,
         default_supplier = excluded.default_supplier,
         drop_zone = excluded.drop_zone,
         active = excluded.active,
@@ -11828,6 +13041,13 @@ app.post("/api/kanban/settings", authenticate, requireManageMaster, async (req, 
         maxValue,
         lotValue,
         leadTimeValue,
+        safetyFactorValue,
+        regularKanbanValue,
+        safetyHoursValue,
+        workHoursValue,
+        cycleXValue,
+        cycleYValue,
+        cycleZValue,
         defaultSupplier || null,
         dropZoneValue || null,
         isActive,
@@ -11838,11 +13058,13 @@ app.post("/api/kanban/settings", authenticate, requireManageMaster, async (req, 
       module: "Kanban",
       severity: "info",
       title: `Master kanban ${itemCode} disimpan.`,
-      detail: `Lot ${lotValue}, min ${minValue}, max ${maxValue}.`,
+      detail: `Lot ${lotValue}, cycle ${cycleXValue}-${cycleYValue}-${cycleZValue}, safety ${safetyHoursValue} jam, work ${workHoursValue} jam.`,
       entityType: "kanban_setting",
       entityId: String(itemCode),
       payload: { itemCode, active: isActive, dropZone: dropZoneValue || null },
     }).catch((error) => console.warn("Kanban notification failed:", error.message));
+    const { year, monthKey } = getCurrentPrlPeriod();
+    await recalculateKanbanFromReleasedPrl(pool, { year, monthKey, itemCodes: [itemCode] });
     res.json(result.rows[0]);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -14418,6 +15640,12 @@ app.post("/api/kanban/requests", authenticate, async (req, res) => {
       return;
     }
     await client.query("begin");
+    const normalizedTrigger = triggerType === "scan" ? "scan" : "manual";
+    if (req.user?.role === "production" && normalizedTrigger !== "scan") {
+      await client.query("rollback");
+      res.status(403).json({ error: "forbidden" });
+      return;
+    }
     const vendorInfo = await getVendorRoleForItem(client, itemCode);
     if (isScheduleVendor(vendorInfo.role)) {
       await client.query("rollback");
@@ -14436,12 +15664,21 @@ app.post("/api/kanban/requests", authenticate, async (req, res) => {
       "select id from kanban_requests where item_code = $1 and status not in ('closed','rejected')",
       [itemCode],
     );
-    if (activeCheck.rows.length > 0) {
+    if (normalizedTrigger !== "scan" && activeCheck.rows.length > 0) {
       await client.query("rollback");
       res.status(409).json({ error: "Request kanban aktif sudah ada untuk item ini." });
       return;
     }
-    const normalizedTrigger = triggerType === "scan" ? "scan" : "manual";
+    let prlPlan = null;
+    if (normalizedTrigger === "scan") {
+      prlPlan = await loadPrlKanbanCirculationState(client, itemCode, { requestQty: qtyValue });
+      if (!prlPlan.eligible) {
+        await client.query("rollback");
+        res.status(409).json({ error: prlPlan.notice || "PRL bulan berjalan tidak tersedia untuk reorder.", prlPlan });
+        return;
+      }
+      qtyValue = Number(prlPlan.requestQty || qtyValue);
+    }
     const config = await getMasterConfigRow(client);
     const requestIdFormat = requireFormat(config?.request_id_format, "Request ID format");
     const requestCode = await buildRequestNumber(client, requestIdFormat, itemCode);
@@ -14454,11 +15691,27 @@ app.post("/api/kanban/requests", authenticate, async (req, res) => {
       const splitCode = splitTotal > 1 && splitIndex > 1 ? `${requestCode}-${splitIndex}/${splitTotal}` : requestCode;
       const result = await client.query(
         `
-        insert into kanban_requests (item_code, request_code, request_group, split_index, split_total, request_qty, trigger_type, status, notes, created_by)
-        values ($1, $2, $3, $4, $5, $6, $7, 'requested', $8, $9)
+        insert into kanban_requests (item_code, request_code, request_group, split_index, split_total, request_qty, trigger_type, status, notes, created_by, exception_code, exception_note)
+        values ($1, $2, $3, $4, $5, $6, $7, 'requested', $8, $9, $10, $11)
         returning *
         `,
-        [itemCode, splitCode, requestCode, splitIndex, splitTotal, qtySplit, normalizedTrigger, notes || null, req.user?.id || null],
+        [
+          itemCode,
+          splitCode,
+          requestCode,
+          splitIndex,
+          splitTotal,
+          qtySplit,
+          normalizedTrigger,
+          [
+            notes || null,
+            prlPlan?.prlId ? `prl:${prlPlan.year}:${prlPlan.monthKey}:${prlPlan.prlId}` : null,
+            prlPlan?.overPrl ? "over_prl" : null,
+          ].filter(Boolean).join(" | ") || null,
+          req.user?.id || null,
+          prlPlan?.overPrl ? "OVER_PRL" : null,
+          prlPlan?.overPrl ? prlPlan.notice : null,
+        ],
       );
       const request = result.rows[0];
       await createKanbanEvent(client, request.id, "manual_request", req.user?.id || null, {
@@ -14483,7 +15736,7 @@ app.post("/api/kanban/requests", authenticate, async (req, res) => {
       entityId: String(createdRows[0]?.id || ""),
       payload: { requestCode, itemCode, requestQty: qtyValue, splitTotal, triggerType: normalizedTrigger },
     }).catch((error) => console.warn("Kanban notification failed:", error.message));
-    res.json(splitTotal > 1 ? { requests: createdRows, request: createdRows[0], splitTotal, requestGroup: requestCode } : createdRows[0]);
+    res.json(splitTotal > 1 ? { requests: createdRows, request: createdRows[0], splitTotal, requestGroup: requestCode, prlPlan } : { ...createdRows[0], prlPlan });
   } catch (error) {
     await client.query("rollback");
     res.status(500).json({ error: error.message });
@@ -14800,14 +16053,57 @@ const handleKanbanEmptyScan = async (req, res) => {
       res.json(responsePayload);
       return;
     }
+    const prlPlan = await loadPrlKanbanCirculationState(client, itemCode, { requestQty: qtyValue });
+    const cardMeta = await resolveKanbanCardScanMeta(client, rawKanbanId || itemCode, itemCode);
+    if (cardMeta.warning) warnings.push(cardMeta.warning);
+    if (!prlPlan.eligible) {
+      await client.query("commit");
+      void recordActivityNotification(pool, {
+        userId: req.user?.id || null,
+        module: "Kanban",
+        severity: "info",
+        title: `Scan kanban ${itemCode} tanpa reorder.`,
+        detail: prlPlan.notice || "PRL bulan berjalan tidak tersedia untuk request ulang.",
+        entityType: "kanban_scan",
+        entityId: String(rawKanbanId || itemCode),
+        payload: { itemCode, qty: qtyValue, prlPlan, actionType: "consumption_only" },
+      }).catch((error) => console.warn("Kanban notification failed:", error.message));
+      const responsePayload = {
+        ok: true,
+        updatedLots: consumedBatches,
+        consumedBatches,
+        consumedQty,
+        requestCreated: false,
+        requestId: null,
+        productionId,
+        notice: prlPlan.notice,
+        prlPlan,
+        warnings,
+      };
+      if (isScan) {
+        responsePayload.status = "success";
+        responsePayload.message = "Consumption Recorded";
+        responsePayload.data = {
+          part_name: itemName || "-",
+          qty: qtyValue,
+          scan_time: scanTimestamp.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }),
+          supplier: supplierCode || supplierRaw || "-",
+        };
+      }
+      res.json(responsePayload);
+      return;
+    }
     const config = await getMasterConfigRow(client);
     const requestIdFormat = requireFormat(config?.request_id_format, "Request ID format");
     const requestCode = await buildRequestNumber(client, requestIdFormat, itemCode);
     const noteParts = [];
     if (body.area) noteParts.push(`area:${body.area}`);
     if (rawKanbanId) noteParts.push(`kanban:${rawKanbanId}`);
+    if (prlPlan.prlId) noteParts.push(`prl:${prlPlan.year}:${prlPlan.monthKey}:${prlPlan.prlId}`);
+    if (prlPlan.overPrl || cardMeta.overPrl) noteParts.push("over_prl");
     const limits = await resolveItemDeliveryLimits(client, itemCode);
-    const splitQtys = splitRequestQtyByMax(qtyValue, limits.maxDeliveryPerRit, packQty);
+    const requestQtyFromPrl = Number(prlPlan.requestQty || qtyValue);
+    const splitQtys = splitRequestQtyByMax(requestQtyFromPrl, limits.maxDeliveryPerRit, packQty);
     const splitTotal = splitQtys.length || 1;
     const createdRequests = [];
     let splitIndex = 1;
@@ -14815,11 +16111,22 @@ const handleKanbanEmptyScan = async (req, res) => {
       const splitCode = splitTotal > 1 && splitIndex > 1 ? `${requestCode}-${splitIndex}/${splitTotal}` : requestCode;
       const result = await client.query(
         `
-        insert into kanban_requests (item_code, request_code, request_group, split_index, split_total, request_qty, trigger_type, status, notes, created_by)
-        values ($1, $2, $3, $4, $5, $6, 'scan', 'requested', $7, $8)
+        insert into kanban_requests (item_code, request_code, request_group, split_index, split_total, request_qty, trigger_type, status, notes, created_by, exception_code, exception_note)
+        values ($1, $2, $3, $4, $5, $6, 'scan', 'requested', $7, $8, $9, $10)
         returning *
         `,
-        [itemCode, splitCode, requestCode, splitIndex, splitTotal, qtySplit, noteParts.length ? noteParts.join(" | ") : null, req.user?.id || null],
+        [
+          itemCode,
+          splitCode,
+          requestCode,
+          splitIndex,
+          splitTotal,
+          qtySplit,
+          noteParts.length ? noteParts.join(" | ") : null,
+          req.user?.id || null,
+          prlPlan.overPrl || cardMeta.overPrl ? "OVER_PRL" : null,
+          prlPlan.overPrl || cardMeta.overPrl ? (cardMeta.warning || prlPlan.notice) : null,
+        ],
       );
       const request = result.rows[0];
       await createKanbanEvent(client, request.id, "empty_kanban", req.user?.id || null, {
@@ -14844,7 +16151,7 @@ const handleKanbanEmptyScan = async (req, res) => {
       detail: `${createdRequests.length} request dibuat dari scan.`,
       entityType: "kanban_scan",
       entityId: String(rawKanbanId || itemCode),
-      payload: { itemCode, qty: qtyValue, requestGroup: requestCode, requestCount: createdRequests.length },
+      payload: { itemCode, qty: requestQtyFromPrl, consumedQty: qtyValue, requestGroup: requestCode, requestCount: createdRequests.length, prlPlan },
     }).catch((error) => console.warn("Kanban notification failed:", error.message));
     const responsePayload = {
       ok: true,
@@ -14857,6 +16164,8 @@ const handleKanbanEmptyScan = async (req, res) => {
       requestGroup: requestCode,
       splitTotal,
       productionId,
+      prlPlan,
+      cardMeta,
       warnings,
     };
     if (isScan) {
@@ -14878,17 +16187,17 @@ const handleKanbanEmptyScan = async (req, res) => {
   }
 };
 
-app.post("/api/kanban/empty", authenticate, requirePermission("editSchedules"), (req, res) => {
+app.post("/api/kanban/empty", authenticate, requireAnyPermission("editSchedules", "production"), (req, res) => {
   handleKanbanEmptyScan(req, res);
 });
 
-app.post("/api/kanban/scan", authenticate, requirePermission("editSchedules"), (req, res) => {
+app.post("/api/kanban/scan", authenticate, requireAnyPermission("editSchedules", "production"), (req, res) => {
   if (!req.body) req.body = {};
   req.body.kanbanId = req.body.kanbanId || req.body.kanban_uuid || req.body.kanban_id || null;
   handleKanbanEmptyScan(req, res);
 });
 
-app.post("/api/kanban/scan-preview", authenticate, async (req, res) => {
+app.post("/api/kanban/scan-preview", authenticate, requireAnyPermission("editSchedules", "production"), async (req, res) => {
   const client = await pool.connect();
   try {
     const body = req.body || {};
@@ -14906,7 +16215,7 @@ app.post("/api/kanban/scan-preview", authenticate, async (req, res) => {
   }
 });
 
-app.post("/api/kanban/process/start", authenticate, async (req, res) => {
+app.post("/api/kanban/process/start", authenticate, requireAnyPermission("editSchedules", "production"), async (req, res) => {
   const client = await pool.connect();
   try {
     const body = req.body || {};
@@ -14950,7 +16259,7 @@ app.post("/api/kanban/process/start", authenticate, async (req, res) => {
   }
 });
 
-app.post("/api/kanban/process/finish", authenticate, async (req, res) => {
+app.post("/api/kanban/process/finish", authenticate, requireAnyPermission("editSchedules", "production"), async (req, res) => {
   const client = await pool.connect();
   try {
     const body = req.body || {};
@@ -15642,61 +16951,173 @@ app.post("/api/kanban/requests/:id/create-dn", authenticate, requirePermission("
 app.get("/api/prl", authenticate, requirePermission("viewPrl"), async (req, res) => {
   try {
     const year = Number(req.query.year) || new Date().getFullYear();
+    const supplier = String(req.query.supplier || "").trim().toLowerCase();
+    const values = [year];
+    let baseItemsCte = `
+      select distinct pr.item_code as code
+      from prl_records pr
+      where pr.year = $1
+    `;
+    if (supplier) {
+      values.push(supplier);
+      baseItemsCte = `
+        select distinct i.code
+        from items i
+        left join master_vendors default_vendor on default_vendor.id = i.vendor_id
+        where i.code not ilike 'TEST-%'
+          and (
+            exists (
+              select 1
+              from master_bom_headers h
+              where h.parent_code = i.code
+            )
+            or lower(coalesce(i.type, '')) ~ '(fg|finish|sub assy|subassy|sub-assy)'
+          )
+          and (
+            exists (
+              select 1
+              from item_suppliers isup
+              left join master_vendors rel_vendor on rel_vendor.id = isup.vendor_id
+              where isup.item_code = i.code
+                and (
+                  lower(coalesce(isup.vendor_id, '')) = $2
+                  or lower(coalesce(rel_vendor.name, '')) = $2
+                )
+            )
+            or (
+              not exists (
+                select 1
+                from item_suppliers isup
+                where isup.item_code = i.code
+              )
+              and (
+                lower(coalesce(i.vendor_id, '')) = $2
+                or lower(coalesce(default_vendor.name, '')) = $2
+                or lower(coalesce(i.supplier_name, '')) = $2
+              )
+            )
+          )
+      `;
+    }
+    else {
+      baseItemsCte = `
+        select distinct pr.item_code as code
+        from prl_records pr
+        join items i on i.code = pr.item_code
+        where pr.year = $1
+          and (
+            exists (
+              select 1
+              from master_bom_headers h
+              where h.parent_code = i.code
+            )
+            or lower(coalesce(i.type, '')) ~ '(fg|finish|sub assy|subassy|sub-assy)'
+          )
+      `;
+    }
     const result = await pool.query(
       `
-      select *
-      from prl_records
-      where year = $1
-      order by item_code
+      with base_items as (
+        ${baseItemsCte}
+      )
+      select
+        pr.id,
+        b.code as item_code,
+        coalesce(pr.year, $1) as year,
+        coalesce(i.part_no, pr.part_no, b.code) as part_no,
+        coalesce(i.name, pr.description) as description,
+        coalesce(i.model, pr.model) as model,
+        coalesce(nullif(i.pack_qty, 0), nullif(ks.lot_qty, 0), pr.qty_per_kanban) as qty_per_kanban,
+        coalesce(i.unit, pr.uom) as uom,
+        coalesce(i.type_pack, pr.type_pack) as type_pack,
+        pr.volume,
+        coalesce(pr.months, '{}'::jsonb) as months,
+        coalesce(pr.status, '{}'::jsonb) as status,
+        pr.source_type,
+        pr.source_ref,
+        coalesce(pr.suggested_qty, 0) as suggested_qty,
+        pr.approved_qty,
+        pr.approved_by,
+        pr.approved_at,
+        pr.due_date,
+        coalesce(pr.priority_score, 0) as priority_score,
+        pr.created_at,
+        pr.updated_at,
+        i.type as category,
+        mc.name as category_name,
+        i.name as item_name,
+        i.part_no as item_part_no,
+        i.model as item_model,
+        i.unit as item_unit,
+        i.type_pack as item_type_pack,
+        mp.name as type_pack_name,
+        i.pack_qty as item_pack_qty,
+        ks.lot_qty as kanban_lot_qty,
+        i.vendor_id as default_supplier,
+        i.supplier_name as supplier_name,
+        i.location_id,
+        coalesce(ml.line_description, i.location_name) as location_name,
+        ml.category as location_category,
+        ml.fifo_lane,
+        coalesce(sup.suppliers, '[]'::jsonb) as suppliers,
+        coalesce(cus.customers, '[]'::jsonb) as customers,
+        u.username as approved_by_name,
+        u.role as approved_by_role
+      from base_items b
+      left join prl_records pr on pr.item_code = b.code and pr.year = $1
+      left join items i on i.code = b.code
+      left join kanban_settings ks on ks.item_code = b.code
+      left join master_categories mc on mc.code = i.type
+      left join master_packings mp on mp.code = i.type_pack
+      left join master_locations ml on ml.id = i.location_id
+      left join users u on u.id = pr.approved_by
+      left join lateral (
+        select jsonb_agg(
+          jsonb_build_object(
+            'vendorId', rel.vendor_id,
+            'vendorName', coalesce(mv.name, rel.vendor_id),
+            'sharePercent', rel.share_percent
+          )
+          order by rel.is_default desc, rel.share_percent desc, rel.vendor_id
+        ) as suppliers
+        from (
+          select distinct on (vendor_id)
+            vendor_id,
+            share_percent,
+            is_default
+          from (
+            select
+              isup.vendor_id,
+              isup.share_percent,
+              (isup.vendor_id = i.vendor_id) as is_default
+            from item_suppliers isup
+            where isup.item_code = b.code
+            union all
+            select i.vendor_id, 100::numeric, true
+            where coalesce(i.vendor_id, '') <> ''
+          ) supplier_candidates
+          order by vendor_id, is_default desc, share_percent desc
+        ) rel
+        left join master_vendors mv on mv.id = rel.vendor_id
+      ) sup on true
+      left join lateral (
+        select jsonb_agg(
+          jsonb_build_object(
+            'customerId', ic.customer_id,
+            'customerName', coalesce(mcust.name, ic.customer_id),
+            'sharePercent', ic.share_percent
+          )
+          order by ic.share_percent desc, ic.customer_id
+        ) as customers
+        from item_customers ic
+        left join master_customers mcust on mcust.id = ic.customer_id
+        where ic.item_code = b.code
+      ) cus on true
+      order by b.code
       `,
-      [year],
+      values,
     );
-    const itemCodes = result.rows.map((row) => row.item_code);
-    if (itemCodes.length === 0) {
-      res.json([]);
-      return;
-    }
-    const itemResult = await pool.query(
-      `
-      select code, type, type_pack
-      from items
-      where code = any($1)
-      `,
-      [itemCodes],
-    );
-    const approverIds = result.rows
-      .map((row) => Number(row.approved_by))
-      .filter((value) => Number.isFinite(value));
-    let approverById = new Map();
-    if (approverIds.length > 0) {
-      const userResult = await pool.query(
-        `
-        select id, username, role
-        from users
-        where id = any($1::int[])
-        `,
-        [[...new Set(approverIds)]],
-      );
-      approverById = new Map(
-        userResult.rows.map((row) => [
-          row.id,
-          {
-            username: row.username,
-            role: row.role,
-          },
-        ]),
-      );
-    }
-    const typeByCode = new Map(itemResult.rows.map((row) => [row.code, row.type]));
-    const typePackByCode = new Map(itemResult.rows.map((row) => [row.code, row.type_pack]));
-    const enriched = result.rows.map((row) => ({
-      ...row,
-      category: typeByCode.get(row.item_code) || null,
-      item_type_pack: typePackByCode.get(row.item_code) || null,
-      approved_by_name: approverById.get(Number(row.approved_by))?.username || null,
-      approved_by_role: approverById.get(Number(row.approved_by))?.role || null,
-    }));
-    res.json(enriched);
+    res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -15722,7 +17143,22 @@ app.post("/api/prl/import", authenticate, requirePermission("prlImport"), async 
         continue;
       }
       const itemResult = await client.query(
-        "select code, name, model, unit, pack_qty from items where code = $1",
+        `
+        select
+          i.code,
+          i.name,
+          i.model,
+          i.unit,
+          i.pack_qty,
+          i.type,
+          exists (
+            select 1
+            from master_bom_headers h
+            where h.parent_code = i.code
+          ) as is_parent_item
+        from items i
+        where i.code = $1
+        `,
         [uniq],
       );
       if (itemResult.rows.length === 0) {
@@ -15730,6 +17166,11 @@ app.post("/api/prl/import", authenticate, requirePermission("prlImport"), async 
         continue;
       }
       const item = itemResult.rows[0];
+      const isParentItem = Boolean(item.is_parent_item) || isPrlParentCandidateType(item.type);
+      if (!isParentItem) {
+        skipped += 1;
+        continue;
+      }
       const ksResult = await client.query(
         "select lot_qty from kanban_settings where item_code = $1",
         [uniq],
@@ -15850,30 +17291,33 @@ app.post("/api/prl/release", authenticate, requirePermission("prlProcess"), asyn
       `
       select
         id,
+        item_code,
         source_type,
         source_ref,
         suggested_qty,
         status,
+        i.type as item_type,
+        exists (
+          select 1
+          from master_bom_headers h
+          where h.parent_code = pr.item_code
+        ) as is_parent_item,
         case
           when (months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
             then (months ->> $2)::numeric
           else 0
         end as month_qty
-      from prl_records
+      from prl_records pr
+      join items i on i.code = pr.item_code
       where year = $1
-        and (
-          case
-            when (months ->> $2) ~ '^[0-9]+(\\.[0-9]+)?$'
-              then (months ->> $2)::numeric
-            else 0
-          end
-        ) > 0
       `,
       [targetYear, monthKey],
     );
     const eligibleRows = eligibleResult.rows || [];
-    const alreadyActive = eligibleRows.filter((row) => getPrlMonthStatus(row.status, monthKey) === "active").length;
-    const releasableRows = eligibleRows.filter((row) => getPrlMonthStatus(row.status, monthKey) !== "active");
+    const parentEligibleRows = eligibleRows.filter((row) => Boolean(row.is_parent_item) || isPrlParentCandidateType(row.item_type));
+    const alreadyActive = parentEligibleRows.filter((row) => getPrlMonthStatus(row.status, monthKey) === "active").length;
+    const releasableRows = parentEligibleRows.filter((row) => getPrlMonthStatus(row.status, monthKey) !== "active");
+    const zeroQtyReleased = releasableRows.filter((row) => Number(row.month_qty || 0) <= 0).length;
     const autoDraftReleased = releasableRows.filter((row) => (
       Number(row.suggested_qty || 0) > 0
       && (
@@ -15892,7 +17336,7 @@ app.post("/api/prl/release", authenticate, requirePermission("prlProcess"), asyn
           approved_qty = case
             when (months ->> $3) ~ '^[0-9]+(\\.[0-9]+)?$'
               then (months ->> $3)::numeric
-            else approved_qty
+            else 0
           end,
           approved_by = $4,
           approved_at = now(),
@@ -15919,13 +17363,22 @@ app.post("/api/prl/release", authenticate, requirePermission("prlProcess"), asyn
       );
       updated = result.rowCount;
     }
+    const recalculation = parentEligibleRows.length > 0
+      ? await recalculateKanbanFromReleasedPrl(client, {
+        year: targetYear,
+        monthKey,
+      })
+      : { updated: 0, workingDays: await getWorkingDaysForPrlPeriod(client, targetYear, monthKey) };
     await client.query("commit");
     transactionStarted = false;
     res.json({
       updated,
       alreadyActive,
       autoDraftReleased,
-      eligible: eligibleRows.length,
+      zeroQtyReleased,
+      kanbanCalculated: recalculation.updated,
+      workingDays: recalculation.workingDays,
+      eligible: parentEligibleRows.length,
     });
   } catch (error) {
     if (transactionStarted) {
@@ -18100,18 +19553,59 @@ app.get("/api/items/:code", authenticate, requireNotSupplier, async (req, res) =
 
 app.post("/api/items", authenticate, requireManageItems, async (req, res) => {
   try {
-    const { code, name, partNo, type, unit, model, weight, cycle, safetyStock, packQty, orderLotSize, maxDeliveryPerRit } = req.body || {};
+    const {
+      code,
+      name,
+      partNo,
+      type,
+      unit,
+      model,
+      weight,
+      price,
+      vendorId,
+      locationId,
+      locationName,
+      lineProduction,
+      imageUrl,
+      imageThumbUrl,
+      cycle,
+      shelfLifeDays,
+      shelfLifeMonths,
+      movingStatus,
+      isSeasonal,
+      typePack,
+      packQty,
+      safetyStock,
+      leadTimeDays,
+      cycleTimeSeconds,
+      orderLotSize,
+      maxDeliveryPerRit,
+    } = req.body || {};
     if (!code || !name || !type || !unit) {
       res.status(400).json({ error: "code, name, type, unit wajib diisi" });
       return;
     }
+    const weightValue = weight === undefined || weight === null || String(weight).trim() === '' ? null : Number(weight);
+    const priceValue = price === undefined || price === null || String(price).trim() === '' ? null : Number(price);
     const safetyValue = Number.isFinite(Number(safetyStock)) ? Number(safetyStock) : 0;
     const packQtyValue = Number.isFinite(Number(packQty)) ? Number(packQty) : 0;
     const orderLotValue = Number(orderLotSize);
     const maxDeliveryValue = Number(maxDeliveryPerRit);
+    const shelfLifeValue = Number(shelfLifeDays);
+    const shelfLifeMonthsValue = Number(shelfLifeMonths);
+    const leadTimeValue = Number.isFinite(Number(leadTimeDays)) ? Math.max(0, Math.round(Number(leadTimeDays))) : 0;
+    const cycleTimeValue = Number.isFinite(Number(cycleTimeSeconds)) ? Math.max(0, Number(cycleTimeSeconds)) : 0;
+    const movingStatusRaw = movingStatus === undefined ? null : String(movingStatus || "").trim().toUpperCase();
+    const movingStatusValue = ["FAST", "SLOW", "DEAD", "SEASONAL"].includes(movingStatusRaw) ? movingStatusRaw : null;
+    const isSeasonalValue = typeof isSeasonal === "boolean" ? isSeasonal : false;
+    const movingStatusInsert = isSeasonalValue ? "SEASONAL" : (movingStatusValue || "SLOW");
     const result = await pool.query(
-      `insert into items (code, name, part_no, type, unit, model, weight, cycle, safety_stock, pack_qty, order_lot_size, max_delivery_per_rit)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      `insert into items (
+         code, name, part_no, type, unit, model, weight, price, vendor_id, location_id, location_name, line_production,
+         image_url, image_thumb_url, cycle, shelf_life_days, shelf_life_months, moving_status, is_seasonal, type_pack,
+         safety_stock, pack_qty, lead_time_days, cycle_time_seconds, order_lot_size, max_delivery_per_rit
+       )
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
        on conflict (code) do update set
          name = excluded.name,
          part_no = excluded.part_no,
@@ -18119,9 +19613,23 @@ app.post("/api/items", authenticate, requireManageItems, async (req, res) => {
          unit = excluded.unit,
          model = excluded.model,
          weight = excluded.weight,
+         price = excluded.price,
+         vendor_id = excluded.vendor_id,
+         location_id = excluded.location_id,
+         location_name = excluded.location_name,
+         line_production = excluded.line_production,
+         image_url = excluded.image_url,
+         image_thumb_url = excluded.image_thumb_url,
          cycle = excluded.cycle,
+         shelf_life_days = excluded.shelf_life_days,
+         shelf_life_months = excluded.shelf_life_months,
+         moving_status = excluded.moving_status,
+         is_seasonal = excluded.is_seasonal,
+         type_pack = excluded.type_pack,
          safety_stock = excluded.safety_stock,
          pack_qty = excluded.pack_qty,
+         lead_time_days = excluded.lead_time_days,
+         cycle_time_seconds = excluded.cycle_time_seconds,
          order_lot_size = excluded.order_lot_size,
          max_delivery_per_rit = excluded.max_delivery_per_rit
        returning *`,
@@ -18132,10 +19640,24 @@ app.post("/api/items", authenticate, requireManageItems, async (req, res) => {
         type,
         unit,
         model || null,
-        weight || null,
+        Number.isFinite(weightValue) ? weightValue : null,
+        Number.isFinite(priceValue) ? priceValue : null,
+        vendorId || null,
+        locationId || null,
+        locationName || null,
+        lineProduction || null,
+        imageUrl || null,
+        imageThumbUrl || null,
         cycle || null,
+        Number.isFinite(shelfLifeValue) ? shelfLifeValue : null,
+        Number.isFinite(shelfLifeMonthsValue) ? shelfLifeMonthsValue : null,
+        movingStatusInsert,
+        isSeasonalValue,
+        typePack || null,
         safetyValue,
         packQtyValue,
+        leadTimeValue,
+        cycleTimeValue,
         Number.isFinite(orderLotValue) ? Math.max(0, orderLotValue) : 0,
         Number.isFinite(maxDeliveryValue) ? Math.max(0, maxDeliveryValue) : 0,
       ],
@@ -18259,6 +19781,8 @@ app.get("/api/bom/headers/:id", authenticate, requireMasterRead, async (req, res
         b.yield_factor,
         b.position_code,
         b.substitute_material_codes,
+        b.process_code,
+        b.consumption_basis,
         b.component_description,
         ci.name as child_name,
         ci.type as child_type,
@@ -18417,9 +19941,12 @@ app.get("/api/bom", authenticate, requireMasterRead, async (req, res) => {
         b.yield_factor,
         b.position_code,
         b.substitute_material_codes,
+        b.process_code,
+        b.consumption_basis,
         b.component_type,
         b.component_description,
         b.model_spec,
+        b.location_name,
         b.line_production,
         b.supplier_name,
         b.packing,
@@ -18472,9 +19999,12 @@ app.get("/api/bom/:parentCode", authenticate, requireMasterRead, async (req, res
         b.yield_factor,
         b.position_code,
         b.substitute_material_codes,
+        b.process_code,
+        b.consumption_basis,
         b.component_type,
         b.component_description,
         b.model_spec,
+        b.location_name,
         b.line_production,
         b.supplier_name,
         b.packing,
@@ -18523,11 +20053,14 @@ app.post("/api/bom", authenticate, requireManageMaster, async (req, res) => {
       componentType = "",
       componentDescription = "",
       modelSpec = "",
+      locationName = "",
       lineProduction = "",
       supplierName = "",
       packing = "",
       assemblyNote = "",
       positionCode = "",
+      processCode = "",
+      consumptionBasis = "",
       cycleTimeSeconds = null,
       processFlow = [],
       processRouting = [],
@@ -18595,9 +20128,12 @@ app.post("/api/bom", authenticate, requireManageMaster, async (req, res) => {
         yield_factor,
         position_code,
         substitute_material_codes,
+        process_code,
+        consumption_basis,
         component_type,
         component_description,
         model_spec,
+        location_name,
         line_production,
         supplier_name,
         packing,
@@ -18607,7 +20143,7 @@ app.post("/api/bom", authenticate, requireManageMaster, async (req, res) => {
         cost_rp,
         lead_time_days,
         assembly_note
-      ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+      ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
       returning *
       `,
       [
@@ -18619,9 +20155,12 @@ app.post("/api/bom", authenticate, requireManageMaster, async (req, res) => {
         yieldFactor,
         String(positionCode || "").trim() || null,
         JSON.stringify(substituteCodes),
+        String(processCode || "").trim() || null,
+        String(consumptionBasis || "").trim() || null,
         componentType,
         componentDescription,
         modelSpec,
+        locationName,
         lineProduction,
         supplierName,
         packing,
@@ -18663,6 +20202,8 @@ app.put("/api/bom/:id", authenticate, requireManageMaster, async (req, res) => {
       packing = "",
       assemblyNote = "",
       positionCode = "",
+      processCode = "",
+      consumptionBasis = "",
       cycleTimeSeconds = null,
       processFlow = [],
       processRouting = [],
@@ -18744,19 +20285,22 @@ app.put("/api/bom/:id", authenticate, requireManageMaster, async (req, res) => {
         yield_factor = $6,
         position_code = $7,
         substitute_material_codes = $8,
-        component_type = $9,
-        component_description = $10,
-        model_spec = $11,
-        line_production = $12,
-        supplier_name = $13,
-        packing = $14,
-        cycle_time_seconds = $15,
-        process_flow = $16,
-        process_routing = $17,
-        cost_rp = $18,
-        lead_time_days = $19,
-        assembly_note = $20
-      where id = $21
+        process_code = $9,
+        consumption_basis = $10,
+      component_type = $11,
+      component_description = $12,
+      model_spec = $13,
+      location_name = $14,
+      line_production = $15,
+      supplier_name = $16,
+      packing = $17,
+      cycle_time_seconds = $18,
+      process_flow = $19,
+      process_routing = $20,
+      cost_rp = $21,
+      lead_time_days = $22,
+      assembly_note = $23
+      where id = $24
       returning *
       `,
       [
@@ -18768,9 +20312,12 @@ app.put("/api/bom/:id", authenticate, requireManageMaster, async (req, res) => {
         yieldFactor,
         String(positionCode || "").trim() || null,
         JSON.stringify(substituteCodes),
+        String(processCode || "").trim() || null,
+        String(consumptionBasis || "").trim() || null,
         componentType,
         componentDescription,
         modelSpec,
+        locationName,
         lineProduction,
         supplierName,
         packing,

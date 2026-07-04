@@ -160,18 +160,9 @@ const TabPrl = (props) => {
     if (Number(row.suggestedQty || 0) > 0) return 'bg-amber-50 text-amber-900 font-semibold';
     return 'bg-slate-50 text-slate-900';
   };
-  const getSourceLabel = (row) => {
-    const sourceType = String(row.sourceType || '').trim().toLowerCase();
-    if (sourceType === 'kanban_request') return 'Source: Kanban';
-    if (sourceType === 'prl') return 'Source: PRL Released';
-    if (sourceType === 'manual' || !sourceType) return 'Source: Manual';
-    return `Source: ${sourceType}`;
-  };
-  const getReleaseMetaLabel = (row) => {
-    if (!row.approvedAt) return '';
-    const byLabel = row.approvedByName ? ` by ${row.approvedByName}` : '';
-    const dateLabel = new Date(row.approvedAt).toLocaleString('id-ID');
-    return `Released${byLabel} at ${dateLabel}`;
+  const getModelCodeLabel = (row) => {
+    const modelLabel = formatModelCodes(masterModelsMap, row.modelCodes) || row.model || '-';
+    return String(modelLabel).split(' - ')[0] || '-';
   };
 
   return (
@@ -562,34 +553,13 @@ const TabPrl = (props) => {
                         <td className="p-2 whitespace-nowrap">{row.partNo}</td>
                         <td className="p-2 whitespace-nowrap">
                           <div>{row.description}</div>
-                          {Number(row.suggestedQty || 0) > 0 && (
-                            <div className="mt-1 flex flex-wrap items-center gap-1 text-[10px]">
-                              <span className="px-1.5 py-0.5 rounded-full border border-amber-200 bg-amber-50 text-amber-700 font-semibold">
-                                {String(row.sourceRef || '').startsWith('KANBAN-STOCK-GAP:') ? 'KANBAN AUTO' : 'SHORTAGE'}
-                              </span>
-                              <span className="px-1.5 py-0.5 rounded-full border border-slate-200 bg-slate-50 text-slate-600">
-                                Suggested {formatNumber0(row.suggestedQty)}
-                              </span>
-                              {row.dueDate && (
-                                <span className="px-1.5 py-0.5 rounded-full border border-rose-200 bg-rose-50 text-rose-700">
-                                  Due {row.dueDate}
-                                </span>
-                              )}
-                            </div>
-                          )}
-                          <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] text-slate-500">
-                            <span>{getSourceLabel(row)}</span>
-                            {getReleaseMetaLabel(row) && (
-                              <span>{getReleaseMetaLabel(row)}</span>
-                            )}
-                          </div>
                         </td>
                           <td className="p-2 whitespace-nowrap">
-                            {formatModelCodes(masterModelsMap, row.modelCodes) || row.model || '-'}
+                            {getModelCodeLabel(row)}
                           </td>
                         <td className="p-2 whitespace-nowrap">{formatNumber0(row.qtyPerKanban)}</td>
                         <td className="p-2 whitespace-nowrap">{row.uom}</td>
-                        <td className="p-2 whitespace-nowrap">{packingNameByCode.get(getPrlTypePack(row)) || getPrlTypePack(row) || '-'}</td>
+                        <td className="p-2 whitespace-nowrap">{row.typePackName || packingNameByCode.get(getPrlTypePack(row)) || getPrlTypePack(row) || '-'}</td>
                         <td className="p-2 whitespace-nowrap">{formatNumber2(getPrlVolPerDay(row))}</td>
                         {prlMonthKeys.map((month) => (
                           <td

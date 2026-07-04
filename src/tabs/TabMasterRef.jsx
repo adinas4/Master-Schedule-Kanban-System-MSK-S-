@@ -196,6 +196,178 @@ const TabMasterRef = (props) => {
     const normalized = getStandardLocationType(value);
     return normalized === 'Production Line' || normalized === 'Work Center';
   };
+  const buildLocationLabel = (location) => {
+    if (!location) return '';
+    const locationId = String(location.id || '').trim();
+    const locationType = getStandardLocationType(location.line_description || location.lineDescription) || String(location.category || location.type || '').trim();
+    const fifoLane = String(location.fifo_lane || location.fifoLane || '').trim();
+    return [locationId, locationType, fifoLane].filter(Boolean).join(' - ');
+  };
+  const buildWarehouseLabel = (warehouse) => {
+    if (!warehouse) return '';
+    const warehouseId = String(warehouse.id || '').trim();
+    const warehouseName = String(warehouse.name || '').trim();
+    return [warehouseId, warehouseName].filter(Boolean).join(' - ');
+  };
+  const standardUnitOptions = [
+    'PCS',
+    'BOX',
+    'PACK',
+    'SET',
+    'UNIT',
+    'KG',
+    'GR',
+    'G',
+    'M',
+    'MTR',
+    'CM',
+    'MM',
+    'L',
+    'LTR',
+    'ML',
+    'M2',
+    'M3',
+    'ROLL',
+    'BUNDLE',
+    'PAIR',
+    'DOZ',
+  ];
+  const itemWarehouseOptions = useMemo(() => {
+    const seen = new Set();
+    return (masterWarehouses || [])
+      .map((warehouse) => {
+        const value = String(warehouse.id || '').trim();
+        return {
+          value,
+          label: buildWarehouseLabel(warehouse),
+          warehouse,
+        };
+      })
+      .filter((option) => {
+        if (!option.value || seen.has(option.value)) return false;
+        seen.add(option.value);
+        return true;
+      });
+  }, [masterWarehouses]);
+  const itemProcessOptions = useMemo(() => {
+    const seen = new Set();
+    return (masterProcesses || [])
+      .map((process) => {
+        const value = String(process.code || '').trim();
+        return {
+          value,
+          label: [String(process.code || '').trim(), String(process.name || '').trim()].filter(Boolean).join(' - '),
+          process,
+        };
+      })
+      .filter((option) => {
+        if (!option.value || seen.has(option.value)) return false;
+        seen.add(option.value);
+        return true;
+      });
+  }, [masterProcesses]);
+  const getItemCategoryCode = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '-';
+    const matched = (masterCategories || []).find((category) => (
+      String(category.code || '').trim().toLowerCase() === raw.toLowerCase()
+      || String(category.name || '').trim().toLowerCase() === raw.toLowerCase()
+    ));
+    if (matched) return String(matched.code || '').trim();
+    const lowered = raw.toLowerCase();
+    const matchedByKeyword = (masterCategories || []).find((category) => {
+      const code = String(category.code || '').trim().toLowerCase();
+      const name = String(category.name || '').trim().toLowerCase();
+      return (
+        (lowered.includes('raw') && (code.includes('raw') || name.includes('raw'))) ||
+        (lowered.includes('indirect') && (code.includes('indirect') || name.includes('indirect'))) ||
+        (lowered.includes('consum') && (code.includes('consum') || name.includes('consum'))) ||
+        (lowered.includes('subcon') && (code.includes('subcon') || name.includes('subcon'))) ||
+        (lowered.includes('child') && (code.includes('child') || name.includes('child'))) ||
+        (lowered.includes('sub assy') && (code.includes('sub') || name.includes('sub'))) ||
+        (lowered.includes('subassy') && (code.includes('sub') || name.includes('sub'))) ||
+        (lowered.includes('fin') && (code.includes('fg') || name.includes('finish') || name.includes('fg')))
+      );
+    });
+    return matchedByKeyword ? String(matchedByKeyword.code || '').trim() : raw;
+  };
+  const getItemPackingCode = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '-';
+    const matched = (masterPackings || []).find((packing) => (
+      String(packing.code || '').trim().toLowerCase() === raw.toLowerCase()
+      || String(packing.name || '').trim().toLowerCase() === raw.toLowerCase()
+    ));
+    return matched ? String(matched.code || '').trim() : raw;
+  };
+  const itemProcessRoutingRows = useMemo(() => {
+    const rows = Array.isArray(itemMasterForm?.processRouting) && itemMasterForm.processRouting.length > 0
+      ? itemMasterForm.processRouting
+      : [{
+        processCode: '',
+        processName: '',
+        workCenter: '',
+        processType: '',
+        appliesToLevel: 'All',
+        sequence: 1,
+        cycleTimeSeconds: '',
+      }];
+    return rows;
+  }, [itemMasterForm?.processRouting]);
+  const updateItemProcessRoutingRow = (rowIndex, patch) => {
+    setItemMasterForm((prev) => {
+      const nextRows = Array.isArray(prev.processRouting) ? [...prev.processRouting] : [];
+      while (nextRows.length <= rowIndex) {
+        nextRows.push({
+          processCode: '',
+          processName: '',
+          workCenter: '',
+          processType: '',
+          appliesToLevel: 'All',
+          sequence: nextRows.length + 1,
+          cycleTimeSeconds: '',
+        });
+      }
+      nextRows[rowIndex] = { ...nextRows[rowIndex], ...patch };
+      return { ...prev, processRouting: nextRows };
+    });
+  };
+  const addItemProcessRoutingRow = () => {
+    setItemMasterForm((prev) => ({
+      ...prev,
+      processRouting: [
+        ...(Array.isArray(prev.processRouting) ? prev.processRouting : []),
+        {
+          processCode: '',
+          processName: '',
+          workCenter: '',
+          processType: '',
+          appliesToLevel: 'All',
+          sequence: (Array.isArray(prev.processRouting) ? prev.processRouting.length : 0) + 1,
+          cycleTimeSeconds: '',
+        },
+      ],
+    }));
+  };
+  const removeItemProcessRoutingRow = (rowIndex) => {
+    setItemMasterForm((prev) => {
+      const nextRows = (Array.isArray(prev.processRouting) ? prev.processRouting : []).filter((_, index) => index !== rowIndex);
+      return { ...prev, processRouting: nextRows };
+    });
+  };
+  const handleItemProcessRoutingChange = (rowIndex, value) => {
+    const processCode = String(value || '').trim();
+    const matchedProcess = (masterProcesses || []).find((process) => String(process.code || '').trim() === processCode) || null;
+    const currentRow = Array.isArray(itemMasterForm?.processRouting) ? itemMasterForm.processRouting[rowIndex] : null;
+    updateItemProcessRoutingRow(rowIndex, {
+      processCode,
+      processName: matchedProcess?.name || processCode,
+      workCenter: String(matchedProcess?.work_center || '').trim(),
+      processType: String(matchedProcess?.process_type || '').trim(),
+      appliesToLevel: String(matchedProcess?.applies_to_level || 'All').trim() || 'All',
+      cycleTimeSeconds: String(currentRow?.cycleTimeSeconds || '').trim() || String(matchedProcess?.standard_time ?? ''),
+    });
+  };
 
   const processTypeOptions = useMemo(() => {
     const defaults = ['Subcon', 'Assembly', 'Machining', 'Welding', 'Painting', 'Inspection', 'Packing', 'Other'];
@@ -215,7 +387,7 @@ const TabMasterRef = (props) => {
         const labelParts = [locationId, inferredType, fifoLane].filter(Boolean);
         return {
           value: locationId,
-          label: labelParts.join(' • '),
+          label: labelParts.join(' - '),
           isProcessType: isProcessLocationType(lineDescription),
         };
       })
@@ -325,7 +497,7 @@ const TabMasterRef = (props) => {
   };
 
   const allowMasterEdit = !!canManageMaster;
-  const allowVendorEdit = !!canManageVendors;
+  const allowVendorEdit = !!(canManageVendors || canManageMaster);
   const [vendorSearch, setVendorSearch] = useState('');
 
   useEffect(() => {
@@ -1710,7 +1882,7 @@ const TabMasterRef = (props) => {
                     {allowItemEdit && (
                       <button
                         onClick={() => {
-                          setItemMasterForm({ code: '', name: '', partNo: '', type: 'Raw Material', unit: 'PCS', typePack: '', packQty: '', orderLotSize: '', maxDeliveryPerRit: '', shelfLifeMonths: '', isSeasonal: false, suppliers: [], customers: [], modelCodes: [], weight: '', price: '', vendorId: '', locationId: '', imageUrl: '', imageThumbUrl: '', shelfLifeDays: '' });
+                          setItemMasterForm({ code: '', name: '', partNo: '', type: 'Raw Material', unit: 'PCS', typePack: '', packQty: '', orderLotSize: '', maxDeliveryPerRit: '', isSeasonal: false, suppliers: [], customers: [], modelCodes: [], weight: '', locationId: '', locationName: '', lineProduction: '', processRouting: [], leadTimeDays: '', cycleTimeSeconds: '', imageUrl: '', imageThumbUrl: '', shelfLifeDays: '' });
                           setItemModelEntry('');
                           setItemImageError('');
                           setItemImageUploading(false);
@@ -1803,11 +1975,19 @@ const TabMasterRef = (props) => {
                           <option key={category} value={category}>{category}</option>
                         ))}
                       </select>
-                      <input className="border rounded px-3 py-2" placeholder="Unit" value={itemMasterForm.unit} onChange={(e) => setItemMasterForm({ ...itemMasterForm, unit: e.target.value })} />
+                      <select className="border rounded px-3 py-2" value={itemMasterForm.unit || ''} onChange={(e) => setItemMasterForm({ ...itemMasterForm, unit: e.target.value })}>
+                        <option value="">Pilih Unit</option>
+                        {String(itemMasterForm.unit || '').trim() && !standardUnitOptions.includes(String(itemMasterForm.unit || '').trim()) && (
+                          <option value={String(itemMasterForm.unit || '').trim()}>{String(itemMasterForm.unit || '').trim()}</option>
+                        )}
+                        {standardUnitOptions.map((unit) => (
+                          <option key={unit} value={unit}>{unit}</option>
+                        ))}
+                      </select>
                       <select className="border rounded px-3 py-2" value={itemMasterForm.typePack} onChange={(e) => setItemMasterForm({ ...itemMasterForm, typePack: e.target.value })}>
                         <option value="">Pilih Type Pack</option>
                         {masterPackings.map((packing) => (
-                          <option key={packing.code} value={packing.code}>{packing.code} - {packing.name}</option>
+                          <option key={packing.code} value={packing.code}>{packing.code}</option>
                         ))}
                       </select>
                       <input
@@ -1831,6 +2011,115 @@ const TabMasterRef = (props) => {
                         value={itemMasterForm.maxDeliveryPerRit || ''}
                         onChange={(e) => setItemMasterForm({ ...itemMasterForm, maxDeliveryPerRit: e.target.value })}
                       />
+                      <input
+                        type="number"
+                        className="border rounded px-3 py-2"
+                        placeholder="Berat Part (Kg)"
+                        value={itemMasterForm.weight || ''}
+                        onChange={(e) => setItemMasterForm({ ...itemMasterForm, weight: e.target.value })}
+                      />
+                      <select
+                        className="border rounded px-3 py-2"
+                        value={itemMasterForm.locationId || ''}
+                        onChange={(e) => {
+                          const nextLocationId = e.target.value;
+                          const selectedWarehouse = (masterWarehouses || []).find((warehouse) => String(warehouse.id || '').trim() === nextLocationId);
+                          const nextLocationName = selectedWarehouse ? buildWarehouseLabel(selectedWarehouse) : '';
+                          setItemMasterForm((prev) => ({
+                            ...prev,
+                            locationId: nextLocationId,
+                            locationName: nextLocationName,
+                          }));
+                        }}
+                      >
+                        <option value="">Pilih Master Ord Warehouse</option>
+                        {itemWarehouseOptions.map((option) => (
+                          <option key={`item-location-${option.value}`} value={option.value}>
+                            {option.label || option.value}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        className="border rounded px-3 py-2"
+                        value={itemMasterForm.lineProduction || ''}
+                        onChange={(e) => setItemMasterForm({ ...itemMasterForm, lineProduction: e.target.value })}
+                      >
+                        <option value="">Pilih Line Produksi / Work Center</option>
+                        {processWorkCenterOptions.map((option) => (
+                          <option key={`item-process-${option.value}`} value={option.value}>
+                            {option.label || option.value}
+                          </option>
+                        ))}
+                      </select>
+                      <div className="md:col-span-3 rounded border border-slate-200 bg-slate-50 p-3 space-y-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <div className="text-[11px] font-semibold text-slate-700">Routing Proses</div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={addItemProcessRoutingRow}
+                            className="px-2 py-1 rounded border text-[10px] inline-flex items-center gap-1 bg-white hover:bg-slate-50"
+                          >
+                            <Plus size={12} />
+                            <span>Tambah Proses</span>
+                          </button>
+                        </div>
+                        <div className="space-y-2">
+                          {itemProcessRoutingRows.map((row, index) => (
+                            <div key={`item-routing-${index}`} className="grid grid-cols-1 md:grid-cols-12 gap-2 items-center">
+                              <div className="md:col-span-7">
+                                <select
+                                  className="border rounded px-3 py-2 w-full"
+                                  value={row.processCode || ''}
+                                  onChange={(e) => handleItemProcessRoutingChange(index, e.target.value)}
+                                >
+                                  <option value="">Pilih Process</option>
+                                  {itemProcessOptions.map((option) => (
+                                    <option key={`item-routing-opt-${index}-${option.value}`} value={option.value}>
+                                      {option.label || option.value}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                              <div className="md:col-span-4">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  className="border rounded px-3 py-2 w-full"
+                                  placeholder="Cycle Time (s)"
+                                  value={row.cycleTimeSeconds || ''}
+                                  onChange={(e) => updateItemProcessRoutingRow(index, { cycleTimeSeconds: e.target.value })}
+                                />
+                              </div>
+                              <div className="md:col-span-1 flex md:justify-end">
+                                <button
+                                  type="button"
+                                  onClick={() => removeItemProcessRoutingRow(index)}
+                                  className="px-2 py-1 rounded border text-[10px] inline-flex items-center gap-1 bg-white hover:bg-rose-50 text-rose-600"
+                                >
+                                  <Trash2 size={12} />
+                                  <span>Hapus</span>
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                      <input
+                        type="number"
+                        className="border rounded px-3 py-2"
+                        placeholder="Lead Time (hari)"
+                        value={itemMasterForm.leadTimeDays || ''}
+                        onChange={(e) => setItemMasterForm({ ...itemMasterForm, leadTimeDays: e.target.value })}
+                      />
+                      <input
+                        type="number"
+                        className="border rounded px-3 py-2"
+                        placeholder="Shelf Life (hari)"
+                        value={itemMasterForm.shelfLifeDays || ''}
+                        onChange={(e) => setItemMasterForm({ ...itemMasterForm, shelfLifeDays: e.target.value })}
+                      />
                       <label className="border rounded px-3 py-2 flex items-center gap-2 text-[11px] font-semibold text-slate-600">
                         <input
                           type="checkbox"
@@ -1845,7 +2134,7 @@ const TabMasterRef = (props) => {
                             {itemMasterForm.modelCodes?.length ? (
                               itemMasterForm.modelCodes.map((code) => (
                               <span key={`model-chip-${code}`} className="text-[10px] flex items-center gap-1 bg-slate-100 px-2 py-0.5 rounded-full border border-slate-200">
-                                <span>{code}</span>
+                                <span>{code}{masterModelsMap.get(code)?.name ? ` - ${masterModelsMap.get(code).name}` : ''}</span>
                                   <button
                                     type="button"
                                     onClick={() => removeModelCodeFromItemForm(code)}
@@ -1869,7 +2158,7 @@ const TabMasterRef = (props) => {
                               <option value="">Pilih kode model</option>
                               {masterModels.map((model) => (
                                 <option key={`item-model-opt-${model.code}`} value={model.code}>
-                                  {model.code}
+                                  {model.code}{model.name ? ` - ${model.name}` : ''}
                                 </option>
                               ))}
                             </select>
@@ -1937,13 +2226,6 @@ const TabMasterRef = (props) => {
                             </div>
                           )}
                         </div>
-                      <input
-                        type="number"
-                        className="border rounded px-3 py-2"
-                        placeholder="Shelf Life (bulan)"
-                        value={itemMasterForm.shelfLifeMonths || ''}
-                        onChange={(e) => setItemMasterForm({ ...itemMasterForm, shelfLifeMonths: e.target.value })}
-                      />
                     </div>
                     <div className="border rounded p-3 text-xs mb-4">
                       <div className="flex items-center justify-between">
@@ -1990,7 +2272,7 @@ const TabMasterRef = (props) => {
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs mb-4">
                       <div className="border rounded p-3">
                         <div className="flex items-center justify-between mb-2">
-                          <div className="font-semibold text-slate-700">Suppliers</div>
+                          <div className="font-semibold text-slate-700">Supplier</div>
                           <button
                             type="button"
                             onClick={() => setItemMasterForm({ ...itemMasterForm, suppliers: [...(itemMasterForm.suppliers || []), { vendorId: '', sharePercent: '' }] })}
@@ -2017,7 +2299,7 @@ const TabMasterRef = (props) => {
                               >
                                 <option value="">Pilih Supplier</option>
                                 {masterVendors.map((vendor) => (
-                                  <option key={vendor.id} value={vendor.id}>{vendor.id}</option>
+                                  <option key={vendor.id} value={vendor.id}>{vendor.id}{vendor.name ? ` - ${vendor.name}` : ''}</option>
                                 ))}
                               </select>
                               <input
@@ -2076,7 +2358,7 @@ const TabMasterRef = (props) => {
                               >
                                 <option value="">Pilih Customer</option>
                                 {masterCustomers.map((customer) => (
-                                  <option key={customer.id} value={customer.id}>{customer.id}</option>
+                                  <option key={customer.id} value={customer.id}>{customer.id}{customer.name ? ` - ${customer.name}` : ''}</option>
                                 ))}
                               </select>
                               <input
@@ -2142,16 +2424,17 @@ const TabMasterRef = (props) => {
                       <th className="text-left p-2">Category</th>
                       <th className="text-left p-2">Unit</th>
                       <th className="text-left p-2">Type Pack</th>
+                      <th className="text-left p-2">Location</th>
                       <th className="text-left p-2">SNP</th>
-                      <th className="text-left p-2">Suppliers</th>
+                      <th className="text-left p-2">Supplier</th>
                       <th className="text-left p-2">Customers</th>
                       <th className="text-left p-2">Model</th>
                       <th className="text-left p-2">Moving Status</th>
-                      <th className="text-left p-2">Shelf Life</th>
+                      <th className="text-left p-2">Shelf Life (hari)</th>
                       <th className="text-left p-2">Actions</th>
                     </tr>
                     <tr className="bg-white text-[10px] text-slate-500">
-                      <th className="p-1 text-left" colSpan={14}>
+                      <th className="p-1 text-left" colSpan={15}>
                         <label className="inline-flex items-center gap-2">
                           <input
                             type="checkbox"
@@ -2219,6 +2502,18 @@ const TabMasterRef = (props) => {
                           <option value="">All</option>
                           {masterPackings.map((packing) => (
                             <option key={packing.code} value={packing.code}>{packing.code} - {packing.name}</option>
+                          ))}
+                        </select>
+                      </th>
+                      <th className="p-1">
+                        <select
+                          className="border rounded px-2 py-1 w-full"
+                          value={localItemFilters.location}
+                          onChange={(e) => setLocalItemFilters({ ...localItemFilters, location: e.target.value })}
+                        >
+                          <option value="">All</option>
+                          {itemWarehouseOptions.map((warehouse) => (
+                            <option key={warehouse.value} value={warehouse.value}>{warehouse.value}</option>
                           ))}
                         </select>
                       </th>
@@ -2309,37 +2604,44 @@ const TabMasterRef = (props) => {
                               )}
                             </div>
                           </td>
-                          <td className="p-2">
-                            <div className="flex items-center gap-1">
-                              <span>{item.part_no || item.partNo || '-'}</span>
+                          <td className="p-2 max-w-[180px] whitespace-normal break-words align-top">
+                            <div className="flex items-start gap-1">
+                              <span className="block whitespace-normal break-all">{item.part_no || item.partNo || '-'}</span>
                               {isPartDuplicate && (
                                 <Flag size={12} className="text-red-500" title="Duplicate Detected" />
                               )}
                             </div>
                           </td>
                           <td className="p-2 max-w-[240px] truncate">{item.name}</td>
-                          <td className="p-2">{categoryNameByCode.get(item.type) || item.type || '-'}</td>
-                          <td className="p-2">{item.unit}</td>
-                          <td className="p-2">{packingNameByCode.get(item.type_pack) || item.type_pack || '-'}</td>
+                          <td className="p-2">{getItemCategoryCode(item.type)}</td>
+                          <td className="p-2">{item.unit || '-'}</td>
+                          <td className="p-2">{getItemPackingCode(item.type_pack)}</td>
+                          <td className="p-2">{item.location_id || '-'}</td>
                           <td className="p-2 text-right">{item.pack_qty ?? '-'}</td>
                           <td className="p-2">{formatRelationList(itemSupplierMap.get(item.code) || [], 'vendorId', 'vendorId')}</td>
                           <td className="p-2">{formatRelationList(itemCustomerMap.get(item.code) || [], 'customerId', 'customerId')}</td>
                           <td className="p-2">
-                            {formatModelCodes(masterModelsMap, item.modelCodes) || item.model || '-'}
+                            {formatModelCodes(masterModelsMap, item.modelCodes || parseModelCodes(item.model || '')) || item.model || '-'}
                           </td>
                           <td className="p-2">
                             <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold ${movingBadgeClass}`}>
                               {movingLabel}
                             </span>
                           </td>
-                          <td className="p-2">{item.shelf_life_months ?? item.shelf_life_days ?? '-'}</td>
+                          <td className="p-2">{item.shelf_life_days ?? (item.shelf_life_months ? Math.round(Number(item.shelf_life_months) * 30) : '-')}</td>
                           <td className="p-2">
                             {allowItemEdit ? (
                               <div className="flex items-center gap-2">
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setItemMasterForm({
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const itemLineProductionValue = String(item.line_production || '').trim();
+                                      const matchedItemProcess = (masterProcesses || []).find((process) => {
+                                        const processCode = String(process.code || '').trim();
+                                        const workCenter = String(process.work_center || process.workCenter || '').trim();
+                                        return processCode === itemLineProductionValue || workCenter === itemLineProductionValue;
+                                      }) || null;
+                                      setItemMasterForm({
                                       code: item.code,
                                       name: item.name,
                                       partNo: item.part_no || item.partNo || '',
@@ -2349,18 +2651,54 @@ const TabMasterRef = (props) => {
                                       packQty: String(item.pack_qty ?? ''),
                                       orderLotSize: String(item.order_lot_size ?? ''),
                                       maxDeliveryPerRit: String(item.max_delivery_per_rit ?? ''),
-                                      shelfLifeMonths: String(item.shelf_life_months ?? ''),
                                       isSeasonal: !!(item.is_seasonal || item.isSeasonal),
                                       suppliers: itemSupplierMap.get(item.code) || [],
                                       customers: itemCustomerMap.get(item.code) || [],
                                       modelCodes: parseModelCodes(item.model || ''),
                                       weight: item.weight || '',
-                                      price: item.price || '',
-                                      vendorId: item.vendor_id || '',
                                       locationId: item.location_id || '',
+                                      locationName: item.location_name || buildWarehouseLabel((masterWarehouses || []).find((warehouse) => String(warehouse.id || '').trim() === String(item.location_id || '').trim())) || '',
+                                      lineProduction: matchedItemProcess?.work_center || itemLineProductionValue || '',
+                                      processRouting: Array.isArray(item.process_routing) && item.process_routing.length > 0
+                                        ? item.process_routing.map((step, index) => ({
+                                          processCode: String(step.code || step.processCode || '').trim(),
+                                          processName: String(step.name || step.processName || '').trim(),
+                                          workCenter: String(step.workCenter || step.work_center || '').trim(),
+                                          processType: String(step.processType || step.process_type || '').trim(),
+                                          appliesToLevel: String(step.appliesToLevel || step.applies_to_level || 'All').trim() || 'All',
+                                          sequence: Number.parseInt(String(step.sequence ?? index + 1), 10) || index + 1,
+                                          cycleTimeSeconds: String(step.standardTime ?? step.standard_time ?? ''),
+                                        }))
+                                        : Array.isArray(item.process_flow) && item.process_flow.length > 0
+                                          ? item.process_flow.map((step, index) => {
+                                            const processCode = String(step || '').trim();
+                                            const matchedProcess = (masterProcesses || []).find((process) => String(process.code || '').trim() === processCode) || null;
+                                            return {
+                                              processCode,
+                                              processName: matchedProcess?.name || processCode,
+                                              workCenter: String(matchedProcess?.work_center || '').trim(),
+                                              processType: String(matchedProcess?.process_type || '').trim(),
+                                              appliesToLevel: String(matchedProcess?.applies_to_level || 'All').trim() || 'All',
+                                              sequence: index + 1,
+                                          cycleTimeSeconds: String(matchedProcess?.standard_time ?? item.cycle_time_seconds ?? ''),
+                                            };
+                                          })
+                                          : (item.line_production || item.cycle_time_seconds)
+                                            ? [{
+                                              processCode: matchedItemProcess?.code || itemLineProductionValue,
+                                              processName: matchedItemProcess?.name || itemLineProductionValue,
+                                              workCenter: matchedItemProcess?.work_center || itemLineProductionValue,
+                                              processType: '',
+                                              appliesToLevel: 'All',
+                                              sequence: 1,
+                                              cycleTimeSeconds: String(item.cycle_time_seconds ?? ''),
+                                            }]
+                                            : [],
+                                      leadTimeDays: String(item.lead_time_days ?? ''),
+                                      cycleTimeSeconds: String(item.cycle_time_seconds ?? ''),
                                       imageUrl: item.image_url || '',
                                       imageThumbUrl: item.image_thumb_url || '',
-                                      shelfLifeDays: String(item.shelf_life_days ?? ''),
+                                      shelfLifeDays: String(item.shelf_life_days ?? (item.shelf_life_months ? Math.round(Number(item.shelf_life_months) * 30) : '')),
                                     });
                                     setItemModelEntry('');
                                     setItemImageError('');

@@ -213,6 +213,8 @@ const TabInbound = (props) => {
   const [poLineMap, setPoLineMap] = useState({});
   const [poLineLoading, setPoLineLoading] = useState({});
   const [poDetailRemainingOnly, setPoDetailRemainingOnly] = useState(false);
+  const [poExportLoading, setPoExportLoading] = useState(false);
+  const [poPrintLoading, setPoPrintLoading] = useState(false);
   const [poSearch, setPoSearch] = useState('');
   const [poTotal, setPoTotal] = useState(0);
   const initialPoMonthRange = useMemo(() => getCurrentMonthRange(), []);
@@ -222,6 +224,7 @@ const TabInbound = (props) => {
   const [poPerPage, setPoPerPage] = useState(20);
   const [poTotalPages, setPoTotalPages] = useState(1);
   const poImportRef = useRef(null);
+  const poActionRef = useRef(null);
   const poSelectAllRef = useRef(null);
   const [inboundActionOpen, setInboundActionOpen] = useState(false);
   const inboundActionRef = useRef(null);
@@ -253,6 +256,7 @@ const TabInbound = (props) => {
   const [scrollbarWidth, setScrollbarWidth] = useState(0);
   const [listSize, setListSize] = useState({ height: 520, width: 0 });
   const [actionMenuId, setActionMenuId] = useState(null);
+  const [poActionOpen, setPoActionOpen] = useState(false);
   const rowHeight = 120;
   const overscan = 6;
   const scheduleRowOptions = useMemo(() => [20, 50, 100], []);
@@ -379,12 +383,14 @@ const TabInbound = (props) => {
       if (event.target.closest('[data-action-menu]')) return;
       if (event.target.closest('[data-po-lookup]')) return;
       setActionMenuId(null);
+      setPoActionOpen(false);
       setInboundActionOpen(false);
       setPoLookupOpen(false);
     };
     const handleKeyDown = (event) => {
       if (event.key === 'Escape') {
         setActionMenuId(null);
+        setPoActionOpen(false);
         setInboundActionOpen(false);
         setPoLookupOpen(false);
       }
@@ -1647,7 +1653,221 @@ const TabInbound = (props) => {
     XLSX.writeFile(wb, 'Template_Master_PO.xlsx');
   };
 
-  const resolvePoStatusMeta = (value) => {
+  const escapeHtml = (value) => String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+  const buildMasterPoExportRows = useCallback(async () => {
+    const summaryRows = Array.isArray(poRows) ? poRows : [];
+    const detailCache = new Map();
+    const getPoDetailLines = async (poNumber) => {
+      const normalized = String(poNumber || '').trim();
+      if (!normalized) return [];
+      if (detailCache.has(normalized)) return detailCache.get(normalized);
+      const cachedLines = Array.isArray(poLineMap?.[normalized]) ? poLineMap[normalized] : null;
+      if (cachedLines) {
+        detailCache.set(normalized, cachedLines);
+        return cachedLines;
+      }
+      const response = await apiFetch(`/api/po/${encodeURIComponent(normalized)}`);
+      const lines = Array.isArray(response?.lines)
+        ? response.lines
+        : Array.isArray(response?.items)
+          ? response.items
+          : [];
+      detailCache.set(normalized, lines);
+      return lines;
+    };
+
+    const rows = [];
+    for (const summaryRow of summaryRows) {
+      const poNumber = String(summaryRow.po_number || '').trim();
+      const detailLines = await getPoDetailLines(poNumber);
+      const scheduleStatusMeta = resolvePoScheduleStatusMeta(summaryRow);
+      const statusMeta = resolvePoStatusMeta(summaryRow.status);
+      const totalOrder = Number(summaryRow.total_qty_order || 0);
+      const totalReceived = Number(summaryRow.total_qty_received || 0);
+      const totalRemaining = Math.max(0, totalOrder - totalReceived);
+      if (detailLines.length === 0) {
+        rows.push({
+          'No': rows.length + 1,
+          'PO Number': poNumber,
+          'Tanggal PO': summaryRow.po_date ? formatDateID(summaryRow.po_date) : '',
+          'Supplier': resolveSupplierLabel(summaryRow),
+          'Status PO': statusMeta.label,
+          'Status Jadwal': scheduleStatusMeta.label,
+          'Kode Item': '',
+          'Nama Barang': '',
+          'Qty/Kanban': '',
+          'Qty Order': '',
+          'Qty Received': '',
+          'Sisa': '',
+          'Status Item': '',
+        });
+        continue;
+      }
+      detailLines.forEach((line) => {
+        const qtyOrderLine = Number(line.qty_order || 0);
+        const qtyReceivedLine = Number(line.qty_received || 0);
+        const remainingLine = Number.isFinite(Number(line.qty_remaining))
+          ? Number(line.qty_remaining)
+          : Math.max(0, qtyOrderLine - qtyReceivedLine);
+        rows.push({
+          'No': rows.length + 1,
+          'PO Number': poNumber,
+          'Tanggal PO': summaryRow.po_date ? formatDateID(summaryRow.po_date) : '',
+          'Supplier': resolveSupplierLabel(summaryRow),
+          'Status PO': statusMeta.label,
+          'Status Jadwal': scheduleStatusMeta.label,
+          'Kode Item': line.item_code || line.itemCode || '',
+          'Nama Barang': line.item_name || line.itemName || '',
+          'Qty/Kanban': Number(line.qty_per_kanban ?? line.qtyPerKanban ?? line.pack_qty ?? 0),
+          'Qty Order': qtyOrderLine,
+          'Qty Received': qtyReceivedLine,
+          'Sisa': remainingLine,
+          'Status Item': resolvePoLineStatus(line).label,
+        });
+      });
+      rows.push({
+        'No': '',
+        'PO Number': `${poNumber} TOTAL`,
+        'Tanggal PO': '',
+        'Supplier': '',
+        'Status PO': '',
+        'Status Jadwal': '',
+        'Kode Item': '',
+        'Nama Barang': '',
+        'Qty/Kanban': '',
+        'Qty Order': totalOrder,
+        'Qty Received': totalReceived,
+        'Sisa': totalRemaining,
+        'Status Item': '',
+      });
+    }
+    return rows;
+  }, [apiFetch, formatDateID, poLineMap, poRows, resolvePoLineStatus, resolvePoScheduleStatusMeta, resolvePoStatusMeta, resolveSupplierLabel]);
+
+  const handleExportMasterPoExcel = async () => {
+    if (!canManagePo) {
+      if (showToastMessage) showToastMessage('Anda tidak memiliki akses export Master PO.', '', null, 'error');
+      return;
+    }
+    setPoExportLoading(true);
+    try {
+      const XLSX = await ensureXlsx();
+      if (!XLSX) return;
+      const rows = await buildMasterPoExportRows();
+      if (rows.length === 0) {
+        alert('Data kosong!');
+        return;
+      }
+      const ws = XLSX.utils.json_to_sheet(rows);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Master PO');
+      XLSX.writeFile(wb, `Master_PO_${new Date().toISOString().slice(0, 10)}.xlsx`);
+    } catch (error) {
+      alert(`Gagal export Master PO: ${error.message || 'Unknown error'}`);
+    } finally {
+      setPoExportLoading(false);
+    }
+  };
+
+  const handlePrintMasterPo = async () => {
+    if (!canManagePo) {
+      if (showToastMessage) showToastMessage('Anda tidak memiliki akses print Master PO.', '', null, 'error');
+      return;
+    }
+    setPoPrintLoading(true);
+    try {
+      const rows = await buildMasterPoExportRows();
+      if (rows.length === 0) {
+        alert('Data kosong!');
+        return;
+      }
+      const printWindow = window.open('', '_blank', 'noopener,noreferrer,width=1280,height=900');
+      if (!printWindow) {
+        alert('Popup print diblokir browser.');
+        return;
+      }
+      const nowLabel = new Date().toLocaleString('id-ID');
+      const tableRows = rows.map((row) => `
+        <tr class="${String(row['PO Number'] || '').endsWith(' TOTAL') ? 'total-row' : ''}">
+          <td>${escapeHtml(row.No)}</td>
+          <td>${escapeHtml(row['PO Number'])}</td>
+          <td>${escapeHtml(row['Tanggal PO'])}</td>
+          <td>${escapeHtml(row.Supplier)}</td>
+          <td>${escapeHtml(row['Status PO'])}</td>
+          <td>${escapeHtml(row['Status Jadwal'])}</td>
+          <td>${escapeHtml(row['Kode Item'])}</td>
+          <td>${escapeHtml(row['Nama Barang'])}</td>
+          <td class="num">${escapeHtml(formatNumber0 ? formatNumber0(row['Qty/Kanban']) : row['Qty/Kanban'])}</td>
+          <td class="num">${escapeHtml(formatNumber0 ? formatNumber0(row['Qty Order']) : row['Qty Order'])}</td>
+          <td class="num">${escapeHtml(formatNumber0 ? formatNumber0(row['Qty Received']) : row['Qty Received'])}</td>
+          <td class="num">${escapeHtml(formatNumber0 ? formatNumber0(row['Sisa']) : row['Sisa'])}</td>
+          <td>${escapeHtml(row['Status Item'])}</td>
+        </tr>
+      `).join('');
+      printWindow.document.open();
+      printWindow.document.write(`
+        <html>
+          <head>
+            <title>Master PO</title>
+            <style>
+              @page { size: landscape; margin: 12mm; }
+              body { font-family: Arial, sans-serif; color: #0f172a; margin: 0; padding: 20px; }
+              h1 { margin: 0 0 6px; font-size: 20px; }
+              .meta { margin-bottom: 14px; color: #475569; font-size: 12px; }
+              table { width: 100%; border-collapse: collapse; font-size: 10px; }
+              th, td { border: 1px solid #cbd5e1; padding: 6px 8px; vertical-align: top; }
+              th { background: #f8fafc; text-align: left; }
+              td.num, th.num { text-align: right; }
+              .total-row td { background: #eff6ff; font-weight: 700; }
+            </style>
+          </head>
+          <body>
+            <h1>Master PO</h1>
+            <div class="meta">Dicetak: ${escapeHtml(nowLabel)} | Total baris: ${rows.length}</div>
+            <table>
+              <thead>
+                <tr>
+                  <th>No</th>
+                  <th>PO Number</th>
+                  <th>Tanggal PO</th>
+                  <th>Supplier</th>
+                  <th>Status PO</th>
+                  <th>Status Jadwal</th>
+                  <th>Kode Item</th>
+                  <th>Nama Barang</th>
+                  <th class="num">Qty/Kanban</th>
+                  <th class="num">Qty Order</th>
+                  <th class="num">Qty Received</th>
+                  <th class="num">Sisa</th>
+                  <th>Status Item</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${tableRows}
+              </tbody>
+            </table>
+          </body>
+        </html>
+      `);
+      printWindow.document.close();
+      printWindow.focus();
+      setTimeout(() => {
+        printWindow.print();
+      }, 250);
+    } catch (error) {
+      alert(`Gagal print Master PO: ${error.message || 'Unknown error'}`);
+    } finally {
+      setPoPrintLoading(false);
+    }
+  };
+
+  function resolvePoStatusMeta(value) {
     const normalized = String(value || '').trim().toLowerCase();
     if (normalized === 'closed') {
       return { label: 'PO CLOSED', className: 'border-emerald-200 bg-emerald-50 text-emerald-700', dot: 'bg-emerald-500' };
@@ -1659,9 +1879,9 @@ const TabInbound = (props) => {
       return { label: 'PO OPEN', className: 'border-sky-200 bg-sky-50 text-sky-700', dot: 'bg-sky-500' };
     }
     return { label: 'PO UNKNOWN', className: 'border-slate-200 bg-slate-100 text-slate-600', dot: 'bg-slate-400' };
-  };
+  }
 
-  const resolvePoScheduleStatusMeta = (row) => {
+  function resolvePoScheduleStatusMeta(row) {
     const totalOrder = Number(row?.total_qty_order || 0);
     const totalReceived = Number(row?.total_qty_received || 0);
     const remaining = totalOrder - totalReceived;
@@ -1678,7 +1898,7 @@ const TabInbound = (props) => {
       return { label: 'DIJADWALKAN SEBAGIAN', className: 'border-amber-200 bg-amber-50 text-amber-700', dot: 'bg-amber-500' };
     }
     return { label: 'FULL DIJADWALKAN', className: 'border-emerald-200 bg-emerald-50 text-emerald-700', dot: 'bg-emerald-500' };
-  };
+  }
 
   const resolveScheduleStatusMeta = (value) => {
     const normalized = String(value || '').trim().toLowerCase();
@@ -1900,6 +2120,7 @@ const TabInbound = (props) => {
                                      />
                                    </th>
                                    <th className="p-3 text-left">Item</th>
+                                   <th className="p-3 text-right">Qty/Kbn</th>
                                    <th className="p-3 text-right">Qty Order</th>
                                    <th className="p-3 text-right">Qty Received</th>
                                    <th className="p-3 text-right">Sisa</th>
@@ -1911,6 +2132,7 @@ const TabInbound = (props) => {
                                      const qtyOrder = Number(line.qty_order || line.qtyOrder || 0);
                                      const qtyReceived = Number(line.qty_received || line.qtyReceived || 0);
                                      const remaining = resolveLineQty(line);
+                                     const qtyPerKanban = Number(line.qty_per_kanban ?? line.qtyPerKanban ?? line.pack_qty ?? 0);
                                      const statusMeta = resolvePoLineStatus(line);
                                      const itemCode = line.item_code || line.itemCode || '-';
                                      const itemName = line.item_name || line.itemName || '';
@@ -1934,7 +2156,9 @@ const TabInbound = (props) => {
                                          <td className="p-3 text-slate-700">
                                            <div className="font-semibold">{itemCode}</div>
                                            {itemName && <div className="text-[11px] text-slate-500">{itemName}</div>}
+                                           <div className="mt-1 text-[11px] text-slate-500">Qty/Kbn: {formatNumber0 ? formatNumber0(qtyPerKanban) : qtyPerKanban}</div>
                                          </td>
+                                         <td className="p-3 text-right text-slate-600">{formatNumber0 ? formatNumber0(qtyPerKanban) : qtyPerKanban}</td>
                                          <td className="p-3 text-right text-slate-600">{formatNumber0 ? formatNumber0(qtyOrder) : qtyOrder}</td>
                                          <td className="p-3 text-right text-slate-600">{formatNumber0 ? formatNumber0(qtyReceived) : qtyReceived}</td>
                                          <td className="p-3 text-right text-slate-600">{formatNumber0 ? formatNumber0(remaining) : remaining}</td>
@@ -2974,30 +3198,76 @@ const TabInbound = (props) => {
                           <Plus size={16} />
                           Tambah PO Manual
                         </button>
-                        <button
-                          type="button"
-                          onClick={handleDownloadPoTemplate}
-                          className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50"
-                        >
-                          <Download size={16} />
-                          Download Template
-                        </button>
-                        <input
-                          type="file"
-                          accept=".xlsx,.xls"
-                          className="hidden"
-                          ref={poImportRef}
-                          onChange={handleImportPoExcel}
-                        />
-                        <button
-                          type="button"
-                          onClick={() => poImportRef.current?.click()}
-                          className="inline-flex items-center gap-2 rounded-2xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white shadow-lg transition hover:bg-slate-800 disabled:opacity-60"
-                          disabled={poImporting}
-                        >
-                          <FileSpreadsheet size={16} />
-                          {poImporting ? 'Mengimpor...' : 'Import Excel'}
-                        </button>
+                        <div className="relative" data-action-menu ref={poActionRef}>
+                          <button
+                            type="button"
+                            onClick={() => setPoActionOpen((prev) => !prev)}
+                            className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50"
+                            aria-expanded={poActionOpen}
+                          >
+                            <MoreVertical size={16} />
+                            Aksi Master PO
+                            <ChevronDown size={14} />
+                          </button>
+                          <input
+                            type="file"
+                            accept=".xlsx,.xls"
+                            className="hidden"
+                            ref={poImportRef}
+                            onChange={handleImportPoExcel}
+                          />
+                          {poActionOpen && (
+                            <div className="absolute right-0 mt-2 w-64 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl z-50 text-sm">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  handleDownloadPoTemplate();
+                                  setPoActionOpen(false);
+                                }}
+                                className="w-full px-4 py-3 text-left hover:bg-slate-50 text-slate-700 flex items-center gap-2"
+                              >
+                                <Download size={16} />
+                                Download Template
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  poImportRef.current?.click();
+                                  setPoActionOpen(false);
+                                }}
+                                className="w-full px-4 py-3 text-left hover:bg-slate-50 text-slate-700 flex items-center gap-2"
+                                disabled={poImporting}
+                              >
+                                <FileSpreadsheet size={16} />
+                                {poImporting ? 'Mengimpor...' : 'Import Excel'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  handlePrintMasterPo();
+                                  setPoActionOpen(false);
+                                }}
+                                className="w-full px-4 py-3 text-left hover:bg-slate-50 text-slate-700 flex items-center gap-2 disabled:opacity-60"
+                                disabled={poPrintLoading}
+                              >
+                                <Printer size={16} />
+                                {poPrintLoading ? 'Mencetak...' : 'Print Master PO'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  handleExportMasterPoExcel();
+                                  setPoActionOpen(false);
+                                }}
+                                className="w-full px-4 py-3 text-left hover:bg-slate-50 text-slate-700 flex items-center gap-2 disabled:opacity-60"
+                                disabled={poExportLoading}
+                              >
+                                <Download size={16} />
+                                {poExportLoading ? 'Mengekspor...' : 'Export Master PO'}
+                              </button>
+                            </div>
+                          )}
+                        </div>
                       </>
                     )}
                   </div>
@@ -3308,6 +3578,7 @@ const TabInbound = (props) => {
                                             <thead className="bg-slate-50 text-slate-500 uppercase tracking-wide">
                                               <tr>
                                                 <th className="p-3 text-left">Kode Item / Nama Barang</th>
+                                                <th className="p-3 text-right">Qty/Kanban</th>
                                                 <th className="p-3 text-right">Qty Order</th>
                                                 <th className="p-3 text-right">Qty Received</th>
                                                 <th className="p-3 text-right">Sisa</th>
@@ -3325,7 +3596,7 @@ const TabInbound = (props) => {
                                                 if (detailLines.length === 0) {
                                                   return (
                                                     <tr>
-                                                      <td colSpan={6} className="p-4 text-center text-slate-400">Tidak ada item dengan sisa.</td>
+                                                      <td colSpan={7} className="p-4 text-center text-slate-400">Tidak ada item dengan sisa.</td>
                                                     </tr>
                                                   );
                                                 }
@@ -3333,6 +3604,7 @@ const TabInbound = (props) => {
                                                   const qtyOrderLine = Number(line.qty_order || 0);
                                                   const qtyReceivedLine = Number(line.qty_received || 0);
                                                   const remainingLine = qtyOrderLine - qtyReceivedLine;
+                                                  const qtyPerKanbanLine = Number(line.qty_per_kanban ?? line.qtyPerKanban ?? line.pack_qty ?? 0);
                                                   const lineStatus = resolvePoLineStatus(line);
                                                   const itemCode = line.item_code || line.itemCode || '-';
                                                   const itemName = line.item_name || line.itemName || '';
@@ -3342,6 +3614,7 @@ const TabInbound = (props) => {
                                                         <div className="font-semibold">{itemCode}</div>
                                                         {itemName && <div className="text-[11px] text-slate-500">{itemName}</div>}
                                                       </td>
+                                                      <td className="p-3 text-right text-slate-600">{formatNumber0 ? formatNumber0(qtyPerKanbanLine) : qtyPerKanbanLine}</td>
                                                       <td className="p-3 text-right text-slate-600">{formatNumber0 ? formatNumber0(qtyOrderLine) : qtyOrderLine}</td>
                                                       <td className="p-3 text-right text-slate-600">{formatNumber0 ? formatNumber0(qtyReceivedLine) : qtyReceivedLine}</td>
                                                       <td className="p-3 text-right text-slate-600">{formatNumber0 ? formatNumber0(remainingLine) : remainingLine}</td>
@@ -3384,7 +3657,7 @@ const TabInbound = (props) => {
                 </div>
 
                 <div className="mt-3 text-[11px] text-slate-500">
-                  Format Excel: `No. PO`, `Tanggal PO (Format: DD-MM-YYYY)`, `Kode Supplier`, `Kode Item`, `Qty Order`.
+                  Export Master PO menampilkan detail item termasuk `Qty/Kanban`.
                 </div>
                 <div className="mt-4 flex flex-col gap-3 border-t border-slate-100 pt-4 text-sm text-slate-600 md:flex-row md:items-center md:justify-between">
                   <div className="flex flex-wrap items-center gap-2">

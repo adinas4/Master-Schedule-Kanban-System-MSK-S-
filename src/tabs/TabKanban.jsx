@@ -52,6 +52,7 @@ const TabKanban = (props) => {
     apiFetch,
     batchForm,
     buildKanbanId,
+    buildKanbanDisplayId,
     canImportExport,
     canEditSchedules,
     canDeleteRecords,
@@ -85,6 +86,7 @@ const TabKanban = (props) => {
     getCategoryLabel,
     getKanbanCardsLabel,
     getRequestIdLabel,
+    handleApproveKanban,
     handleApproveAndCreateDn,
     handleBatchSubmit,
     handleCreateDn,
@@ -97,7 +99,6 @@ const TabKanban = (props) => {
     handleDnPreview,
     handleDnPrintPdf,
     handleEmptyKanbanSubmit,
-    handleLoadSampleScan,
     handleManualRequest,
     handleProcessScan,
     handleReceive,
@@ -135,10 +136,14 @@ const TabKanban = (props) => {
     masterAreas,
     masterDeliveries,
     masterCategories,
+    masterItems,
     masterItemsByCode,
+    masterLocations,
     masterLocationsById,
     masterPlants,
     masterVendors,
+    masterWarehouses,
+    user,
     openDnDetailModal,
     openDnModal,
     openKanbanShortageInPrl,
@@ -221,13 +226,31 @@ const TabKanban = (props) => {
     showToastMessage,
   } = props;
 
+  const getDisplayPrlQty = (row) => row?.effective_prl_qty ?? row?.prl_month_qty;
+  const isProductionUser = String(user?.role || '').trim().toLowerCase() === 'production';
+  const kanbanBoardTabs = isProductionUser
+    ? [
+      { key: 'empty', label: 'Kanban Kosong' },
+      { key: 'scan', label: 'Scan QR' },
+    ]
+    : [
+      { key: 'dashboard', label: 'Dashboard' },
+      { key: 'items', label: 'Kanban Items' },
+      { key: 'requests', label: 'Requests' },
+      { key: 'dn', label: 'DN Register' },
+      { key: 'receiving', label: 'Receiving Notes' },
+      { key: 'empty', label: 'Kanban Kosong' },
+      { key: 'scan', label: 'Scan QR' },
+      canProduction ? { key: 'production', label: 'Produksi' } : null,
+    ].filter(Boolean);
+
   const emptyLogRef = useRef(null);
   const [emptyScrollTop, setEmptyScrollTop] = useState(0);
   const [emptyListSize, setEmptyListSize] = useState({ height: 320, width: 0 });
   const emptyRowHeight = 44;
   const emptyOverscan = 6;
   const emptyLogGrid = useMemo(
-    () => '160px 140px minmax(220px, 1.6fr) 140px 120px 120px 140px 120px',
+    () => '160px 140px minmax(220px, 1.6fr) 140px 120px 120px 140px 180px',
     [],
   );
   const emptyLogRows = useMemo(() => kanbanEmptyPaginationMeta.rows || [], [kanbanEmptyPaginationMeta.rows]);
@@ -246,7 +269,7 @@ const TabKanban = (props) => {
   const requestQuickFilterOptions = useMemo(() => ([
     { value: 'all', label: 'Semua' },
     { value: 'overdue', label: 'Overdue' },
-    { value: 'blocked', label: 'Blocked' },
+    { value: 'blocked', label: 'Over PRL' },
     { value: 'stock-gap', label: 'Stock Gap' },
   ]), []);
   const [localKanbanSearch, setLocalKanbanSearch] = useState(kanbanSearch || '');
@@ -309,27 +332,41 @@ const TabKanban = (props) => {
   );
   const resolveKanbanDashboardCategory = (row) => {
     const masterItem = masterItemsByCode.get(row?.item_code);
-    const rawValue = String(row?.item_type || masterItem?.type || masterItem?.category || '').trim().toLowerCase();
+    const rawText = String(row?.item_type || masterItem?.type || masterItem?.category || '').trim();
+    const rawValue = rawText.toLowerCase();
     if (!rawValue) return 'unknown';
+    const masterCategory = (masterCategories || []).find((category) => {
+      const code = String(category?.code || '').trim().toLowerCase();
+      const name = String(category?.name || '').trim().toLowerCase();
+      return rawValue === code || rawValue === name;
+    });
+    if (masterCategory?.code) return String(masterCategory.code).trim().toLowerCase();
     if (rawValue.includes('raw')) return 'raw';
     if (rawValue.includes('indirect')) return 'indirect';
     if (rawValue.includes('consum')) return 'consumable';
     if (rawValue.includes('subcon')) return 'subcon';
     if (rawValue.includes('sub assy') || rawValue.includes('subassy') || rawValue === 'sa') return 'subassy';
     if (rawValue.includes('child part') || rawValue === 'cp' || rawValue.startsWith('cp')) return 'cp';
-    if (rawValue.includes('fg') || rawValue.includes('finish')) return 'fg';
     return rawValue;
   };
-  const kanbanDashboardCategoryOptions = useMemo(() => ([
-    { value: 'all', label: 'Semua Kategori' },
-    { value: 'fg', label: 'FG / Finished Goods' },
-    { value: 'subassy', label: 'Sub-Assy' },
-    { value: 'cp', label: 'Child Part' },
-    { value: 'raw', label: 'Raw Material' },
-    { value: 'indirect', label: 'Indirect Material' },
-    { value: 'consumable', label: 'Consumable' },
-    { value: 'subcon', label: 'Subcon' },
-  ]), []);
+  const kanbanDashboardCategoryOptions = useMemo(() => {
+    const masterOptions = (masterCategories || [])
+      .map((category) => {
+        const code = String(category?.code || '').trim();
+        const name = String(category?.name || '').trim();
+        if (!code && !name) return null;
+        return { value: (code || name).toLowerCase(), label: [code, name].filter(Boolean).join(' - ') };
+      })
+      .filter(Boolean);
+    if (masterOptions.length > 0) return [{ value: 'all', label: 'Semua Kategori' }, ...masterOptions];
+    return [
+      { value: 'all', label: 'Semua Kategori' },
+      { value: 'raw', label: 'Raw Material' },
+      { value: 'indirect', label: 'Indirect Material' },
+      { value: 'consumable', label: 'Consumable' },
+      { value: 'subcon', label: 'Subcon' },
+    ];
+  }, [masterCategories]);
   const kanbanDashboardCategoryCounts = useMemo(() => (
     kanbanActiveRows.reduce((acc, row) => {
       const key = resolveKanbanDashboardCategory(row);
@@ -362,7 +399,7 @@ const TabKanban = (props) => {
       if (statusKey === 'approved') summary.approved += 1;
       if (['dn_created', 'scheduled', 'in_transit'].includes(statusKey)) summary.inFlow += 1;
       if (statusKey === 'receiving') summary.receiving += 1;
-      if (health.isBlocked) summary.blocked += 1;
+      if (health.isOverPrl) summary.blocked += 1;
       if (health.isOverdue) summary.overdue += 1;
       if (health.ageHours >= summary.oldestAge) {
         summary.oldestAge = health.ageHours;
@@ -380,7 +417,7 @@ const TabKanban = (props) => {
     return {
       ...meta,
       count: rows.length,
-      blocked: enrichedRows.filter((entry) => entry.health.isBlocked).length,
+      blocked: enrichedRows.filter((entry) => entry.health.isOverPrl).length,
       overdue: enrichedRows.filter((entry) => entry.health.isOverdue).length,
       topRows: enrichedRows.slice(0, 3),
       oldestLabel: oldest ? `${getRequestIdLabel(oldest.row)} • ${formatRequestAging(oldest.health.ageHours)}` : '-',
@@ -413,7 +450,7 @@ const TabKanban = (props) => {
     kanbanRequests.reduce((acc, row) => {
       const health = getKanbanRequestHealth(row);
       if (health.isOverdue) acc.overdue += 1;
-      if (health.isBlocked) acc.blocked += 1;
+      if (health.isOverPrl) acc.blocked += 1;
       if (health.hasStockGap) acc.stockGap += 1;
       return acc;
     }, { overdue: 0, blocked: 0, stockGap: 0 })
@@ -430,7 +467,7 @@ const TabKanban = (props) => {
       }
       acc[itemCode].open += 1;
       if (health.isOverdue) acc[itemCode].overdue += 1;
-      if (health.isBlocked) acc[itemCode].blocked += 1;
+      if (health.isOverPrl) acc[itemCode].blocked += 1;
       if (health.hasStockGap) acc[itemCode].stockGap += 1;
       return acc;
     }, {})
@@ -440,7 +477,7 @@ const TabKanban = (props) => {
     const metrics = kanbanRequestHealthByItem[itemCode] || { open: 0, overdue: 0, blocked: 0, stockGap: 0 };
     const masterItem = masterItemsByCode.get(itemCode);
     const stock = Number(fifoTotalsByItemCode.get(itemCode) ?? 0);
-    const min = Number(masterItem?.safety_stock ?? 0);
+    const min = Number(row?.min_qty ?? masterItem?.safety_stock ?? 0);
     const lot = Math.max(0, Number(row?.lot_qty ?? 0));
     const yellowThreshold = min + (lot > 0 ? lot : Math.max(1, Math.ceil(min * 0.25)));
     if (metrics.overdue > 0 || metrics.stockGap > 0 || (min > 0 && stock < min)) {
@@ -462,7 +499,7 @@ const TabKanban = (props) => {
         level: 'yellow',
         label: 'Andon Yellow',
         note: metrics.blocked > 0
-          ? `${metrics.blocked} blocked request`
+          ? `${metrics.blocked} over PRL request`
           : metrics.open > 0
             ? `${metrics.open} open request`
             : 'Stock approaching minimum',
@@ -535,6 +572,134 @@ const TabKanban = (props) => {
     () => resolveScheduleRowsForSupplier(dnForm?.supplier),
     [dnForm?.supplier, masterVendors],
   );
+  const masterItemOptions = useMemo(
+    () => (Array.isArray(masterItems) ? masterItems : []).filter((item) => item?.code),
+    [masterItems],
+  );
+  const masterVendorOptions = useMemo(
+    () => (Array.isArray(masterVendors) ? masterVendors : []).filter((vendor) => vendor?.id || vendor?.name),
+    [masterVendors],
+  );
+  const deliveryNoteVendorOptions = useMemo(() => {
+    const rows = masterVendorOptions.filter((vendor) => String(vendor.role || '').trim().toLowerCase() === 'delivery note');
+    return rows.length > 0 ? rows : masterVendorOptions;
+  }, [masterVendorOptions]);
+  const dropZoneOptions = useMemo(() => {
+    const rows = [];
+    const seen = new Set();
+    const addOption = (value, label, source) => {
+      const key = String(value || '').trim();
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      rows.push({ value: key, label: label || key, source });
+    };
+    (Array.isArray(masterLocations) ? masterLocations : Array.from(masterLocationsById?.values?.() || [])).forEach((location) => {
+      addOption(location.id, `${location.id}${location.category ? ` - ${location.category}` : ''}`, 'Location');
+    });
+    (Array.isArray(masterAreas) ? masterAreas : []).forEach((area) => {
+      addOption(area.id, `${area.id}${area.name ? ` - ${area.name}` : ''}`, 'Area');
+    });
+    (Array.isArray(masterDeliveries) ? masterDeliveries : []).forEach((delivery) => {
+      addOption(delivery.id, `${delivery.id}${delivery.area_id ? ` - ${delivery.area_id}` : ''}`, 'Delivery');
+    });
+    (Array.isArray(masterWarehouses) ? masterWarehouses : []).forEach((warehouse) => {
+      addOption(warehouse.id, `${warehouse.id}${warehouse.name ? ` - ${warehouse.name}` : ''}`, 'Warehouse');
+    });
+    return rows;
+  }, [masterLocations, masterLocationsById, masterAreas, masterDeliveries, masterWarehouses]);
+  const allVendorScheduleOptions = useMemo(() => {
+    const rows = [];
+    masterVendorOptions.forEach((vendor) => {
+      buildVendorScheduleRows(vendor).forEach((scheduleRow, index) => {
+        const time = String(scheduleRow.time || '').trim();
+        if (!time) return;
+        const vendorLabel = vendor.name || vendor.id || 'Vendor';
+        const detail = [
+          scheduleRow.rit ? `Rit ${scheduleRow.rit}` : '',
+          scheduleRow.cycle || '',
+        ].filter(Boolean).join(' - ');
+        rows.push({
+          key: `${vendor.id || vendor.name}-${index}-${time}`,
+          value: time,
+          label: `${time} - ${vendorLabel}${detail ? ` (${detail})` : ''}`,
+        });
+      });
+    });
+    return rows;
+  }, [masterVendorOptions]);
+  const parseCycleParts = (value) => {
+    const parts = String(value || '')
+      .split(/[-\/x×,;\s]+/i)
+      .map((part) => Number(String(part || '').trim()))
+      .filter((num) => Number.isFinite(num) && num > 0);
+    return {
+      x: parts[0] || '',
+      y: parts[1] || '',
+      z: parts[2] || '',
+    };
+  };
+  const resolveVendorCycleDefaults = (supplierValue) => {
+    const supplierText = String(supplierValue || '').trim().toLowerCase();
+    if (!supplierText) return { x: '1', y: '4', z: '4' };
+    const vendor = (masterVendors || []).find((row) => (
+      String(row?.id || '').trim().toLowerCase() === supplierText
+      || String(row?.name || '').trim().toLowerCase() === supplierText
+    ));
+    const rows = vendor ? buildVendorScheduleRows(vendor) : [];
+    const withCycle = rows.find((row) => String(row?.cycle || '').trim());
+    const parsed = parseCycleParts(withCycle?.cycle || vendor?.cycle);
+    return {
+      x: String(parsed.x || 1),
+      y: String(parsed.y || 4),
+      z: String(parsed.z || 4),
+    };
+  };
+  const syncKanbanSettingFromItem = (itemCode) => {
+    const item = masterItemsByCode.get(itemCode);
+    const itemSetting = kanbanSettingsByCode.get(itemCode);
+    const lotQty = itemSetting?.lot_qty ?? item?.pack_qty ?? item?.packQty ?? item?.order_lot_size ?? item?.orderLotSize ?? '';
+    const defaultSupplier = itemSetting?.default_supplier ?? item?.vendor_id ?? item?.supplier_name ?? item?.supplierName ?? '';
+    const vendorCycle = resolveVendorCycleDefaults(defaultSupplier);
+    setKanbanSettingsForm((prev) => ({
+      ...prev,
+      itemCode,
+      minQty: itemSetting?.min_qty ?? item?.safety_stock ?? item?.safetyStock ?? '',
+      maxQty: itemSetting?.max_qty ?? '',
+      lotQty,
+      leadTimeDays: itemSetting?.lead_time_days ?? item?.lead_time_days ?? item?.leadTimeDays ?? '',
+      safetyFactor: itemSetting?.safety_factor ?? '',
+      regularKanban: itemSetting?.regular_kanban ?? '2',
+      safetyHours: itemSetting?.safety_hours ?? '48',
+      workHours: itemSetting?.work_hours ?? '24',
+      cycleX: itemSetting?.cycle_x ?? vendorCycle.x,
+      cycleY: itemSetting?.cycle_y ?? vendorCycle.y,
+      cycleZ: itemSetting?.cycle_z ?? vendorCycle.z,
+      defaultSupplier,
+      dropZone: itemSetting?.drop_zone ?? item?.location_id ?? item?.line_production ?? item?.location_name ?? '',
+    }));
+    const categoryValue = item?.type || itemSetting?.item_type || '';
+    if (categoryValue) setKanbanCategory(categoryValue);
+  };
+  const syncManualRequestFromItem = (itemCode, kanbanIdValue = '') => {
+    const setting = kanbanSettingsByCode.get(itemCode);
+    const requestQty = Number(setting?.lot_qty || setting?.min_qty || 0);
+    const onHand = Number(fifoTotalsByItemCode.get(itemCode) ?? 0);
+    setManualRequestForm((prev) => ({
+      ...prev,
+      itemCode,
+      kanbanId: kanbanIdValue || prev.kanbanId,
+      onHand: String(onHand),
+      requestQty: requestQty > 0 ? String(requestQty) : prev.requestQty,
+    }));
+  };
+  const handleManualKanbanSelect = (value) => {
+    const selected = kanbanSettings.find((row) => buildKanbanDisplayId(row.item_code, row.item_type, row) === value);
+    if (selected?.item_code) {
+      syncManualRequestFromItem(selected.item_code, value);
+      return;
+    }
+    setManualRequestForm((prev) => ({ ...prev, kanbanId: value }));
+  };
 
   const handleDnSupplierChange = (value) => {
     const scheduleRows = resolveScheduleRowsForSupplier(value);
@@ -842,6 +1007,10 @@ const TabKanban = (props) => {
   const [selectedRnDetail, setSelectedRnDetail] = useState(null);
   const [showRnPrintModal, setShowRnPrintModal] = useState(false);
   const [rnPrintPayload, setRnPrintPayload] = useState(null);
+  const [qrSimulationLoading, setQrSimulationLoading] = useState(false);
+  const [qrSimulationError, setQrSimulationError] = useState('');
+  const [qrSimulationResult, setQrSimulationResult] = useState(null);
+  const [qrSimulationRefreshNonce, setQrSimulationRefreshNonce] = useState(0);
 
   useEffect(() => {
     if (typeof document === 'undefined') return undefined;
@@ -873,6 +1042,44 @@ const TabKanban = (props) => {
   useEffect(() => {
     setLocalProductionCompareCode(productionCompareCode || '');
   }, [productionCompareCode]);
+
+  useEffect(() => {
+    if (!showQrModal || !qrPayload) {
+      setQrSimulationLoading(false);
+      setQrSimulationError('');
+      setQrSimulationResult(null);
+      return undefined;
+    }
+    let cancelled = false;
+    const run = async () => {
+      setQrSimulationLoading(true);
+      setQrSimulationError('');
+      try {
+        const data = await apiFetch('/api/kanban/scan-preview', {
+          method: 'POST',
+          body: JSON.stringify({
+            kanbanId: qrPayload,
+          }),
+        });
+        if (!cancelled) {
+          setQrSimulationResult(data || null);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setQrSimulationResult(null);
+          setQrSimulationError(error.message || 'Gagal memuat simulasi QR.');
+        }
+      } finally {
+        if (!cancelled) {
+          setQrSimulationLoading(false);
+        }
+      }
+    };
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [apiFetch, qrPayload, showQrModal, qrSimulationRefreshNonce]);
 
   const buildProductionUniqLabel = (itemCode, partNo) => {
     const code = String(itemCode || '').trim();
@@ -2441,7 +2648,7 @@ const TabKanban = (props) => {
                           <div className="text-[8pt] font-semibold">PT MRP</div>
                         </div>
                         <div className="flex items-center justify-center">
-                          <QRCodeCanvas value={card.secondaryQrValue} size={48} />
+                          <QRCodeSVG value={card.secondaryQrValue} size={48} />
                         </div>
                       </div>
 
@@ -2512,7 +2719,7 @@ const TabKanban = (props) => {
                           </div>
                           <div className="p-1 flex flex-col items-center justify-center">
                             <div className="text-[7pt] font-semibold uppercase">QR</div>
-                            <QRCodeCanvas value={card.mainQrValue} size={90} />
+                            <QRCodeSVG value={card.mainQrValue} size={90} />
                           </div>
                         </div>
                       </div>
@@ -2539,6 +2746,7 @@ const TabKanban = (props) => {
   const [masterToolsOpen, setMasterToolsOpen] = useState(false);
   const [masterSearch, setMasterSearch] = useState('');
   const [kanbanSyncLoading, setKanbanSyncLoading] = useState(false);
+  const [kanbanItemVisibleLimit, setKanbanItemVisibleLimit] = useState(75);
   const [showMissingKanbanPanel, setShowMissingKanbanPanel] = useState(false);
   const [missingKanbanSearch, setMissingKanbanSearch] = useState('');
   const [missingKanbanCategoryFilter, setMissingKanbanCategoryFilter] = useState('all');
@@ -2572,6 +2780,14 @@ const TabKanban = (props) => {
         || dropZone.includes(query);
     });
   }, [kanbanSettings, masterSearch]);
+  const visibleKanbanBoardItems = useMemo(
+    () => filteredKanbanItems.slice(0, kanbanItemVisibleLimit),
+    [filteredKanbanItems, kanbanItemVisibleLimit],
+  );
+
+  useEffect(() => {
+    setKanbanItemVisibleLimit(75);
+  }, [kanbanSearch, kanbanCategoryFilter]);
 
   const missingKanbanItems = useMemo(() => {
     const existingCodes = new Set((kanbanSettings || []).map((row) => String(row.item_code || '').trim()).filter(Boolean));
@@ -2593,7 +2809,6 @@ const TabKanban = (props) => {
       .filter((category) => category.code || category.name);
     if (options.length > 0) return options;
     return [
-      { code: 'FG', name: 'Finished Goods' },
       { code: 'CP', name: 'Child Part' },
       { code: 'SA', name: 'Sub-Assy' },
       { code: 'RM', name: 'Raw Material' },
@@ -2845,9 +3060,46 @@ const TabKanban = (props) => {
   const scanActionType = String(scanActiveResult?.actionType || '').trim();
   const scanActionLabel = scanActiveResult?.actionLabel || '-';
   const scanActionHint = scanActiveResult?.actionHint || '-';
+  const scanPrlPlan = scanActiveResult?.prlPlan || null;
+  const scanPrlEligible = Boolean(scanPrlPlan?.eligible);
+  const scanPrlOver = Boolean(scanPrlPlan?.overPrl || scanActiveResult?.cardMeta?.overPrl);
   const isScanIssueAction = scanActionType === 'issue' || scanActionType === 'consumption';
   const isScanSubconAction = scanActionType === 'external_transfer';
   const isScanRoutingAction = scanActionType === 'routing_execution';
+  const executeScanFlow = async () => {
+    if (!scanActiveResult) {
+      setScanError('Hasil scan belum tersedia.');
+      return;
+    }
+    try {
+      if (isScanIssueAction) {
+        const outcome = await consumeStockFromScan(scanActiveResult);
+        setScanError(outcome.ok ? '' : outcome.reason || 'Gagal potong stok.');
+        if (outcome.ok && typeof handleProcessScan === 'function') {
+          await handleProcessScan();
+        }
+        return;
+      }
+      if (isScanRoutingAction) {
+        const currentStatus = String(scanActiveResult.processState?.status || scanActiveResult.currentProcess?.status || '').trim().toLowerCase();
+        const currentStepStatus = String(scanActiveResult.processState?.currentStep?.status || '').trim().toLowerCase();
+        const isInProcess = currentStatus === 'in_process' || currentStepStatus === 'started' || currentStepStatus === 'in_process';
+        const outcome = isInProcess
+          ? await handleKanbanProcessFinish(scanActiveResult)
+          : await handleKanbanProcessStart(scanActiveResult);
+        setScanError(outcome.ok ? '' : outcome.reason || (isInProcess ? 'Gagal finish proses.' : 'Gagal start proses.'));
+        return;
+      }
+      if (isScanSubconAction) {
+        setMainTab('subcon');
+        setScanError('');
+        return;
+      }
+      setScanError('Kategori item belum dikenali.');
+    } catch (error) {
+      setScanError(error.message || 'Gagal eksekusi scan.');
+    }
+  };
 
   return (
     <>
@@ -2932,6 +3184,17 @@ const TabKanban = (props) => {
                                   "Max Qty": row.max_qty,
                                   "Lot Qty": row.lot_qty,
                                   "Lead Time Days": row.lead_time_days,
+                                  "Safety Factor": row.safety_factor,
+                                  "Regular Kanban": row.regular_kanban,
+                                  "Safety Hours": row.safety_hours,
+                                  "Work Hours": row.work_hours,
+                                  "Cycle X": row.cycle_x,
+                                  "Cycle Y": row.cycle_y,
+                                  "Cycle Z": row.cycle_z,
+                                  "Calculated Cards": row.effective_card_count ?? row.calculated_card_count ?? '',
+                                  "Calculated Regular": row.effective_regular_kanban ?? row.calculated_regular_kanban ?? '',
+                                  "Calculated Safety": row.effective_safety_kanban ?? row.calculated_safety_kanban ?? '',
+                                  "Calculated Max Qty": row.effective_max_qty ?? row.calculated_max_qty ?? '',
                                   "Default Supplier": row.default_supplier || '',
                                   "Drop Zone": row.drop_zone || '',
                                   "Active": row.active ? 'Yes' : 'No',
@@ -2959,6 +3222,13 @@ const TabKanban = (props) => {
                                   "Max Qty": "",
                                   "Lot Qty": "",
                                   "Lead Time Days": "",
+                                  "Safety Factor": "0",
+                                  "Regular Kanban": "2",
+                                  "Safety Hours": "48",
+                                  "Work Hours": "24",
+                                  "Cycle X": "1",
+                                  "Cycle Y": "4",
+                                  "Cycle Z": "4",
                                   "Default Supplier": "",
                                   "Drop Zone": "",
                                   "Active": "Yes",
@@ -2997,6 +3267,13 @@ const TabKanban = (props) => {
                                       maxQty: row["Max Qty"] ?? row["max_qty"] ?? row["maxQty"],
                                       lotQty: row["Lot Qty"] ?? row["lot_qty"] ?? row["lotQty"],
                                       leadTimeDays: row["Lead Time Days"] ?? row["lead_time_days"] ?? row["leadTimeDays"],
+                                      safetyFactor: row["Safety Factor"] ?? row["safety_factor"] ?? row["safetyFactor"],
+                                      regularKanban: row["Regular Kanban"] ?? row["regular_kanban"] ?? row["regularKanban"],
+                                      safetyHours: row["Safety Hours"] ?? row["safety_hours"] ?? row["safetyHours"],
+                                      workHours: row["Work Hours"] ?? row["work_hours"] ?? row["workHours"],
+                                      cycleX: row["Cycle X"] ?? row["cycle_x"] ?? row["cycleX"],
+                                      cycleY: row["Cycle Y"] ?? row["cycle_y"] ?? row["cycleY"],
+                                      cycleZ: row["Cycle Z"] ?? row["cycle_z"] ?? row["cycleZ"],
                                       defaultSupplier: row["Default Supplier"] || row["default_supplier"] || row["defaultSupplier"],
                                       dropZone: row["Drop Zone"] || row["drop_zone"] || row["dropZone"] || row["line_code"] || row["lineCode"],
                                       active: String(row["Active"] ?? row["active"] ?? "Yes").toLowerCase() !== 'no',
@@ -3027,13 +3304,20 @@ const TabKanban = (props) => {
                         onClick={() => {
                           setShowKanbanEdit(true);
                           setKanbanEditMode('new');
-                          setKanbanCategory('raw');
+                          setKanbanCategory('');
                           setKanbanSettingsForm({
                             itemCode: '',
                             minQty: '',
                             maxQty: '',
                             lotQty: '',
                             leadTimeDays: '',
+                            safetyFactor: '',
+                            regularKanban: '2',
+                            safetyHours: '48',
+                            workHours: '24',
+                            cycleX: '1',
+                            cycleY: '4',
+                            cycleZ: '4',
                             defaultSupplier: '',
                             dropZone: '',
                             active: true,
@@ -3213,7 +3497,7 @@ const TabKanban = (props) => {
                       <div key={row.item_code} className="border rounded-xl p-4 bg-white shadow-sm">
                         <div className="flex flex-wrap items-start justify-between gap-3">
                           <div>
-                            <div className="text-sm font-bold">{buildKanbanId(row.item_code, row.item_type)}</div>
+                            <div className="text-sm font-bold">{buildKanbanDisplayId(row.item_code, row.item_type, row)}</div>
                             <div className="text-xs text-slate-500">{row.item_code} - {row.item_name || '-'}</div>
                           </div>
                           <div className="flex items-center gap-2 text-[10px]">
@@ -3237,12 +3521,32 @@ const TabKanban = (props) => {
                           <div>
                             <div className="text-[10px] uppercase text-slate-400">Quantities</div>
                             <div className="font-semibold text-slate-700">
-                              {row.lot_qty} / Min: {row.min_qty} / Max: {row.max_qty}
+                              {row.lot_qty} / Min: {row.min_qty} / Max: {row.effective_max_qty ?? row.max_qty}
                             </div>
+                            {getDisplayPrlQty(row) !== null && getDisplayPrlQty(row) !== undefined && getDisplayPrlQty(row) !== '' && (
+                              <div className="mt-0.5 text-[10px] text-sky-600">
+                                PRL {row.prl_month_label || ''}: {getDisplayPrlQty(row)}
+                              </div>
+                            )}
+                            {getDisplayPrlQty(row) !== null && getDisplayPrlQty(row) !== undefined && getDisplayPrlQty(row) !== '' && (
+                              <div className="mt-0.5 text-[10px] text-slate-500">
+                                WD {row.effective_working_days || row.calculated_working_days || '-'} / Work {row.work_hours ?? 24}h / Cycle {row.cycle_x ?? 1}×{row.cycle_y ?? 4}×{row.cycle_z ?? 4} / Safety {row.safety_hours ?? 48}h
+                              </div>
+                            )}
                           </div>
                           <div>
                             <div className="text-[10px] uppercase text-slate-400">Cards</div>
                             <div className="font-semibold text-slate-700">{getKanbanCardsLabel(row)}</div>
+                            {(row.effective_regular_kanban != null || row.calculated_regular_kanban != null || row.effective_safety_kanban != null || row.calculated_safety_kanban != null) && (
+                              <div className="mt-0.5 text-[10px] text-slate-500">
+                                Reg {row.effective_regular_kanban ?? row.calculated_regular_kanban ?? '-'} + Safety {row.effective_safety_kanban ?? row.calculated_safety_kanban ?? '-'}
+                              </div>
+                            )}
+                            {row.effective_daily_demand !== null && row.effective_daily_demand !== undefined && row.effective_daily_demand !== '' && (
+                              <div className="mt-0.5 text-[10px] text-slate-500">
+                                Daily {formatNumber2 ? formatNumber2(row.effective_daily_demand) : Number(row.effective_daily_demand || 0).toFixed(2)}
+                              </div>
+                            )}
                           </div>
                         </div>
                         <div className="mt-3 flex items-center justify-end gap-2">
@@ -3250,13 +3554,20 @@ const TabKanban = (props) => {
                           onClick={() => {
                             setShowKanbanEdit(true);
                             setKanbanEditMode('edit');
-                            setKanbanCategory('raw');
+                            setKanbanCategory('');
                             setKanbanSettingsForm({
                               itemCode: row.item_code,
                               minQty: String(row.min_qty ?? ''),
                               maxQty: String(row.max_qty ?? ''),
                               lotQty: String(row.lot_qty ?? ''),
                               leadTimeDays: String(row.lead_time_days ?? ''),
+                              safetyFactor: String(row.safety_factor ?? ''),
+                              regularKanban: String(row.regular_kanban ?? '2'),
+                              safetyHours: String(row.safety_hours ?? '48'),
+                              workHours: String(row.work_hours ?? '24'),
+                              cycleX: String(row.cycle_x ?? '1'),
+                              cycleY: String(row.cycle_y ?? '4'),
+                              cycleZ: String(row.cycle_z ?? '4'),
                               defaultSupplier: row.default_supplier || '',
                               dropZone: row.drop_zone || '',
                               active: Boolean(row.active),
@@ -3296,41 +3607,76 @@ const TabKanban = (props) => {
                         value={kanbanCategory}
                         onChange={(e) => setKanbanCategory(e.target.value)}
                       >
-                        <option value="raw">Raw Material</option>
-                        <option value="indirect">Indirect Material</option>
-                        <option value="consumable">Consumable</option>
-                        <option value="subcon">Subcon</option>
+                        <option value="">Pilih kategori dari master</option>
+                        {kanbanCategory && !masterCategories.some((category) => [category.code, category.name].includes(kanbanCategory)) && (
+                          <option value={kanbanCategory}>{kanbanCategory}</option>
+                        )}
+                        {masterCategories.map((category) => (
+                          <option key={category.code || category.name} value={category.code || category.name}>
+                            {category.code ? `${category.code}${category.name ? ` - ${category.name}` : ''}` : category.name}
+                          </option>
+                        ))}
                       </select>
                       <label className="block text-[10px] uppercase text-slate-400">Item Code</label>
                       <select
                         className="border p-2 rounded w-full text-xs"
                         value={kanbanSettingsForm.itemCode}
-                        onChange={(e) => setKanbanSettingsForm({ ...kanbanSettingsForm, itemCode: e.target.value })}
+                        onChange={(e) => syncKanbanSettingFromItem(e.target.value)}
                       >
-                        <option value="">Pilih Item</option>
-                        {items.map((it) => (
-                          <option key={it.code} value={it.code}>{it.code} - {it.name}</option>
+                        <option value="">Pilih item dari Master Item</option>
+                        {masterItemOptions.map((item) => (
+                          <option key={item.code} value={item.code}>{item.code} - {item.name}</option>
                         ))}
                       </select>
                       <label className="block text-[10px] uppercase text-slate-400">Item Name</label>
                       <input
                         className="border p-2 rounded w-full text-xs bg-slate-50"
-                        value={items.find((it) => it.code === kanbanSettingsForm.itemCode)?.name || ''}
+                        value={masterItemsByCode.get(kanbanSettingsForm.itemCode)?.name || ''}
                         readOnly
                       />
                       <label className="block text-[10px] uppercase text-slate-400">Supplier/Subcon Default</label>
-                      <input
+                      <select
                         className="border p-2 rounded w-full text-xs"
                         value={kanbanSettingsForm.defaultSupplier}
-                        onChange={(e) => setKanbanSettingsForm({ ...kanbanSettingsForm, defaultSupplier: e.target.value })}
-                      />
+                        onChange={(e) => {
+                          const nextSupplier = e.target.value;
+                          const vendorCycle = resolveVendorCycleDefaults(nextSupplier);
+                          setKanbanSettingsForm({
+                            ...kanbanSettingsForm,
+                            defaultSupplier: nextSupplier,
+                            cycleX: vendorCycle.x,
+                            cycleY: vendorCycle.y,
+                            cycleZ: vendorCycle.z,
+                          });
+                        }}
+                      >
+                        <option value="">Pilih supplier dari Master Vendor</option>
+                        {kanbanSettingsForm.defaultSupplier && !masterVendorOptions.some((vendor) => [vendor.id, vendor.name].includes(kanbanSettingsForm.defaultSupplier)) && (
+                          <option value={kanbanSettingsForm.defaultSupplier}>{kanbanSettingsForm.defaultSupplier}</option>
+                        )}
+                        {masterVendorOptions.map((vendor) => (
+                          <option key={vendor.id || vendor.name} value={vendor.id || vendor.name}>
+                            {vendor.id ? `${vendor.id} - ${vendor.name || vendor.id}` : vendor.name}
+                            {vendor.role ? ` (${vendor.role})` : ''}
+                          </option>
+                        ))}
+                      </select>
                       <label className="block text-[10px] uppercase text-slate-400">Drop Zone / Line</label>
-                      <input
+                      <select
                         className="border p-2 rounded w-full text-xs"
-                        placeholder="Contoh: Dock 1 / Line A"
                         value={kanbanSettingsForm.dropZone}
                         onChange={(e) => setKanbanSettingsForm({ ...kanbanSettingsForm, dropZone: e.target.value })}
-                      />
+                      >
+                        <option value="">Pilih lokasi/area dari Master Referensi</option>
+                        {kanbanSettingsForm.dropZone && !dropZoneOptions.some((option) => option.value === kanbanSettingsForm.dropZone) && (
+                          <option value={kanbanSettingsForm.dropZone}>{kanbanSettingsForm.dropZone}</option>
+                        )}
+                        {dropZoneOptions.map((option) => (
+                          <option key={`${option.source}-${option.value}`} value={option.value}>
+                            {option.source}: {option.label}
+                          </option>
+                        ))}
+                      </select>
                     </div>
 
                     <div className="space-y-2">
@@ -3349,8 +3695,30 @@ const TabKanban = (props) => {
                           <input type="number" className="border p-2 rounded w-full text-xs" value={kanbanSettingsForm.maxQty} onChange={(e) => setKanbanSettingsForm({ ...kanbanSettingsForm, maxQty: e.target.value })} />
                         </div>
                         <div>
-                          <label className="block text-[10px] uppercase text-slate-400">MOQ/Pack Size</label>
-                          <input type="number" className="border p-2 rounded w-full text-xs" value={kanbanSettingsForm.lotQty} onChange={(e) => setKanbanSettingsForm({ ...kanbanSettingsForm, lotQty: e.target.value })} />
+                          <label className="block text-[10px] uppercase text-slate-400">Safety Factor</label>
+                          <input type="number" step="0.01" min="0" className="border p-2 rounded w-full text-xs" value={kanbanSettingsForm.safetyFactor} onChange={(e) => setKanbanSettingsForm({ ...kanbanSettingsForm, safetyFactor: e.target.value })} placeholder="0.1 = 10%" />
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+                        <div>
+                          <label className="block text-[10px] uppercase text-slate-400">Cycle X</label>
+                          <input type="number" min="1" className="border p-2 rounded w-full text-xs" value={kanbanSettingsForm.cycleX} onChange={(e) => setKanbanSettingsForm({ ...kanbanSettingsForm, cycleX: e.target.value })} />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] uppercase text-slate-400">Cycle Y</label>
+                          <input type="number" min="1" className="border p-2 rounded w-full text-xs" value={kanbanSettingsForm.cycleY} onChange={(e) => setKanbanSettingsForm({ ...kanbanSettingsForm, cycleY: e.target.value })} />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] uppercase text-slate-400">Cycle Z</label>
+                          <input type="number" min="1" className="border p-2 rounded w-full text-xs" value={kanbanSettingsForm.cycleZ} onChange={(e) => setKanbanSettingsForm({ ...kanbanSettingsForm, cycleZ: e.target.value })} />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] uppercase text-slate-400">Safety Hours</label>
+                          <input type="number" min="0" className="border p-2 rounded w-full text-xs" value={kanbanSettingsForm.safetyHours} onChange={(e) => setKanbanSettingsForm({ ...kanbanSettingsForm, safetyHours: e.target.value })} />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] uppercase text-slate-400">Work Hours</label>
+                          <input type="number" min="1" className="border p-2 rounded w-full text-xs" value={kanbanSettingsForm.workHours} onChange={(e) => setKanbanSettingsForm({ ...kanbanSettingsForm, workHours: e.target.value })} />
                         </div>
                       </div>
                       <div className="grid grid-cols-2 gap-2">
@@ -3371,10 +3739,12 @@ const TabKanban = (props) => {
                         </div>
                       </div>
                       <div className="bg-sky-50 text-sky-700 text-xs p-3 rounded-lg">
-                        Perhitungan Otomatis: Jumlah Kartu = {getKanbanCardsLabel({
-                          lot_qty: kanbanSettingsForm.lotQty,
-                          max_qty: kanbanSettingsForm.maxQty,
-                        })}
+                        <div className="font-semibold mb-1">Formula PRL</div>
+                        <div>Hourly Demand = (PRL / Work Days) / Work Hours</div>
+                        <div>Total Kanban = Reguler + Safety</div>
+                        <div>Reguler = Ceil((Hourly Demand × Cycle X × Cycle Y) / Kanban Qty)</div>
+                        <div>Safety = Ceil((Hourly Demand × Safety Hours) / Kanban Qty)</div>
+                        <div className="mt-1">Nilai otomatis dihitung saat PRL dirilis.</div>
                       </div>
                     </div>
 
@@ -3390,11 +3760,18 @@ const TabKanban = (props) => {
                             maxQty: '',
                             lotQty: '',
                             leadTimeDays: '',
+                            safetyFactor: '',
+                            regularKanban: '2',
+                            safetyHours: '48',
+                            workHours: '24',
+                            cycleX: '1',
+                            cycleY: '4',
+                            cycleZ: '4',
                             defaultSupplier: '',
                             dropZone: '',
                             active: true,
                           });
-                          setKanbanCategory('raw');
+                          setKanbanCategory('');
                           setShowKanbanEdit(false);
                         }}
                       >
@@ -3411,16 +3788,7 @@ const TabKanban = (props) => {
               {kanbanView === 'board' && (
               <div className="space-y-4">
                 <div className="bg-white rounded-xl border p-3 flex flex-wrap gap-2 text-xs">
-                  {[
-                    { key: 'dashboard', label: 'Dashboard' },
-                    { key: 'items', label: 'Kanban Items' },
-                    { key: 'requests', label: 'Requests' },
-                    { key: 'dn', label: 'DN Register' },
-                    { key: 'receiving', label: 'Receiving Notes' },
-                    { key: 'empty', label: 'Kanban Kosong' },
-                    { key: 'scan', label: 'Scan QR' },
-                    canProduction ? { key: 'production', label: 'Produksi' } : null,
-                  ].filter(Boolean).map((tab) => (
+                  {kanbanBoardTabs.map((tab) => (
                     <button
                       key={tab.key}
                       onClick={() => setKanbanSubTab(tab.key)}
@@ -3431,7 +3799,7 @@ const TabKanban = (props) => {
                   ))}
                 </div>
 
-                {kanbanSubTab === 'dashboard' && (
+                {!isProductionUser && kanbanSubTab === 'dashboard' && (
                   <div className="space-y-4">
                     <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-7 gap-3">
                       {[
@@ -3440,7 +3808,7 @@ const TabKanban = (props) => {
                         { label: 'Approved', value: kanbanOperationalSummary.approved, tone: 'border-emerald-200 bg-emerald-50 text-emerald-700' },
                         { label: 'In Flow', value: kanbanOperationalSummary.inFlow, tone: 'border-blue-200 bg-blue-50 text-blue-700' },
                         { label: 'Receiving', value: kanbanOperationalSummary.receiving, tone: 'border-orange-200 bg-orange-50 text-orange-700' },
-                        { label: 'Blocked', value: kanbanOperationalSummary.blocked, tone: 'border-rose-200 bg-rose-50 text-rose-700' },
+                        { label: 'Over PRL', value: kanbanOperationalSummary.blocked, tone: 'border-rose-200 bg-rose-50 text-rose-700' },
                         { label: 'Overdue', value: kanbanOperationalSummary.overdue, tone: 'border-red-200 bg-red-50 text-red-700' },
                       ].map((card) => (
                         <div key={card.label} className={`rounded-xl border px-4 py-3 ${card.tone}`}>
@@ -3513,7 +3881,7 @@ const TabKanban = (props) => {
                                 </div>
                                 <div className="text-right">
                                   <div className="text-2xl font-bold">{statusCard.count}</div>
-                                  <div className="text-[10px] opacity-80">blocked {statusCard.blocked} · overdue {statusCard.overdue}</div>
+                                  <div className="text-[10px] opacity-80">over PRL {statusCard.blocked} · overdue {statusCard.overdue}</div>
                                 </div>
                               </div>
                               <div className="mt-2 text-[10px] opacity-80">Next: {statusCard.nextAction}</div>
@@ -3527,9 +3895,9 @@ const TabKanban = (props) => {
                                     </div>
                                     <div className="text-slate-500">{row.item_code} · {row.item_name || '-'}</div>
                                     <div className="mt-1 flex flex-wrap gap-1">
-                                      {health.isBlocked && (
+                                      {health.isOverPrl && (
                                         <span className="rounded-full border border-rose-200 bg-rose-100 px-2 py-0.5 text-[10px] font-semibold text-rose-700">
-                                          Blocked
+                                          Over PRL
                                         </span>
                                       )}
                                       {health.isOverdue && (
@@ -3588,9 +3956,9 @@ const TabKanban = (props) => {
                                 <span className="rounded-full border bg-white px-2 py-0.5 text-slate-600">
                                   Next: {getKanbanNextAction(row)}
                                 </span>
-                                {health.isBlocked && (
+                                {health.isOverPrl && (
                                   <span className="rounded-full border border-rose-200 bg-rose-100 px-2 py-0.5 text-rose-700">
-                                    Blocked
+                                    Over PRL
                                   </span>
                                 )}
                                 {health.isOverdue && (
@@ -3612,7 +3980,7 @@ const TabKanban = (props) => {
                   </div>
                 )}
 
-                {kanbanSubTab === 'items' && (
+                {!isProductionUser && kanbanSubTab === 'items' && (
                   <div className="space-y-3">
                     <div className="flex flex-wrap items-center gap-3">
                       <div className="flex items-center gap-2 border rounded px-3 py-2 bg-white text-xs">
@@ -3640,13 +4008,20 @@ const TabKanban = (props) => {
                           onClick={() => {
                             setShowKanbanEdit(true);
                             setKanbanEditMode('new');
-                            setKanbanCategory('raw');
+                            setKanbanCategory('');
                             setKanbanSettingsForm({
                               itemCode: '',
                               minQty: '',
                               maxQty: '',
                               lotQty: '',
                               leadTimeDays: '',
+                              safetyFactor: '',
+                              regularKanban: '2',
+                              safetyHours: '48',
+                              workHours: '24',
+                              cycleX: '1',
+                              cycleY: '4',
+                              cycleZ: '4',
                               defaultSupplier: '',
                               dropZone: '',
                               active: true,
@@ -3690,11 +4065,11 @@ const TabKanban = (props) => {
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                      {filteredKanbanItems.map((row) => {
+                      {visibleKanbanBoardItems.map((row) => {
                         const masterItem = masterItemsByCode.get(row.item_code);
                         const masterLocation = masterLocationsById.get(masterItem?.location_id);
                         const stock = Number(fifoTotalsByItemCode.get(row.item_code) ?? 0);
-                        const min = Number(masterItem?.safety_stock ?? 0);
+                        const min = Number(row.min_qty ?? masterItem?.safety_stock ?? 0);
                         const andon = getKanbanItemAndon(row);
                         const itemRequestHealth = kanbanRequestHealthByItem[String(row.item_code || '').trim()] || { open: 0, overdue: 0, blocked: 0, stockGap: 0 };
                         const thumbUrl = masterItem?.image_thumb_url || masterItem?.imageThumbUrl || masterItem?.image_url || masterItem?.imageUrl || '';
@@ -3715,7 +4090,7 @@ const TabKanban = (props) => {
                                   )}
                                 </div>
                                 <div>
-                                  <div className="text-sm font-bold">{buildKanbanId(row.item_code, row.item_type)}</div>
+                                  <div className="text-sm font-bold">{buildKanbanDisplayId(row.item_code, row.item_type, row)}</div>
                                   <div className="text-xs text-slate-500">{row.item_code}</div>
                                 </div>
                               </div>
@@ -3741,7 +4116,7 @@ const TabKanban = (props) => {
                               )}
                               {itemRequestHealth.blocked > 0 && (
                                 <span className="rounded-full border border-amber-200 bg-amber-100 px-2 py-0.5 text-amber-700">
-                                  Blocked {itemRequestHealth.blocked}
+                                  Over PRL {itemRequestHealth.blocked}
                                 </span>
                               )}
                             </div>
@@ -3758,11 +4133,26 @@ const TabKanban = (props) => {
                               </div>
                               <div>
                                 <div className="text-[10px] uppercase text-slate-400">Min/Max</div>
-                                <div className="font-semibold text-slate-700">{min} / {row.max_qty}</div>
+                                <div className="font-semibold text-slate-700">{min} / {row.effective_max_qty ?? row.max_qty}</div>
+                                {getDisplayPrlQty(row) !== null && getDisplayPrlQty(row) !== undefined && getDisplayPrlQty(row) !== '' && (
+                                  <div className="mt-0.5 text-[10px] text-sky-600">
+                                    PRL {row.prl_month_label || ''}: {getDisplayPrlQty(row)}
+                                  </div>
+                                )}
+                                {getDisplayPrlQty(row) !== null && getDisplayPrlQty(row) !== undefined && getDisplayPrlQty(row) !== '' && (
+                                  <div className="mt-0.5 text-[10px] text-slate-500">
+                                    WD {row.effective_working_days || row.calculated_working_days || '-'} / Work {row.work_hours ?? 24}h / Cycle {row.cycle_x ?? 1}×{row.cycle_y ?? 4}×{row.cycle_z ?? 4} / Safety {row.safety_hours ?? 48}h
+                                  </div>
+                                )}
                               </div>
                               <div>
                                 <div className="text-[10px] uppercase text-slate-400">Cards</div>
                                 <div className="font-semibold text-slate-700">{getKanbanCardsLabel(row)}</div>
+                                {(row.effective_regular_kanban != null || row.calculated_regular_kanban != null || row.effective_safety_kanban != null || row.calculated_safety_kanban != null) && (
+                                  <div className="mt-0.5 text-[10px] text-slate-500">
+                                    Reg {row.effective_regular_kanban ?? row.calculated_regular_kanban ?? '-'} + Safety {row.effective_safety_kanban ?? row.calculated_safety_kanban ?? '-'}
+                                  </div>
+                                )}
                               </div>
                             </div>
                             <div className="mt-3 flex items-center justify-between text-[10px] text-slate-500">
@@ -3776,6 +4166,17 @@ const TabKanban = (props) => {
                           </div>
                         );
                       })}
+                      {visibleKanbanBoardItems.length < filteredKanbanItems.length && (
+                        <div className="md:col-span-2 xl:col-span-3 flex justify-center">
+                          <button
+                            type="button"
+                            onClick={() => setKanbanItemVisibleLimit((prev) => prev + 75)}
+                            className="px-4 py-2 text-xs border rounded-lg bg-white hover:bg-slate-50 text-slate-600"
+                          >
+                            Tampilkan 75 lagi ({visibleKanbanBoardItems.length} / {filteredKanbanItems.length})
+                          </button>
+                        </div>
+                      )}
                       {!kanbanLoading && filteredKanbanItems.length === 0 && (
                         <div className="text-sm text-gray-400">Tidak ada item.</div>
                       )}
@@ -3783,7 +4184,7 @@ const TabKanban = (props) => {
                   </div>
                 )}
 
-                {kanbanSubTab === 'requests' && (
+                {!isProductionUser && kanbanSubTab === 'requests' && (
                   <div className="space-y-4">
                     {(() => {
                       const criticalCount = kanbanRequests.reduce((acc, row) => {
@@ -3810,7 +4211,7 @@ const TabKanban = (props) => {
                         <div className="flex flex-wrap items-center justify-between gap-3">
                           <div>
                             <div className="text-sm font-semibold">Kanban Request Log</div>
-                            <div className="text-xs text-slate-500">Aging, overdue, dan blocked request dipantau langsung dari board.</div>
+                            <div className="text-xs text-slate-500">Aging, overdue, dan Over PRL request dipantau langsung dari board.</div>
                           </div>
                           <div className="flex items-center gap-2">
                             <select
@@ -3841,7 +4242,7 @@ const TabKanban = (props) => {
                             <div className="mt-1 text-xl font-bold text-amber-700">{kanbanRequestHealthSummary.overdue}</div>
                           </div>
                           <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3">
-                            <div className="text-[11px] uppercase tracking-wide text-rose-700">Blocked</div>
+                            <div className="text-[11px] uppercase tracking-wide text-rose-700">Over PRL</div>
                             <div className="mt-1 text-xl font-bold text-rose-700">{kanbanRequestHealthSummary.blocked}</div>
                           </div>
                           <div className="rounded-xl border border-orange-200 bg-orange-50 px-4 py-3">
@@ -3906,14 +4307,20 @@ const TabKanban = (props) => {
                               const groupOnHand = Number(fifoTotalsByItemCode.get(firstRow?.item_code) ?? 0);
                               const groupTriggerLabel = firstRow?.trigger_type === 'manual' ? 'Manual' : 'Auto';
                               const groupDate = firstRow?.created_at ? new Date(firstRow.created_at).toLocaleString('id-ID') : '-';
-                              const groupKanbanId = firstRow ? buildKanbanId(firstRow.item_code, firstRow.item_type) : '-';
+                              const groupKanbanId = firstRow ? buildKanbanDisplayId(firstRow.item_code, firstRow.item_type, firstRow) : '-';
                               const groupSelectableIds = group.rows.filter((row) => isRequestSelectable(row)).map((row) => row.id);
                               const groupSelectedCount = groupSelectableIds.filter((id) => selectedRequestIds.includes(id)).length;
                               const groupAllSelected = groupSelectableIds.length > 0 && groupSelectedCount === groupSelectableIds.length;
                               const groupSomeSelected = groupSelectedCount > 0 && !groupAllSelected;
                               const groupHasOverdue = group.rows.some((row) => getKanbanRequestHealth(row).isOverdue);
-                              const groupHasBlocked = group.rows.some((row) => getKanbanRequestHealth(row).isBlocked);
+                              const groupHasBlocked = group.rows.some((row) => getKanbanRequestHealth(row).isOverPrl);
+                              const groupHasStockGap = group.rows.some((row) => getKanbanRequestHealth(row).hasStockGap);
                               const groupMaxAge = group.rows.reduce((maxAge, row) => Math.max(maxAge, getKanbanRequestHealth(row).ageHours), 0);
+                              const groupStatusLabel = groupHasStockGap
+                                ? 'Pending - Stock Gap'
+                                : groupHasBlocked
+                                  ? 'Pending - Over PRL'
+                                  : group.progressLabel;
                               return (
                                 <React.Fragment key={group.key}>
                                   <tr className="border-t bg-slate-50">
@@ -3957,9 +4364,13 @@ const TabKanban = (props) => {
                                       </span>
                                     </td>
                                     <td className="p-2">
-                                      {groupHasBlocked ? (
+                                      {groupHasStockGap ? (
+                                        <span className="inline-flex items-center rounded-full border border-orange-200 bg-orange-100 px-2 py-0.5 text-[10px] font-semibold text-orange-700">
+                                          Stock Gap
+                                        </span>
+                                      ) : groupHasBlocked ? (
                                         <span className="inline-flex items-center rounded-full border border-rose-200 bg-rose-100 px-2 py-0.5 text-[10px] font-semibold text-rose-700">
-                                          Blocked
+                                          Over PRL
                                         </span>
                                       ) : (
                                         <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
@@ -3968,8 +4379,14 @@ const TabKanban = (props) => {
                                       )}
                                     </td>
                                     <td className="p-2">
-                                      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] bg-slate-200 text-slate-700">
-                                        {group.progressLabel}
+                                      <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] ${
+                                        groupHasStockGap
+                                          ? 'bg-orange-100 text-orange-700'
+                                          : groupHasBlocked
+                                            ? 'bg-rose-100 text-rose-700'
+                                          : 'bg-slate-200 text-slate-700'
+                                      }`}>
+                                        {groupStatusLabel}
                                       </span>
                                     </td>
                                     <td className="p-2 text-slate-400">—</td>
@@ -3978,13 +4395,30 @@ const TabKanban = (props) => {
                                     const health = getKanbanRequestHealth(row);
                                     const onHand = health.onHand;
                                     const triggerLabel = row.trigger_type === 'manual' ? 'Manual' : 'Auto';
-                                    const statusLabel = row.status === 'triggered' || row.status === 'requested' ? 'Pending' : row.status === 'approved' ? 'Approved' : row.status === 'rejected' ? 'Rejected' : row.status;
-                                    const statusClass = statusLabel === 'Approved'
-                                      ? 'bg-slate-900 text-white'
-                                      : statusLabel === 'Rejected'
-                                        ? 'bg-red-100 text-red-700'
-                                        : 'bg-slate-100 text-slate-700';
-                                    const allowApprove = dnStatusFlowList.length === 0 || dnStatusFlowList.includes('APPROVE') || dnStatusFlowList.includes('APPROVED');
+                                    const statusKey = String(row.status || '').trim().toLowerCase();
+                                    const baseStatusLabel = statusKey === 'triggered' || statusKey === 'requested'
+                                      ? 'Pending'
+                                      : statusKey === 'approved'
+                                        ? 'Approved'
+                                        : statusKey === 'rejected'
+                                          ? 'Rejected'
+                                          : row.status;
+                                    const statusLabel = health.hasStockGap && ['triggered', 'requested'].includes(statusKey)
+                                      ? 'Pending - Stock Gap'
+                                      : health.isOverPrl && !health.hasStockGap && ['triggered', 'requested'].includes(statusKey)
+                                        ? 'Pending - Over PRL'
+                                        : baseStatusLabel;
+                                    const statusClass = health.hasStockGap && ['triggered', 'requested', 'approved'].includes(statusKey)
+                                      ? 'bg-orange-100 text-orange-700'
+                                      : statusLabel === 'Approved'
+                                        ? 'bg-slate-900 text-white'
+                                        : statusLabel === 'Rejected'
+                                          ? 'bg-red-100 text-red-700'
+                                          : health.isOverPrl
+                                            ? 'bg-rose-100 text-rose-700'
+                                            : 'bg-slate-100 text-slate-700';
+                                    const canApproveRequest = ['triggered', 'requested'].includes(statusKey);
+                                    const allowApproveAndDn = dnStatusFlowList.length === 0 || dnStatusFlowList.includes('APPROVE') || dnStatusFlowList.includes('APPROVED');
                                     return (
                                       <tr key={row.id} className="border-t text-[11px] bg-white">
                                         <td className="p-2">
@@ -3997,7 +4431,7 @@ const TabKanban = (props) => {
                                         </td>
                                         <td className="p-2 font-semibold pl-6">{getRequestIdLabel(row)}</td>
                                         <td className="p-2">{row.created_at ? new Date(row.created_at).toLocaleString('id-ID') : '-'}</td>
-                                        <td className="p-2">{buildKanbanId(row.item_code, row.item_type)}</td>
+                                        <td className="p-2">{buildKanbanDisplayId(row.item_code, row.item_type, row)}</td>
                                         <td className="p-2">{row.item_code} - {row.item_name || '-'}</td>
                                         <td className="p-2">{triggerLabel}</td>
                                         <td className="p-2 text-right">{onHand}</td>
@@ -4022,14 +4456,9 @@ const TabKanban = (props) => {
                                         <td className="p-2">
                                           <div className="flex flex-wrap gap-1">
                                             {health.hasStockGap && (
-                                              <button
-                                                type="button"
-                                                onClick={() => openKanbanShortageInPrl(row)}
-                                                className="inline-flex items-center rounded-full border border-orange-200 bg-orange-100 px-2 py-0.5 text-[10px] font-semibold text-orange-700 transition hover:bg-orange-200"
-                                                title="Buka PRL auto draft untuk item ini"
-                                                >
-                                                  {'Stock Gap -> PRL'}
-                                                </button>
+                                              <span className="inline-flex items-center rounded-full border border-orange-200 bg-orange-100 px-2 py-0.5 text-[10px] font-semibold text-orange-700">
+                                                Stock Gap
+                                              </span>
                                             )}
                                             {row.exception_code && (
                                               <span className="inline-flex items-center rounded-full border border-rose-200 bg-rose-100 px-2 py-0.5 text-[10px] font-semibold text-rose-700">
@@ -4051,16 +4480,35 @@ const TabKanban = (props) => {
                                         </td>
                                         <td className="p-2">
                                           <div className="flex gap-1 flex-wrap items-center">
-                                            {(row.status === 'triggered' || row.status === 'requested') && (
+                                            {health.hasStockGap && (
+                                              <button
+                                                type="button"
+                                                onClick={() => openKanbanShortageInPrl(row)}
+                                                className="px-2 py-1 border rounded text-orange-700 bg-orange-50 hover:bg-orange-100"
+                                                title="Buka PRL auto draft untuk item ini"
+                                                aria-label="Open stock gap in PRL"
+                                              >
+                                                PRL
+                                              </button>
+                                            )}
+                                            {canApproveRequest && (
                                               <>
-                                                {allowApprove && (
+                                                <button
+                                                  onClick={() => handleApproveKanban(row)}
+                                                  className="px-2 py-1 border rounded text-emerald-700 bg-emerald-50 hover:bg-emerald-100"
+                                                  title="Approve request"
+                                                  aria-label="Approve request"
+                                                >
+                                                  Approve
+                                                </button>
+                                                {allowApproveAndDn && !health.hasStockGap && (
                                                   <button
                                                     onClick={() => handleApproveAndCreateDn(row)}
-                                                    className="p-2 border rounded text-emerald-600 hover:text-emerald-700"
-                                                    title="Approve + DN (Single)"
+                                                    className="px-2 py-1 border rounded text-indigo-700 bg-indigo-50 hover:bg-indigo-100"
+                                                    title="Approve + DN"
                                                     aria-label="Approve and create DN"
                                                   >
-                                                    <Check size={12} />
+                                                    Approve + DN
                                                   </button>
                                                 )}
                                                 <button
@@ -4162,7 +4610,7 @@ const TabKanban = (props) => {
                   </div>
                 )}
 
-                {kanbanSubTab === 'dn' && (
+                {!isProductionUser && kanbanSubTab === 'dn' && (
                   <div className="bg-white rounded-xl border p-4">
                     <div className="text-sm font-semibold mb-3">DN Register</div>
                     <div className="overflow-x-auto">
@@ -4280,7 +4728,7 @@ const TabKanban = (props) => {
                   </div>
                 )}
 
-                {kanbanSubTab === 'receiving' && (
+                {!isProductionUser && kanbanSubTab === 'receiving' && (
                   <div className="bg-white rounded-xl border p-4">
                     {showReceiveFormModal && (
                       <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
@@ -4683,47 +5131,49 @@ const TabKanban = (props) => {
                       <div className="text-xs text-slate-500">Catat kanban kosong untuk potong stok dan memicu request.</div>
                     </div>
 
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                      {(() => {
-                        const pending = kanbanRequests.filter((row) => ['triggered', 'requested'].includes(row.status));
-                        const today = new Date().toISOString().slice(0, 10);
-                        const processedToday = kanbanRequests.filter((row) => row.dn_id && String(row.created_at || '').slice(0, 10) === today);
-                        const totalEmpty = kanbanRequests.filter((row) => ['triggered', 'requested', 'approved', 'dn_created', 'scheduled', 'in_transit', 'receiving', 'fifo', 'closed'].includes(row.status));
-                        return (
-                          <>
-                            <div className="bg-white rounded-xl border p-4">
-                              <div className="flex items-center justify-between">
-                                <div className="text-xs font-semibold text-slate-600">Antrian Belum Diproses</div>
-                                <Clock size={14} className="text-amber-500" />
+                    {!isProductionUser && (
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        {(() => {
+                          const pending = kanbanRequests.filter((row) => ['triggered', 'requested'].includes(row.status));
+                          const today = new Date().toISOString().slice(0, 10);
+                          const processedToday = kanbanRequests.filter((row) => row.dn_id && String(row.created_at || '').slice(0, 10) === today);
+                          const totalEmpty = kanbanRequests.filter((row) => ['triggered', 'requested', 'approved', 'dn_created', 'scheduled', 'in_transit', 'receiving', 'fifo', 'closed'].includes(row.status));
+                          return (
+                            <>
+                              <div className="bg-white rounded-xl border p-4">
+                                <div className="flex items-center justify-between">
+                                  <div className="text-xs font-semibold text-slate-600">Antrian Belum Diproses</div>
+                                  <Clock size={14} className="text-amber-500" />
+                                </div>
+                                <div className="text-2xl font-bold text-amber-600 mt-3">{pending.length}</div>
+                                <div className="text-xs text-slate-400">Menunggu pembuatan DN</div>
                               </div>
-                              <div className="text-2xl font-bold text-amber-600 mt-3">{pending.length}</div>
-                              <div className="text-xs text-slate-400">Menunggu pembuatan DN</div>
-                            </div>
-                            <div className="bg-white rounded-xl border p-4">
-                              <div className="flex items-center justify-between">
-                                <div className="text-xs font-semibold text-slate-600">Diproses Hari Ini</div>
-                                <CheckCircle size={14} className="text-emerald-500" />
+                              <div className="bg-white rounded-xl border p-4">
+                                <div className="flex items-center justify-between">
+                                  <div className="text-xs font-semibold text-slate-600">Diproses Hari Ini</div>
+                                  <CheckCircle size={14} className="text-emerald-500" />
+                                </div>
+                                <div className="text-2xl font-bold text-emerald-600 mt-3">{processedToday.length}</div>
+                                <div className="text-xs text-slate-400">Dikonversi ke DN</div>
                               </div>
-                              <div className="text-2xl font-bold text-emerald-600 mt-3">{processedToday.length}</div>
-                              <div className="text-xs text-slate-400">Dikonversi ke DN</div>
-                            </div>
-                            <div className="bg-white rounded-xl border p-4">
-                              <div className="flex items-center justify-between">
-                                <div className="text-xs font-semibold text-slate-600">Total Kosong</div>
-                                <Package size={14} className="text-blue-500" />
+                              <div className="bg-white rounded-xl border p-4">
+                                <div className="flex items-center justify-between">
+                                  <div className="text-xs font-semibold text-slate-600">Total Kosong</div>
+                                  <Package size={14} className="text-blue-500" />
+                                </div>
+                                <div className="text-2xl font-bold text-blue-600 mt-3">{totalEmpty.length}</div>
+                                <div className="text-xs text-slate-400">Catatan sepanjang waktu</div>
                               </div>
-                              <div className="text-2xl font-bold text-blue-600 mt-3">{totalEmpty.length}</div>
-                              <div className="text-xs text-slate-400">Catatan sepanjang waktu</div>
-                            </div>
-                          </>
-                        );
-                      })()}
-                    </div>
+                            </>
+                          );
+                        })()}
+                      </div>
+                    )}
 
-                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                      <div className="bg-white rounded-xl border p-4">
+                    <div className={isProductionUser ? 'grid grid-cols-1 gap-4 max-w-3xl' : 'grid grid-cols-1 lg:grid-cols-2 gap-4'}>
+                      <div className="bg-white rounded-2xl border p-5 shadow-sm">
                         <div className="text-sm font-semibold mb-1">Pemindaian Kanban Tunggal</div>
-                        <div className="text-xs text-slate-500 mb-3">Pindai atau masukkan ID kanban untuk satu kartu kosong.</div>
+                        <div className="text-xs text-slate-500 mb-4">Pindai atau masukkan Kanban ID untuk satu kartu kosong.</div>
                         <form onSubmit={handleEmptyKanbanSubmit} className="space-y-3 text-xs">
                           <div>
                             <label className="block text-[10px] uppercase text-slate-400 mb-1">Area/Lini</label>
@@ -4741,10 +5191,10 @@ const TabKanban = (props) => {
                             </select>
                           </div>
                           <div>
-                            <label className="block text-[10px] uppercase text-slate-400 mb-1">ID Kanban</label>
+                            <label className="block text-[10px] uppercase text-slate-400 mb-1">Kanban ID</label>
                             <input
                               className="border p-2 rounded w-full text-xs"
-                              placeholder="Pindai atau masukkan ID kanban (mis., KB-RM-000124)"
+                              placeholder="Pindai atau masukkan Kanban ID dari master"
                               value={emptyKanbanForm.kanbanId}
                               onChange={(e) => setEmptyKanbanForm({ ...emptyKanbanForm, kanbanId: e.target.value })}
                             />
@@ -4759,32 +5209,33 @@ const TabKanban = (props) => {
                         </form>
                       </div>
 
-                      <div className="bg-white rounded-xl border p-4">
-                        <div className="text-sm font-semibold mb-1 flex items-center gap-2"><Plus size={14} /> Input Batch</div>
-                        <div className="text-xs text-slate-500 mb-3">Proses beberapa kanban kosong sekaligus.</div>
-                        <button
-                          onClick={() => setShowBatchModal(true)}
-                          className="w-full bg-slate-900 text-white py-2 rounded text-xs flex items-center justify-center gap-2 disabled:opacity-60"
-                          disabled={isStockOpnameLocked}
-                        >
-                          <Plus size={14} /> Buka Input Batch
-                        </button>
-                      </div>
+                      {!isProductionUser && (
+                        <div className="bg-white rounded-xl border p-4">
+                          <div className="text-sm font-semibold mb-1 flex items-center gap-2"><Plus size={14} /> Input Batch</div>
+                          <div className="text-xs text-slate-500 mb-3">Proses beberapa kanban kosong sekaligus.</div>
+                          <button
+                            onClick={() => setShowBatchModal(true)}
+                            className="w-full bg-slate-900 text-white py-2 rounded text-xs flex items-center justify-center gap-2 disabled:opacity-60"
+                            disabled={isStockOpnameLocked}
+                          >
+                            <Plus size={14} /> Buka Input Batch
+                          </button>
+                        </div>
+                      )}
                     </div>
 
                     <div className="bg-white rounded-xl border p-4">
                       <div className="text-sm font-semibold mb-1">Log Kanban Kosong</div>
-                      <div className="text-xs text-slate-500 mb-3">Riwayat semua kartu kanban kosong.</div>
+                      <div className="text-xs text-slate-500 mb-3">{isProductionUser ? 'Riwayat ringkas kartu kanban kosong.' : 'Riwayat semua kartu kanban kosong.'}</div>
                       <div className="overflow-x-auto">
-                        <div className="min-w-[980px] text-xs">
-                          <div className="bg-slate-100 grid items-center" style={{ gridTemplateColumns: emptyLogGrid }}>
+                        <div className={`${isProductionUser ? 'min-w-[720px]' : 'min-w-[980px]'} text-xs`}>
+                          <div className="bg-slate-100 grid items-center" style={{ gridTemplateColumns: isProductionUser ? '170px 180px minmax(220px, 1fr) 120px 140px' : emptyLogGrid }}>
                             <div className="text-left p-2">Waktu</div>
                             <div className="text-left p-2">ID Kanban</div>
                             <div className="text-left p-2">Item</div>
-                            <div className="text-left p-2">Area/Lini</div>
-                            <div className="text-left p-2">Kategori</div>
+                            {!isProductionUser && <><div className="text-left p-2">Area/Lini</div><div className="text-left p-2">Kategori</div></>}
                             <div className="text-left p-2">Status</div>
-                            <div className="text-left p-2">Referensi DN</div>
+                            {!isProductionUser && <div className="text-left p-2">Referensi DN</div>}
                             <div className="text-left p-2">Aksi</div>
                           </div>
                           {kanbanEmptyPaginationMeta.total === 0 ? (
@@ -4799,22 +5250,46 @@ const TabKanban = (props) => {
                                 {visibleEmptyRows.map((row, idx) => {
                                   const rowIndex = emptyWindow.startIndex + idx;
                                   const setting = kanbanSettingsByCode.get(row.item_code);
+                                  const statusKey = String(row.status || '').trim().toLowerCase();
+                                  const allowApprove = dnStatusFlowList.length === 0 || dnStatusFlowList.includes('APPROVE') || dnStatusFlowList.includes('APPROVED');
+                                  const canApproveRequest = ['triggered', 'requested'].includes(statusKey);
                                   return (
                                     <div
                                       key={row.id}
                                       className="grid items-center border-t"
-                                      style={{ gridTemplateColumns: emptyLogGrid, position: 'absolute', top: rowIndex * emptyRowHeight, height: emptyRowHeight, width: '100%' }}
+                                      style={{ gridTemplateColumns: isProductionUser ? '170px 180px minmax(220px, 1fr) 120px 140px' : emptyLogGrid, position: 'absolute', top: rowIndex * emptyRowHeight, height: emptyRowHeight, width: '100%' }}
                                     >
                                       <div className="p-2">{row.created_at ? new Date(row.created_at).toLocaleString('id-ID') : '-'}</div>
-                                      <div className="p-2 font-semibold">{extractKanbanIdNote(row.notes) || buildKanbanId(row.item_code, row.item_type)}</div>
+                                      <div className="p-2 font-semibold">{extractKanbanIdNote(row.notes) || buildKanbanDisplayId(row.item_code, row.item_type, row)}</div>
                                       <div className="p-2">{row.item_code} - {row.item_name || '-'}</div>
-                                      <div className="p-2">{extractAreaNote(row.notes)}</div>
-                                      <div className="p-2">{getCategoryLabel(setting?.item_type)}</div>
+                                      {!isProductionUser && <div className="p-2">{extractAreaNote(row.notes)}</div>}
+                                      {!isProductionUser && <div className="p-2">{getCategoryLabel(setting?.item_type)}</div>}
                                       <div className="p-2">{row.status}</div>
-                                      <div className="p-2">{row.dn_id ? `DN-${row.dn_id}` : '-'}</div>
-                                      <div className="p-2">
-                                        {row.status === 'approved' && (
+                                      {!isProductionUser && <div className="p-2">{row.dn_id ? `DN-${row.dn_id}` : '-'}</div>}
+                                      <div className="p-2 flex flex-wrap items-center gap-1">
+                                        {canApproveRequest && allowApprove && (
+                                          <button
+                                            onClick={() => handleApproveAndCreateDn(row)}
+                                            className="px-2 py-1 text-[10px] bg-emerald-600 text-white rounded"
+                                            title="Approve + DN"
+                                          >
+                                            Approve
+                                          </button>
+                                        )}
+                                        {canApproveRequest && (
+                                          <button
+                                            onClick={() => handleRejectKanban(row)}
+                                            className="px-2 py-1 text-[10px] border border-amber-200 text-amber-700 rounded"
+                                            title="Reject request"
+                                          >
+                                            Reject
+                                          </button>
+                                        )}
+                                        {statusKey === 'approved' && !row.dn_id && (
                                           <button onClick={() => openDnModal(row)} className="px-2 py-1 text-[10px] bg-indigo-600 text-white rounded">Buat DN</button>
+                                        )}
+                                        {statusKey === 'approved' && row.dn_id && (
+                                          <span className="text-[10px] text-indigo-600 font-semibold">DN-{row.dn_id}</span>
                                         )}
                                       </div>
                                     </div>
@@ -4832,7 +5307,7 @@ const TabKanban = (props) => {
                   </div>
                 )}
 
-                {kanbanSubTab === 'production' && (
+                {!isProductionUser && kanbanSubTab === 'production' && (
                   <div className="space-y-4">
                     <div className="bg-white/90 rounded-xl border px-4">
                       <div className="flex flex-wrap items-center gap-6 text-sm">
@@ -5242,31 +5717,33 @@ const TabKanban = (props) => {
                 )}
 
                 {kanbanSubTab === 'scan' && (
-                  <div className="space-y-4">
-                    <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-                      {[
-                        { key: 'items', label: 'Kanban Items', icon: <Package size={16} /> },
-                        { key: 'requests', label: 'Requests', icon: <FileSpreadsheet size={16} /> },
-                        { key: 'dn', label: 'DN Register', icon: <FileText size={16} /> },
-                        { key: 'receiving', label: 'Receiving Notes', icon: <Truck size={16} /> },
-                      ].map((shortcut) => (
-                        <button
-                          key={shortcut.key}
-                          onClick={() => setKanbanSubTab(shortcut.key)}
-                          className="bg-white border rounded-xl p-3 flex items-center gap-2 text-xs hover:bg-slate-50"
-                        >
-                          <span className="p-2 rounded-lg bg-slate-100 text-slate-700">{shortcut.icon}</span>
-                          <span className="font-semibold text-slate-700">{shortcut.label}</span>
-                        </button>
-                      ))}
-                    </div>
+                  <div className={isProductionUser ? 'space-y-4 max-w-5xl mx-auto' : 'space-y-4'}>
+                    {!isProductionUser && (
+                      <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                        {[
+                          { key: 'items', label: 'Kanban Items', icon: <Package size={16} /> },
+                          { key: 'requests', label: 'Requests', icon: <FileSpreadsheet size={16} /> },
+                          { key: 'dn', label: 'DN Register', icon: <FileText size={16} /> },
+                          { key: 'receiving', label: 'Receiving Notes', icon: <Truck size={16} /> },
+                        ].map((shortcut) => (
+                          <button
+                            key={shortcut.key}
+                            onClick={() => setKanbanSubTab(shortcut.key)}
+                            className="bg-white border rounded-xl p-3 flex items-center gap-2 text-xs hover:bg-slate-50"
+                          >
+                            <span className="p-2 rounded-lg bg-slate-100 text-slate-700">{shortcut.icon}</span>
+                            <span className="font-semibold text-slate-700">{shortcut.label}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
 
                     <div>
                       <div className="text-2xl font-bold text-slate-900">Pemindai QR/Barcode</div>
                       <div className="text-xs text-slate-500">Pindai kartu kanban untuk operasi material cepat.</div>
                     </div>
 
-                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    <div className={isProductionUser ? 'grid grid-cols-1 gap-4' : 'grid grid-cols-1 lg:grid-cols-2 gap-4'}>
                       <div className="bg-white rounded-xl border p-4">
                         <div className="flex items-center gap-2 text-sm font-semibold mb-1">
                           <QrCode size={16} /> Pemindai
@@ -5276,7 +5753,6 @@ const TabKanban = (props) => {
                           {[
                             { key: 'camera', label: 'Kamera' },
                             { key: 'manual', label: 'Manual' },
-                            { key: 'simulasi', label: 'Simulasi' },
                           ].map((mode) => (
                             <button
                               key={mode.key}
@@ -5317,16 +5793,15 @@ const TabKanban = (props) => {
                             <label className="block text-[10px] uppercase text-slate-400 mb-2">Masukkan data QR (satu per baris untuk pemindaian multi)</label>
                             <textarea
                               className="border p-2 rounded w-full text-xs h-36"
-                              placeholder="KANBAN_ID:KB-RM-000124|ITEM:RM-STKM11AH-22216|QTY:30"
+                              placeholder="Pindai atau masukkan Kanban ID"
                               value={scanInput}
                               onChange={(e) => setScanInput(e.target.value)}
                             />
                             <div className="text-[10px] text-slate-400 mt-2">Masukkan satu QR per baris. Banyak kode akan diproses batch.</div>
-                            <div className="mt-3 space-y-2">
+                            <div className="mt-3">
                               <button onClick={handleProcessScan} className="w-full bg-slate-900 text-white py-2 rounded text-xs flex items-center justify-center gap-2">
                                 <Search size={14} /> Proses Data QR ({scanResults.length} item)
                               </button>
-                              <button onClick={handleLoadSampleScan} className="w-full border py-2 rounded text-xs">Muat Data Contoh (3 item)</button>
                             </div>
                           </>
                         )}
@@ -5348,6 +5823,11 @@ const TabKanban = (props) => {
                         )}
                         {scanActiveResult && (
                           <div className="space-y-2 max-h-64 overflow-y-auto">
+                            {Array.isArray(scanActiveResult.scanWarnings) && scanActiveResult.scanWarnings.length > 0 && (
+                              <div className="bg-rose-50 border border-rose-200 text-rose-700 text-xs p-3 rounded-xl">
+                                {scanActiveResult.scanWarnings.join(' ')}
+                              </div>
+                            )}
                             <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4">
                               <div className="flex items-center justify-between gap-3">
                                 <div className="flex items-center gap-2 text-emerald-700 font-semibold text-xs">
@@ -5361,7 +5841,7 @@ const TabKanban = (props) => {
                                   {scanActiveResult.itemLabel || `${scanActiveResult.itemCode} - ${scanActiveResult.itemName}`}
                                 </div>
                                 <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-slate-600">
-                                  <span className="px-2 py-1 rounded-full bg-white border">Unique No: {scanActiveResult.kanbanId}</span>
+                                  <span className="px-2 py-1 rounded-full bg-white border">Kanban ID: {scanActiveResult.kanbanId}</span>
                                   <span className="px-2 py-1 rounded-full bg-white border">Kode Item: {scanActiveResult.itemCode}</span>
                                   <span className="px-2 py-1 rounded-full bg-white border">Qty Kartu: {scanActiveResult.qty}</span>
                                 </div>
@@ -5380,6 +5860,33 @@ const TabKanban = (props) => {
                                 </div>
                               )}
                             </div>
+                            {scanPrlPlan && (
+                              <div className={`border rounded-xl p-3 text-xs ${scanPrlOver ? 'bg-rose-50 border-rose-200 text-rose-800' : scanPrlEligible ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="text-[10px] uppercase tracking-wide">PRL Kanban Edar</div>
+                                  <span className={`px-2 py-0.5 rounded-full text-[10px] ${scanPrlOver ? 'bg-rose-600 text-white' : scanPrlEligible ? 'bg-emerald-600 text-white' : 'bg-amber-600 text-white'}`}>
+                                    {scanPrlOver ? 'OVER PRL' : scanPrlEligible ? 'REORDER OK' : 'CONSUMPTION ONLY'}
+                                  </span>
+                                </div>
+                                <div className="mt-2 grid grid-cols-3 gap-2">
+                                  <div>
+                                    <div className="text-[10px] opacity-70">Plan {scanPrlPlan.monthLabel || '-'}</div>
+                                    <div className="font-semibold">{formatNumber0(scanPrlPlan.plannedQty || 0)}</div>
+                                  </div>
+                                  <div>
+                                    <div className="text-[10px] opacity-70">Terpakai</div>
+                                    <div className="font-semibold">{formatNumber0(scanPrlPlan.usedQty || 0)}</div>
+                                  </div>
+                                  <div>
+                                    <div className="text-[10px] opacity-70">Sisa</div>
+                                    <div className="font-semibold">{formatNumber0(scanPrlPlan.remainingQty || 0)}</div>
+                                  </div>
+                                </div>
+                                {!scanPrlEligible && scanPrlPlan.notice && (
+                                  <div className="mt-2 text-[11px]">{scanPrlPlan.notice}</div>
+                                )}
+                              </div>
+                            )}
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs">
                               <div className="border rounded-xl p-3 bg-white">
                                 <div className="text-[10px] uppercase tracking-wide text-slate-400">Posisi Sekarang</div>
@@ -5431,6 +5938,14 @@ const TabKanban = (props) => {
                               )}
                             </div>
                             <div className="flex gap-2">
+                              {(isScanIssueAction || isScanRoutingAction || isScanSubconAction) && (
+                                <button
+                                  onClick={executeScanFlow}
+                                  className="flex-1 bg-indigo-600 text-white py-2 rounded text-xs flex items-center justify-center gap-2"
+                                >
+                                  <ArrowDownUp size={14} /> Eksekusi Scan
+                                </button>
+                              )}
                               {isScanIssueAction && (
                                 <>
                                   <button
@@ -5498,7 +6013,7 @@ const TabKanban = (props) => {
                             </div>
                           </div>
                         )}
-                        {scanResults.length > 1 && (
+                        {!isProductionUser && scanResults.length > 1 && (
                           <div className="mt-3 space-y-2">
                             <div className="text-[10px] uppercase text-slate-400">Hasil Batch</div>
                             <div className="space-y-2 max-h-40 overflow-y-auto">
@@ -5517,7 +6032,8 @@ const TabKanban = (props) => {
                       </div>
                     </div>
 
-                    <div className="bg-white rounded-xl border p-4">
+                    {!isProductionUser && (
+                      <div className="bg-white rounded-xl border p-4">
                       <div className="flex items-center gap-2 text-sm font-semibold mb-3">
                         <Clock size={16} /> Pemindaian Terbaru
                       </div>
@@ -5542,7 +6058,8 @@ const TabKanban = (props) => {
                           ))}
                         </div>
                       )}
-                    </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -5612,7 +6129,22 @@ const TabKanban = (props) => {
                         readOnly
                         disabled
                       />
-                      <input className="border p-2 rounded text-sm w-full" placeholder="Supplier" value={dnForm.supplier} onChange={(e) => handleDnSupplierChange(e.target.value)} />
+                      <select
+                        className="border p-2 rounded text-sm w-full"
+                        value={dnForm.supplier}
+                        onChange={(e) => handleDnSupplierChange(e.target.value)}
+                      >
+                        <option value="">Pilih supplier dari Master Vendor</option>
+                        {dnForm.supplier && !deliveryNoteVendorOptions.some((vendor) => [vendor.id, vendor.name].includes(dnForm.supplier)) && (
+                          <option value={dnForm.supplier}>{dnForm.supplier}</option>
+                        )}
+                        {deliveryNoteVendorOptions.map((vendor) => (
+                          <option key={vendor.id || vendor.name} value={vendor.id || vendor.name}>
+                            {vendor.id ? `${vendor.id} - ${vendor.name || vendor.id}` : vendor.name}
+                            {vendor.role ? ` (${vendor.role})` : ''}
+                          </option>
+                        ))}
+                      </select>
                       <input type="date" className="border p-2 rounded text-sm w-full" value={dnForm.plannedDate} onChange={(e) => setDnForm({ ...dnForm, plannedDate: e.target.value })} />
                       <select
                         className="border p-2 rounded text-sm w-full"
@@ -5984,7 +6516,19 @@ const TabKanban = (props) => {
                     <form onSubmit={handleCreateSchedule} className="space-y-3">
                       <input className="border p-2 rounded text-sm w-full" placeholder="PO Number" value={scheduleForm.poNumber} onChange={(e) => setScheduleForm({ ...scheduleForm, poNumber: e.target.value })} />
                       <input type="date" className="border p-2 rounded text-sm w-full" value={scheduleForm.requestDate} onChange={(e) => setScheduleForm({ ...scheduleForm, requestDate: e.target.value })} />
-                      <input className="border p-2 rounded text-sm w-full" placeholder="Delivery Time" value={scheduleForm.deliveryTime} onChange={(e) => setScheduleForm({ ...scheduleForm, deliveryTime: e.target.value })} />
+                      <select
+                        className="border p-2 rounded text-sm w-full"
+                        value={scheduleForm.deliveryTime}
+                        onChange={(e) => setScheduleForm({ ...scheduleForm, deliveryTime: e.target.value })}
+                      >
+                        <option value="">Pilih delivery time dari Master Vendor</option>
+                        {scheduleForm.deliveryTime && !allVendorScheduleOptions.some((option) => option.value === scheduleForm.deliveryTime) && (
+                          <option value={scheduleForm.deliveryTime}>{scheduleForm.deliveryTime}</option>
+                        )}
+                        {allVendorScheduleOptions.map((option) => (
+                          <option key={option.key} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
                       <div className="flex justify-end gap-2">
                         <button type="button" onClick={() => setShowScheduleModal(false)} className="px-3 py-2 text-sm border rounded">Batal</button>
                         <button type="submit" className="px-3 py-2 text-sm bg-sky-600 text-white rounded">Simpan</button>
@@ -6017,7 +6561,10 @@ const TabKanban = (props) => {
                       <input type="number" className="border p-2 rounded text-sm w-full" placeholder="Qty Dokumen" value={receiveForm.docQty} onChange={(e) => setReceiveForm({ ...receiveForm, docQty: e.target.value })} />
                       <input type="number" className="border p-2 rounded text-sm w-full" placeholder="Qty Fisik" value={receiveForm.receivedQty} onChange={(e) => setReceiveForm({ ...receiveForm, receivedQty: e.target.value })} />
                       <select className="border p-2 rounded text-sm w-full" value={receiveForm.qcStatus} onChange={(e) => setReceiveForm({ ...receiveForm, qcStatus: e.target.value })}>
-                        {(qcStatusOptions.length > 0 ? qcStatusOptions : ['OK', 'HOLD', 'REJECT']).map((status) => (
+                        {qcStatusOptions.length === 0 && (
+                          <option value="">QC status belum diatur di Master Config</option>
+                        )}
+                        {qcStatusOptions.map((status) => (
                           <option key={status} value={status.toLowerCase()}>
                             {status.toUpperCase()}
                           </option>
@@ -6052,21 +6599,36 @@ const TabKanban = (props) => {
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                         <div>
                           <label className="block text-xs font-semibold text-slate-600 mb-1">Kanban ID *</label>
-                          <input
+                          <select
                             className="border p-2 rounded w-full text-sm"
-                            placeholder="e.g., KB-RM-000124"
                             value={manualRequestForm.kanbanId}
-                            onChange={(e) => setManualRequestForm({ ...manualRequestForm, kanbanId: e.target.value })}
-                          />
+                            onChange={(e) => handleManualKanbanSelect(e.target.value)}
+                          >
+                            <option value="">Pilih Kanban ID dari Master Kanban</option>
+                            {kanbanSettings.map((row) => {
+                              const kanbanId = buildKanbanDisplayId(row.item_code, row.item_type, row);
+                              return (
+                                <option key={row.item_code} value={kanbanId}>
+                                  {kanbanId} - {row.item_code} - {row.item_name || '-'}
+                                </option>
+                              );
+                            })}
+                          </select>
                         </div>
                         <div>
                           <label className="block text-xs font-semibold text-slate-600 mb-1">Item Code *</label>
-                          <input
+                          <select
                             className="border p-2 rounded w-full text-sm"
-                            placeholder="e.g., RM-STKM11AH-22216"
                             value={manualRequestForm.itemCode}
-                            onChange={(e) => setManualRequestForm({ ...manualRequestForm, itemCode: e.target.value })}
-                          />
+                            onChange={(e) => syncManualRequestFromItem(e.target.value)}
+                          >
+                            <option value="">Pilih item dari Master Item</option>
+                            {masterItemOptions.map((item) => (
+                              <option key={item.code} value={item.code}>
+                                {item.code} - {item.name || '-'}
+                              </option>
+                            ))}
+                          </select>
                         </div>
                       </div>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -6087,7 +6649,7 @@ const TabKanban = (props) => {
                           <input
                             type="number"
                             className="border p-2 rounded w-full text-sm"
-                            placeholder="e.g., 25"
+                            placeholder="Qty on hand"
                             value={manualRequestForm.onHand}
                             onChange={(e) => setManualRequestForm({ ...manualRequestForm, onHand: e.target.value })}
                           />
@@ -6098,7 +6660,7 @@ const TabKanban = (props) => {
                         <input
                           type="number"
                           className="border p-2 rounded w-full text-sm"
-                          placeholder="e.g., 60"
+                          placeholder="Qty request"
                           value={manualRequestForm.requestQty}
                           onChange={(e) => setManualRequestForm({ ...manualRequestForm, requestQty: e.target.value })}
                         />
@@ -6114,15 +6676,92 @@ const TabKanban = (props) => {
 
               {showQrModal && (
                 <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-                  <div className="bg-white rounded-xl w-full max-w-sm p-5">
+                  <div className="bg-white rounded-2xl w-full max-w-4xl p-5 shadow-xl">
                     <div className="flex items-center justify-between mb-3">
-                      <div className="text-sm font-semibold">QR Kanban</div>
-                      <button onClick={() => setShowQrModal(false)}><X size={16} /></button>
+                      <div className="text-sm font-semibold">QR Kanban ID</div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setQrSimulationRefreshNonce((prev) => prev + 1)}
+                          className="px-3 py-1.5 text-xs border rounded-lg bg-slate-50 hover:bg-slate-100"
+                          disabled={qrSimulationLoading}
+                        >
+                          {qrSimulationLoading ? 'Menyimulasikan...' : 'Simulasi Ulang'}
+                        </button>
+                        <button onClick={() => setShowQrModal(false)}><X size={16} /></button>
+                      </div>
                     </div>
-                    <div className="flex flex-col items-center gap-3">
-                      <div className="text-xs text-slate-500">{qrTitle}</div>
-                      <QRCodeCanvas value={qrPayload || 'KANBAN'} size={180} />
-                      <div className="text-[10px] text-slate-400">Payload: {qrPayload || '-'}</div>
+                    <div className="grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-4">
+                      <div className="bg-slate-50 border rounded-2xl p-4 flex flex-col items-center justify-center gap-3">
+                        <div className="text-xs text-slate-500 text-center">{qrTitle}</div>
+                        <div className="bg-white border rounded-2xl p-3 shadow-sm">
+                          <QRCodeCanvas value={qrPayload || '-'} size={180} />
+                        </div>
+                        <div className="text-[10px] text-slate-400 break-all text-center">Kanban ID: {qrPayload || '-'}</div>
+                      </div>
+                      <div className="space-y-3">
+                        <div className="rounded-2xl border bg-white p-4">
+                          <div className="text-sm font-semibold text-slate-900">Simulasi Scan QR</div>
+                          <div className="text-xs text-slate-500 mt-1">
+                            Ini menampilkan hasil yang akan dibaca sistem saat QR ini dipindai.
+                          </div>
+                          {qrSimulationLoading && (
+                            <div className="mt-3 text-xs text-slate-500">Memuat simulasi...</div>
+                          )}
+                          {qrSimulationError && (
+                            <div className="mt-3 rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-700">
+                              {qrSimulationError}
+                            </div>
+                          )}
+                          {qrSimulationResult && (
+                            <div className="mt-3 space-y-3 text-xs">
+                              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                                <div className="rounded-xl border bg-slate-50 p-3">
+                                  <div className="text-[10px] uppercase text-slate-400">Action</div>
+                                  <div className="font-semibold text-slate-800">{qrSimulationResult.actionLabel || qrSimulationResult.actionType || '-'}</div>
+                                </div>
+                                <div className="rounded-xl border bg-slate-50 p-3">
+                                  <div className="text-[10px] uppercase text-slate-400">Item</div>
+                                  <div className="font-semibold text-slate-800">{qrSimulationResult.itemLabel || qrSimulationResult.itemCode || '-'}</div>
+                                </div>
+                                <div className="rounded-xl border bg-slate-50 p-3">
+                                  <div className="text-[10px] uppercase text-slate-400">Qty</div>
+                                  <div className="font-semibold text-slate-800">{formatNumber0(qrSimulationResult.qty || 0)} pcs</div>
+                                </div>
+                              </div>
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                <div className="rounded-xl border p-3">
+                                  <div className="text-[10px] uppercase text-slate-400">Posisi Sekarang</div>
+                                  <div className="font-semibold text-slate-800">{qrSimulationResult.currentPosition?.label || qrSimulationResult.location || '-'}</div>
+                                </div>
+                                <div className="rounded-xl border p-3">
+                                  <div className="text-[10px] uppercase text-slate-400">Target Berikutnya</div>
+                                  <div className="font-semibold text-slate-800">{qrSimulationResult.nextProcess?.label || qrSimulationResult.nextDestination || '-'}</div>
+                                </div>
+                              </div>
+                              {Array.isArray(qrSimulationResult.scanWarnings) && qrSimulationResult.scanWarnings.length > 0 && (
+                                <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-amber-800">
+                                  {qrSimulationResult.scanWarnings.join(' ')}
+                                </div>
+                              )}
+                              {qrSimulationResult.prlPlan && (
+                                <div className={`rounded-xl border p-3 ${qrSimulationResult.prlPlan.overPrl ? 'border-rose-200 bg-rose-50 text-rose-800' : 'border-emerald-200 bg-emerald-50 text-emerald-800'}`}>
+                                  <div className="text-[10px] uppercase tracking-wide">PRL Preview</div>
+                                  <div className="mt-1 text-xs">
+                                    Plan: {formatNumber0(qrSimulationResult.prlPlan.plannedQty || 0)} • Terpakai: {formatNumber0(qrSimulationResult.prlPlan.usedQty || 0)} • Sisa: {formatNumber0(qrSimulationResult.prlPlan.remainingQty || 0)}
+                                  </div>
+                                  {qrSimulationResult.prlPlan.notice && (
+                                    <div className="mt-1 text-[11px]">{qrSimulationResult.prlPlan.notice}</div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                          {!qrSimulationLoading && !qrSimulationError && !qrSimulationResult && (
+                            <div className="mt-3 text-xs text-slate-400">Belum ada simulasi.</div>
+                          )}
+                        </div>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -6156,7 +6795,7 @@ const TabKanban = (props) => {
                         <textarea
                           className="border p-2 rounded w-full text-sm"
                           rows={6}
-                          placeholder="KB-RM-000124&#10;KB-IM-000089&#10;KB-CS-000034"
+                          placeholder="Satu Kanban ID dari master per baris"
                           value={batchForm.kanbanIds}
                           onChange={(e) => setBatchForm({ ...batchForm, kanbanIds: e.target.value })}
                         />

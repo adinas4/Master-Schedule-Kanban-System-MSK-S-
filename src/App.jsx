@@ -14,12 +14,15 @@ import logoMatra from './assets/logo-matra.png';
 import logoPrl from './assets/kop-mrp.png';
 import {
   parseModelCodes,
-  joinModelCodes,
   buildModelMap,
   formatModelCodes,
 } from './utils/modelUtils';
-import { QRCodeCanvas } from 'qrcode.react';
+import { QRCodeCanvas, QRCodeSVG } from 'qrcode.react';
 import { useScheduleStore } from './stores/useScheduleStore';
+
+const standardKanbanIdFormat = 'KB-{CATEGORY}-{UNIQ}';
+const standardKanbanCardIdFormat = 'KB-{CATEGORY}-{UNIQ}-{TOTAL:02}-{SEQ:02}';
+const standardKanbanQrRule = 'KANBAN_ID|ITEM|CATEGORY|QTY|AREA|CYCLE|RIT|TIME';
 
 // ⚠️ PENTING: Hapus tanda '//' di bawah ini di komputer Anda agar fitur Excel aktif
 
@@ -342,6 +345,8 @@ const buildKanbanIdRegex = (format) => {
     .replace(/{MODEL}/gi, '[A-Za-z0-9_-]+')
     .replace(/{PART_NO}/gi, '[A-Za-z0-9_-]+')
     .replace(/{UNIQ}/gi, '(?<uniq>[A-Za-z0-9._-]+)')
+    .replace(/{SEQ(?::\\d+)?}/gi, '\\d+')
+    .replace(/{TOTAL(?::\\d+)?}/gi, '\\d+')
     .replace(/{YEAR}/gi, '\\d{4}')
     .replace(/{YY}/gi, '\\d{2}')
     .replace(/{MONTH}/gi, '\\d{2}')
@@ -802,11 +807,18 @@ const Dashboard = ({ onLogout, token, user }) => {
     maxQty: '',
     lotQty: '',
     leadTimeDays: '',
+    safetyFactor: '',
+    regularKanban: '2',
+    safetyHours: '48',
+    workHours: '24',
+    cycleX: '1',
+    cycleY: '4',
+    cycleZ: '4',
     defaultSupplier: '',
     dropZone: '',
     active: true,
   });
-  const [kanbanCategory, setKanbanCategory] = useState('raw');
+  const [kanbanCategory, setKanbanCategory] = useState('');
   const [selectedKanban, setSelectedKanban] = useState(null);
   const [showDnModal, setShowDnModal] = useState(false);
   const [showDnDetailModal, setShowDnDetailModal] = useState(false);
@@ -960,7 +972,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     sjSubFormat: '',
     prlFormat: '',
     dnStatusFlow: 'CREATED,SENT,RECEIVED,CLOSED',
-    qrTextRule: 'KANBAN_ID|ITEM|QTY|AREA|CYCLE|RIT|TIME',
+    qrTextRule: standardKanbanQrRule,
     qcStatus: 'OK,HOLD,REJECT',
     holdLocation: 'QC-HOLD-AREA',
     workingDays: '',
@@ -985,19 +997,67 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [modelFormVisible, setModelFormVisible] = useState(false);
   const [masterModels, setMasterModels] = useState([]);
   const masterModelsMap = useMemo(() => buildModelMap(masterModels), [masterModels]);
+  const masterModelLookup = useMemo(() => {
+    const lookup = new Map();
+    (masterModels || []).forEach((model) => {
+      const code = String(model?.code || '').trim();
+      const name = String(model?.name || '').trim();
+      if (!code) return;
+      [
+        code,
+        name,
+        name && `${code} - ${name}`,
+        name && `${code}-${name}`,
+        name && `${code} ${name}`,
+      ]
+        .filter(Boolean)
+        .forEach((key) => lookup.set(String(key).trim().toLowerCase(), code));
+    });
+    return lookup;
+  }, [masterModels]);
   const masterModelCodeSet = useMemo(
     () => new Set((masterModels || []).map((model) => String(model.code || '').trim()).filter(Boolean)),
     [masterModels],
   );
+  const resolveModelCodesFromMaster = useCallback((value) => {
+    const segments = parseModelCodes(value);
+    const resolved = [];
+    const addCode = (code) => {
+      const cleanCode = String(code || '').trim();
+      if (cleanCode && !resolved.includes(cleanCode)) resolved.push(cleanCode);
+    };
+
+    segments.forEach((segment) => {
+      const cleanSegment = String(segment || '').trim();
+      if (!cleanSegment) return;
+      const directCode = masterModelLookup.get(cleanSegment.toLowerCase());
+      if (directCode) {
+        addCode(directCode);
+        return;
+      }
+
+      const prefixCode = (masterModels || []).find((model) => {
+        const code = String(model?.code || '').trim();
+        if (!code) return false;
+        return cleanSegment.toLowerCase().startsWith(`${code.toLowerCase()} `)
+          || cleanSegment.toLowerCase().startsWith(`${code.toLowerCase()} -`)
+          || cleanSegment.toLowerCase().startsWith(`${code.toLowerCase()}-`);
+      })?.code;
+      addCode(prefixCode || cleanSegment);
+    });
+
+    return resolved;
+  }, [masterModelLookup, masterModels]);
   const [processFormVisible, setProcessFormVisible] = useState(false);
   const [masterProcesses, setMasterProcesses] = useState([]);
   const masterItemsWithModelCodes = useMemo(
     () => masterItems.map((item) => ({
       ...item,
-      modelCodes: parseModelCodes(item.model),
+      modelCodes: resolveModelCodesFromMaster(item.model),
     })),
-    [masterItems],
+    [masterItems, resolveModelCodesFromMaster],
   );
+  const [itemImportDuplicateKeys, setItemImportDuplicateKeys] = useState({ code: [], partNo: [] });
   const itemDuplicateKeySets = useMemo(() => {
     const codeCounts = new Map();
     const partNoCounts = new Map();
@@ -1019,8 +1079,10 @@ const Dashboard = ({ onLogout, token, user }) => {
     partNoCounts.forEach((count, key) => {
       if (count > 1) partNo.add(key);
     });
+    (itemImportDuplicateKeys.code || []).forEach((key) => code.add(normalizeDuplicateKey(key)));
+    (itemImportDuplicateKeys.partNo || []).forEach((key) => partNo.add(normalizeDuplicateKey(key)));
     return { code, partNo };
-  }, [masterItems]);
+  }, [masterItems, itemImportDuplicateKeys]);
   const [modelCatalogForm, setModelCatalogForm] = useState({ code: '', name: '' });
   const [editingModelCode, setEditingModelCode] = useState(null);
   const getDefaultProcessCatalogForm = () => ({
@@ -1061,15 +1123,17 @@ const Dashboard = ({ onLogout, token, user }) => {
     packQty: '',
     orderLotSize: '',
     maxDeliveryPerRit: '',
-    shelfLifeMonths: '',
     isSeasonal: false,
     suppliers: [],
     customers: [],
     modelCodes: [],
     weight: '',
-    price: '',
-    vendorId: '',
     locationId: '',
+    locationName: '',
+    lineProduction: '',
+    processRouting: [],
+    leadTimeDays: '',
+    cycleTimeSeconds: '',
     imageUrl: '',
     imageThumbUrl: '',
     shelfLifeDays: '',
@@ -1105,6 +1169,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     unit: '',
     typePack: '',
     model: '',
+    location: '',
     supplier: '',
     customer: '',
     duplicatesOnly: false,
@@ -1116,7 +1181,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [fifoSimStep, setFifoSimStep] = useState(0);
   const fifoSimTimerRef = useRef(null);
   const [inventoryShowKanban, setInventoryShowKanban] = useState(true);
-  const [itemForm, setItemForm] = useState({ code: '', name: '', type: 'Finished', unit: 'Unit', model: '', weight: '', cycle: '', safetyStock: '' });
+  const [itemForm, setItemForm] = useState({ code: '', name: '', type: '', unit: 'Unit', model: '', weight: '', cycle: '', safetyStock: '' });
   const [showItemForm, setShowItemForm] = useState(false);
   const [editingItemCode, setEditingItemCode] = useState(null);
   const [itemFilters, setItemFilters] = useState({
@@ -1170,6 +1235,163 @@ const Dashboard = ({ onLogout, token, user }) => {
     masterLocations.forEach((loc) => map.set(loc.id, loc));
     return map;
   }, [masterLocations]);
+  const masterWarehousesById = useMemo(() => {
+    const map = new Map();
+    masterWarehouses.forEach((warehouse) => map.set(String(warehouse.id || '').trim(), warehouse));
+    return map;
+  }, [masterWarehouses]);
+  const masterProcessesByCode = useMemo(() => {
+    const map = new Map();
+    masterProcesses.forEach((process) => {
+      const code = String(process.code || '').trim();
+      if (code) map.set(code, process);
+    });
+    return map;
+  }, [masterProcesses]);
+  const getMasterWarehouseLabel = (warehouse) => {
+    if (!warehouse) return '';
+    const warehouseId = String(warehouse.id || '').trim();
+    const warehouseName = String(warehouse.name || '').trim();
+    return [warehouseId, warehouseName].filter(Boolean).join(' - ');
+  };
+  const getMasterCategoryLabel = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '-';
+    const matched = masterCategories.find((category) => (
+      String(category.code || '').trim().toLowerCase() === raw.toLowerCase()
+      || String(category.name || '').trim().toLowerCase() === raw.toLowerCase()
+    ));
+    if (matched) return [String(matched.code || '').trim(), String(matched.name || '').trim()].filter(Boolean).join(' - ');
+    return getCategoryLabel(raw);
+  };
+  const getMasterPackingLabel = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '-';
+    const matched = masterPackings.find((packing) => (
+      String(packing.code || '').trim().toLowerCase() === raw.toLowerCase()
+      || String(packing.name || '').trim().toLowerCase() === raw.toLowerCase()
+    ));
+    return matched
+      ? [String(matched.code || '').trim(), String(matched.name || '').trim()].filter(Boolean).join(' - ')
+      : raw;
+  };
+  const resolveMasterWarehouseId = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    const direct = masterWarehousesById.get(raw);
+    if (direct) return String(direct.id || '').trim();
+    const lowered = raw.toLowerCase();
+    const match = masterWarehouses.find((warehouse) => {
+      const candidates = [warehouse.id, warehouse.name, getMasterWarehouseLabel(warehouse)].filter(Boolean);
+      return candidates.some((candidate) => String(candidate).trim().toLowerCase() === lowered);
+    });
+    return match ? String(match.id || '').trim() : raw;
+  };
+  const getMasterProcessLabel = (process) => {
+    if (!process) return '';
+    const code = String(process.code || '').trim();
+    const name = String(process.name || '').trim();
+    return [code, name].filter(Boolean).join(' - ');
+  };
+  const resolveMasterProcessCode = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    const direct = masterProcessesByCode.get(raw);
+    if (direct) return String(direct.code || '').trim();
+    const lowered = raw.toLowerCase();
+    const match = masterProcesses.find((process) => {
+      const candidates = [process.code, process.name, getMasterProcessLabel(process)].filter(Boolean);
+      return candidates.some((candidate) => String(candidate).trim().toLowerCase() === lowered);
+    });
+    return match ? String(match.code || '').trim() : raw;
+  };
+  const normalizeItemProcessRouting = (routingRows = [], fallbackLineProduction = '', fallbackCycleTimeSeconds = '') => {
+    const normalizedRows = [];
+    (Array.isArray(routingRows) ? routingRows : []).forEach((row, index) => {
+      const processCode = resolveMasterProcessCode(row?.processCode || row?.code || row?.process || row?.processName || row?.name || '');
+      const masterProcess = masterProcessesByCode.get(String(processCode || '').trim()) || null;
+      const cycleTimeValue = Number(row?.cycleTimeSeconds ?? row?.cycle_time_seconds ?? row?.standardTime ?? row?.standard_time ?? masterProcess?.standard_time ?? 0);
+      const workCenterValue = String(row?.workCenter || row?.work_center || masterProcess?.work_center || '').trim();
+      const processNameValue = String(row?.processName || row?.name || masterProcess?.name || '').trim();
+      const processTypeValue = String(row?.processType || row?.process_type || masterProcess?.process_type || '').trim();
+      const appliesToLevelValue = String(row?.appliesToLevel || row?.applies_to_level || masterProcess?.applies_to_level || 'All').trim() || 'All';
+      normalizedRows.push({
+        code: processCode || processNameValue || workCenterValue || `STEP-${index + 1}`,
+        name: processNameValue || processCode || workCenterValue || `Step ${index + 1}`,
+        processType: processTypeValue,
+        appliesToLevel: appliesToLevelValue,
+        workCenter: workCenterValue || 'UNASSIGNED',
+        sequence: Number.parseInt(String(row?.sequence ?? index + 1), 10) || index + 1,
+        standardTime: Number.isFinite(cycleTimeValue) ? Math.max(0, cycleTimeValue) : 0,
+      });
+    });
+    if (normalizedRows.length > 0) return normalizedRows;
+    const fallbackProcessCode = resolveMasterProcessCode(fallbackLineProduction);
+    const fallbackProcess = masterProcessesByCode.get(String(fallbackProcessCode || '').trim()) || null;
+    const fallbackCycleTime = Number(fallbackCycleTimeSeconds || 0);
+    const fallbackLineValue = String(fallbackLineProduction || '').trim();
+    if (!fallbackProcessCode && !fallbackLineValue && (!Number.isFinite(fallbackCycleTime) || fallbackCycleTime <= 0)) {
+      return [];
+    }
+    return [{
+      code: fallbackProcessCode || fallbackLineValue || 'STEP-1',
+      name: fallbackProcess?.name || fallbackProcessCode || fallbackLineValue || 'Step 1',
+      processType: fallbackProcess?.process_type || '',
+      appliesToLevel: fallbackProcess?.applies_to_level || 'All',
+      workCenter: fallbackProcess?.work_center || fallbackLineValue || 'UNASSIGNED',
+      sequence: 1,
+      standardTime: Number.isFinite(fallbackCycleTime) ? Math.max(0, fallbackCycleTime) : 0,
+    }];
+  };
+  const getMasterLocationLabel = (location) => {
+    if (!location) return '';
+    const locationId = String(location.id || '').trim();
+    const locationType = String(location.line_description || location.lineDescription || location.category || location.type || '').trim();
+    const fifoLane = String(location.fifo_lane || location.fifoLane || '').trim();
+    return [locationId, locationType, fifoLane].filter(Boolean).join(' - ');
+  };
+  const resolveMasterLocationId = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    const direct = masterLocationsById.get(raw);
+    if (direct) return direct.id;
+    const lowered = raw.toLowerCase();
+    const match = masterLocations.find((location) => {
+      const candidates = [
+        location.id,
+        location.warehouse_id,
+        location.line_description,
+        location.lineDescription,
+        location.category,
+        location.type,
+        location.fifo_lane,
+        location.fifoLane,
+        getMasterLocationLabel(location),
+      ].filter(Boolean);
+      return candidates.some((candidate) => String(candidate).trim().toLowerCase() === lowered);
+    });
+    return match ? String(match.id || '').trim() : raw;
+  };
+  const resolveMasterWorkCenterId = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    const lowered = raw.toLowerCase();
+    const match = masterLocations.find((location) => {
+      const locationId = String(location.id || '').trim();
+      const locationType = String(location.line_description || location.lineDescription || '').trim();
+      const fifoLane = String(location.fifo_lane || location.fifoLane || '').trim();
+      const aliases = [
+        locationId,
+        locationType,
+        fifoLane,
+        `${locationId} - ${locationType}`,
+        `${locationId} • ${locationType}`,
+        `${locationId} • ${locationType}${fifoLane ? ` • ${fifoLane}` : ''}`,
+      ].filter(Boolean);
+      return aliases.some((alias) => String(alias).trim().toLowerCase() === lowered);
+    });
+    return match ? String(match.id || '').trim() : raw;
+  };
   const masterVendorsById = useMemo(() => {
     const map = new Map();
     masterVendors.forEach((vendor) => map.set(vendor.id, vendor));
@@ -1420,6 +1642,24 @@ const Dashboard = ({ onLogout, token, user }) => {
       deleteRecords: false,
       resetAll: false,
     },
+    production: {
+      viewReport: false,
+      viewScorecard: false,
+      viewMaster: false,
+      manageMaster: false,
+      manageVendors: false,
+      manageItems: false,
+      viewPrl: false,
+      prlProcess: false,
+      prlImport: false,
+      editSchedules: false,
+      production: true,
+      manageUsers: false,
+      useAI: false,
+      importExport: false,
+      deleteRecords: false,
+      resetAll: false,
+    },
     purchasing: {
       viewReport: true,
       viewScorecard: true,
@@ -1511,11 +1751,12 @@ const Dashboard = ({ onLogout, token, user }) => {
     deleteRecords: false,
     resetAll: false,
   };
-  const userRoleOptions = ['user', 'ppic', 'warehouse', 'purchasing', 'management', 'supplier', 'admin'];
+  const userRoleOptions = ['user', 'ppic', 'warehouse', 'production', 'purchasing', 'management', 'supplier', 'admin'];
   const userRoleDescriptions = {
     user: 'Akses dasar untuk user umum.',
     ppic: 'Fokus planning, PRL, dan monitoring.',
     warehouse: 'Fokus stok, schedule, dan operasi gudang.',
+    production: 'Fokus scan QR dan kanban kosong di lapangan.',
     purchasing: 'Fokus pembelian, PRL, dan supplier.',
     management: 'Fokus dashboard, report, dan review.',
     supplier: 'Akses terbatas ke data supplier sendiri.',
@@ -1698,6 +1939,7 @@ const Dashboard = ({ onLogout, token, user }) => {
 
   const isAdmin = user?.role === 'admin';
   const isSupplier = user?.role === 'supplier';
+  const isProductionUser = user?.role === 'production';
   const can = (perm) => user?.role === 'admin' || user?.permissions?.[perm];
   const canViewReport = can('viewReport');
   const canViewScorecard = can('viewScorecard');
@@ -1716,7 +1958,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   const canManageUsers = can('manageUsers');
   const canResetAll = can('resetAll');
   const canSubcon = canEditSchedules || canViewReport;
-  const canProduction = can('production');
+  const canProduction = can('production') && !isProductionUser;
 
   const refreshAiConfigStatus = useCallback(async ({ silent = false } = {}) => {
     if (!canUseAI) {
@@ -2036,6 +2278,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   };
 
   const fetchItems = async ({ silent = false } = {}) => {
+    if (isProductionUser) return [];
     if (!silent && !items.length) setItemsLoading(true);
     try {
       const data = await apiFetch('/api/items');
@@ -2168,8 +2411,12 @@ const Dashboard = ({ onLogout, token, user }) => {
       const masterItem = masterItemsByCode.get(itemCode);
       const masterLocation = masterLocationsById.get(masterItem?.location_id);
       const masterVendor = masterVendorsById.get(masterItem?.vendor_id);
+      const locationCode = String(masterLocation?.id || masterItem?.location_id || setting?.drop_zone || '').trim();
+      const locationName = String(masterLocation?.name || masterItem?.location_name || '').trim();
+      const supplierCode = String(masterVendor?.id || setting?.default_supplier || masterItem?.vendor_id || '').trim();
+      const supplierName = String(masterVendor?.name || masterItem?.supplier_name || '').trim();
       const minQty = Number(setting?.min_qty || 0);
-      const maxQty = Number(setting?.max_qty || 0);
+      const maxQty = Number(setting?.effective_max_qty ?? setting?.max_qty ?? 0);
       const kanbanQty = Number(setting?.lot_qty || 0);
       const onHand = Number(masterItem?.stock_qty ?? receivedTotals.get(itemCode) ?? 0);
       const reserved = Number(reservedTotals.get(itemCode) || 0);
@@ -2191,7 +2438,11 @@ const Dashboard = ({ onLogout, token, user }) => {
         itemCode,
         itemName: masterItem?.name || setting?.item_name || '',
         category,
-        location: masterLocation?.id || masterLocation?.name || '',
+        categoryCode: String(masterItem?.type || setting?.item_type || '').trim(),
+        categoryLabel: getCategoryLabel(masterItem?.type || setting?.item_type || ''),
+        locationCode,
+        locationName,
+        location: locationCode || locationName || '',
         onHand,
         reserved,
         available,
@@ -2199,7 +2450,9 @@ const Dashboard = ({ onLogout, token, user }) => {
         maxQty,
         noOfCards,
         kanbanQty,
-        supplier: masterVendor?.name || setting?.default_supplier || '',
+        supplierCode,
+        supplierName,
+        supplier: supplierCode || supplierName || '',
         leadTime: Number(setting?.lead_time_days || 0),
         uom: masterItem?.unit || '',
         status,
@@ -2236,6 +2489,10 @@ const Dashboard = ({ onLogout, token, user }) => {
       alert('Item wajib dipilih.');
       return;
     }
+    if (kanbanSettingsForm.active && Number(kanbanSettingsForm.lotQty || 0) <= 0) {
+      alert('Kanban Qty wajib lebih dari 0 untuk setting aktif.');
+      return;
+    }
     try {
       const payload = {
         ...kanbanSettingsForm,
@@ -2244,6 +2501,13 @@ const Dashboard = ({ onLogout, token, user }) => {
         maxQty: Number(kanbanSettingsForm.maxQty) || 0,
         lotQty: Number(kanbanSettingsForm.lotQty) || 0,
         leadTimeDays: Number(kanbanSettingsForm.leadTimeDays) || 0,
+        safetyFactor: Number(kanbanSettingsForm.safetyFactor) || 0,
+        regularKanban: Number(kanbanSettingsForm.regularKanban) || 0,
+        safetyHours: Number(kanbanSettingsForm.safetyHours) || 0,
+        workHours: Number(kanbanSettingsForm.workHours) || 24,
+        cycleX: Number(kanbanSettingsForm.cycleX) || 1,
+        cycleY: Number(kanbanSettingsForm.cycleY) || 4,
+        cycleZ: Number(kanbanSettingsForm.cycleZ) || 4,
       };
       await apiFetch('/api/kanban/settings', {
         method: 'POST',
@@ -2255,6 +2519,13 @@ const Dashboard = ({ onLogout, token, user }) => {
         maxQty: '',
         lotQty: '',
         leadTimeDays: '',
+        safetyFactor: '',
+        regularKanban: '2',
+        safetyHours: '48',
+        workHours: '24',
+        cycleX: '1',
+        cycleY: '4',
+        cycleZ: '4',
         defaultSupplier: '',
         dropZone: '',
         active: true,
@@ -2666,7 +2937,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   };
 
   const buildKanbanId = (itemCode, categoryOverride = '') => {
-    const format = requireConfigFormat(masterConfig.kanbanIdFormat, 'Kanban ID format');
+    const format = requireConfigFormat(masterConfig.kanbanIdFormat || standardKanbanIdFormat, 'Kanban ID format');
     if (!itemCode) return '';
     if (!format) return '';
     const now = new Date();
@@ -2678,12 +2949,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     const counterRaw = kanbanIdCounterMap.get(itemCode) || 1;
     const masterItem = masterItemsByCode.get(itemCode);
     const categoryCodeRaw = masterItem?.type || categoryOverride || '';
-    const categoryCode = (() => {
-      const raw = String(categoryCodeRaw || '').trim();
-      if (!raw) return '';
-      if (categoryNameByCode.has(raw)) return raw;
-      return categoryCodeByName.get(raw.toLowerCase()) || raw;
-    })();
+    const categoryCode = resolveMasterCategoryCode(categoryCodeRaw);
     const supplierRow = (itemSupplierMap.get(itemCode) || [])[0];
     const supplierId = supplierRow?.vendorId || masterItem?.vendor_id || '';
     const modelValue = masterItem?.model || '';
@@ -2706,6 +2972,158 @@ const Dashboard = ({ onLogout, token, user }) => {
     });
 
     return result;
+  };
+
+  const buildKanbanCardId = (itemCode, categoryOverride = '', seq = 1, totalCards = 1) => {
+    const format = requireConfigFormat(masterConfig.kanbanIdFormat || standardKanbanCardIdFormat, 'Kanban ID format');
+    if (!itemCode) return '';
+    if (!format) return '';
+    const now = new Date();
+    const yearFull = String(now.getFullYear());
+    const yearShort = yearFull.slice(-2);
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const romanMonths = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII'];
+    const romanMonth = romanMonths[now.getMonth()];
+    const masterItem = masterItemsByCode.get(itemCode);
+    const categoryCodeRaw = masterItem?.type || categoryOverride || '';
+    const categoryCode = resolveMasterCategoryCode(categoryCodeRaw);
+    const supplierRow = (itemSupplierMap.get(itemCode) || [])[0];
+    const supplierId = supplierRow?.vendorId || masterItem?.vendor_id || '';
+    const modelValue = masterItem?.model || '';
+    const partNoValue = masterItem?.part_no || masterItem?.partNo || masterItem?.code || itemCode;
+    const seqValue = Number(seq || 1);
+    const totalValue = Number(totalCards || seqValue || 1);
+
+    let result = format
+      .replaceAll('{CATEGORY}', sanitizeKanbanToken(categoryCode))
+      .replaceAll('{SUPPLIER}', sanitizeKanbanToken(supplierId))
+      .replaceAll('{MODEL}', sanitizeKanbanToken(modelValue))
+      .replaceAll('{PART_NO}', sanitizeKanbanToken(partNoValue))
+      .replaceAll('{UNIQ}', sanitizeKanbanToken(itemCode))
+      .replaceAll('{YEAR}', yearFull)
+      .replaceAll('{YY}', yearShort)
+      .replaceAll('{MONTH}', month)
+      .replaceAll('{ROMAN_MONTH}', romanMonth)
+      .replaceAll('{SEQ}', String(seqValue))
+      .replaceAll('{TOTAL}', String(totalValue))
+      .replaceAll('{COUNTER}', String(seqValue));
+
+    result = result.replace(/{SEQ(?::(\d+))?}/gi, (_match, pad) => {
+      const padValue = Number(pad || 2);
+      return String(seqValue).padStart(padValue, '0');
+    });
+
+    result = result.replace(/{TOTAL(?::(\d+))?}/gi, (_match, pad) => {
+      const padValue = Number(pad || 2);
+      return String(totalValue).padStart(padValue, '0');
+    });
+
+    result = result.replace(/{COUNTER(?::(\d+))?}/gi, (_match, pad) => {
+      const padValue = Number(pad || 2);
+      return String(seqValue).padStart(padValue, '0');
+    });
+
+    return result;
+  };
+
+  const resolveKanbanCardTotal = (itemCode) => {
+    const setting = kanbanSettingsByCode.get(itemCode);
+    if (!setting) return 1;
+    const lotQty = Number(setting.lot_qty || 0);
+    const effectiveCardCount = Number(setting.effective_card_count ?? setting.calculated_card_count ?? 0);
+    const prlQtyValue = setting.effective_prl_qty ?? setting.prl_month_qty;
+    if (effectiveCardCount > 0) return effectiveCardCount;
+    if (effectiveCardCount === 0 && prlQtyValue !== null && prlQtyValue !== undefined && prlQtyValue !== '') return 0;
+    const hasPrlQty = prlQtyValue !== null && prlQtyValue !== undefined && prlQtyValue !== '';
+    const maxQty = Number(hasPrlQty ? setting.effective_max_qty ?? prlQtyValue : setting.max_qty || 0);
+    if (!lotQty || !maxQty) {
+      if (hasPrlQty && lotQty > 0 && maxQty === 0) return 0;
+      return Number(setting.no_of_cards || setting.noOfCards || 1) || 1;
+    }
+    return hasPrlQty ? Math.ceil(maxQty / lotQty) : Math.max(1, Math.ceil(maxQty / lotQty));
+  };
+
+  const buildKanbanDisplayId = (itemCode, categoryOverride = '', row = null) => {
+    const code = String(itemCode || '').trim();
+    if (!code) return '-';
+    const category = String(categoryOverride || row?.item_type || row?.type || '').trim();
+    const seqValue = Number(row?.card_seq || row?.cardSeq || row?.seq || 0);
+    const totalValue = Number(row?.total_cards || row?.totalCards || row?.noOfCards || row?.no_of_cards || 0) || resolveKanbanCardTotal(code);
+    if (seqValue > 0 && totalValue > 0) {
+      return buildKanbanCardId(code, category, seqValue, totalValue);
+    }
+    return buildKanbanCardId(code, category, 1, totalValue);
+  };
+
+  function extractKanbanIdToken(value) {
+    return String(value || '').trim();
+  }
+
+  function extractKanbanItemCodeCandidates(value) {
+    const trimmed = extractKanbanIdToken(value);
+    if (!trimmed) return [];
+    const candidates = [];
+    const seen = new Set();
+    const pushCandidate = (candidate) => {
+      const text = String(candidate || '').trim();
+      if (!text || seen.has(text)) return;
+      seen.add(text);
+      candidates.push(text);
+    };
+
+    pushCandidate(trimmed);
+    const directMatch = trimmed.match(/^KB-([A-Za-z0-9_-]+)-(.+)$/i);
+    if (directMatch) {
+      const parts = String(directMatch[2] || '')
+        .split('-')
+        .map((part) => part.trim())
+        .filter(Boolean);
+      for (let endIndex = parts.length; endIndex >= 1; endIndex -= 1) {
+        pushCandidate(parts.slice(0, endIndex).join('-'));
+      }
+    }
+
+    const genericParts = trimmed
+      .split(/[-_/]+/)
+      .map((part) => part.trim())
+      .filter(Boolean);
+    if (genericParts.length >= 2) {
+      for (let endIndex = genericParts.length - 1; endIndex >= 1; endIndex -= 1) {
+        pushCandidate(genericParts.slice(0, endIndex).join('-'));
+      }
+    }
+
+    return candidates;
+  }
+
+  function resolveKanbanTransactionQty(itemCode) {
+    const code = String(itemCode || '').trim();
+    if (!code) return 0;
+    const setting = kanbanSettingsByCode.get(code);
+    const item = itemsByCode.get(code) || masterItemsByCode.get(code);
+    const candidates = [
+      setting?.lot_qty,
+      setting?.min_qty,
+      item?.pack_qty,
+      item?.packQty,
+      item?.order_lot_size,
+      item?.orderLotSize,
+      resolveNspForItem(code),
+    ];
+    for (const candidate of candidates) {
+      const qty = Number(candidate);
+      if (Number.isFinite(qty) && qty > 0) return qty;
+    }
+    return 0;
+  }
+
+  const buildKanbanQrPayload = (row = {}) => {
+    const code = String(row?.item_code || row?.itemCode || '').trim();
+    const category = String(row?.item_type || row?.type || '').trim();
+    const lotQty = Number(row?.lot_qty || row?.lotQty || row?.qty_kbn || row?.qtyKbn || 0);
+    const maxQty = Number(row?.max_qty || row?.maxQty || row?.order_qty || row?.orderQty || 0);
+    const totalCards = lotQty > 0 ? Math.max(1, Math.ceil(maxQty / lotQty)) : 1;
+    return buildKanbanCardId(code, category, 1, totalCards);
   };
 
   const getRequestIdLabel = (row) => {
@@ -2732,13 +3150,15 @@ const Dashboard = ({ onLogout, token, user }) => {
   };
 
   const resolvePrlSupplierInfo = (row) => {
+    const suppliers = Array.isArray(row?.suppliers) ? row.suppliers : [];
+    const primarySupplier = suppliers[0] || null;
     const item = masterItemsByCode.get(row.uniq);
-    const vendorId = item?.vendor_id || '';
+    const vendorId = primarySupplier?.vendorId || row.defaultSupplier || item?.vendor_id || '';
     const vendor = (vendorId && masterVendorsById.get(vendorId)) || masterVendors.find((v) => (
       String(v.id).toLowerCase() === String(vendorId).toLowerCase()
-      || String(v.name || '').toLowerCase() === String(item?.supplier_name || '').toLowerCase()
+      || String(v.name || '').toLowerCase() === String(primarySupplier?.vendorName || row.supplierName || item?.supplier_name || '').toLowerCase()
     ));
-    const supplierName = vendor?.name || item?.supplier_name || vendorId || 'UNASSIGNED';
+    const supplierName = vendor?.name || primarySupplier?.vendorName || row.supplierName || item?.supplier_name || vendorId || 'UNASSIGNED';
     const supplierCode = String(vendor?.id || vendorId || supplierName)
       .replace(/\s+/g, '')
       .replace(/[^A-Za-z0-9-]/g, '')
@@ -2819,7 +3239,7 @@ const Dashboard = ({ onLogout, token, user }) => {
 
   const getPrlTypePack = (row) => {
     const item = masterItemsByCode.get(row.uniq);
-    return item?.type_pack || row.typePack || row.item_type_pack || '';
+    return row.typePack || row.item_type_pack || item?.type_pack || '';
   };
   const workingDaysConfig = useMemo(() => {
     if (!masterConfig.workingDays) return {};
@@ -2853,37 +3273,72 @@ const Dashboard = ({ onLogout, token, user }) => {
   const isAutoDraftPrlRow = (row) => Number(row?.suggestedQty || 0) > 0;
   const prlActiveMonthKey = prlFilters.month || monthKeyByIndex[new Date().getMonth()];
   const prlActiveMonthLabel = prlMonthLabel(prlActiveMonthKey) || monthLabelByIndex[new Date().getMonth()];
+  const sanitizePrlDownloadPart = (value, fallback = 'all') => {
+    const clean = String(value || '').trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    return clean || fallback;
+  };
+  const buildPrlDownloadBaseName = (yearValue = prlFilters.year || currentYear, monthKeyValue = prlActiveMonthKey) => {
+    const monthIndex = monthKeyByIndex.indexOf(monthKeyValue);
+    const monthSlug = sanitizePrlDownloadPart(
+      monthIndex >= 0 ? monthLabelByIndex[monthIndex] : monthKeyValue,
+      'all',
+    );
+    const yearSlug = String(yearValue || currentYear).slice(-2);
+    const supplierRaw = String(prlFilters.supplier || '').trim();
+    const supplierVendor = masterVendors.find((vendor) => (
+      String(vendor.id || '').trim().toLowerCase() === supplierRaw.toLowerCase()
+      || String(vendor.name || '').trim().toLowerCase() === supplierRaw.toLowerCase()
+    ));
+    const supplierSlug = sanitizePrlDownloadPart(supplierVendor?.id || supplierRaw, 'all');
+    return `prl-${monthSlug}-${yearSlug}-${supplierSlug}`;
+  };
 
   const filteredPrlRows = useMemo(() => {
     const search = prlFilters.search.trim().toLowerCase();
     const supplierFilter = String(prlFilters.supplier || '').trim().toLowerCase();
-    return prlRows.filter((row) => {
+    return prlRows.map((row) => ({
+      ...row,
+      modelCodes: resolveModelCodesFromMaster(row.modelCodes?.length ? row.modelCodes.join(', ') : row.model),
+    })).filter((row) => {
+      const modelLabel = formatModelCodes(masterModelsMap, row.modelCodes);
       const hay = [
         row.uniq,
         row.partNo,
         row.description,
         row.model,
+        modelLabel,
         row.category,
+        row.categoryName,
         row.uom,
         row.typePack,
+        row.typePackName,
+        row.locationName,
+        ...(row.suppliers || []).flatMap((supplier) => [supplier.vendorId, supplier.vendorName]),
+        ...(row.customers || []).flatMap((customer) => [customer.customerId, customer.customerName]),
       ]
         .filter(Boolean)
         .join(' ')
         .toLowerCase();
       if (search && !hay.includes(search)) return false;
-      const rowModelCodes = parseModelCodes(row.model);
+      const rowModelCodes = row.modelCodes || [];
       if (prlFilters.model?.length && !prlFilters.model.some((code) => rowModelCodes.includes(code))) return false;
       if ((prlFilters.category || []).length && !(prlFilters.category || []).includes(row.category)) return false;
       if (supplierFilter) {
-        const info = resolvePrlSupplierInfo(row);
-        const codeKey = String(info.code || '').toLowerCase();
-        const nameKey = String(info.name || '').toLowerCase();
-        if (supplierFilter !== codeKey && supplierFilter !== nameKey) return false;
+        const suppliers = Array.isArray(row.suppliers) ? row.suppliers : [];
+        const relationMatch = suppliers.some((supplier) => (
+          supplierFilter === String(supplier.vendorId || '').toLowerCase()
+          || supplierFilter === String(supplier.vendorName || '').toLowerCase()
+        ));
+        const fallbackMatch = suppliers.length === 0 && (
+          supplierFilter === String(row.defaultSupplier || '').toLowerCase()
+          || supplierFilter === String(row.supplierName || '').toLowerCase()
+        );
+        if (!relationMatch && !fallbackMatch) return false;
       }
       if (prlFilters.year && String(row.year || '') !== String(prlFilters.year)) return false;
       if (prlFilters.month) {
         const monthValue = Number(row.months?.[prlFilters.month] || 0);
-        if (!monthValue) return false;
+        if (!monthValue && !supplierFilter) return false;
       }
       if (prlFilters.shortage && prlFilters.month) {
         const need = Number(row.months?.[prlFilters.month] || 0);
@@ -2893,7 +3348,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       if (prlFilters.autoDraft && !isAutoDraftPrlRow(row)) return false;
       return true;
     });
-  }, [prlRows, prlFilters]);
+  }, [prlRows, prlFilters, resolveModelCodesFromMaster, masterModelsMap]);
 
   const prlAutoDraftSummary = useMemo(() => {
     const today = new Date();
@@ -2930,8 +3385,34 @@ const Dashboard = ({ onLogout, token, user }) => {
     const modelFilter = itemTableFilters.model.trim().toLowerCase();
     const unitFilter = itemTableFilters.unit.trim().toLowerCase();
     const typePackFilter = itemTableFilters.typePack.trim().toLowerCase();
+    const locationFilter = itemTableFilters.location.trim();
     const supplierFilter = itemTableFilters.supplier.trim();
     const customerFilter = itemTableFilters.customer.trim();
+    const resolveItemCategoryCode = (value) => {
+      const raw = String(value || '').trim();
+      if (!raw) return '';
+      const lowered = raw.toLowerCase();
+      const directMaster = masterCategories.find((category) => (
+        String(category.code || '').trim().toLowerCase() === lowered
+        || String(category.name || '').trim().toLowerCase() === lowered
+      ));
+      if (directMaster?.code) return String(directMaster.code || '').trim();
+      const keywordMatch = masterCategories.find((category) => {
+        const code = String(category.code || '').trim().toLowerCase();
+        const name = String(category.name || '').trim().toLowerCase();
+        return (
+          (lowered.includes('raw') && (code.includes('raw') || name.includes('raw'))) ||
+          (lowered.includes('indirect') && (code.includes('indirect') || name.includes('indirect'))) ||
+          (lowered.includes('consum') && (code.includes('consum') || name.includes('consum'))) ||
+          (lowered.includes('subcon') && (code.includes('subcon') || name.includes('subcon'))) ||
+          (lowered.includes('child') && (code.includes('child') || name.includes('child'))) ||
+          (lowered.includes('sub assy') && (code.includes('sub') || name.includes('sub'))) ||
+          (lowered.includes('subassy') && (code.includes('sub') || name.includes('sub'))) ||
+          (lowered.includes('fin') && (code.includes('fg') || name.includes('finish') || name.includes('fg')))
+        );
+      });
+      return keywordMatch?.code ? String(keywordMatch.code || '').trim() : raw;
+    };
     return masterItemsWithModelCodes.filter((item) => {
       if (codeFilter && !String(item.code || '').toLowerCase().includes(codeFilter)) return false;
       if (partNoFilter) {
@@ -2942,7 +3423,8 @@ const Dashboard = ({ onLogout, token, user }) => {
       if (modelFilter && !String(item.model || '').toLowerCase().includes(modelFilter)) return false;
       if (unitFilter && !String(item.unit || '').toLowerCase().includes(unitFilter)) return false;
       if (typePackFilter && !String(item.type_pack || '').toLowerCase().includes(typePackFilter)) return false;
-      if (itemTableFilters.category && String(item.type || '') !== itemTableFilters.category) return false;
+      if (itemTableFilters.category && resolveItemCategoryCode(item.type) !== itemTableFilters.category) return false;
+      if (locationFilter && String(item.location_id || '').trim() !== locationFilter) return false;
       if (itemTableFilters.duplicatesOnly) {
         const codeKey = normalizeDuplicateKey(item.code);
         const partKey = normalizeDuplicateKey(item.part_no || item.partNo);
@@ -2965,25 +3447,52 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (!silent && !prlRows.length) setPrlLoading(true);
     try {
       const yearParam = yearValue || prlFilters.year || currentYear;
-      const data = await apiFetch(`/api/prl?year=${encodeURIComponent(yearParam)}`);
-        const normalized = (data || []).map((row) => {
-          const rowModelCodes = parseModelCodes(row.model);
+      const params = new URLSearchParams();
+      params.set('year', yearParam);
+      if (prlFilters.supplier) params.set('supplier', prlFilters.supplier);
+      const data = await apiFetch(`/api/prl?${params.toString()}`);
+      const selectedSupplier = String(prlFilters.supplier || '').trim();
+      const supplierKey = selectedSupplier.toLowerCase();
+      const filterSupplierRelations = (relations = []) => {
+        const supplierRows = Array.isArray(relations) ? relations : [];
+        if (!supplierKey) return supplierRows;
+        const matched = supplierRows.filter((supplier) => (
+          supplierKey === String(supplier.vendorId || '').trim().toLowerCase()
+          || supplierKey === String(supplier.vendorName || '').trim().toLowerCase()
+        ));
+        return matched.length > 0 ? matched : supplierRows;
+      };
+        let normalized = (data || []).map((row) => {
+          const rowModelSource = row.item_model || row.model || '';
+          const rowModelCodes = resolveModelCodesFromMaster(rowModelSource);
           return {
             id: row.id,
             uniq: row.item_code,
             partNo: row.part_no || row.item_code,
             description: row.description || '',
-            model: row.model || '',
+            model: rowModelSource,
             modelCodes: rowModelCodes,
             qtyPerKanban: row.qty_per_kanban ?? '',
             uom: row.uom || '',
             typePack: row.type_pack || row.item_type_pack || '',
+            typePackName: row.type_pack_name || '',
             volume: row.volume || '',
             months: row.months || {},
             status: row.status || {},
             category: row.category || '',
+            categoryName: row.category_name || '',
+            suppliers: filterSupplierRelations(row.suppliers),
+            customers: Array.isArray(row.customers) ? row.customers : [],
+            locationId: row.location_id || '',
+            locationName: row.location_name || '',
+            locationCategory: row.location_category || '',
+            fifoLane: row.fifo_lane || '',
+            itemPackQty: row.item_pack_qty ?? '',
+            kanbanLotQty: row.kanban_lot_qty ?? '',
+            defaultSupplier: row.default_supplier || '',
+            supplierName: row.supplier_name || '',
             year: row.year,
-            sourceType: row.source_type || '',
+            sourceType: row.id ? row.source_type || '' : 'master_item',
             sourceRef: row.source_ref || '',
             suggestedQty: Number(row.suggested_qty || 0),
             dueDate: row.due_date || '',
@@ -2994,8 +3503,70 @@ const Dashboard = ({ onLogout, token, user }) => {
             approvedAt: row.approved_at || '',
           };
         });
+      if (selectedSupplier) {
+        const existingCodes = new Set(normalized.map((row) => String(row.uniq || '').trim()).filter(Boolean));
+        const extraRows = masterItems
+          .filter((item) => {
+            const relations = itemSupplierMap.get(item.code) || [];
+            const relationMatch = relations.some((relation) => (
+              String(relation.vendorId || '').trim().toLowerCase() === supplierKey
+              || String(relation.vendorName || '').trim().toLowerCase() === supplierKey
+            ));
+            const defaultMatch = String(item.vendor_id || '').trim().toLowerCase() === supplierKey
+              || String(item.supplier_name || '').trim().toLowerCase() === supplierKey;
+            return (relationMatch || (relations.length === 0 && defaultMatch)) && !existingCodes.has(String(item.code || '').trim());
+          })
+          .map((item) => {
+            const relations = itemSupplierMap.get(item.code) || [];
+            const customers = itemCustomerMap.get(item.code) || [];
+            const vendor = masterVendorsById.get(item.vendor_id);
+            const suppliers = relations.length > 0
+              ? relations
+              : item.vendor_id
+                ? [{ vendorId: item.vendor_id, vendorName: vendor?.name || item.supplier_name || item.vendor_id, sharePercent: 100 }]
+                : [];
+            return {
+              id: null,
+              uniq: item.code,
+              partNo: item.part_no || item.partNo || item.code,
+              description: item.name || '',
+              model: item.model || '',
+              modelCodes: resolveModelCodesFromMaster(item.model),
+              qtyPerKanban: item.pack_qty ?? '',
+              uom: item.unit || '',
+              typePack: item.type_pack || '',
+              typePackName: packingNameByCode.get(item.type_pack) || '',
+              volume: '',
+              months: {},
+              status: {},
+              category: item.type || '',
+              categoryName: categoryNameByCode.get(item.type) || '',
+              suppliers: filterSupplierRelations(suppliers),
+              customers,
+              locationId: item.location_id || '',
+              locationName: item.location_name || '',
+              locationCategory: '',
+              fifoLane: '',
+              itemPackQty: item.pack_qty ?? '',
+              kanbanLotQty: '',
+              defaultSupplier: item.vendor_id || '',
+              supplierName: item.supplier_name || '',
+              year: Number(yearParam),
+              sourceType: 'master_item',
+              sourceRef: '',
+              suggestedQty: 0,
+              dueDate: '',
+              priorityScore: 0,
+              approvedQty: 0,
+              approvedBy: null,
+              approvedByName: '',
+              approvedAt: '',
+            };
+          });
+        normalized = [...normalized, ...extraRows].sort((left, right) => String(left.uniq || '').localeCompare(String(right.uniq || '')));
+      }
       setPrlRows(normalized);
-      dataCacheRef.current.prlLoadedYear = String(yearParam);
+      dataCacheRef.current.prlLoadedYear = `${yearParam}:${prlFilters.supplier || 'all'}`;
     } catch (error) {
       showToastMessage(`Gagal memuat PRL: ${error.message || 'Unknown error'}`);
     } finally {
@@ -3006,9 +3577,11 @@ const Dashboard = ({ onLogout, token, user }) => {
   useEffect(() => {
     if (mainTab !== 'prl') return;
     const yearParam = prlFilters.year || currentYear;
-    const silent = dataCacheRef.current.prlLoadedYear === String(yearParam);
+    const cacheKey = `${yearParam}:${prlFilters.supplier || 'all'}`;
+    const supplierScopedMasterReady = !prlFilters.supplier || (masterItems.length > 0 && itemSupplierMap.size > 0);
+    const silent = dataCacheRef.current.prlLoadedYear === cacheKey && supplierScopedMasterReady;
     fetchPrlRows(yearParam, { silent });
-  }, [mainTab, prlFilters.year]);
+  }, [mainTab, prlFilters.year, prlFilters.supplier, masterItems.length, itemSupplierMap.size, masterModels.length]);
 
   const buildPrlTemplateRows = () => ([
     {
@@ -3041,15 +3614,16 @@ const Dashboard = ({ onLogout, token, user }) => {
   const handlePrlExport = async () => {
     const XLSX = await ensureXlsx();
     if (!XLSX) return;
-    const rows = prlRows.map((row, idx) => ({
+    const exportRows = filteredPrlRows;
+    const rows = exportRows.map((row, idx) => ({
       NO: idx + 1,
       UNIQ: row.uniq || '',
       'PART NO': row.partNo || '',
       DESKRIPSI: row.description || '',
-        MODEL: joinModelCodes(row.modelCodes) || row.model || '',
+      MODEL: formatModelCodes(masterModelsMap, row.modelCodes) || row.model || '',
       'Qty/KBN': row.qtyPerKanban ?? '',
       UOM: row.uom || '',
-      'TYPE PACK': getPrlTypePack(row) || '',
+      'TYPE PACK': row.typePackName || packingNameByCode.get(getPrlTypePack(row)) || getPrlTypePack(row) || '',
       'VOL/DAY': getPrlVolPerDay(row) || '',
       JAN: row.months?.jan ?? '',
       FEB: row.months?.feb ?? '',
@@ -3067,8 +3641,8 @@ const Dashboard = ({ onLogout, token, user }) => {
     const ws = XLSX.utils.json_to_sheet(rows, { header: prlColumns });
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'PRL');
-    XLSX.writeFile(wb, `PRL_${prlFilters.year || currentYear}.xlsx`);
-    showToastMessage(`Export PRL selesai: ${prlRows.length} baris.`);
+    XLSX.writeFile(wb, `${buildPrlDownloadBaseName()}.xlsx`);
+    showToastMessage(`Export PRL selesai: ${exportRows.length} baris.`);
   };
 
   const handlePrlPrintPdf = async () => {
@@ -3141,7 +3715,25 @@ const Dashboard = ({ onLogout, token, user }) => {
     const periodLabel = monthSlots[1].label;
     const printDate = new Date().toLocaleDateString('id-ID');
 
-    const resolveSupplierInfo = (row) => resolvePrlSupplierInfo(row);
+    const selectedSupplierInfo = (() => {
+      const supplierRaw = String(prlFilters.supplier || '').trim();
+      if (!supplierRaw) return null;
+      const supplierVendor = masterVendors.find((vendor) => (
+        String(vendor.id || '').trim().toLowerCase() === supplierRaw.toLowerCase()
+        || String(vendor.name || '').trim().toLowerCase() === supplierRaw.toLowerCase()
+      ));
+      const supplierCode = String(supplierVendor?.id || supplierRaw)
+        .replace(/\s+/g, '')
+        .replace(/[^A-Za-z0-9-]/g, '')
+        .toUpperCase() || 'UNASSIGNED';
+      return {
+        name: supplierVendor?.name || supplierRaw,
+        code: supplierCode,
+        attention: supplierVendor?.email || '-',
+      };
+    })();
+
+    const resolveSupplierInfo = (row) => selectedSupplierInfo || resolvePrlSupplierInfo(row);
 
     const grouped = new Map();
     filteredPrlRows.forEach((row) => {
@@ -3161,89 +3753,104 @@ const Dashboard = ({ onLogout, token, user }) => {
     const pageHeight = doc.internal.pageSize.getHeight();
     const margin = 24;
 
-    const signatureLabels = ['Confirmation', 'Acknowledged', 'Approved', 'Checked', 'Prepared'];
-    const signatureSubLabels = ['', 'Div. Head PPIC', 'Sec. Head MKT', 'Sec. Head PPIC', 'Staff PPIC'];
+    const signatureCards = [
+      { title: 'Confirmation', role: '' },
+      { title: 'Acknowledged', role: 'Div. Head PPIC' },
+      { title: 'Approved', role: 'Sec. Head MKT' },
+      { title: 'Checked', role: 'Sec. Head PPIC' },
+      { title: 'Prepared', role: 'Staff PPIC' },
+    ];
 
     const drawHeader = (supplierInfo, prlNo, showSignature = true) => {
-      const top = 24;
-      const logoWidth = 72;
-      const logoHeight = 40;
+      const top = 16;
+      const logoWidth = 58;
+      const logoHeight = 32;
       if (logoData) {
         doc.addImage(logoData, 'PNG', margin, top, logoWidth, logoHeight);
       }
-      const textX = logoData ? margin + logoWidth + 12 : margin;
-      doc.setFontSize(12);
+      const textX = logoData ? margin + logoWidth + 10 : margin;
+      doc.setFontSize(10);
       doc.setTextColor(30);
-      doc.text('PT. MATRA RODA PIRANTI', textX, top + 14);
-      doc.setFontSize(9);
+      doc.text('PT. MATRA RODA PIRANTI', textX, top + 11);
+      doc.setFontSize(7.5);
       doc.setTextColor(80);
-      doc.text('PRODUCTION CONTROL DEPARTMENT', textX, top + 28);
-      doc.text('PART PROCUREMENT & LOGISTIC DEPARTMENT', textX, top + 40);
+      doc.text('PRODUCTION CONTROL DEPARTMENT', textX, top + 23);
+      doc.text('PART PROCUREMENT & LOGISTIC DEPARTMENT', textX, top + 33);
 
-      const boxW = 130;
-      const boxH = 52;
+      const boxW = 112;
+      const boxH = 42;
       const boxX = (pageWidth - boxW) / 2;
       const boxY = top + 2;
       doc.setDrawColor(100);
       doc.rect(boxX, boxY, boxW, boxH);
       doc.setFillColor(90, 99, 109);
-      doc.rect(boxX, boxY, boxW, 16, 'F');
-      doc.setFontSize(9);
+      doc.rect(boxX, boxY, boxW, 14, 'F');
+      doc.setFontSize(7);
       doc.setTextColor(255);
-      doc.text('#PRL NUMBER', boxX + boxW / 2, boxY + 12, { align: 'center' });
-      doc.setFontSize(12);
+      doc.text('#PRL NUMBER', boxX + boxW / 2, boxY + 10, { align: 'center' });
+      doc.setFontSize(10);
       doc.setTextColor(60);
-      doc.text(prlNo, boxX + boxW / 2, boxY + 36, { align: 'center' });
+      doc.text(prlNo, boxX + boxW / 2, boxY + 30, { align: 'center' });
 
-      const infoTop = top + 58;
-      doc.setFontSize(9);
+      const infoTop = top + 48;
+      doc.setFontSize(7.5);
       doc.setTextColor(60);
       doc.text('FORECAST ORDER', margin, infoTop);
-      doc.text(`MONTH : ${periodLabel}`, margin, infoTop + 14);
-      doc.text(`SUPPLIER : ${supplierInfo.name}`, margin, infoTop + 28);
-      doc.text(`CODE : ${supplierInfo.code || '-'}`, margin, infoTop + 42);
-      doc.text('', margin, infoTop + 56);
-      doc.text('', margin, infoTop + 70);
+      doc.text(`MONTH : ${periodLabel}`, margin, infoTop + 12);
+      doc.text(`SUPPLIER : ${supplierInfo.name}`, margin, infoTop + 24);
+      doc.text(`CODE : ${supplierInfo.code || '-'}`, margin, infoTop + 36);
 
-      doc.setFontSize(8);
+      doc.setFontSize(7);
       doc.setTextColor(90);
-      doc.text(`PRINT DATE : ${printDate}`, pageWidth - margin, infoTop + 70, { align: 'right' });
+      doc.text(`PRINT DATE : ${printDate}`, pageWidth - margin, infoTop + 54, { align: 'right' });
 
       doc.setDrawColor(180);
       if (showSignature) {
-        const signatureGap = 0;
-        const signatureBoxHeight = 32;
-        const signatureAreaLeft = boxX + boxW + 8;
+        const signatureGap = 4;
+        const signatureBoxHeight = 36;
+        const signatureHeaderHeight = 9;
+        const signatureAreaLeft = boxX + boxW + 14;
         const signatureAreaRight = pageWidth - margin;
         const signatureAvailableWidth = Math.max(0, signatureAreaRight - signatureAreaLeft);
-        let signatureBoxWidth = Math.floor(
-          (signatureAvailableWidth - signatureGap * (signatureLabels.length - 1)) / signatureLabels.length,
-        );
-        signatureBoxWidth = Math.max(36, Math.min(62, signatureBoxWidth));
-        const signatureTotalWidth = signatureLabels.length * signatureBoxWidth
-          + (signatureLabels.length - 1) * signatureGap;
-        const signatureStartX = signatureAreaRight - signatureTotalWidth;
-        const signatureLabelY = top + 8;
-        const signatureBoxY = signatureLabelY + 6;
-        signatureLabels.forEach((label, index) => {
+        const signatureBoxWidth = Math.max(48, Math.floor(
+          (signatureAvailableWidth - signatureGap * (signatureCards.length - 1)) / signatureCards.length,
+        ));
+        const signatureTotalWidth = signatureCards.length * signatureBoxWidth
+          + (signatureCards.length - 1) * signatureGap;
+        const signatureStartX = signatureAreaLeft + Math.max(0, (signatureAvailableWidth - signatureTotalWidth) / 2);
+        const signatureBoxY = top + 16;
+        const signatureRoleY = signatureBoxY + signatureBoxHeight + 8;
+        signatureCards.forEach((card, index) => {
           const x = signatureStartX + index * (signatureBoxWidth + signatureGap);
-          doc.setFontSize(8);
-          doc.setTextColor(30);
-          if (label) {
-            doc.text(label, x + signatureBoxWidth / 2, signatureLabelY, { align: 'center' });
-          }
-          doc.setDrawColor(90);
-          doc.rect(x, signatureBoxY, signatureBoxWidth, signatureBoxHeight);
-          const subLabel = signatureSubLabels[index] || '';
-          if (subLabel) {
-            doc.setFontSize(7);
-            doc.setTextColor(40);
-            doc.text(subLabel, x + signatureBoxWidth / 2, signatureBoxY + signatureBoxHeight + 10, { align: 'center' });
+          doc.setFillColor(236, 239, 243);
+          doc.rect(x, signatureBoxY, signatureBoxWidth, signatureHeaderHeight, 'F');
+          doc.setDrawColor(110);
+          doc.setLineWidth(0.6);
+          doc.roundedRect(x, signatureBoxY, signatureBoxWidth, signatureBoxHeight, 2, 2);
+          doc.line(x, signatureBoxY + signatureHeaderHeight, x + signatureBoxWidth, signatureBoxY + signatureHeaderHeight);
+          doc.setFont('helvetica', 'bold');
+          doc.setFontSize(5);
+          doc.setTextColor(45);
+          doc.text(card.title.toUpperCase(), x + signatureBoxWidth / 2, signatureBoxY + 6.5, { align: 'center' });
+          const signLineY = signatureBoxY + signatureBoxHeight - 8;
+          doc.setDrawColor(145);
+          doc.setLineWidth(0.4);
+          doc.line(x + 6, signLineY, x + signatureBoxWidth - 6, signLineY);
+          doc.setFont('helvetica', 'normal');
+          doc.setFontSize(4.8);
+          doc.setTextColor(120);
+          doc.text('Nama & Tanda Tangan', x + signatureBoxWidth / 2, signLineY - 1.5, { align: 'center' });
+          if (card.role) {
+            doc.setFont('helvetica', 'normal');
+            doc.setFontSize(5.5);
+            doc.setTextColor(55);
+            doc.text(card.role, x + signatureBoxWidth / 2, signatureRoleY, { align: 'center' });
           }
         });
+        doc.setFont('helvetica', 'normal');
       }
 
-      const separatorY = infoTop + 80;
+      const separatorY = infoTop + 62;
       doc.line(margin, separatorY, pageWidth - margin, separatorY);
     };
 
@@ -3294,7 +3901,6 @@ const Dashboard = ({ onLogout, token, user }) => {
       const supplierInfo = group.info;
       prlCounter += 1;
       const prlNo = buildPrlNumber(supplierInfo, prlCounter);
-      drawHeader(supplierInfo, prlNo, true);
 
       const buildMonthHeaderLabel = (slot) => {
         const workValue = slot.workDays ?? '-';
@@ -3361,10 +3967,10 @@ const Dashboard = ({ onLogout, token, user }) => {
           ? `${itemCode} / ${partNoValue}`
           : (itemCode || partNoValue || '');
         const partLabel = `${itemLabel}\n${row.description || ''}`.trim();
-        const modelLabel = joinModelCodes(row.modelCodes) || row.model || '-';
+        const modelLabel = String(formatModelCodes(masterModelsMap, row.modelCodes) || row.model || '-').split(' - ')[0] || '-';
         const stdPackRaw = row.qtyPerKanban ?? masterItemsByCode.get(row.uniq)?.pack_qty ?? '';
         const stdPack = Number(stdPackRaw);
-        const typePack = packingNameByCode.get(getPrlTypePack(row)) || getPrlTypePack(row) || '-';
+        const typePack = row.typePackName || packingNameByCode.get(getPrlTypePack(row)) || getPrlTypePack(row) || '-';
         const volPerDayNMinus = roundUpToPack(getVolPerDayForSlot(nMinus, monthSlots[0]), stdPack);
         const volPerDayN = roundUpToPack(getVolPerDayForSlot(nValue, monthSlots[1]), stdPack);
         const uomValue = row.uom
@@ -3399,14 +4005,17 @@ const Dashboard = ({ onLogout, token, user }) => {
       });
 
       let headerPageIndex = 0;
+      const tableStartY = 134;
       autoTable(doc, {
         head,
         body,
-        startY: 170,
-        margin: { left: margin, right: margin, top: 170, bottom: 70 },
+        startY: tableStartY,
+        margin: { left: margin, right: margin, top: tableStartY, bottom: 2 },
+        pageBreak: 'auto',
+        rowPageBreak: 'avoid',
         theme: 'grid',
-        styles: { fontSize: 8, cellPadding: 2.2, textColor: [20, 20, 20], halign: 'center', valign: 'middle', lineWidth: 0.2, lineColor: [200, 200, 200] },
-        headStyles: { fillColor: [238, 242, 248], textColor: [30, 41, 59], fontStyle: 'bold', halign: 'center', valign: 'middle', lineWidth: 0.3, lineColor: [180, 180, 180], cellPadding: 2.4 },
+        styles: { fontSize: 6.4, cellPadding: 1.1, textColor: [20, 20, 20], halign: 'center', valign: 'middle', lineWidth: 0.2, lineColor: [200, 200, 200], minCellHeight: 0 },
+        headStyles: { fillColor: [238, 242, 248], textColor: [30, 41, 59], fontStyle: 'bold', halign: 'center', valign: 'middle', lineWidth: 0.3, lineColor: [180, 180, 180], cellPadding: 1.2, fontSize: 6.2 },
         showHead: 'everyPage',
         columnStyles: {
           0: { cellWidth: 22, halign: 'center' },
@@ -3428,27 +4037,16 @@ const Dashboard = ({ onLogout, token, user }) => {
           16: { cellWidth: 38, halign: 'right' },
           17: { cellWidth: 66, halign: 'center' },
         },
-        didDrawPage: () => {
+        willDrawPage: () => {
           drawHeader(supplierInfo, prlNo, headerPageIndex === 0);
+        },
+        didDrawPage: () => {
           headerPageIndex += 1;
         },
       });
     }
 
-    const sanitizePrlFilenamePart = (value) => String(value || '')
-      .trim()
-      .replace(/\s+/g, '_')
-      .replace(/[^A-Za-z0-9_-]/g, '')
-      .toUpperCase();
-    const periodSlug = sanitizePrlFilenamePart(periodLabel);
-    let supplierSlug = 'ALL';
-    if (grouped.size === 1) {
-      const onlyGroup = grouped.values().next().value;
-      supplierSlug = sanitizePrlFilenamePart(onlyGroup?.info?.name || onlyGroup?.info?.code || 'ALL');
-    } else if (grouped.size > 1) {
-      supplierSlug = 'MULTI';
-    }
-    doc.save(`PRL_${periodSlug}_${supplierSlug}.pdf`);
+    doc.save(`${buildPrlDownloadBaseName(baseYear, monthKeyByIndex[baseMonthIndex])}.pdf`);
   };
 
   const parsePrlSheet = (sheet, XLSX) => {
@@ -3577,9 +4175,13 @@ const Dashboard = ({ onLogout, token, user }) => {
         body: JSON.stringify(payload),
       });
       await fetchPrlRows(prlFilters.year);
+      await fetchKanbanSettings({ silent: true });
       const parts = [`${result.updated || 0} item aktif`];
+      if (Number(result.zeroQtyReleased || 0) > 0) parts.push(`${result.zeroQtyReleased} qty 0 ikut aktif`);
       if (Number(result.autoDraftReleased || 0) > 0) parts.push(`${result.autoDraftReleased} auto draft diproses`);
       if (Number(result.alreadyActive || 0) > 0) parts.push(`${result.alreadyActive} sudah aktif`);
+      if (Number(result.kanbanCalculated || 0) > 0) parts.push(`${result.kanbanCalculated} kanban dihitung ulang`);
+      if (Number(result.workingDays || 0) > 0) parts.push(`${result.workingDays} hari kerja`);
       showToastMessage(
         `Rilis Kanban ${prlMonthLabel(prlFilters.month)} ${prlFilters.year}: ${parts.join(', ')}.`,
       );
@@ -3881,7 +4483,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     'FIFO by Lot/Batch + Received Date',
     'FIFO by Received Date',
   ];
-  const qrRuleTokens = ['KANBAN_ID', 'ITEM', 'QTY', 'AREA'];
+  const qrRuleTokens = ['KANBAN_ID', 'ITEM', 'CATEGORY', 'QTY', 'AREA', 'CYCLE', 'RIT', 'TIME'];
   const dnFormatTokens = ['{PREFIX}', '{SUPPLIER_CODE}', '{SUPPLIER}', '{YY}', '{YEAR}', '{COUNTER}', '{ROMAN_MONTH}', '{MONTH}'];
   const sjSubFormatTokens = ['{YEAR}', '{YY}', '{MONTH}', '{ROMAN_MONTH}', '{COUNTER}'];
   const prlFormatTokens = ['{SUPPLIER_CODE}', '{SUPPLIER}', '{YY}', '{YEAR}', '{COUNTER}', '{ROMAN_MONTH}', '{MONTH}'];
@@ -3894,7 +4496,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     qrTextRule: { label: 'QR Text Rule', type: 'text', helper: qrRuleTokens },
     qcStatus: { label: 'QC Status', type: 'tags' },
     holdLocation: { label: 'Hold Location', type: 'text' },
-    kanbanIdFormat: { label: 'Kanban ID Format', type: 'text', helper: ['{CATEGORY}', '{SUPPLIER}', '{MODEL}', '{PART_NO}', '{UNIQ}', '{COUNTER}', '{YEAR}', '{YY}', '{MONTH}', '{ROMAN_MONTH}'] },
+    kanbanIdFormat: { label: 'Kanban ID Format', type: 'text', helper: ['{CATEGORY}', '{SUPPLIER}', '{MODEL}', '{PART_NO}', '{UNIQ}', '{SEQ}', '{TOTAL}', '{COUNTER}', '{YEAR}', '{YY}', '{MONTH}', '{ROMAN_MONTH}'] },
     requestIdFormat: { label: 'Request ID Format', type: 'text', helper: ['{ITEM_ID}', '{COUNTER}'] },
     locationPrefixWarehouse: { label: 'Location Prefix - Warehouse', type: 'text' },
     locationPrefixProduction: { label: 'Location Prefix - Production Line', type: 'text' },
@@ -3911,7 +4513,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (masterCategories.length > 0) {
       return masterCategories.map((category) => category.code);
     }
-    return ['Raw Material', 'Indirect Material', 'Consumable', 'Subcon', 'Finished'];
+    return ['Raw Material', 'Indirect Material', 'Consumable', 'Subcon'];
   }, [masterCategories]);
   const categoryNameByCode = useMemo(() => {
     const map = new Map();
@@ -3928,6 +4530,16 @@ const Dashboard = ({ onLogout, token, user }) => {
     });
     return map;
   }, [masterCategories]);
+  const resolveMasterCategoryCode = (value, fallbackValue = '') => {
+    const raw = String(value || '').trim();
+    const fallback = String(fallbackValue || '').trim();
+    const firstMasterCode = String(masterCategories?.[0]?.code || '').trim();
+    if (!raw) return fallback || firstMasterCode || '';
+    if (categoryNameByCode.has(raw)) return raw;
+    const byName = categoryCodeByName.get(raw.toLowerCase());
+    if (byName) return byName;
+    return fallback || firstMasterCode || '';
+  };
   const packingNameByCode = useMemo(() => {
     const map = new Map();
     masterPackings.forEach((packing) => {
@@ -3977,7 +4589,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       dailyCapacityQty: '',
       deliverySchedule: [],
     });
-      setItemMasterForm({ code: '', name: '', partNo: '', type: 'Raw Material', unit: 'PCS', typePack: '', packQty: '', orderLotSize: '', maxDeliveryPerRit: '', shelfLifeMonths: '', isSeasonal: false, suppliers: [], customers: [], modelCodes: [], weight: '', price: '', vendorId: '', locationId: '', imageUrl: '', imageThumbUrl: '', shelfLifeDays: '' });
+    setItemMasterForm({ code: '', name: '', partNo: '', type: 'Raw Material', unit: 'PCS', typePack: '', packQty: '', orderLotSize: '', maxDeliveryPerRit: '', isSeasonal: false, suppliers: [], customers: [], modelCodes: [], weight: '', locationId: '', locationName: '', lineProduction: '', processRouting: [], leadTimeDays: '', cycleTimeSeconds: '', imageUrl: '', imageThumbUrl: '', shelfLifeDays: '' });
       setItemModelEntry('');
     setLocationForm({ id: '', lineDescription: '', areaId: '', warehouseId: '', category: 'Raw Material', fifoLane: '', machineNote: '' });
     setPackingForm({ code: '', name: '' });
@@ -4243,7 +4855,6 @@ const Dashboard = ({ onLogout, token, user }) => {
       return;
     }
     const shelfLifeValue = parseFloat(String(itemMasterForm.shelfLifeDays || '').replace(',', '.'));
-    const shelfLifeMonthsValue = parseFloat(String(itemMasterForm.shelfLifeMonths || '').replace(',', '.'));
     const packQtyValue = parseFloat(String(itemMasterForm.packQty || '').replace(',', '.'));
     const orderLotValue = parseFloat(String(itemMasterForm.orderLotSize || '').replace(',', '.'));
     const maxDeliveryValue = parseFloat(String(itemMasterForm.maxDeliveryPerRit || '').replace(',', '.'));
@@ -4272,14 +4883,37 @@ const Dashboard = ({ onLogout, token, user }) => {
       alert('Max Delivery / RIT harus kelipatan SNP / Pack Qty.');
       return;
     }
+    const selectedWarehouse = masterWarehousesById.get(String(itemMasterForm.locationId || '').trim()) || null;
+    const locationNameValue = String(itemMasterForm.locationName || '').trim()
+      || getMasterWarehouseLabel(selectedWarehouse)
+      || String(selectedWarehouse?.id || '').trim();
+    const normalizedProcessRouting = normalizeItemProcessRouting(
+      itemMasterForm.processRouting || [],
+      itemMasterForm.lineProduction || '',
+      itemMasterForm.cycleTimeSeconds || '',
+    );
+    const processFlowValue = normalizedProcessRouting.map((step) => String(step.code || '').trim()).filter(Boolean);
+    const derivedCycleTimeSeconds = normalizedProcessRouting.reduce((sum, step) => sum + Number(step.standardTime || 0), 0);
+    const lineProductionValue = String(itemMasterForm.lineProduction || '').trim()
+      || String(normalizedProcessRouting[0]?.workCenter || '').trim()
+      || String(normalizedProcessRouting[0]?.code || '').trim();
+    const cycleTimeSecondsValue = normalizedProcessRouting.length > 0
+      ? derivedCycleTimeSeconds
+      : Number(itemMasterForm.cycleTimeSeconds || 0);
+    const { vendorId, ...itemMasterPayload } = itemMasterForm;
     const payload = {
-      ...itemMasterForm,
+      ...itemMasterPayload,
+      locationName: locationNameValue,
+      lineProduction: lineProductionValue || null,
       shelfLifeDays: Number.isFinite(shelfLifeValue) ? Math.max(0, Math.round(shelfLifeValue)) : 0,
-      shelfLifeMonths: Number.isFinite(shelfLifeMonthsValue) ? Math.max(0, Math.round(shelfLifeMonthsValue)) : null,
+      shelfLifeMonths: null,
       isSeasonal: !!itemMasterForm.isSeasonal,
       packQty: Number.isFinite(packQtyValue) ? Math.max(0, packQtyValue) : 0,
       orderLotSize: Number.isFinite(orderLotValue) ? Math.max(0, orderLotValue) : 0,
       maxDeliveryPerRit: Number.isFinite(maxDeliveryValue) ? Math.max(0, maxDeliveryValue) : 0,
+      cycleTimeSeconds: Number.isFinite(cycleTimeSecondsValue) ? Math.max(0, cycleTimeSecondsValue) : 0,
+      processFlow: processFlowValue,
+      processRouting: normalizedProcessRouting,
       suppliers: itemMasterForm.suppliers || [],
       customers: itemMasterForm.customers || [],
     };
@@ -4572,7 +5206,7 @@ const Dashboard = ({ onLogout, token, user }) => {
         sjSubFormat: nextConfig.sjSubFormat,
         prlFormat: nextConfig.prlFormat,
         dnStatusFlow: nextConfig.dnStatusFlow.split(',').map((val) => val.trim()).filter(Boolean),
-        qrTextRule: nextConfig.qrTextRule,
+        qrTextRule: standardKanbanQrRule,
         locationPrefixWarehouse: String(nextConfig.locationPrefixWarehouse || '').trim(),
         locationPrefixProduction: String(nextConfig.locationPrefixProduction || '').trim(),
         locationPrefixWorkCenter: String(nextConfig.locationPrefixWorkCenter || '').trim(),
@@ -4588,7 +5222,9 @@ const Dashboard = ({ onLogout, token, user }) => {
   };
 
   const openConfigModal = (key) => {
-    const baseValue = masterConfig[key] ?? '';
+    const baseValue = key === 'qrTextRule'
+      ? standardKanbanQrRule
+      : masterConfig[key] ?? '';
     if (key === 'qcStatus' || key === 'dnStatusFlow') {
       setConfigModalValue(
         String(baseValue)
@@ -5338,105 +5974,85 @@ const Dashboard = ({ onLogout, token, user }) => {
   const openQrModal = (row) => {
     const code = row?.item_code || row?.itemCode || '';
     const name = row?.item_name || row?.itemName || code;
-    const category = row?.item_type || row?.type || '';
-    const kanbanId = buildKanbanId(code, category);
-    const { separator, tokens } = getQrRuleConfig();
-    const tokenValues = {
-      kanban_id: kanbanId,
-      kanban: kanbanId,
-      kanbanid: kanbanId,
-      item: code,
-      qty: row?.lot_qty || row?.lotQty || row?.min_qty || row?.minQty || '',
-      area: row?.area || '',
-      cycle: row?.cycle || '',
-      rit: row?.rit || '',
-      time: row?.time || '',
-    };
-    let payload = '';
-    if (tokens.length > 0) {
-      payload = tokens.map((token) => tokenValues[token.toLowerCase()] ?? '').join(separator);
-    } else {
-      payload = kanbanId;
-    }
+    const payload = buildKanbanQrPayload(row);
     setQrPayload(payload);
     setQrTitle(name || 'Kanban Item');
     setShowQrModal(true);
   };
 
   function resolveKanbanItemCode(kanbanId) {
-    if (!kanbanId) return '';
-    const trimmed = String(kanbanId).trim();
+    const trimmed = extractKanbanIdToken(kanbanId);
+    if (!trimmed) return '';
+    if (/[:|,;]/.test(trimmed)) return '';
     if (masterItemsByCode.has(trimmed)) return trimmed;
-    const format = requireConfigFormat(masterConfig.kanbanIdFormat, 'Kanban ID format');
+    const format = requireConfigFormat(masterConfig.kanbanIdFormat || standardKanbanCardIdFormat, 'Kanban ID format');
     if (!format) return trimmed;
     const regex = buildKanbanIdRegex(format);
     const match = trimmed.match(regex);
     if (match?.groups?.uniq) {
       return match.groups.uniq;
     }
-    const separatorMatch = trimmed.match(/^(.+?)[-_\/](\d+)(?:[-_\/].*)?$/);
-    if (separatorMatch?.[1] && masterItemsByCode.has(separatorMatch[1])) {
-      return separatorMatch[1];
-    }
-    const lastDash = trimmed.lastIndexOf('-');
-    if (lastDash > 0) {
-      const prefix = trimmed.slice(0, lastDash).trim();
-      if (masterItemsByCode.has(prefix)) return prefix;
+    for (const candidate of extractKanbanItemCodeCandidates(trimmed)) {
+      if (masterItemsByCode.has(candidate)) return candidate;
+      const normalizedCandidate = candidate.toUpperCase();
+      if (masterItemsByCode.has(normalizedCandidate)) return normalizedCandidate;
     }
     return trimmed;
   }
 
   const extractAreaNote = (notes) => {
     if (!notes) return '-';
-    const match = String(notes).match(/area:s*([^|]+)/i);
+    const match = String(notes).match(/area:\s*([^|]+)/i);
     return match ? match[1].trim() : '-';
   };
 
   const extractKanbanIdNote = (notes) => {
     if (!notes) return '';
-    const match = String(notes).match(/kanban:s*([^|]+)/i);
+    const match = String(notes).match(/kanban:\s*([^|]+)/i);
     return match ? match[1].trim() : '';
-  };
-
-  const getQrRuleConfig = () => {
-    const rule = String(masterConfig.qrTextRule || '').trim();
-    if (!rule) {
-      return { separator: '|', tokens: [] };
-    }
-    const match = rule.match(/[|,;/]/);
-    const separator = match ? match[0] : '|';
-    const tokens = rule.split(separator).map((token) => token.trim()).filter(Boolean);
-    return { separator, tokens };
   };
 
   const parseScanLine = (line) => {
     if (!line) return null;
-    const { separator, tokens } = getQrRuleConfig();
-    if (!line.includes(separator) && !line.includes(':')) {
-      return { kanbanId: line, item: '', qty: '', area: '' };
-    }
-    let parts = {};
-    if (line.includes(':')) {
-      parts = Object.fromEntries(
-        line.split(separator).map((chunk) => {
-          const [key, ...rest] = chunk.split(':');
-          return [String(key || '').trim().toLowerCase(), rest.join(':').trim()];
-        }),
-      );
-    } else if (tokens.length > 0) {
-      const values = line.split(separator).map((val) => val.trim());
-      parts = Object.fromEntries(tokens.map((token, index) => [token.toLowerCase(), values[index] || '']));
-    }
+    const trimmed = String(line || '').trim();
+    if (!trimmed) return null;
     return {
-      kanbanId: parts.kanban_id || parts.kanban || parts.kanbanid || parts.kanban_id || line,
-      item: parts.item || '',
-      qty: parts.qty || '',
-      area: parts.area || '',
+      kanbanId: trimmed,
+      item: '',
+      category: '',
+      qty: '',
+      area: '',
+      cycle: '',
+      rit: '',
+      time: '',
     };
   };
 
   const buildScanResult = (payload, index = 0) => {
     const code = resolveKanbanItemCode(payload.kanbanId);
+    if (!code) {
+      return {
+        id: index + 1,
+        kanbanId: payload.kanbanId,
+        itemCode: '',
+        itemName: '-',
+        qty: payload.qty || '-',
+        stock: 0,
+        min: 0,
+        max: 0,
+        status: 'Invalid',
+        itemCategoryCode: '',
+        itemCategoryLabel: '',
+        actionType: '',
+        actionLabel: '',
+        actionHint: '',
+        nextDestination: '',
+        scannedAt: new Date().toISOString(),
+        category: '-',
+        location: '-',
+        scanPreviewError: 'Kanban ID tidak valid.',
+      };
+    }
     const setting = kanbanSettingsByCode.get(code);
     const item = itemsByCode.get(code);
     const masterItem = masterItemsByCode.get(code);
@@ -5445,13 +6061,14 @@ const Dashboard = ({ onLogout, token, user }) => {
     const stock = Number(fifoTotalsByItemCode.get(code) ?? 0);
     const min = Number(masterItem?.safety_stock ?? 0);
     const max = Number(setting?.max_qty ?? 0);
+    const resolvedQty = resolveKanbanTransactionQty(code);
     const status = stock < min ? 'Critical' : 'Normal';
     return {
       id: index + 1,
       kanbanId: payload.kanbanId,
       itemCode: code,
       itemName: masterItem?.name || item?.name || payload.item || '-',
-      qty: payload.qty || setting?.lot_qty || setting?.min_qty || '-',
+      qty: payload.qty || resolvedQty || '-',
       stock,
       min,
       max,
@@ -5554,13 +6171,9 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (!result?.itemCode) {
       return { ok: false, reason: 'ID kanban tidak valid.' };
     }
-    const setting = kanbanSettingsByCode.get(result.itemCode);
-    if (!setting) {
-      return { ok: false, reason: 'ID kanban tidak ditemukan di Master Kanban.' };
-    }
-    const qty = Number(setting.lot_qty || setting.min_qty || 0);
+    const qty = resolveKanbanTransactionQty(result.itemCode);
     if (!qty) {
-      return { ok: false, reason: 'Kanban qty belum diatur.' };
+      return { ok: false, reason: 'Kanban qty belum diatur di master item/kanban.' };
     }
     try {
       await apiFetch('/api/kanban/requests', {
@@ -5586,10 +6199,9 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (!itemCode) {
       return { ok: false, reason: 'Item belum terdeteksi.' };
     }
-    const setting = kanbanSettingsByCode.get(itemCode);
-    const qtyValue = Number((qtyOverride ?? result?.qty) || 0) || Number(setting?.lot_qty || setting?.min_qty || 0);
+    const qtyValue = Number((qtyOverride ?? result?.qty) || 0) || resolveKanbanTransactionQty(itemCode);
     if (!qtyValue) {
-      return { ok: false, reason: 'Qty belum valid.' };
+      return { ok: false, reason: 'Qty belum valid di master item/kanban.' };
     }
     try {
       await apiFetch('/api/stock/consume', {
@@ -5610,23 +6222,19 @@ const Dashboard = ({ onLogout, token, user }) => {
       alert('Selesaikan dulu Stock Opname!');
       return;
     }
-    const code = resolveKanbanItemCode(emptyKanbanForm.kanbanId);
+    const kanbanInput = extractKanbanIdToken(emptyKanbanForm.kanbanId);
+    const code = resolveKanbanItemCode(kanbanInput);
     if (!code) {
-      alert('ID Kanban wajib diisi.');
+      alert('Kanban ID wajib diisi.');
       return;
     }
     if (emptyKanbanForm.area && !masterAreas.some((area) => area.id === emptyKanbanForm.area)) {
       alert('Area tidak valid. Pilih dari Master Referensi.');
       return;
     }
-    const setting = kanbanSettingsByCode.get(code);
-    if (!setting) {
-      alert('ID Kanban tidak ditemukan di Master Kanban.');
-      return;
-    }
-    const qty = Number(setting.lot_qty || setting.min_qty || 0);
+    const qty = resolveKanbanTransactionQty(code);
     if (!qty) {
-      alert('Kanban qty belum diatur.');
+      alert('Kanban qty belum diatur di master item/kanban.');
       return;
     }
     try {
@@ -5636,19 +6244,24 @@ const Dashboard = ({ onLogout, token, user }) => {
           itemCode: code,
           requestQty: qty,
           area: emptyKanbanForm.area || null,
-          kanbanId: emptyKanbanForm.kanbanId || null,
+          kanbanId: kanbanInput || null,
         }),
       });
       setEmptyKanbanForm({ area: '', kanbanId: '' });
       const consumedQty = Number(result?.consumedQty ?? qty);
       const consumedBatches = Number(result?.consumedBatches ?? result?.updatedLots ?? 0);
       const stockNote = `Stok terpotong ${formatNumber0(consumedQty)}${consumedBatches ? ` (${consumedBatches} lot)` : ''}.`;
+      const prlNotice = result?.prlPlan?.notice || result?.notice || '';
+      const scanWarning = Array.isArray(result?.warnings) && result.warnings.length ? ` ${result.warnings.join(' ')}` : '';
       if (result?.notice) {
-        showToastMessage(`${stockNote} ${result.notice}`);
+        showToastMessage(`${stockNote} ${result.notice}${scanWarning}`);
       } else if (result?.requestCreated) {
-        showToastMessage(`Kanban kosong diproses. ${stockNote} Request dibuat.`);
+        const prlLabel = result?.prlPlan?.monthLabel ? ` PRL ${result.prlPlan.monthLabel} tersisa ${formatNumber0(result.prlPlan.remainingQty || 0)}.` : '';
+        showToastMessage(`Kanban kosong diproses. ${stockNote} Request dibuat.${prlLabel}${scanWarning}`);
+      } else if (prlNotice) {
+        showToastMessage(`Kanban kosong diproses. ${stockNote} ${prlNotice}${scanWarning}`);
       } else {
-        showToastMessage(`Kanban kosong diproses. ${stockNote} Request sudah ada.`);
+        showToastMessage(`Kanban kosong diproses. ${stockNote} Request sudah ada.${scanWarning}`);
       }
       await fetchKanbanRequests();
       await fetchItems();
@@ -5668,7 +6281,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       return;
     }
     const ids = batchForm.kanbanIds
-      .split(/r?n|,/)
+      .split(/\r?\n|,/)
       .map((value) => value.trim())
       .filter(Boolean);
     if (ids.length === 0) {
@@ -5699,7 +6312,10 @@ const Dashboard = ({ onLogout, token, user }) => {
           const consumedQty = Number(result?.consumedQty ?? qty);
           const consumedBatches = Number(result?.consumedBatches ?? result?.updatedLots ?? 0);
           const stockNote = `Stok terpotong ${formatNumber0(consumedQty)}${consumedBatches ? ` (${consumedBatches} lot)` : ''}.`;
-          notices.push(`${id}: ${stockNote} ${result.notice}`);
+          const scanWarning = Array.isArray(result?.warnings) && result.warnings.length ? ` ${result.warnings.join(' ')}` : '';
+          notices.push(`${id}: ${stockNote} ${result.notice}${scanWarning}`);
+        } else if (Array.isArray(result?.warnings) && result.warnings.length) {
+          notices.push(`${id}: ${result.warnings.join(' ')}`);
         }
       } catch (_error) {
         failed.push(id);
@@ -5713,7 +6329,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       alert(`Sebagian gagal diproses: ${failed.join(', ')}`);
     }
     if (notices.length > 0) {
-      showToastMessage(notices.join('n'));
+      showToastMessage(notices.join('\n'));
     }
   };
 
@@ -5803,7 +6419,7 @@ const Dashboard = ({ onLogout, token, user }) => {
 
   const handleProcessScan = async () => {
     const lines = scanInput
-      .split(/r?n/)
+      .split(/\r?\n/)
       .map((line) => line.trim())
       .filter(Boolean);
     if (lines.length === 0) {
@@ -5823,16 +6439,6 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
   };
 
-  const handleLoadSampleScan = () => {
-    setScanInput(
-      [
-        'KANBAN_ID:KB-RM-000124|ITEM:RM-STKM11AH-22216|QTY:30',
-        'KANBAN_ID:KB-IM-000089|ITEM:IM-BRG-0456|QTY:50',
-        'KANBAN_ID:KB-CS-000034|ITEM:CS-OIL-001|QTY:20',
-      ].join('n'),
-    );
-  };
-
   const handleCreateItem = async (e) => {
     e.preventDefault();
     if (!itemForm.code || !itemForm.name || !itemForm.type || !itemForm.unit) {
@@ -5850,7 +6456,7 @@ const Dashboard = ({ onLogout, token, user }) => {
         body: JSON.stringify(payload),
       });
       await fetchItems();
-      setItemForm({ code: '', name: '', type: 'Finished', unit: 'Unit', model: '', weight: '', cycle: '', safetyStock: '' });
+      setItemForm({ code: '', name: '', type: masterCategoryOptions?.[0] || '', unit: 'Unit', model: '', weight: '', cycle: '', safetyStock: '' });
       setEditingItemCode(null);
       setShowItemForm(false);
     } catch (error) {
@@ -5862,7 +6468,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     setItemForm({
       code: item.code || '',
       name: item.name || '',
-      type: item.type || 'Finished',
+      type: resolveMasterCategoryCode(item.type, masterCategoryOptions?.[0] || ''),
       unit: item.unit || 'Unit',
       model: item.model || '',
       weight: item.weight ?? '',
@@ -6009,12 +6615,37 @@ const Dashboard = ({ onLogout, token, user }) => {
     readItemImportRows(file).then(async (rows) => {
       if (!rows.length) { showToastMessage('File kosong.'); return; }
       try {
+        setItemImportDuplicateKeys({ code: [], partNo: [] });
         const existingCodes = new Set(masterItems.map((item) => String(item.code || '').trim()).filter(Boolean));
+        const existingPartNos = new Set(masterItems.map((item) => String(item.part_no || item.partNo || '').trim()).filter(Boolean));
         let inserted = 0;
         let updated = 0;
         let skipped = 0;
+        let duplicates = 0;
         const payloads = [];
         const skippedReasons = [];
+        const duplicateReasons = [];
+        const duplicateCodeKeys = new Set();
+        const duplicatePartNoKeys = new Set();
+        const seenCodesInFile = new Set();
+        const seenPartNosInFile = new Set();
+        const hasImportValue = (value) => String(value ?? '').trim() !== '';
+        const pickTextValue = (importedValue, existingValue = '') => (
+          hasImportValue(importedValue) ? String(importedValue).trim() : String(existingValue || '').trim()
+        );
+        const pickNumberValue = (importedValue, existingValue = 0) => {
+          if (hasImportValue(importedValue)) {
+            const parsed = Number(importedValue);
+            return Number.isFinite(parsed) ? parsed : Number(existingValue || 0);
+          }
+          const parsedExisting = Number(existingValue || 0);
+          return Number.isFinite(parsedExisting) ? parsedExisting : 0;
+        };
+        const pickBooleanValue = (importedValue, existingValue = false) => (
+          hasImportValue(importedValue)
+            ? /^(1|true|yes|y|seasonal)$/i.test(String(importedValue).trim())
+            : Boolean(existingValue)
+        );
         rows.forEach((row, index) => {
           const rowNumber = index + 2;
           const sheetName = String(row.__sheetName || '').trim();
@@ -6023,11 +6654,25 @@ const Dashboard = ({ onLogout, token, user }) => {
           const partNo = getImportValue(row, ['Part No', 'PART NO', 'PartNo', 'partNo', 'Part Number', 'part number']);
           const typeRaw = getImportValue(row, ['Type', 'type', 'Category', 'category', 'Kategori', 'kategori']);
           const unit = getImportValue(row, ['Satuan', 'Unit', 'unit', 'UOM', 'uom', 'OUM', 'oum']);
+          const typePack = getImportValue(row, ['Type Pack', 'TypePack', 'typePack', 'type_pack']);
           const model = getImportValue(row, ['Model', 'model']);
           const weight = getImportValue(row, ['Berat', 'Weight', 'weight', 'Kgs', 'kgs']);
+          const price = getImportValue(row, ['Price', 'Harga', 'price']);
+          const leadTimeDays = getImportValue(row, ['Lead Time (Days)', 'Lead Time', 'leadTimeDays', 'lead_time_days']);
           const cycle = getImportValue(row, ['Cycle', 'cycle']);
+          const cycleTimeSeconds = getImportValue(row, ['Cycle Time (s)', 'Cycle Time', 'Cycle Time Seconds', 'cycleTimeSeconds', 'cycle_time_seconds']);
+          const shelfLifeDays = getImportValue(row, ['Shelf Life (hari)', 'Shelf Life Days', 'shelfLifeDays', 'shelf_life_days']);
+          const shelfLifeMonths = getImportValue(row, ['Shelf Life (bulan)', 'Shelf Life Months', 'shelfLifeMonths', 'shelf_life_months']);
+          const movingStatus = getImportValue(row, ['Moving Status', 'movingStatus', 'moving_status']);
+          const seasonalValue = getImportValue(row, ['Seasonal', 'Is Seasonal', 'isSeasonal', 'is_seasonal']);
+          const locationInput = getImportValue(row, ['Master Ord Warehouse', 'Nama Master Ord Warehouse', 'Warehouse / Lokasi', 'Warehouse', 'Warehouse ID', 'Location', 'Location Name', 'Lokasi', 'Storage Location', 'locationId', 'location_id', 'location_name']);
+          const supplierInput = getImportValue(row, ['Supplier / Vendor', 'Supplier', 'Vendor', 'Supplier Code', 'Vendor Code', 'Kode Supplier', 'Kode Vendor', 'supplier', 'vendor', 'vendor_id', 'supplier_id', 'default_supplier']);
+          const lineProductionInput = getImportValue(row, ['Line Produksi / Work Center', 'Line Produksi', 'Master Proses', 'Process', 'Process Code', 'Process Name', 'Line Production', 'Production Line', 'Line', 'Work Center', 'lineProduction', 'line_production']);
+          const processRoutingInput = getImportValue(row, ['Process Routing', 'Routing Proses', 'Process Flow', 'Routing', 'processRouting', 'process_routing']);
+          const orderLotSize = getImportValue(row, ['Order Lot Size', 'Order Lot Size / Qty per Lot Order', 'Order Lot', 'orderLotSize', 'order_lot_size']);
+          const maxDeliveryPerRit = getImportValue(row, ['Max Delivery / Rit', 'Max Delivery', 'maxDeliveryPerRit', 'max_delivery_per_rit']);
           const safetyStock = getImportValue(row, ['Safety Stock', 'Safety', 'safetyStock']);
-          const packQty = getImportValue(row, ['SNP', 'Pack Qty', 'PackQty', 'packQty', 'QTY / KBN RM', 'QTY / KBN FG']);
+          const packQty = getImportValue(row, ['SNP', 'SNP / Pack Qty', 'Pack Qty', 'PackQty', 'packQty', 'QTY / KBN RM', 'QTY / KBN FG']);
           const type = inferImportType(typeRaw, sheetName, file.name);
           if (!code || !name || !type || !unit) {
             skipped += 1;
@@ -6037,18 +6682,132 @@ const Dashboard = ({ onLogout, token, user }) => {
             );
             return;
           }
+          const locationIdResolved = resolveMasterWarehouseId(locationInput);
+          const lineProductionResolved = resolveMasterWorkCenterId(lineProductionInput);
+          const selectedWarehouse = masterWarehousesById.get(locationIdResolved);
+          const supplierTokens = String(supplierInput || '')
+            .split(/[,;|]/)
+            .map((value) => String(value || '').trim())
+            .filter(Boolean);
+          const resolvedSupplier = supplierTokens
+            .map((value) => resolveVendorFromSupplier(value))
+            .find((vendor) => Boolean(vendor))
+            || resolveVendorFromSupplier(supplierInput);
+          const shelfLifeDaysValue = shelfLifeDays
+            ? Number(shelfLifeDays)
+            : (shelfLifeMonths ? Number(shelfLifeMonths) * 30 : 0);
+          const routingSourceRows = [];
+          for (let stepIndex = 1; stepIndex <= 5; stepIndex += 1) {
+            const stepProcess = getImportValue(row, [
+              `Process ${stepIndex}`,
+              `Process Code ${stepIndex}`,
+              `Process Name ${stepIndex}`,
+              `Routing ${stepIndex}`,
+              `Routing Process ${stepIndex}`,
+              `Work Center ${stepIndex}`,
+              `Line ${stepIndex}`,
+            ]);
+            const stepCycleTime = getImportValue(row, [
+              `Cycle Time ${stepIndex} (s)`,
+              `Cycle Time ${stepIndex}`,
+              `Cycle ${stepIndex}`,
+              `Standard Time ${stepIndex}`,
+              `Std Time ${stepIndex}`,
+            ]);
+            if (!stepProcess && !stepCycleTime) continue;
+            routingSourceRows.push({
+              processCode: stepProcess ? String(stepProcess).trim() : '',
+              cycleTimeSeconds: stepCycleTime ? Number(stepCycleTime) : '',
+            });
+          }
+          if (!routingSourceRows.length && (processRoutingInput || lineProductionInput || cycleTimeSeconds)) {
+            routingSourceRows.push({
+              processCode: processRoutingInput ? String(processRoutingInput).trim() : String(lineProductionInput || '').trim(),
+              cycleTimeSeconds: cycleTimeSeconds ? Number(cycleTimeSeconds) : '',
+            });
+          }
+          const normalizedProcessRouting = normalizeItemProcessRouting(
+            routingSourceRows,
+            lineProductionInput,
+            cycleTimeSeconds ? Number(cycleTimeSeconds) : 0,
+          );
+          const processFlowValue = normalizedProcessRouting.map((step) => String(step.code || '').trim()).filter(Boolean);
+          const derivedCycleTimeSeconds = normalizedProcessRouting.reduce((sum, step) => sum + Number(step.standardTime || 0), 0);
+          const normalizedCode = String(code).trim();
+          const existingItem = masterItems.find((item) => String(item.code || '').trim() === normalizedCode) || null;
+          const existingSupplierRows = itemSupplierMap.get(normalizedCode) || [];
+          const existingCustomerRows = itemCustomerMap.get(normalizedCode) || [];
+          const mergedSuppliers = existingSupplierRows.length > 0
+            ? existingSupplierRows.map((supplier) => ({
+                vendorId: String(supplier.vendorId || '').trim(),
+                vendorName: String(supplier.vendorName || supplier.vendorId || '').trim(),
+                sharePercent: Number(supplier.sharePercent || 0),
+              }))
+            : (resolvedSupplier?.id ? [{ vendorId: String(resolvedSupplier.id).trim(), vendorName: String(resolvedSupplier.name || resolvedSupplier.id || '').trim(), sharePercent: 100 }] : []);
+          const mergedCustomers = existingCustomerRows.length > 0
+            ? existingCustomerRows.map((customer) => ({
+                customerId: String(customer.customerId || '').trim(),
+                customerName: String(customer.customerName || customer.customerId || '').trim(),
+                sharePercent: Number(customer.sharePercent || 0),
+              }))
+            : [];
           payloads.push({
-            code: String(code).trim(),
+            code: normalizedCode,
             name: String(name).trim(),
-            partNo: partNo ? String(partNo).trim() : '',
+            partNo: pickTextValue(partNo, existingItem?.part_no || existingItem?.partNo || ''),
             type,
-            unit: String(unit).trim(),
-            model: model ? String(model).trim() : '',
-            weight: weight ? Number(weight) : null,
-            cycle: cycle ? String(cycle).trim() : '',
-            safetyStock: safetyStock ? Number(safetyStock) : 0,
-            packQty: packQty ? Number(packQty) : 0,
+            unit: pickTextValue(unit, existingItem?.unit || ''),
+            model: pickTextValue(model, existingItem?.model || ''),
+            weight: hasImportValue(weight) ? Number(weight) : (existingItem?.weight ?? null),
+            price: hasImportValue(price) ? Number(price) : (existingItem?.price ?? null),
+            locationId: pickTextValue(locationIdResolved, existingItem?.location_id || existingItem?.locationId || ''),
+            locationName: pickTextValue(
+              getMasterWarehouseLabel(selectedWarehouse) || String(locationInput || '').trim(),
+              existingItem?.location_name || existingItem?.locationName || '',
+            ),
+            vendorId: pickTextValue(
+              resolvedSupplier?.id || '',
+              existingItem?.vendor_id || existingItem?.vendorId || mergedSuppliers[0]?.vendorId || '',
+            ),
+            supplierName: pickTextValue(
+              resolvedSupplier?.name || '',
+              existingItem?.supplier_name || existingItem?.supplierName || mergedSuppliers[0]?.vendorName || '',
+            ),
+            lineProduction: pickTextValue(lineProductionResolved, existingItem?.line_production || existingItem?.lineProduction || ''),
+            leadTimeDays: pickNumberValue(leadTimeDays, existingItem?.lead_time_days || existingItem?.leadTimeDays || 0),
+            cycle: pickTextValue(cycle, existingItem?.cycle || ''),
+            cycleTimeSeconds: normalizedProcessRouting.length > 0
+              ? derivedCycleTimeSeconds
+              : pickNumberValue(cycleTimeSeconds, existingItem?.cycle_time_seconds || existingItem?.cycleTimeSeconds || 0),
+            processFlow: processFlowValue,
+            processRouting: normalizedProcessRouting,
+            shelfLifeDays: pickNumberValue(shelfLifeDaysValue, existingItem?.shelf_life_days || existingItem?.shelfLifeDays || 0),
+            shelfLifeMonths: existingItem?.shelf_life_months ?? existingItem?.shelfLifeMonths ?? null,
+            movingStatus: pickTextValue(movingStatus, existingItem?.moving_status || existingItem?.movingStatus || ''),
+            isSeasonal: pickBooleanValue(seasonalValue, existingItem?.is_seasonal || existingItem?.isSeasonal || false),
+            typePack: pickTextValue(typePack, existingItem?.type_pack || existingItem?.typePack || ''),
+            orderLotSize: pickNumberValue(orderLotSize, existingItem?.order_lot_size || existingItem?.orderLotSize || 0),
+            maxDeliveryPerRit: pickNumberValue(maxDeliveryPerRit, existingItem?.max_delivery_per_rit || existingItem?.maxDeliveryPerRit || 0),
+            safetyStock: pickNumberValue(safetyStock, existingItem?.safety_stock || existingItem?.safetyStock || 0),
+            packQty: pickNumberValue(packQty, existingItem?.pack_qty || existingItem?.packQty || 0),
+            imageUrl: existingItem?.image_url || existingItem?.imageUrl || '',
+            imageThumbUrl: existingItem?.image_thumb_url || existingItem?.imageThumbUrl || '',
+            suppliers: mergedSuppliers,
+            customers: mergedCustomers,
           });
+          const normalizedPartNo = String(partNo || '').trim();
+          const duplicateCode = existingCodes.has(normalizedCode) || seenCodesInFile.has(normalizedCode);
+          const duplicatePartNo = normalizedPartNo && (existingPartNos.has(normalizedPartNo) || seenPartNosInFile.has(normalizedPartNo));
+          if (duplicateCode || duplicatePartNo) {
+            duplicates += 1;
+            if (duplicateCode) duplicateCodeKeys.add(normalizedCode);
+            if (duplicatePartNo) duplicatePartNoKeys.add(normalizedPartNo);
+            duplicateReasons.push(
+              `Baris ${rowNumber}${sheetName ? ` [${sheetName}]` : ''}: ${duplicateCode ? `UNIQ ${normalizedCode}` : ''}${duplicateCode && duplicatePartNo ? ' / ' : ''}${duplicatePartNo ? `Part No ${normalizedPartNo}` : ''} duplicate, tetap diproses.`,
+            );
+          }
+          seenCodesInFile.add(normalizedCode);
+          if (normalizedPartNo) seenPartNosInFile.add(normalizedPartNo);
         });
         for (const payload of payloads) {
           try {
@@ -6064,11 +6823,22 @@ const Dashboard = ({ onLogout, token, user }) => {
             skippedReasons.push(`${payload.code}: ${error.message || 'gagal simpan'}`);
           }
         }
+        setItemImportDuplicateKeys({
+          code: Array.from(duplicateCodeKeys),
+          partNo: Array.from(duplicatePartNoKeys),
+        });
         await fetchItems();
-        const summaryMessage = `Import items selesai. Inserted: ${inserted}, Updated: ${updated}, Skipped: ${skipped}.`;
+        const summaryMessage = `Import items selesai. Inserted: ${inserted}, Updated: ${updated}, Duplicate: ${duplicates}, Skipped: ${skipped}.`;
         showToastMessage(summaryMessage);
+        const detailSections = [];
+        if (duplicateReasons.length > 0) {
+          detailSections.push(`Detail duplicate:\n- ${duplicateReasons.slice(0, 12).join('\n- ')}${duplicateReasons.length > 12 ? `\n- ... dan ${duplicateReasons.length - 12} lainnya` : ''}`);
+        }
         if (skippedReasons.length > 0) {
-          alert(`${summaryMessage}\n\nDetail skip:\n- ${skippedReasons.slice(0, 12).join('\n- ')}${skippedReasons.length > 12 ? `\n- ... dan ${skippedReasons.length - 12} lainnya` : ''}`);
+          detailSections.push(`Detail skip:\n- ${skippedReasons.slice(0, 12).join('\n- ')}${skippedReasons.length > 12 ? `\n- ... dan ${skippedReasons.length - 12} lainnya` : ''}`);
+        }
+        if (detailSections.length > 0) {
+          alert(`${summaryMessage}\n\n${detailSections.join('\n\n')}`);
         }
       } catch (error) {
         showToastMessage(`Import items gagal: ${error.message || 'Unknown error'}`);
@@ -6117,9 +6887,136 @@ const Dashboard = ({ onLogout, token, user }) => {
   const handleDownloadItemsTemplate = async () => {
     const XLSX = await ensureXlsx();
     if (!XLSX) return;
+    const sampleWarehouse = masterWarehouses.find(Boolean) || null;
+    const sampleSupplier = masterVendors.find((vendor) => String(vendor?.type || '').trim().toLowerCase() === 'supplier') || masterVendors.find(Boolean) || null;
+    const samplePacking = masterPackings.find(Boolean) || null;
+    const sampleCategory = masterCategories.find((category) => (
+      String(category?.code || '').trim().toLowerCase() === 'fg'
+      || String(category?.name || '').trim().toLowerCase().includes('finish')
+    )) || masterCategories.find(Boolean) || null;
+    const sampleWarehouseCode = String(sampleWarehouse?.id || 'WH-MRP1').trim();
+    const sampleWarehouseName = String(sampleWarehouse?.name || 'MRP PLANT 1').trim();
+    const sampleSupplierCode = String(sampleSupplier?.id || 'SUP-001').trim();
+    const sampleSupplierName = String(sampleSupplier?.name || 'Sample Supplier').trim();
+    const samplePackingCode = String(samplePacking?.code || 'BOX').trim();
+    const sampleCategoryCode = String(sampleCategory?.code || 'FG').trim();
     const rows = [
-      { "Kode Item": "AS-FR-FRAME", "Nama Item": "Full Assy Rangka Kursi", "Part No": "FR-0001", "Type": "Finished", "Satuan": "Unit", "SNP": 20, "Model": "Driver Seat", "Berat": 12.5, "Cycle": "C1", "Safety Stock": 5 },
-      { "Kode Item": "RM-ST-TUBE", "Nama Item": "Pipa Baja High-Tensile", "Part No": "ST-HT-010", "Type": "Raw", "Satuan": "Meter", "SNP": 50, "Model": "", "Berat": 1.8, "Cycle": "", "Safety Stock": 100 },
+      {
+        "Kode Item": "FG-ASM-001",
+        "Nama Item": "Seat Complete Assembly",
+        "Part No": "CH-ASM-001",
+        "Type": sampleCategoryCode,
+        "Satuan": "PCS",
+        "Type Pack": samplePackingCode,
+        "SNP / Pack Qty": 10,
+        "Order Lot Size / Qty per Lot Order": 100,
+        "Max Delivery / Rit": 100,
+        "Model": "SEAT-BASE-A",
+        "Berat Part (Kg)": 12.5,
+        "Kode Lokasi": sampleWarehouseCode,
+        "Nama Lokasi": sampleWarehouseName,
+        "Master Ord Warehouse": sampleWarehouseCode,
+        "Nama Master Ord Warehouse": sampleWarehouseName,
+        "Supplier / Vendor": sampleSupplierCode,
+        "Nama Supplier / Vendor": sampleSupplierName,
+        "Line Produksi / Work Center": "LOC-PR-003",
+        "Process 1": "ACB",
+        "Cycle Time 1 (s)": 60,
+        "Process 2": "FIN",
+        "Cycle Time 2 (s)": 15,
+        "Process 3": "PKG",
+        "Cycle Time 3 (s)": 10,
+        "Lead Time (hari)": 2,
+        "Shelf Life (hari)": 180,
+        "Safety Stock": 5,
+      },
+      {
+        "Kode Item": "RM-TUBE-001",
+        "Nama Item": "Steel Tube 1.2mm",
+        "Part No": "ST-TUBE-120",
+        "Type": "RM",
+        "Satuan": "MTR",
+        "Type Pack": samplePackingCode,
+        "SNP / Pack Qty": 50,
+        "Order Lot Size / Qty per Lot Order": 500,
+        "Max Delivery / Rit": 500,
+        "Model": "STEEL-GRADE-A",
+        "Berat Part (Kg)": 1.8,
+        "Kode Lokasi": sampleWarehouseCode,
+        "Nama Lokasi": sampleWarehouseName,
+        "Master Ord Warehouse": sampleWarehouseCode,
+        "Nama Master Ord Warehouse": sampleWarehouseName,
+        "Supplier / Vendor": sampleSupplierCode,
+        "Nama Supplier / Vendor": sampleSupplierName,
+        "Line Produksi / Work Center": "LOC-PR-001",
+        "Process 1": "BDG",
+        "Cycle Time 1 (s)": 45,
+        "Process 2": "FLW",
+        "Cycle Time 2 (s)": 25,
+        "Process 3": "BDP",
+        "Cycle Time 3 (s)": 20,
+        "Lead Time (hari)": 1,
+        "Shelf Life (hari)": 365,
+        "Safety Stock": 100,
+      },
+      {
+        "Kode Item": "SA-ARM-001",
+        "Nama Item": "Armrest Sub Assembly",
+        "Part No": "AR-ASM-001",
+        "Type": "SA",
+        "Satuan": "PCS",
+        "Type Pack": samplePackingCode,
+        "SNP / Pack Qty": 20,
+        "Order Lot Size / Qty per Lot Order": 40,
+        "Max Delivery / Rit": 40,
+        "Model": "SEAT-BASE-A",
+        "Berat Part (Kg)": 2.15,
+        "Kode Lokasi": sampleWarehouseCode,
+        "Nama Lokasi": sampleWarehouseName,
+        "Master Ord Warehouse": sampleWarehouseCode,
+        "Nama Master Ord Warehouse": sampleWarehouseName,
+        "Supplier / Vendor": sampleSupplierCode,
+        "Nama Supplier / Vendor": sampleSupplierName,
+        "Line Produksi / Work Center": "LOC-PR-004",
+        "Process 1": "ADJ",
+        "Cycle Time 1 (s)": 35,
+        "Process 2": "ASP",
+        "Cycle Time 2 (s)": 40,
+        "Process 3": "PKG",
+        "Cycle Time 3 (s)": 12,
+        "Lead Time (hari)": 3,
+        "Shelf Life (hari)": 90,
+        "Safety Stock": 20,
+      },
+      {
+        "Kode Item": "IM-BOLT-001",
+        "Nama Item": "Bolt M8 x 20",
+        "Part No": "BL-M8-20",
+        "Type": "IM",
+        "Satuan": "PCS",
+        "Type Pack": samplePackingCode,
+        "SNP / Pack Qty": 100,
+        "Order Lot Size / Qty per Lot Order": 1000,
+        "Max Delivery / Rit": 1000,
+        "Model": "MRO-STANDARD",
+        "Berat Part (Kg)": 0.01,
+        "Kode Lokasi": sampleWarehouseCode,
+        "Nama Lokasi": sampleWarehouseName,
+        "Master Ord Warehouse": sampleWarehouseCode,
+        "Nama Master Ord Warehouse": sampleWarehouseName,
+        "Supplier / Vendor": sampleSupplierCode,
+        "Nama Supplier / Vendor": sampleSupplierName,
+        "Line Produksi / Work Center": "LOC-PR-002",
+        "Process 1": "EDGE",
+        "Cycle Time 1 (s)": 0,
+        "Process 2": "INS",
+        "Cycle Time 2 (s)": 0,
+        "Process 3": "PKG",
+        "Cycle Time 3 (s)": 5,
+        "Lead Time (hari)": 2,
+        "Shelf Life (hari)": 720,
+        "Safety Stock": 500,
+      },
     ];
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
@@ -6133,6 +7030,24 @@ const Dashboard = ({ onLogout, token, user }) => {
     const rows = masterItems.map((item) => {
       const suppliers = (itemSupplierMap.get(item.code) || []).map((row) => row.vendorId).filter(Boolean).join(', ');
       const customers = (itemCustomerMap.get(item.code) || []).map((row) => row.customerId).filter(Boolean).join(', ');
+      const warehouse = masterWarehousesById.get(String(item.location_id || '').trim()) || null;
+      const locationLabel = getMasterWarehouseLabel(warehouse) || item.location_name || item.location_id || '';
+      const workCenter = masterLocationsById.get(String(item.line_production || '').trim()) || null;
+      const workCenterLabel = workCenter ? getMasterLocationLabel(workCenter) : item.line_production || '';
+      const routingSteps = Array.isArray(item.process_routing) && item.process_routing.length > 0
+        ? item.process_routing
+        : Array.isArray(item.process_flow) && item.process_flow.length > 0
+          ? item.process_flow
+          : [];
+      const routingLabel = routingSteps.map((step, index) => {
+        const code = String(step?.code || step?.processCode || step || '').trim();
+        const name = String(step?.name || step?.processName || '').trim();
+        const cycle = Number(step?.standardTime ?? step?.standard_time ?? 0);
+        const title = [code, name].filter(Boolean).join(' - ') || code || name || `Step ${index + 1}`;
+        return `${index + 1}. ${title}${Number.isFinite(cycle) ? ` (${cycle}s)` : ''}`;
+      }).filter(Boolean).join(' | ');
+      const firstRoutingStep = routingSteps[0] || null;
+      const firstRoutingCode = String(firstRoutingStep?.code || firstRoutingStep?.processCode || firstRoutingStep || '').trim();
       return {
         "Kode Item": item.code,
         "Nama Item": item.name,
@@ -6140,15 +7055,24 @@ const Dashboard = ({ onLogout, token, user }) => {
         "Type": item.type,
         "Satuan": item.unit,
         "SNP": item.pack_qty ?? '',
-        "Type Pack": packingNameByCode.get(item.type_pack) || item.type_pack || '',
+        "Type Pack": item.type_pack || '',
+        "Order Lot Size": item.order_lot_size ?? '',
+        "Max Delivery / Rit": item.max_delivery_per_rit ?? '',
         "Model": item.model || '',
-        "Berat": item.weight ?? '',
-        "Harga": item.price ?? '',
-        "Vendor": item.vendor_id || '',
-        "Lokasi": item.location_id || '',
-        Suppliers: suppliers,
+        "Berat Part (kg)": item.weight ?? '',
+        "Master Ord Warehouse": locationLabel,
+        "Nama Master Ord Warehouse": item.location_name || locationLabel || '',
+        "Work Center": workCenterLabel,
+        "Master Proses": getMasterProcessLabel(masterProcessesByCode.get(firstRoutingCode)) || firstRoutingCode || workCenterLabel || '',
+        "Routing Proses": routingLabel,
+        "Lead Time (hari)": item.lead_time_days ?? '',
+        "Cycle": item.cycle || '',
+        "Cycle Time (s)": item.cycle_time_seconds ?? '',
+        Supplier: suppliers,
         Customers: customers,
-        "Shelf Life (hari)": item.shelf_life_days ?? '',
+        "Shelf Life (hari)": item.shelf_life_days ?? (item.shelf_life_months ? Math.round(Number(item.shelf_life_months) * 30) : ''),
+        "Moving Status": item.moving_status || '',
+        Seasonal: !!item.is_seasonal,
         "Safety Stock": item.safety_stock ?? '',
         "Image URL": item.image_url || '',
       };
@@ -6481,8 +7405,12 @@ const Dashboard = ({ onLogout, token, user }) => {
       const masterVendor =
         masterVendorsById.get(row.default_supplier) ||
         masterVendors.find((vendor) => vendor.name === row.default_supplier);
+      const locationCode = String(masterLocation?.id || masterItem?.location_id || row.drop_zone || '').trim();
+      const locationName = String(masterLocation?.name || masterItem?.location_name || '').trim();
+      const supplierCode = String(masterVendor?.id || row.default_supplier || masterItem?.vendor_id || '').trim();
+      const supplierName = String(masterVendor?.name || row.default_supplier || '').trim();
       const category = masterItem?.type || row.item_type || '';
-      const kanbanId = buildKanbanId(row.item_code || 'ITEM', category);
+      const kanbanId = buildKanbanId(row.item_code || '', category);
       const kanbanQty = Number(row.lot_qty || 0);
       const maxQty = Number(row.max_qty || 0);
       const minQty = Number(row.min_qty || 0);
@@ -6495,13 +7423,19 @@ const Dashboard = ({ onLogout, token, user }) => {
         itemCode: row.item_code || '',
         itemName: masterItem?.name || row.item_name || '',
         category,
-        location: masterLocation?.id || masterLocation?.name || '',
+        categoryCode: String(masterItem?.type || row.item_type || '').trim(),
+        categoryLabel: getCategoryLabel(masterItem?.type || row.item_type || ''),
+        locationCode,
+        locationName,
+        location: locationCode || locationName || '',
         onHand,
         minQty,
         maxQty,
         noOfCards,
         kanbanQty,
-        supplier: masterVendor?.name || row.default_supplier || '',
+        supplierCode,
+        supplierName,
+        supplier: supplierCode || supplierName || '',
         leadTime: Number(row.lead_time_days || 0),
         uom: masterItem?.unit || '',
         status,
@@ -7100,7 +8034,7 @@ const Dashboard = ({ onLogout, token, user }) => {
           <meta charset="utf-8" />
         </head>
         <body style="font-family: Arial, sans-serif; color:#111; margin:24px;">
-          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px;">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:1px;">
             <div>
               <div style="font-size:18px;font-weight:bold;">PT. MATRA</div>
               <div style="font-size:12px;color:#666;">Laporan Sasaran Mutu</div>
@@ -7262,6 +8196,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   }, [mainTab, kanbanSettings.length]);
 
   useEffect(() => {
+    if (!user || isProductionUser) return;
     if (mainTab !== 'reports') return;
     if (reportTab !== 'scorecard') return;
     fetchItems({ silent: dataCacheRef.current.itemsLoaded });
@@ -7292,17 +8227,20 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (mainTab === 'kanban') {
       fetchKanbanSettings({ silent: dataCacheRef.current.kanbanSettingsLoaded });
       fetchKanbanRequests({ silent: dataCacheRef.current.kanbanRequestsLoaded });
-      fetchDeliveryNotes({ silent: dataCacheRef.current.deliveryNotesLoaded });
-      fetchReceiveNotes({ silent: dataCacheRef.current.receiveNotesLoaded });
-      fetchItems({ silent: dataCacheRef.current.itemsLoaded });
+      if (!isProductionUser) {
+        fetchDeliveryNotes({ silent: dataCacheRef.current.deliveryNotesLoaded });
+        fetchReceiveNotes({ silent: dataCacheRef.current.receiveNotesLoaded });
+        fetchItems({ silent: dataCacheRef.current.itemsLoaded });
+      }
     }
-  }, [mainTab]);
+  }, [mainTab, isProductionUser]);
 
   useEffect(() => {
+    if (!user || isProductionUser) return;
     if (!['dashboard', 'dash-prl', 'dash-kanban', 'dash-inventory', 'dash-schedule'].includes(mainTab)) return;
     fetchItems({ silent: dataCacheRef.current.itemsLoaded });
     fetchKanbanRequests({ silent: dataCacheRef.current.kanbanRequestsLoaded });
-    fetchPrlRows(prlFilters.year, { silent: dataCacheRef.current.prlLoadedYear === String(prlFilters.year || currentYear) });
+    fetchPrlRows(prlFilters.year, { silent: dataCacheRef.current.prlLoadedYear === `${prlFilters.year || currentYear}:${prlFilters.supplier || 'all'}` });
   }, [mainTab]);
 
   useEffect(() => {
@@ -7338,6 +8276,15 @@ const Dashboard = ({ onLogout, token, user }) => {
 
   useEffect(() => {
     if (!user) return;
+    if (isProductionUser) {
+      if (mainTab !== 'kanban') {
+        setMainTab('kanban');
+      }
+      if (!['scan', 'empty'].includes(kanbanSubTab)) {
+        setKanbanSubTab('scan');
+      }
+      return;
+    }
     if (user.role === 'supplier' && mainTab !== 'supplier') {
       setMainTab('supplier');
     }
@@ -7347,7 +8294,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (user.role !== 'admin' && mainTab === 'audit') {
       setMainTab('dashboard');
     }
-  }, [user, mainTab, setMainTab]);
+  }, [user, mainTab, kanbanSubTab, isProductionUser, setKanbanSubTab, setMainTab]);
 
   useEffect(() => {
     if (!receiveNotes.length && !kanbanSettings.length) {
@@ -7572,21 +8519,25 @@ const Dashboard = ({ onLogout, token, user }) => {
 
   const getKanbanCardsLabel = (row) => {
     const lot = Number(row?.lot_qty ?? 0);
-    const max = Number(row?.max_qty ?? 0);
+    const effectiveCardCount = Number(row?.effective_card_count ?? row?.calculated_card_count ?? 0);
+    const prlQtyValue = row?.effective_prl_qty ?? row?.prl_month_qty;
+    if (Number.isFinite(lot) && lot > 0 && effectiveCardCount > 0) return `${effectiveCardCount} x ${lot}`;
+    if (Number.isFinite(lot) && lot > 0 && effectiveCardCount === 0 && prlQtyValue !== null && prlQtyValue !== undefined && prlQtyValue !== '') return `0 x ${lot}`;
+    const hasPrlQty = prlQtyValue !== null && prlQtyValue !== undefined && prlQtyValue !== '';
+    const max = Number(hasPrlQty ? row?.effective_max_qty ?? prlQtyValue : row?.max_qty ?? 0);
     if (!Number.isFinite(lot) || lot <= 0) return '-';
-    const cards = Math.max(1, Math.ceil(max / lot));
+    const cards = hasPrlQty ? Math.ceil(Math.max(max, 0) / lot) : Math.max(1, Math.ceil(max / lot));
     return `${cards} x ${lot}`;
   };
 
   const getCategoryLabel = (value) => {
     if (!value) return 'Material';
-    const raw = String(value).toLowerCase();
-    if (raw.includes('raw')) return 'Raw Material';
-    if (raw.includes('indirect')) return 'Indirect Material';
-    if (raw.includes('consum')) return 'Consumable';
-    if (raw.includes('subcon')) return 'Subcon';
-    if (raw.includes('finished')) return 'Finished';
-    return value;
+    const raw = String(value).trim();
+    const code = resolveMasterCategoryCode(raw, '');
+    if (code && categoryNameByCode.has(code)) {
+      return categoryNameByCode.get(code) || code;
+    }
+    return raw;
   };
 
   const resolveKanbanActionMeta = (itemType) => {
@@ -7611,13 +8562,23 @@ const Dashboard = ({ onLogout, token, user }) => {
         nextDestination: 'Gudang / Line',
       };
     }
-    if (text.includes('indirect') || text.includes('consum')) {
+    if (text.includes('indirect')) {
       return {
         categoryCode: 'IM',
         categoryLabel: 'Indirect Material',
         actionType: 'consumption',
         actionLabel: 'Consumption',
-        actionHint: 'Scan ini dipakai untuk pemakaian consumable / indirect.',
+        actionHint: 'Scan ini dipakai untuk pemakaian indirect material.',
+        nextDestination: 'Work Center / Department',
+      };
+    }
+    if (text.includes('consum')) {
+      return {
+        categoryCode: 'CS',
+        categoryLabel: 'Consumable',
+        actionType: 'consumption',
+        actionLabel: 'Consumption',
+        actionHint: 'Scan ini dipakai untuk pemakaian consumable.',
         nextDestination: 'Work Center / Department',
       };
     }
@@ -7686,25 +8647,49 @@ const Dashboard = ({ onLogout, token, user }) => {
   }, [kanbanSettings, kanbanSearch, kanbanCategoryFilter]);
 
   const kanbanCardPayloads = useMemo(() => {
+    if (!showKanbanCardModal) return [];
     const payloads = [];
     filteredKanbanItems.forEach((row) => {
       const lotQty = Number(row.lot_qty ?? row.min_qty ?? 0);
-      const maxQty = Number(row.max_qty ?? 0);
-      const totalCards = lotQty > 0 ? Math.max(1, Math.ceil(maxQty / lotQty)) : 1;
-      const supplier = row.default_supplier || '-';
-      const itemName = row.item_name || row.item_code || '-';
-      const sidNumber = row.item_code || '-';
-      const qtyBox = lotQty || row.min_qty || '-';
-      const areaId = masterAreas[0]?.id || '-';
-      const dockCode = masterDeliveries[0]?.id || 'N/A';
-      const progressLine = masterWarehouses[0]?.id || 'N/A';
-      const plantName = masterPlants[0]?.name || 'PLANT';
+      const prlQtyValue = row.effective_prl_qty ?? row.prl_month_qty;
+      const hasPrlQty = prlQtyValue !== null && prlQtyValue !== undefined && prlQtyValue !== '';
+      const maxQty = Number(hasPrlQty ? row.effective_max_qty ?? prlQtyValue : row.max_qty ?? 0);
+      const totalCards = lotQty > 0
+        ? hasPrlQty
+          ? Math.ceil(Math.max(maxQty, 0) / lotQty)
+          : Math.max(1, Math.ceil(maxQty / lotQty))
+        : 1;
+      const masterItem = masterItemsByCode.get(row.item_code);
+      const masterLocation = masterLocationsById.get(masterItem?.location_id || row.drop_zone);
+      const masterWarehouse = masterWarehouses.find((warehouse) => warehouse.id === masterLocation?.warehouse_id);
+      const masterArea = masterAreas.find((area) => (
+        area.id === row.drop_zone
+        || area.id === masterWarehouse?.area_id
+        || area.warehouse_id === masterWarehouse?.id
+        || area.warehouse_id === masterLocation?.warehouse_id
+      ));
+      const masterDelivery = masterDeliveries.find((delivery) => (
+        delivery.area_id === masterArea?.id
+        || delivery.area_id === row.drop_zone
+      ));
+      const masterPlant = masterPlants.find((plant) => (
+        plant.id === masterArea?.plant_id
+        || plant.id === masterWarehouse?.plant_id
+      ));
+      const supplier = row.default_supplier || masterItem?.vendor_id || '';
+      const itemName = row.item_name || masterItem?.name || row.item_code || '';
+      const sidNumber = row.item_code || '';
+      const qtyBox = lotQty || row.min_qty || '';
+      const areaId = masterArea?.id || row.drop_zone || masterLocation?.id || '';
+      const dockCode = masterDelivery?.id || '';
+      const progressLine = masterWarehouse?.id || masterLocation?.warehouse_id || '';
+      const plantName = masterPlant?.name || masterPlant?.id || '';
       Array.from({ length: totalCards }).forEach((_, idx) => {
         const arrivalTime = new Date().toISOString().slice(0, 16).replace('T', ' ');
         const orderNo = `${String(idx + 1).padStart(2, '0')} / ${totalCards}`;
-        const uniqueNo = `${row.item_code || 'ITEM'}-${String(idx + 1).padStart(3, '0')}`;
+        const kanbanId = buildKanbanCardId(row.item_code || '', row.item_type, idx + 1, totalCards);
         const conveyanceNo = `CV-${String(idx + 1).padStart(2, '0')}`;
-        const pressBarcodeValue = `${row.item_code || 'ITEM'}-${String(idx + 1).padStart(3, '0')}`;
+        const pressBarcodeValue = kanbanId;
         payloads.push({
           key: `${row.item_code}-${idx}-${row.item_name}`,
           supplier,
@@ -7716,7 +8701,8 @@ const Dashboard = ({ onLogout, token, user }) => {
           progressLine,
           arrivalTime,
           orderNo,
-          uniqueNo,
+          uniqueNo: kanbanId,
+          kanbanId,
           pressLocation: areaId,
           conveyanceNo,
           pressBarcodeValue,
@@ -7725,7 +8711,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       });
     });
     return payloads;
-  }, [filteredKanbanItems, masterAreas, masterDeliveries, masterWarehouses, masterPlants]);
+  }, [showKanbanCardModal, filteredKanbanItems, masterAreas, masterDeliveries, masterWarehouses, masterPlants, masterItemsByCode, masterLocationsById]);
 
   const renderKanbanCard = (payload) => (
     <div
@@ -7751,15 +8737,15 @@ const Dashboard = ({ onLogout, token, user }) => {
               <div className="text-[11px] font-bold">{payload.arrivalTime}</div>
             </div>
             <div className="p-1">
-              <div className="text-[9px] uppercase text-slate-500">Unique No</div>
-              <div className="text-[12px] font-bold">{payload.uniqueNo}</div>
+              <div className="text-[9px] uppercase text-slate-500">Kanban ID</div>
+              <div className="text-[12px] font-bold">{payload.kanbanId}</div>
             </div>
           </div>
           <div className="grid grid-cols-3 border-b border-slate-400 flex-1">
             <div className="col-span-2 border-r border-slate-400 p-1">
               <div className="text-[9px] uppercase text-slate-500">Barcode Nomor Part</div>
               <div className="mt-2 flex items-center gap-2">
-                <QRCodeCanvas value={payload.sidNumber} size={42} />
+                <QRCodeSVG value={payload.sidNumber} size={42} />
                 <div className="text-[10px] font-semibold">{payload.sidNumber}</div>
               </div>
             </div>
@@ -7804,11 +8790,11 @@ const Dashboard = ({ onLogout, token, user }) => {
             <div className="text-[9px] uppercase text-slate-500">Conveyance No</div>
             <div className="text-[12px] font-bold">{payload.conveyanceNo}</div>
           </div>
-          <div className="flex-1 p-1">
-            <div className="text-[9px] uppercase text-slate-500">QR Nomor Press Part</div>
+            <div className="flex-1 p-1">
+            <div className="text-[9px] uppercase text-slate-500">QR Kanban ID</div>
             <div className="mt-2 flex items-center gap-2">
-              <QRCodeCanvas value={payload.pressBarcodeValue} size={60} />
-              <div className="text-[10px] font-semibold">{payload.pressBarcodeValue}</div>
+              <QRCodeSVG value={payload.kanbanId} size={60} />
+              <div className="text-[10px] font-semibold">{payload.kanbanId}</div>
             </div>
           </div>
         </div>
@@ -7817,6 +8803,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   );
 
   const kanbanPrintPages = useMemo(() => {
+    if (!showKanbanCardModal) return [];
     const cards = kanbanCardPayloads.map(renderKanbanCard);
     const pages = [];
     for (let i = 0; i < cards.length; i += 4) {
@@ -7839,7 +8826,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       );
     }
     return pages;
-  }, [kanbanCardPayloads]);
+  }, [showKanbanCardModal, kanbanCardPayloads]);
 
   const renderInboundCard = (card) => (
     <div
@@ -7883,7 +8870,7 @@ const Dashboard = ({ onLogout, token, user }) => {
         <div className="border border-slate-400 flex flex-col h-full p-1">
           <div className="text-[9px] uppercase text-slate-500">QR Card</div>
           <div className="mt-1 flex items-center gap-2">
-            <QRCodeCanvas value={card.card_uid} size={60} />
+            <QRCodeSVG value={card.card_uid} size={60} />
             <div className="text-[10px] font-semibold break-all">{card.card_uid}</div>
           </div>
           <div className="mt-auto text-[9px] uppercase text-slate-500">Status</div>
@@ -7952,7 +8939,10 @@ const Dashboard = ({ onLogout, token, user }) => {
     const createdAtMs = createdAt && !Number.isNaN(createdAt.getTime()) ? createdAt.getTime() : null;
     const slaDueAtMs = slaDueAt && !Number.isNaN(slaDueAt.getTime()) ? slaDueAt.getTime() : null;
     const ageHours = createdAtMs ? Math.max(0, Math.floor((nowMs - createdAtMs) / 3600000)) : 0;
-    const hasException = Boolean(String(row?.exception_code || '').trim() || String(row?.exception_note || '').trim());
+    const exceptionCode = String(row?.exception_code || '').trim().toUpperCase();
+    const exceptionNote = String(row?.exception_note || '').trim();
+    const isOverPrl = exceptionCode === 'OVER_PRL' || /over[_\s-]?prl/i.test(`${exceptionCode} ${exceptionNote} ${row?.notes || ''}`);
+    const hasException = Boolean(exceptionCode || exceptionNote);
     const hasStockGap = ['triggered', 'requested', 'approved'].includes(statusKey) && onHand < requestQty;
     const isClosedLike = ['closed', 'rejected', 'fifo'].includes(statusKey);
     const fallbackOverdue = !isClosedLike && createdAtMs && ageHours >= 24;
@@ -7965,8 +8955,11 @@ const Dashboard = ({ onLogout, token, user }) => {
       onHand,
       requestQty,
       ageHours,
+      exceptionCode,
+      exceptionNote,
       hasException,
       hasStockGap,
+      isOverPrl,
       isBlocked,
       isOverdue,
       slaDueAt,
@@ -7990,7 +8983,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       : statusFiltered.filter((row) => {
         const health = getKanbanRequestHealth(row);
         if (kanbanRequestQuickFilter === 'overdue') return health.isOverdue;
-        if (kanbanRequestQuickFilter === 'blocked') return health.isBlocked;
+        if (kanbanRequestQuickFilter === 'blocked' || kanbanRequestQuickFilter === 'over-prl') return health.isOverPrl;
         if (kanbanRequestQuickFilter === 'stock-gap') return health.hasStockGap;
         return true;
       });
@@ -8016,7 +9009,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       const orderQty = health.requestQty;
       const requestIdLabel = getRequestIdLabel(row);
       const createdLabel = row.created_at ? new Date(row.created_at).toLocaleString('id-ID') : '';
-      const kanbanIdLabel = buildKanbanId(row.item_code, row.item_type);
+      const kanbanIdLabel = buildKanbanDisplayId(row.item_code, row.item_type, row);
       const itemLabel = `${row.item_code} - ${row.item_name || ''}`.trim();
       const triggerLabel = row.trigger_type === 'manual' ? 'Manual' : 'Auto';
       const statusLabel = row.status === 'triggered' || row.status === 'requested'
@@ -8582,14 +9575,19 @@ const Dashboard = ({ onLogout, token, user }) => {
         timeScore: Math.round(timeScore),
         qtyScore: Math.round(qtyScore),
         packingScore: Number.isFinite(packingScore) ? Math.round(packingScore) : null,
+        weightedScore: Math.round(weightedScore * 100) / 100,
         rating,
         monthLabel: data.periodLabel || '',
       };
     }).sort((a, b) => {
-      if (a.periodKey !== b.periodKey) return String(a.periodKey || '').localeCompare(String(b.periodKey || ''));
-      if (a.name !== b.name) return String(a.name || '').localeCompare(String(b.name || ''), 'id');
       if (b.rating !== a.rating) return b.rating - a.rating;
-      return b.timeScore - a.timeScore;
+      if (b.weightedScore !== a.weightedScore) return b.weightedScore - a.weightedScore;
+      if (b.timeScore !== a.timeScore) return b.timeScore - a.timeScore;
+      if (b.qtyScore !== a.qtyScore) return b.qtyScore - a.qtyScore;
+      if ((b.packingScore ?? -1) !== (a.packingScore ?? -1)) return (b.packingScore ?? -1) - (a.packingScore ?? -1);
+      if (b.totalSchedules !== a.totalSchedules) return b.totalSchedules - a.totalSchedules;
+      if (a.periodKey !== b.periodKey) return String(b.periodKey || '').localeCompare(String(a.periodKey || ''));
+      return String(a.name || '').localeCompare(String(b.name || ''), 'id');
     });
   };
 
@@ -8624,7 +9622,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   const handleGenerateReport = async () => {
       const rows = await ensureSchedulesLoaded();
       if (!Array.isArray(rows) || rows.length === 0) { alert("Data kosong!"); return; }
-      const summary = rows.map(s => `- ${s.supplier}: PO ${s.poNumber}, Item ${s.item}, Status ${s.status}, Qty ${s.requestQty}, Tiba ${s.receivedQty}`).join('n');
+      const summary = rows.map(s => `- ${s.supplier}: PO ${s.poNumber}, Item ${s.item}, Status ${s.status}, Qty ${s.requestQty}, Tiba ${s.receivedQty}`).join('\n');
       const prompt = `Analisis data logistik ini dan berikan respons dalam format JSON murni. Data:n${summary}nFormat JSON: {"summary": "Ringkasan singkat...", "stats": {"onTime": 0, "late": 0, "pending": 0, "totalQtyReceived": 0}, "criticalIssues": ["Isu 1"], "recommendations": ["Saran 1"]}`;
       callGeminiAI(prompt, "✨ Laporan Statistik Cerdas (AI)", true); 
   };
@@ -8666,7 +9664,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (!ready) return;
     const newMessages = [...chatMessages, { role: 'user', text: chatInput }]; setChatMessages(newMessages); setChatInput(''); setIsChatLoading(true);
     const rows = await ensureSchedulesLoaded();
-    const contextData = (Array.isArray(rows) ? rows : []).map(s => `${s.supplier} (PO ${s.poNumber}): ${s.item} ${s.requestQty}pcs, Jadwal ${s.requestDate}, Status: ${s.status}`).join('n');
+    const contextData = (Array.isArray(rows) ? rows : []).map(s => `${s.supplier} (PO ${s.poNumber}): ${s.item} ${s.requestQty}pcs, Jadwal ${s.requestDate}, Status: ${s.status}`).join('\n');
     const prompt = `Asisten Logistik. Data:n${contextData}nJawab user: ${chatInput}`;
     try {
         const data = await callAiGenerate({ contents: [{ parts: [{ text: prompt }] }] });
@@ -8835,6 +9833,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     batchForm,
     bomProcessOptions,
     buildKanbanId,
+    buildKanbanDisplayId,
     inboundCardAdjustLoading,
     inboundCardAdjustOpen,
     inboundCardAdjustSchedule,
@@ -8970,6 +9969,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     ensureSchedulesLoaded: scheduleStore.ensureSchedulesLoaded,
     handleAnalyzeData,
     handleAddPlan,
+    handleApproveKanban,
     handleApproveAndCreateDn,
     handleBatchSubmit,
     handleCancelEdit,
@@ -9022,7 +10022,6 @@ const Dashboard = ({ onLogout, token, user }) => {
     handleFifoIssue,
     handleFifoReceive,
     handleInventoryDelete,
-    handleLoadSampleScan,
     handleManualRequest,
     handlePrintPDF,
     handlePrintQualityObjectives,
@@ -9523,6 +10522,17 @@ const Dashboard = ({ onLogout, token, user }) => {
                     className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'supplier' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                   >
                     Supplier Portal
+                  </button>
+                </div>
+              </div>
+            ) : isProductionUser ? (
+              <div className="mb-6 flex flex-wrap gap-3 print:hidden">
+                <div className="flex flex-wrap items-center gap-1.5 rounded-full border border-slate-200 bg-white/80 p-1 shadow-sm backdrop-blur">
+                  <button
+                    onClick={() => setMainTab('kanban')}
+                    className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'kanban' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
+                  >
+                    Kanban Board
                   </button>
                 </div>
               </div>

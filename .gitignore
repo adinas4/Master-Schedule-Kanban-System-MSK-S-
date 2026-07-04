@@ -23,6 +23,7 @@ server/.env.local
 tmp-downloads/*
 *.tmp
 *.bak
+*.dump
 dev.log
 consoleCapture.cjs
 

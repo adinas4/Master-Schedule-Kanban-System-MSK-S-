@@ -28,5 +28,9 @@ export const formatModelCodes = (_modelMap, codes) => {
   return codes
     .map((code) => String(code || '').trim())
     .filter(Boolean)
+    .map((code) => {
+      const model = _modelMap?.get?.(code);
+      return model?.name ? `${code} - ${model.name}` : code;
+    })
     .join(', ');
 };

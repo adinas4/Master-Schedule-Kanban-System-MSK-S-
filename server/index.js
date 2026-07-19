@@ -922,6 +922,19 @@ const ensureSchema = async () => {
   `);
 
   await pool.query(`
+    create table if not exists po_headers (
+      po_number text primary key,
+      po_date date not null,
+      supplier_id text not null references master_vendors(id),
+      status text not null default 'open' check (status in ('open','partial','closed')),
+      force_closed boolean not null default false,
+      remarks text,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
     update schedules s
     set supplier_id = ph.supplier_id
     from po_headers ph

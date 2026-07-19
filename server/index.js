@@ -922,36 +922,37 @@ const ensureSchema = async () => {
   `);
 
   await pool.query(`
-    create table if not exists po_headers (
-      po_number text primary key,
-      po_date date not null,
-      supplier_id text not null references master_vendors(id),
-      status text not null default 'open' check (status in ('open','partial','closed')),
-      force_closed boolean not null default false,
-      remarks text,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    );
+    do $$
+    begin
+      if to_regclass('public.po_headers') is not null then
+        execute '
+          update schedules s
+          set supplier_id = ph.supplier_id
+          from po_headers ph
+          where s.supplier_id is null
+            and lower(trim(s.po_number)) = lower(trim(ph.po_number))
+            and ph.supplier_id is not null
+        ';
+      end if;
+    end $$;
   `);
 
   await pool.query(`
-    update schedules s
-    set supplier_id = ph.supplier_id
-    from po_headers ph
-    where s.supplier_id is null
-      and lower(trim(s.po_number)) = lower(trim(ph.po_number))
-      and ph.supplier_id is not null;
-  `);
-
-  await pool.query(`
-    update schedules s
-    set supplier_id = mv.id
-    from master_vendors mv
-    where s.supplier_id is null
-      and (
-        mv.id = s.supplier
-        or mv.name = s.supplier
-      );
+    do $$
+    begin
+      if to_regclass('public.master_vendors') is not null then
+        execute '
+          update schedules s
+          set supplier_id = mv.id
+          from master_vendors mv
+          where s.supplier_id is null
+            and (
+              mv.id = s.supplier
+              or mv.name = s.supplier
+            )
+        ';
+      end if;
+    end $$;
   `);
 
   await pool.query(`

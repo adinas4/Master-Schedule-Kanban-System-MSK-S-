@@ -29,6 +29,7 @@ consoleCapture.cjs
 server/uploads/
 .certs/
 .secrets/
+.tools/
 
 # Editor directories and files
 .vscode/*

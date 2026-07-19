@@ -2082,11 +2082,18 @@ const ensureSchema = async () => {
   `);
 
   await pool.query(`
-    update delivery_notes dn
-    set supplier_id = mv.id
-    from master_vendors mv
-    where dn.supplier_id is null
-      and (mv.id = dn.supplier or mv.name = dn.supplier);
+    do $$
+    begin
+      if to_regclass('public.master_vendors') is not null then
+        execute '
+          update delivery_notes dn
+          set supplier_id = mv.id
+          from master_vendors mv
+          where dn.supplier_id is null
+            and (mv.id = dn.supplier or mv.name = dn.supplier)
+        ';
+      end if;
+    end $$;
   `);
 
   await pool.query(`

@@ -6,6 +6,7 @@ const DEFAULT_PLAN = {
   item: '',
   requestDate: '',
   requestQty: '',
+  allowLooseQty: false,
   dailyQty: '',
   leadTimeDays: '',
   cycleDays: '1',
@@ -20,8 +21,10 @@ const DEFAULT_EDIT_FORM = {
   supplierName: '',
   item: '',
   itemName: '',
+  itemUnit: '',
   requestDate: '',
   requestQty: '',
+  allowLooseQty: false,
   deliveryTime: '',
 };
 
@@ -329,6 +332,12 @@ export const useScheduleStore = ({
     if (!merged.po_status && prevRow.po_status) {
       merged.po_status = prevRow.po_status;
     }
+    if (!merged.itemUnit && prevRow.itemUnit) {
+      merged.itemUnit = prevRow.itemUnit;
+    }
+    if (!merged.allowLooseQty && prevRow.allowLooseQty) {
+      merged.allowLooseQty = prevRow.allowLooseQty;
+    }
     return merged;
   };
 
@@ -416,6 +425,17 @@ export const useScheduleStore = ({
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) return '-';
     return new Intl.NumberFormat('id-ID', { maximumFractionDigits: 0 }).format(numeric);
+  };
+
+  const formatDisplayQty = (value, unit = '') => {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return '-';
+    const normalizedUnit = String(unit || '').trim().toLowerCase();
+    if (normalizedUnit === 'kg') {
+      const trimmed = numeric.toFixed(3).replace(/\.?0+$/, '');
+      return trimmed || '0';
+    }
+    return String(Math.round(numeric));
   };
 
   const buildSplitScheduleSuccessMessage = ({ poNumber = '', itemCode = '', createdItems = [], sourceCount = 1 }) => {
@@ -545,7 +565,7 @@ export const useScheduleStore = ({
     return totals;
   }, [scheduleSourceRows, getScheduleKey]);
 
-  const getDisplayOrderQty = (row) => row?.requestQty ?? '-';
+  const getDisplayOrderQty = (row) => formatDisplayQty(row?.requestQty, row?.itemUnit || row?.item_unit);
 
   const getTotalOrderQty = (row) => {
     const totals = scheduleTotalsByKey.get(getScheduleKey(row));
@@ -764,8 +784,10 @@ export const useScheduleStore = ({
       supplierName: item.supplierName || item.supplier_name || '',
       item: item.item || item.itemCode || '',
       itemName: item.itemName || item.item_name || '',
+      itemUnit: item.itemUnit || item.item_unit || '',
       requestDate: item.requestDate || '',
       requestQty: item.requestQty ?? '',
+      allowLooseQty: Boolean(item.allowLooseQty || item.allow_loose_qty),
       deliveryTime: item.deliveryTime || '',
     });
     setScheduleEditError('');
@@ -785,18 +807,20 @@ export const useScheduleStore = ({
     if (!schedulesLoaded) {
       await ensureSchedulesLoaded();
     }
+    const canUseLooseQtyAccess = ['admin', 'ppic'].includes(String(user?.role || '').trim().toLowerCase());
     const selectedLines = Array.isArray(newPlan.selectedLines) ? newPlan.selectedLines.filter((line) => line && line.item) : [];
     const hasMultiLines = selectedLines.length > 1;
     if (!newPlan.poNumber || !newPlan.supplier || !newPlan.requestDate || (!hasMultiLines && (!newPlan.item || !newPlan.requestQty))) { alert("Mohon lengkapi data!"); return; }
+    const allowLooseQty = !hasMultiLines && canUseLooseQtyAccess && Boolean(newPlan.allowLooseQty);
     const selectedLineNsp = Number(selectedLines[0]?.packQty || 0);
     const qtyInfo = normalizeQtyWithNsp(newPlan.requestQty, newPlan.item, selectedLineNsp);
-    const normalizedRequestQty = qtyInfo.normalized;
-    if (qtyInfo.nsp > 0 && qtyInfo.normalized !== qtyInfo.raw && showToastMessage) {
-      showToastMessage(`Qty dibulatkan ke kelipatan NSP ${qtyInfo.nsp}: ${qtyInfo.raw} → ${qtyInfo.normalized}.`);
+    const normalizedRequestQty = allowLooseQty ? qtyInfo.raw : qtyInfo.normalized;
+    if (!allowLooseQty && qtyInfo.nsp > 0 && qtyInfo.normalized !== qtyInfo.raw && showToastMessage) {
+      showToastMessage(`Qty dibulatkan ke kelipatan NSP ${qtyInfo.nsp}: ${qtyInfo.raw} -> ${qtyInfo.normalized}.`);
     }
     const dailyInfo = normalizeQtyWithNsp(newPlan.dailyQty, newPlan.item);
-    const normalizedDailyQty = dailyInfo.normalized;
-    if (dailyInfo.nsp > 0 && dailyInfo.raw > 0 && dailyInfo.normalized !== dailyInfo.raw && showToastMessage) {
+    const normalizedDailyQty = allowLooseQty ? dailyInfo.raw : dailyInfo.normalized;
+    if (!allowLooseQty && dailyInfo.nsp > 0 && dailyInfo.raw > 0 && dailyInfo.normalized !== dailyInfo.raw && showToastMessage) {
       showToastMessage(`Kapasitas harian dibulatkan ke kelipatan NSP ${dailyInfo.nsp}: ${dailyInfo.raw} → ${dailyInfo.normalized}.`);
     }
     if (isEditing) {
@@ -829,6 +853,7 @@ export const useScheduleStore = ({
           poLineId: selectedLineId || existing.poLineId,
           requestDate: newPlan.requestDate,
           requestQty: normalizedRequestQty,
+          allowLooseQty,
           deliveryTime: newPlan.deliveryTime,
           status: newStatus,
         };
@@ -873,6 +898,7 @@ export const useScheduleStore = ({
               const poLineId = resolvePoLineIdValue(line);
               payloadLines.push({
                 ...newPlan,
+                allowLooseQty: false,
                 item: line.item,
                 itemCode: line.item,
                 poLineId,
@@ -901,8 +927,9 @@ export const useScheduleStore = ({
             }
             return {
               ...newPlan,
-              item: line.item,
-              itemCode: line.item,
+                allowLooseQty: false,
+                item: line.item,
+                itemCode: line.item,
               poLineId: resolvePoLineIdValue(line),
               requestQty: qtyInfoLine.normalized,
               arrivalDate: '',
@@ -1038,6 +1065,7 @@ export const useScheduleStore = ({
           itemCode: newPlan.item,
           poLineId: resolvePoLineIdValue(selectedLines[0]),
           requestQty: normalizedRequestQty,
+          allowLooseQty,
           arrivalDate: '',
           receivedQty: 0,
           status: 'Pending',
@@ -1530,6 +1558,7 @@ export const useScheduleStore = ({
 
   const handleScheduleEditSave = async () => {
     if (!canEditSchedules) { alert("Anda tidak memiliki akses edit."); return; }
+    const canUseLooseQtyAccess = ['admin', 'ppic'].includes(String(user?.role || '').trim().toLowerCase());
     const id = scheduleEditForm.id;
     const existing = schedules.find((row) => row.id === id)
       || filteredSchedules.find((row) => row.id === id);
@@ -1542,12 +1571,13 @@ export const useScheduleStore = ({
       setScheduleEditError('Tanggal jadwal wajib diisi.');
       return;
     }
+    const allowLooseQty = canUseLooseQtyAccess && Boolean(scheduleEditForm.allowLooseQty);
     const qtyInfo = normalizeQtyWithNsp(scheduleEditForm.requestQty, existing.item || existing.itemCode);
     if (qtyInfo.raw <= 0) {
       setScheduleEditError('Qty plan wajib diisi.');
       return;
     }
-    if (qtyInfo.nsp > 0 && qtyInfo.normalized !== qtyInfo.raw && showToastMessage) {
+    if (!allowLooseQty && qtyInfo.nsp > 0 && qtyInfo.normalized !== qtyInfo.raw && showToastMessage) {
       showToastMessage(`Qty dibulatkan ke kelipatan NSP ${qtyInfo.nsp}: ${qtyInfo.raw} -> ${qtyInfo.normalized}.`);
     }
     const deliveryTime = String(scheduleEditForm.deliveryTime || existing.deliveryTime || '08:00 (Cycle 1)').trim();
@@ -1563,7 +1593,8 @@ export const useScheduleStore = ({
     const payload = {
       ...existing,
       requestDate,
-      requestQty: qtyInfo.normalized,
+      requestQty: allowLooseQty ? qtyInfo.raw : qtyInfo.normalized,
+      allowLooseQty,
       deliveryTime,
       status: newStatus,
     };
@@ -1738,10 +1769,6 @@ export const useScheduleStore = ({
         method: 'POST',
         body: JSON.stringify({ supplier: item.supplier, requestDate: item.requestDate }),
       });
-      if (result?.sent) {
-        alert(`Email reminder terkirim ke ${result.to || item.supplier}.`);
-        return;
-      }
       if (result?.html) {
         const preview = window.open('', '_blank', 'noopener');
         if (preview) {
@@ -1749,7 +1776,17 @@ export const useScheduleStore = ({
           preview.document.write(result.html);
           preview.document.close();
         }
-        alert(result.notice || 'Email reminder siap dikirim.');
+        alert(result.sent
+          ? `Email reminder terkirim ke ${result.to || item.supplier}.`
+          : (result.notice || 'Email reminder siap dikirim.'));
+        return;
+      }
+      if (result?.sent) {
+        alert(`Email reminder terkirim ke ${result.to || item.supplier}.`);
+        return;
+      }
+      if (result?.notice) {
+        alert(result.notice);
       }
     } catch (error) {
       alert(`Gagal kirim reminder: ${error.message || 'Unknown error'}`);
@@ -1826,3 +1863,6 @@ export const useScheduleStore = ({
     handleSendEmailReminder,
   };
 };
+
+
+

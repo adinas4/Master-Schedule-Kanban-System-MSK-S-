@@ -80,7 +80,9 @@ Buat file `.env` di folder root aplikasi:
 VITE_API_BASE=http://alamat_server_anda:4000
 ```
 
-Untuk hosting di server yang sama, Anda dapat menggunakan:
+Untuk mode LAN HTTPS bawaan repo ini, `VITE_API_BASE` bersifat opsional karena frontend sudah memakai proxy `/api` ke backend.
+
+Untuk hosting di server yang sama tanpa proxy, Anda dapat menggunakan:
 
 ```text
 VITE_API_BASE=http://localhost:4000
@@ -180,11 +182,26 @@ npm run preview -- --host 0.0.0.0 --port 3000
 
 Tetapi untuk produksi, lebih baik gunakan file statis dari `dist/`.
 
+### Opsi 4: Mode LAN HTTPS untuk kamera QR
+
+Untuk kebutuhan kamera di browser, jalankan frontend dengan HTTPS bawaan repo:
+
+```bash
+npm run host
+```
+
+Lalu buka:
+
+- `https://localhost:3000`
+- `https://192.168.1.194:3000`
+
+Di mesin dev, repo ini juga menyediakan launcher browser yang membuka URL HTTPS dengan flag dev agar sertifikat lokal tidak menghambat akses.
+
 ## 9. Akses aplikasi
 
 Buka browser dan kunjungi:
 
-- Frontend: `http://alamat_server_anda:3000`
+- Frontend: `https://alamat_server_anda:3000` untuk mode LAN HTTPS
 - Backend API: `http://alamat_server_anda:4000`
 
 Jika menggunakan Nginx, frontend akan diakses melalui domain atau IP tanpa port jika Anda menggunakan port 80.
@@ -233,6 +250,7 @@ VITE_API_BASE=http://domain_anda:4000
 - `ECONNREFUSED` ke database: cek `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, dan akses jaringan ke DB.
 - `Cannot GET /` di browser: pastikan frontend sudah build dan dikonfigurasi untuk serve `dist/`.
 - Error CORS: backend harus menerima request dari origin frontend. Jika backend menolak, sesuaikan konfigurasi CORS di `server/index.js`.
+- `Cannot POST /api/receive-notes/check-do`: backend live belum memuat source terbaru. Restart proses API yang menjalankan `server/index.js` atau redeploy backend, lalu cek lagi status `POST /api/receive-notes/check-do` harusnya `401/403`, bukan `404`.
 
 ---
 

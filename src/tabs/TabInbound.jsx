@@ -12,6 +12,7 @@ import {
   Edit,
   Filter,
   FileSpreadsheet,
+  FileUp,
   GitFork,
   Lock,
   Mail,
@@ -50,6 +51,32 @@ const createEmptyPoLine = () => ({
   itemCode: '',
   qty: '',
 });
+
+const normalizeActualReceiveText = (value) => String(value ?? '').trim();
+
+const normalizeActualReceiveKey = (value) => String(value ?? '')
+  .trim()
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, '');
+
+const normalizeReceiveDoNumber = (value) => String(value ?? '').trim();
+
+const parseActualReceiveBoolean = (value) => {
+  const normalized = normalizeActualReceiveText(value).toLowerCase();
+  return ['1', 'true', 'yes', 'y', 'ya', 'on'].includes(normalized);
+};
+
+const getActualReceiveImportValue = (row, aliases = []) => {
+  const entries = Object.entries(row || {});
+  for (const alias of aliases) {
+    const normalizedAlias = normalizeActualReceiveKey(alias);
+    const match = entries.find(([key]) => normalizeActualReceiveKey(key) === normalizedAlias);
+    if (match && match[1] !== undefined && match[1] !== null && String(match[1]).trim() !== '') {
+      return match[1];
+    }
+  }
+  return '';
+};
 
 const TabInbound = (props) => {
   const {
@@ -165,6 +192,29 @@ const TabInbound = (props) => {
     return map;
   }, [masterVendors]);
 
+  const masterItemUnitMap = useMemo(() => {
+    const map = new Map();
+    (masterItems || []).forEach((item) => {
+      if (!item) return;
+      const code = String(item.code || item.itemCode || item.item_code || '').trim().toLowerCase();
+      const unit = String(item.unit || item.uom || item.itemUnit || '').trim().toLowerCase();
+      if (code && unit) {
+        map.set(code, unit);
+      }
+    });
+    return map;
+  }, [masterItems]);
+
+  const resolveItemUnit = useCallback((itemCode, fallbackUnit = '') => {
+    const directUnit = String(fallbackUnit || '').trim().toLowerCase();
+    if (directUnit) return directUnit;
+    const code = String(itemCode || '').trim().toLowerCase();
+    if (!code) return '';
+    return masterItemUnitMap.get(code) || '';
+  }, [masterItemUnitMap]);
+
+  const canUseLooseScheduleQty = ['admin', 'ppic'].includes(String(user?.role || '').trim().toLowerCase());
+
   const [poFormVisible, setPoFormVisible] = useState(false);
   const [poForm, setPoForm] = useState({
     poNumber: '',
@@ -195,6 +245,7 @@ const TabInbound = (props) => {
     poDate: '',
     supplier: '',
     remarks: '',
+    status: 'open',
   });
   const [poLineEditOpen, setPoLineEditOpen] = useState(false);
   const [poLineEditSaving, setPoLineEditSaving] = useState(false);
@@ -249,8 +300,18 @@ const TabInbound = (props) => {
   const [actualReceivePoOptionsLoading, setActualReceivePoOptionsLoading] = useState(false);
   const [actualReceivePoError, setActualReceivePoError] = useState('');
   const [actualReceiveError, setActualReceiveError] = useState('');
+  const [actualReceiveDoCheckStatus, setActualReceiveDoCheckStatus] = useState('idle');
+  const [actualReceiveDoCheckMessage, setActualReceiveDoCheckMessage] = useState('');
   const [actualReceiveSubmitting, setActualReceiveSubmitting] = useState(false);
   const [actualReceiveAllowOver, setActualReceiveAllowOver] = useState(false);
+  const actualReceiveImportRef = useRef(null);
+  const actualReceivePoPickerRef = useRef(null);
+  const actualReceiveDoCheckSeqRef = useRef(0);
+  const [actualReceiveImportLoading, setActualReceiveImportLoading] = useState(false);
+  const [actualReceiveImportError, setActualReceiveImportError] = useState('');
+  const [actualReceiveImportSummary, setActualReceiveImportSummary] = useState(null);
+  const [actualReceivePoPickerOpen, setActualReceivePoPickerOpen] = useState(false);
+  const [actualReceivePoActiveIndex, setActualReceivePoActiveIndex] = useState(-1);
   const scrollRef = useRef(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [scrollbarWidth, setScrollbarWidth] = useState(0);
@@ -320,12 +381,17 @@ const TabInbound = (props) => {
     setActualReceivePoAvailableLines([]);
     setActualReceivePoOptions([]);
     setActualReceivePoSearch('');
+    setActualReceivePoPickerOpen(false);
+    setActualReceivePoActiveIndex(-1);
     setActualReceivePoLoading(false);
     setActualReceivePoOptionsLoading(false);
     setActualReceivePoError('');
     setActualReceiveError('');
+    setActualReceiveDoCheckStatus('idle');
+    setActualReceiveDoCheckMessage('');
     setActualReceiveSubmitting(false);
     setActualReceiveAllowOver(false);
+    actualReceiveDoCheckSeqRef.current += 1;
     actualReceiveQtyRefs.current = {};
   }, [createActualReceiveRow]);
 
@@ -455,6 +521,7 @@ const TabInbound = (props) => {
     }
     setActualReceivePoLoading(true);
     setActualReceivePoError('');
+    setActualReceiveSupplier('');
     try {
       const response = await apiFetch(`/api/po/${encodeURIComponent(poNumber)}`);
       const detailLines = Array.isArray(response?.lines)
@@ -496,17 +563,300 @@ const TabInbound = (props) => {
     const nextPoNumber = String(prefillPoNumber || '').trim();
     if (nextPoNumber) {
       setActualReceivePoNumber(nextPoNumber);
+      setActualReceivePoSearch(nextPoNumber);
+      setActualReceivePoPickerOpen(false);
+      setActualReceivePoActiveIndex(-1);
       void loadActualReceivePo(nextPoNumber);
     }
   }, [loadActualReceivePo, resetActualReceiveForm]);
 
+  const handleDownloadActualReceiveTemplate = useCallback(async () => {
+    if (!canEditSchedules) {
+      if (showToastMessage) showToastMessage('Anda tidak memiliki akses untuk download template.', '', null, 'error');
+      return;
+    }
+    const XLSX = await ensureXlsx();
+    if (!XLSX) return;
+    const rows = [
+      {
+        'No PO': 'PO-EXAMPLE-001',
+        UNIQ: 'DT17',
+        'Qty Aktual': 10,
+        'No SJ / DO': 'DN-EXAMPLE-001',
+        'Tgl Kedatangan': new Date().toISOString().slice(0, 10),
+        'Izin Over Qty': 'N',
+      },
+    ];
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Penerimaan Aktual');
+    XLSX.writeFile(wb, 'Template_Penerimaan_Aktual_Sederhana.xlsx');
+  }, [canEditSchedules, ensureXlsx, showToastMessage]);
+
+  const handleImportActualReceiveExcel = useCallback((event) => {
+    if (!canEditSchedules) {
+      setActualReceiveImportError('Anda tidak memiliki akses import penerimaan aktual.');
+      if (actualReceiveImportRef.current) actualReceiveImportRef.current.value = '';
+      return;
+    }
+    if (isStockOpnameLocked) {
+      setActualReceiveImportError('Selesaikan dulu Stock Opname!');
+      if (actualReceiveImportRef.current) actualReceiveImportRef.current.value = '';
+      return;
+    }
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const fileName = file.name || '';
+    setActualReceiveImportLoading(true);
+    setActualReceiveImportError('');
+    setActualReceiveImportSummary(null);
+    const finish = () => {
+      setActualReceiveImportLoading(false);
+      if (actualReceiveImportRef.current) actualReceiveImportRef.current.value = '';
+    };
+    const reader = new FileReader();
+    reader.onload = async (evt) => {
+      try {
+        const XLSX = await ensureXlsx();
+        if (!XLSX) {
+          setActualReceiveImportError('Library XLSX belum tersedia.');
+          finish();
+          return;
+        }
+        const bstr = evt.target.result;
+        const wb = XLSX.read(bstr, { type: 'binary' });
+        const wsname = wb.SheetNames[0];
+        const ws = wb.Sheets[wsname];
+        const rows = XLSX.utils.sheet_to_json(ws);
+        if (!Array.isArray(rows) || rows.length === 0) {
+          setActualReceiveImportError('File kosong.');
+          finish();
+          return;
+        }
+
+        const groupedDocs = new Map();
+        const invalidRows = [];
+        rows.forEach((row, idx) => {
+          const poNumber = normalizeActualReceiveText(getActualReceiveImportValue(row, ['No PO', 'PO Number', 'PO', 'No. PO']));
+          const doNumber = normalizeReceiveDoNumber(getActualReceiveImportValue(row, ['No SJ / DO', 'DO Number', 'No DO', 'DN Number']));
+          const arrivalDate = formatExcelDate?.(getActualReceiveImportValue(row, ['Tgl Kedatangan', 'Tanggal Kedatangan', 'Tanggal Terima', 'Arrival Date', 'Received Date', 'Date'])) || '';
+          const allowOverReceive = parseActualReceiveBoolean(getActualReceiveImportValue(row, ['Izin Over Qty', 'Allow Over Qty', 'Allow Over Receive', 'Over Receive', 'Boleh Over']));
+          const itemCode = normalizeActualReceiveText(getActualReceiveImportValue(row, ['UNIQ', 'Kode Item', 'Item Code', 'Item', 'Part No', 'Part Number']));
+          const qty = Number(getActualReceiveImportValue(row, ['Qty Aktual', 'Qty', 'Actual Qty', 'Received Qty', 'Qty Receive']));
+          const notes = normalizeActualReceiveText(getActualReceiveImportValue(row, ['Remarks', 'Remark', 'Catatan', 'Notes']));
+          const sisaPo = Number(getActualReceiveImportValue(row, ['Sisa PO', 'Sisa Qty', 'Remaining Qty', 'Qty Remaining']));
+          const errors = [];
+          if (!poNumber) errors.push('No PO kosong');
+          if (!doNumber) errors.push('No SJ / DO kosong');
+          if (!arrivalDate) errors.push('Tanggal kedatangan tidak valid');
+          if (!itemCode) errors.push('UNIQ kosong');
+          if (!Number.isFinite(qty) || qty <= 0) errors.push('Qty aktual tidak valid');
+          if (errors.length > 0) {
+            invalidRows.push({ no: idx + 2, errors: errors.join(', ') });
+            return;
+          }
+          const groupKey = [poNumber, arrivalDate, doNumber || '', allowOverReceive ? '1' : '0'].join('|');
+          const current = groupedDocs.get(groupKey) || {
+            poNumber,
+            doNumber,
+            arrivalDate,
+            allowOverReceive,
+            remarks: notes,
+            items: [],
+          };
+          if (!current.doNumber && doNumber) {
+            current.doNumber = doNumber;
+          }
+          if (!current.remarks && notes) {
+            current.remarks = notes;
+          }
+          const itemKey = itemCode.toLowerCase();
+          const existingItem = current.items.find((item) => item.key === itemKey);
+          if (existingItem) {
+            existingItem.qty += qty;
+            if (!existingItem.notes && notes) {
+              existingItem.notes = notes;
+            }
+            if (Number.isFinite(sisaPo) && sisaPo >= 0 && existingItem.sisaPo === null) {
+              existingItem.sisaPo = sisaPo;
+            }
+          } else {
+            current.items.push({
+              key: itemKey,
+              itemCode,
+              qty,
+              notes: notes || null,
+              sisaPo: Number.isFinite(sisaPo) && sisaPo >= 0 ? sisaPo : null,
+            });
+          }
+          groupedDocs.set(groupKey, current);
+        });
+
+        if (invalidRows.length > 0) {
+          const firstInvalid = invalidRows[0];
+          const message = `Import dibatalkan. Gagal di baris ${firstInvalid.no}: ${firstInvalid.errors}`;
+          setActualReceiveImportError(message);
+          setActualReceiveImportSummary({
+            fileName,
+            totalGroups: groupedDocs.size,
+            successGroups: 0,
+            failedGroups: invalidRows.length,
+            totalItems: rows.length,
+            totalLines: 0,
+            totalQty: 0,
+            validationRows: invalidRows,
+            results: [],
+          });
+          finish();
+          return;
+        }
+        if (groupedDocs.size === 0) {
+          setActualReceiveImportError('Tidak ada data valid untuk di-import.');
+          finish();
+          return;
+        }
+
+        const groups = Array.from(groupedDocs.values());
+        const poDetailCache = new Map();
+        const resolvePoDetail = async (poNumber) => {
+          const cacheKey = String(poNumber || '').trim().toLowerCase();
+          if (!cacheKey) return null;
+          if (!poDetailCache.has(cacheKey)) {
+            poDetailCache.set(
+              cacheKey,
+              apiFetch(`/api/po/${encodeURIComponent(poNumber)}`).catch((error) => ({ error })),
+            );
+          }
+          const result = await poDetailCache.get(cacheKey);
+          if (result?.error) throw result.error;
+          return result;
+        };
+        let successGroups = 0;
+        let failedGroups = 0;
+        let totalImportedLines = 0;
+        let totalImportedQty = 0;
+        const importErrors = [];
+        const importResults = [];
+
+        for (const group of groups) {
+          try {
+            const poDetail = await resolvePoDetail(group.poNumber);
+            const supplierValue = String(poDetail?.header?.supplier_id || poDetail?.header?.supplier_name || '').trim();
+            if (!supplierValue) {
+              throw new Error(`Supplier PO ${group.poNumber} tidak ditemukan.`);
+            }
+            const doNumber = normalizeReceiveDoNumber(group.doNumber);
+            if (!doNumber) {
+              throw new Error(`No SJ / DO wajib diisi untuk PO ${group.poNumber}.`);
+            }
+            const response = await apiFetch('/api/receive-notes/actual', {
+              method: 'POST',
+              body: JSON.stringify({
+                supplier: supplierValue,
+                poNumber: group.poNumber,
+                doNumber,
+                arrivalDate: group.arrivalDate,
+                allowOverReceive: group.allowOverReceive,
+                remarks: group.remarks || '',
+                items: group.items.map((item) => ({
+                  itemCode: item.itemCode,
+                  qty: item.qty,
+                  notes: item.notes || group.remarks || '',
+                })),
+              }),
+            });
+            const groupTotalQty = group.items.reduce((sum, item) => sum + Number(item.qty || 0), 0);
+            successGroups += 1;
+            totalImportedLines += group.items.length;
+            totalImportedQty += groupTotalQty;
+            importResults.push({
+              status: 'success',
+              poNumber: group.poNumber,
+              doNumber,
+              supplier: supplierValue,
+              arrivalDate: group.arrivalDate,
+              totalQty: groupTotalQty,
+              itemCount: group.items.length,
+              rnNumber: response?.rnNumber || '',
+              message: `Tersimpan${response?.rnNumber ? ` sebagai ${response.rnNumber}` : ''}.`,
+            });
+            if (response?.rnNumber) {
+              importErrors.push(`Sukses ${doNumber}: ${response.rnNumber}`);
+            }
+          } catch (error) {
+            failedGroups += 1;
+            const groupTotalQty = group.items.reduce((sum, item) => sum + Number(item.qty || 0), 0);
+            const message = error.message || 'Gagal import.';
+            importResults.push({
+              status: 'error',
+              poNumber: group.poNumber,
+              doNumber: normalizeReceiveDoNumber(group.doNumber),
+              supplier: '',
+              arrivalDate: group.arrivalDate,
+              totalQty: groupTotalQty,
+              itemCount: group.items.length,
+              rnNumber: '',
+              message,
+            });
+            importErrors.push(`${group.doNumber || group.poNumber || 'Baris'}: ${message}`);
+          }
+        }
+
+        setActualReceiveImportSummary({
+          fileName,
+          totalGroups: groups.length,
+          successGroups,
+          failedGroups,
+          totalLines: totalImportedLines,
+          totalQty: totalImportedQty,
+          validationRows: [],
+          results: importResults,
+        });
+        if (failedGroups === 0) {
+          setActualReceiveImportError('');
+          if (showToastMessage) showToastMessage(`Import penerimaan aktual selesai: ${successGroups} dokumen berhasil.`, '', null, 'info');
+        } else {
+          const firstError = importErrors.find((msg) => !msg.startsWith('Sukses ')) || 'Ada dokumen yang gagal di-import.';
+          setActualReceiveImportError(firstError);
+          if (showToastMessage) showToastMessage(`Import selesai dengan ${failedGroups} gagal.`, '', null, 'error');
+        }
+        await refreshSchedules?.();
+      } catch (error) {
+        setActualReceiveImportError(error.message || 'Import penerimaan aktual gagal.');
+        if (showToastMessage) showToastMessage(error.message || 'Import penerimaan aktual gagal.', '', null, 'error');
+      } finally {
+        finish();
+      }
+    };
+    reader.onerror = () => {
+      setActualReceiveImportError('Gagal membaca file.');
+      setActualReceiveImportLoading(false);
+      if (actualReceiveImportRef.current) actualReceiveImportRef.current.value = '';
+    };
+    reader.readAsBinaryString(file);
+  }, [
+    actualReceiveImportRef,
+    apiFetch,
+    canEditSchedules,
+    ensureXlsx,
+    formatExcelDate,
+    isStockOpnameLocked,
+    refreshSchedules,
+    showToastMessage,
+  ]);
+
   const actualReceivePoVisibleOptions = useMemo(() => {
     const searchKey = String(actualReceivePoSearch || '').trim().toLowerCase();
     const mergedMap = new Map();
+    const isReceivablePoRow = (row) => {
+      const statusKey = String(row?.status || '').trim().toLowerCase();
+      return ['open', 'partial'].includes(statusKey);
+    };
     const mergeRow = (row) => {
       if (!row) return;
       const poNumber = String(row.po_number || '').trim();
       if (!poNumber) return;
+      if (!isReceivablePoRow(row)) return;
       const key = poNumber.toLowerCase();
       const current = mergedMap.get(key) || {
         ...row,
@@ -548,7 +898,10 @@ const TabInbound = (props) => {
       (Array.isArray(filteredSchedules) ? filteredSchedules : []).forEach((schedule) => {
         const poNumber = String(schedule.poNumber || schedule.po_number || '').trim();
         if (!poNumber) return;
+        const scheduleStatus = String(schedule.status || schedule.scheduleStatus || '').trim().toLowerCase();
         const remainingQty = Number(getRemainingQty(schedule) || 0);
+        if (remainingQty <= 0) return;
+        if (!['open', 'partial'].includes(scheduleStatus)) return;
         const current = map.get(poNumber) || {
           po_number: poNumber,
           po_date: schedule.poDate || schedule.po_date || '',
@@ -594,8 +947,183 @@ const TabInbound = (props) => {
         .map((value) => String(value || '').trim().toLowerCase())
         .join(' ');
       return searchable.includes(searchKey);
-    });
+      });
   }, [actualReceivePoOptions, actualReceivePoSearch, filteredSchedules, getRemainingQty]);
+  const actualReceivePoMenuOptions = useMemo(
+    () => actualReceivePoVisibleOptions.slice(0, 80),
+    [actualReceivePoVisibleOptions],
+  );
+
+  useEffect(() => {
+    if (!showActualReceiveModal) {
+      setActualReceivePoPickerOpen(false);
+      setActualReceivePoActiveIndex(-1);
+      return undefined;
+    }
+    const handlePointerDown = (event) => {
+      if (!actualReceivePoPickerRef.current) return;
+      if (actualReceivePoPickerRef.current.contains(event.target)) return;
+      setActualReceivePoPickerOpen(false);
+      setActualReceivePoActiveIndex(-1);
+    };
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('touchstart', handlePointerDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('touchstart', handlePointerDown);
+    };
+  }, [showActualReceiveModal]);
+
+  useEffect(() => {
+    if (!actualReceivePoPickerOpen) {
+      setActualReceivePoActiveIndex(-1);
+      return;
+    }
+    if (actualReceivePoMenuOptions.length === 0) {
+      setActualReceivePoActiveIndex(-1);
+      return;
+    }
+    setActualReceivePoActiveIndex((prev) => {
+      if (prev < 0) return 0;
+      return Math.min(prev, actualReceivePoMenuOptions.length - 1);
+    });
+  }, [actualReceivePoPickerOpen, actualReceivePoMenuOptions.length, actualReceivePoSearch]);
+
+  const handleActualReceivePoSearchChange = useCallback((value) => {
+    setActualReceivePoSearch(value);
+    setActualReceivePoPickerOpen(true);
+    setActualReceivePoActiveIndex(0);
+  }, []);
+
+  const handleActualReceivePoPick = useCallback((row) => {
+    const poNumber = String(row?.po_number || '').trim();
+    if (!poNumber) return;
+    setActualReceivePoNumber(poNumber);
+    setActualReceivePoSearch(poNumber);
+    setActualReceivePoPickerOpen(false);
+    setActualReceivePoActiveIndex(-1);
+    setActualReceivePoError('');
+    setActualReceivePoDetail(null);
+    setActualReceivePoLines([]);
+    setActualReceivePoAvailableLines([]);
+    setActualReceiveSupplier('');
+    setActualReceiveRows([createActualReceiveRow()]);
+    setActualReceiveDoCheckStatus('idle');
+    setActualReceiveDoCheckMessage('');
+    void loadActualReceivePo(poNumber);
+  }, [createActualReceiveRow, loadActualReceivePo]);
+
+  const handleActualReceivePoClear = useCallback(() => {
+    setActualReceivePoNumber('');
+    setActualReceivePoSearch('');
+    setActualReceivePoPickerOpen(true);
+    setActualReceivePoActiveIndex(0);
+    setActualReceivePoError('');
+    setActualReceivePoDetail(null);
+    setActualReceivePoLines([]);
+    setActualReceivePoAvailableLines([]);
+    setActualReceiveSupplier('');
+    setActualReceiveRows([createActualReceiveRow()]);
+    setActualReceiveDoCheckStatus('idle');
+    setActualReceiveDoCheckMessage('');
+  }, [createActualReceiveRow]);
+
+  const handleActualReceivePoKeyDown = useCallback((event) => {
+    const optionCount = actualReceivePoMenuOptions.length;
+    if (event.key === 'Escape') {
+      setActualReceivePoPickerOpen(false);
+      setActualReceivePoActiveIndex(-1);
+      return;
+    }
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      if (!actualReceivePoPickerOpen) setActualReceivePoPickerOpen(true);
+      if (!optionCount) return;
+      setActualReceivePoActiveIndex((prev) => {
+        if (prev < 0) return 0;
+        return Math.min(prev + 1, optionCount - 1);
+      });
+      return;
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (!actualReceivePoPickerOpen) setActualReceivePoPickerOpen(true);
+      if (!optionCount) return;
+      setActualReceivePoActiveIndex((prev) => {
+        if (prev < 0) return optionCount - 1;
+        return Math.max(prev - 1, 0);
+      });
+      return;
+    }
+    if (event.key === 'Home') {
+      if (!optionCount) return;
+      event.preventDefault();
+      setActualReceivePoPickerOpen(true);
+      setActualReceivePoActiveIndex(0);
+      return;
+    }
+    if (event.key === 'End') {
+      if (!optionCount) return;
+      event.preventDefault();
+      setActualReceivePoPickerOpen(true);
+      setActualReceivePoActiveIndex(optionCount - 1);
+      return;
+    }
+    if (event.key !== 'Enter') return;
+    const activeRow = actualReceivePoMenuOptions[Math.max(0, actualReceivePoActiveIndex)];
+    const firstMatch = activeRow || actualReceivePoMenuOptions[0];
+    if (!firstMatch) return;
+    event.preventDefault();
+    handleActualReceivePoPick(firstMatch);
+  }, [actualReceivePoActiveIndex, actualReceivePoPickerOpen, actualReceivePoMenuOptions, handleActualReceivePoPick]);
+
+  const performActualReceiveDoCheck = useCallback(async (supplierValue, doNumberValue) => {
+    const supplier = String(supplierValue || '').trim();
+    const doNumber = normalizeReceiveDoNumber(doNumberValue);
+    if (!supplier || !doNumber) {
+      setActualReceiveDoCheckStatus('idle');
+      setActualReceiveDoCheckMessage('');
+      return { ok: true, duplicate: false, unavailable: false };
+    }
+
+    const requestId = actualReceiveDoCheckSeqRef.current + 1;
+    actualReceiveDoCheckSeqRef.current = requestId;
+    setActualReceiveDoCheckStatus('checking');
+    setActualReceiveDoCheckMessage('Memeriksa duplikasi No. SJ / DO...');
+
+    try {
+      const result = await apiFetch('/api/receive-notes/check-do', {
+        method: 'POST',
+        body: JSON.stringify({
+          supplier,
+          doNumber,
+          poNumber: String(actualReceivePoNumber || '').trim(),
+        }),
+      });
+      if (actualReceiveDoCheckSeqRef.current !== requestId) return { ok: true, duplicate: false, unavailable: false };
+      if (result?.status === 'block' || result?.duplicate) {
+        setActualReceiveDoCheckStatus('block');
+        setActualReceiveDoCheckMessage('Nomor surat jalan/DO sudah ada!');
+        return { ok: false, duplicate: true, unavailable: false };
+      }
+      setActualReceiveDoCheckStatus('ok');
+      setActualReceiveDoCheckMessage('');
+      return { ok: true, duplicate: false, unavailable: false };
+    } catch (error) {
+      if (actualReceiveDoCheckSeqRef.current !== requestId) return { ok: true, duplicate: false, unavailable: false };
+      setActualReceiveDoCheckStatus('error');
+      const rawMessage = String(error?.message || '').trim();
+      const isRouteError = error?.status === 404
+        || /^cannot (get|post|put|patch|delete)\s+/i.test(rawMessage)
+        || /<!doctype html>|<html[\s>]/i.test(rawMessage);
+      setActualReceiveDoCheckMessage(
+        isRouteError
+          ? 'Validasi duplikasi No. SJ belum tersedia. Anda masih bisa lanjut simpan.'
+          : (rawMessage || 'Gagal memeriksa No. SJ / DO.'),
+      );
+      return { ok: true, duplicate: false, unavailable: true };
+    }
+  }, [actualReceivePoNumber, apiFetch]);
 
   const actualReceiveSelectableLines = useMemo(() => (
     actualReceiveAllowOver ? actualReceivePoLines : actualReceivePoAvailableLines
@@ -605,10 +1133,8 @@ const TabInbound = (props) => {
     if (actualReceiveSubmitting) return;
     const supplier = String(actualReceiveSupplier || actualReceivePoDetail?.header?.supplier_id || actualReceivePoDetail?.header?.supplier_name || '').trim();
     const poNumber = String(actualReceivePoNumber || '').trim();
-    const doNumber = String(actualReceiveDoNumber || '').trim();
+    const doNumberInput = String(actualReceiveDoNumber || '').trim();
     const arrivalDate = String(actualReceiveArrivalDate || '').trim();
-    const truckNo = String(actualReceiveTruckNo || '').trim();
-    const driverName = String(actualReceiveDriverName || '').trim();
     const remarks = String(actualReceiveRemarks || '').trim();
     const poLines = Array.isArray(actualReceivePoLines) ? actualReceivePoLines : [];
     const availablePoLines = Array.isArray(actualReceivePoAvailableLines) ? actualReceivePoAvailableLines : [];
@@ -622,12 +1148,17 @@ const TabInbound = (props) => {
       setActualReceiveError('Supplier wajib diisi.');
       return;
     }
-    if (!doNumber) {
-      setActualReceiveError('No SJ / DO wajib diisi.');
-      return;
-    }
     if (!arrivalDate) {
       setActualReceiveError('Tanggal kedatangan wajib diisi.');
+      return;
+    }
+    if (!doNumberInput) {
+      setActualReceiveError('No. SJ / DO wajib diisi.');
+      return;
+    }
+    const duplicateCheck = await performActualReceiveDoCheck(supplier, doNumberInput);
+    if (duplicateCheck?.duplicate) {
+      setActualReceiveError('Nomor surat jalan/DO sudah ada!');
       return;
     }
     if (poLines.length === 0) {
@@ -641,6 +1172,7 @@ const TabInbound = (props) => {
 
     const items = [];
     const selectableLines = allowOverReceive ? poLines : availablePoLines;
+    const doNumber = doNumberInput;
     for (const row of (Array.isArray(actualReceiveRows) ? actualReceiveRows : [])) {
       const poLineId = Number(row.poLineId || 0);
       if (!(poLineId > 0)) continue;
@@ -684,8 +1216,8 @@ const TabInbound = (props) => {
           poNumber,
           doNumber,
           arrivalDate,
-          truckNo,
-          driverName,
+          truckNo: String(actualReceiveTruckNo || '').trim(),
+          driverName: String(actualReceiveDriverName || '').trim(),
           remarks,
           allowOverReceive,
           items,
@@ -722,6 +1254,7 @@ const TabInbound = (props) => {
     closeActualReceiveModal,
     openInboundScheduleFromToast,
     refreshSchedules,
+    performActualReceiveDoCheck,
     showToastMessage,
   ]);
 
@@ -740,6 +1273,28 @@ const TabInbound = (props) => {
     actualReceivePoLoading,
     actualReceivePoNumber,
     loadActualReceivePo,
+    showActualReceiveModal,
+  ]);
+
+  useEffect(() => {
+    if (!showActualReceiveModal) return undefined;
+    const supplier = String(actualReceiveSupplier || actualReceivePoDetail?.header?.supplier_id || actualReceivePoDetail?.header?.supplier_name || '').trim();
+    const doNumber = normalizeReceiveDoNumber(actualReceiveDoNumber);
+    if (!supplier || !doNumber) {
+      setActualReceiveDoCheckStatus('idle');
+      setActualReceiveDoCheckMessage('');
+      return undefined;
+    }
+    const handle = window.setTimeout(() => {
+      void performActualReceiveDoCheck(supplier, doNumber);
+    }, 450);
+    return () => window.clearTimeout(handle);
+  }, [
+    actualReceiveDoNumber,
+    actualReceivePoDetail?.header?.supplier_id,
+    actualReceivePoDetail?.header?.supplier_name,
+    actualReceiveSupplier,
+    performActualReceiveDoCheck,
     showActualReceiveModal,
   ]);
 
@@ -896,6 +1451,8 @@ const TabInbound = (props) => {
       if (search) params.set('q', search);
       if (start) params.set('start', start);
       if (end) params.set('end', end);
+      if (start) params.set('start_date', start);
+      if (end) params.set('end_date', end);
       params.set('limit', String(perPage));
       params.set('offset', String(Math.max(0, (page - 1) * perPage)));
       params.set('includeTotal', '1');
@@ -951,7 +1508,7 @@ const TabInbound = (props) => {
     if (inboundNav.tab === 'master-po' && typeof inboundNav.poSearch === 'string') {
       setPoSearch(inboundNav.poSearch);
       setPoPage(1);
-      fetchPoList({ search: inboundNav.poSearch, page: 1 });
+      fetchPoList({ search: inboundNav.poSearch, page: 1, start: poFilterStart, end: poFilterEnd });
     }
     if (inboundNav.tab === 'master-po' && inboundNav.expandPo) {
       const poNumber = String(inboundNav.expandPo || '').trim();
@@ -994,6 +1551,7 @@ const TabInbound = (props) => {
       poDate: row.po_date || '',
       supplier: row.supplier_code || '',
       remarks: row.remarks || '',
+      status: row.force_closed ? 'close' : 'open',
     });
     setPoEditError('');
     setPoEditOpen(true);
@@ -1082,6 +1640,8 @@ const TabInbound = (props) => {
         body: JSON.stringify({
           poDate,
           supplierId: supplier,
+          status: poEditForm.status || 'open',
+          forceClosed: String(poEditForm.status || '').trim().toLowerCase() === 'close',
           remarks: poEditForm.remarks || null,
         }),
       });
@@ -1542,20 +2102,37 @@ const TabInbound = (props) => {
   const normalizedInputQty = useMemo(() => {
     const itemCode = selectedLineForInput?.item_code || selectedLineForInput?.itemCode || newPlan.item;
     const linePackQty = Number(selectedLineForInput?.pack_qty ?? selectedLineForInput?.packQty ?? 0);
+    if (newPlan.allowLooseQty) {
+      return inputQtyValue;
+    }
     if (Number.isFinite(linePackQty) && linePackQty > 0) {
       return Math.ceil(inputQtyValue / linePackQty) * linePackQty;
     }
     if (typeof normalizeQtyByNsp !== 'function') return inputQtyValue;
     const normalized = normalizeQtyByNsp(inputQtyValue, itemCode);
     return Number.isFinite(normalized) ? normalized : inputQtyValue;
-  }, [inputQtyValue, newPlan.item, normalizeQtyByNsp, selectedLineForInput]);
+  }, [inputQtyValue, newPlan.allowLooseQty, newPlan.item, normalizeQtyByNsp, selectedLineForInput]);
   const isQtyRoundedUp = Number.isFinite(normalizedInputQty)
     && Number.isFinite(inputQtyValue)
+    && !newPlan.allowLooseQty
     && normalizedInputQty > inputQtyValue;
   const isQtyOver = Number.isFinite(remainingForInput)
     && Number.isFinite(normalizedInputQty)
+    && !newPlan.allowLooseQty
     && normalizedInputQty > 0
     && normalizedInputQty > remainingForInput;
+
+  useEffect(() => {
+    if (canUseLooseScheduleQty) return;
+    if (!newPlan.allowLooseQty) return;
+    setNewPlan((prev) => (prev.allowLooseQty ? { ...prev, allowLooseQty: false } : prev));
+  }, [canUseLooseScheduleQty, newPlan.allowLooseQty, setNewPlan]);
+
+  useEffect(() => {
+    if (canUseLooseScheduleQty) return;
+    if (!scheduleEditForm.allowLooseQty) return;
+    setScheduleEditForm((prev) => (prev.allowLooseQty ? { ...prev, allowLooseQty: false } : prev));
+  }, [canUseLooseScheduleQty, scheduleEditForm.allowLooseQty, setScheduleEditForm]);
 
   useEffect(() => {
     if (!poSelectAllRef.current) return;
@@ -1881,6 +2458,18 @@ const TabInbound = (props) => {
     return { label: 'PO UNKNOWN', className: 'border-slate-200 bg-slate-100 text-slate-600', dot: 'bg-slate-400' };
   }
 
+  function resolvePoLifecycleMeta(row) {
+    const status = String(row?.status || '').trim().toLowerCase();
+    const remainingRaw = Number(row?.total_qty_remaining);
+    const hasRemaining = Number.isFinite(remainingRaw);
+    const isClosedLike = ['closed', 'rejected', 'cancelled', 'canceled', 'close'].includes(status)
+      || (hasRemaining ? remainingRaw <= 0 : false);
+    if (isClosedLike) {
+      return { label: 'CLOSED', className: 'border-slate-200 bg-slate-100 text-slate-600', dot: 'bg-slate-400' };
+    }
+    return { label: 'OPEN', className: 'border-emerald-200 bg-emerald-50 text-emerald-700', dot: 'bg-emerald-500' };
+  }
+
   function resolvePoScheduleStatusMeta(row) {
     const totalOrder = Number(row?.total_qty_order || 0);
     const totalReceived = Number(row?.total_qty_received || 0);
@@ -2051,14 +2640,15 @@ const TabInbound = (props) => {
                            <div className="flex flex-col gap-1"><label className="text-xs font-semibold text-gray-500">Item / Barang</label><input required className="border p-2 rounded outline-none" value={newPlan.item} onChange={e => setNewPlan({...newPlan, item: e.target.value})} readOnly={poLocked} disabled={poLocked} /></div>
                            <div className="flex flex-col gap-1">
                              <label className="text-xs font-semibold text-gray-500">{inputMode === 'bulk' && !isEditing ? 'Total Qty' : 'Qty Order'}</label>
-                             <input
-                               required
-                               type="number"
-                               className={`border p-2 rounded outline-none ${isQtyOver ? 'border-red-400 bg-red-50' : ''}`}
-                               value={newPlan.requestQty}
-                               onChange={e => setNewPlan({ ...newPlan, requestQty: e.target.value })}
-                               readOnly={poLocked && !hasSingleSelectedPoLine}
-                               disabled={poLocked && !hasSingleSelectedPoLine}
+                              <input
+                                required
+                                type="number"
+                                step={canUseLooseScheduleQty ? 'any' : '1'}
+                                className={`border p-2 rounded outline-none ${isQtyOver ? 'border-red-400 bg-red-50' : ''}`}
+                                value={newPlan.requestQty}
+                                onChange={e => setNewPlan({ ...newPlan, requestQty: e.target.value })}
+                                readOnly={poLocked && !hasSingleSelectedPoLine}
+                                disabled={poLocked && !hasSingleSelectedPoLine}
                              />
                              {isQtyRoundedUp && !isQtyOver && (
                                <div className="text-[11px] text-amber-600">
@@ -2069,6 +2659,16 @@ const TabInbound = (props) => {
                                <div className="text-[11px] text-red-600">
                                  Error: Qty setelah pembulatan pack menjadi {formatNumber0 ? formatNumber0(normalizedInputQty) : normalizedInputQty}, melebihi sisa PO ({formatNumber0 ? formatNumber0(remainingForInput) : remainingForInput})
                                </div>
+                             )}
+                             {canUseLooseScheduleQty && (
+                               <label className="flex items-center gap-2 text-[11px] text-slate-600 pt-1">
+                                 <input
+                                   type="checkbox"
+                                   checked={Boolean(newPlan.allowLooseQty)}
+                                   onChange={(e) => setNewPlan({ ...newPlan, allowLooseQty: e.target.checked })}
+                                 />
+                                 Izinkan plus/minus (khusus admin & PPIC)
+                               </label>
                              )}
                            </div>
                          </>
@@ -2297,11 +2897,15 @@ const TabInbound = (props) => {
                         Aksi
                       </button>
                       {inboundActionOpen && (
-                        <div className="absolute right-0 mt-2 w-60 rounded-2xl border border-slate-200 bg-white shadow-xl z-[90] overflow-hidden text-sm">
+                        <div
+                          className="absolute right-0 mt-2 w-60 rounded-2xl border border-slate-200 bg-white shadow-xl z-[90] overflow-hidden text-sm"
+                          onClick={(e) => e.stopPropagation()}
+                        >
                           {canImportSchedules && (
                             <button
                               type="button"
-                              onClick={() => {
+                              onClick={(e) => {
+                                e.stopPropagation();
                                 inboundImportRef.current?.click();
                                 setInboundActionOpen(false);
                               }}
@@ -2326,7 +2930,8 @@ const TabInbound = (props) => {
                               </button>
                               <button
                                 type="button"
-                                onClick={() => {
+                                onClick={(e) => {
+                                  e.stopPropagation();
                                   inboundImportRef.current?.click();
                                   setInboundActionOpen(false);
                                 }}
@@ -2394,7 +2999,8 @@ const TabInbound = (props) => {
                               <div className="border-t border-slate-100" />
                               <button
                                 type="button"
-                                onClick={() => {
+                                onClick={(e) => {
+                                  e.stopPropagation();
                                   inboundImportRef.current?.click();
                                   setInboundActionOpen(false);
                                 }}
@@ -2766,14 +3372,36 @@ const TabInbound = (props) => {
             {showActualReceiveModal && inboundSubTab === 'schedule' && (
               <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={closeActualReceiveModal}>
                 <div className="w-full max-w-6xl rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
-                  <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                  <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 pb-3">
                     <div>
                       <div className="text-base font-semibold text-slate-900">FORM: PENERIMAAN AKTUAL</div>
                       <div className="text-[11px] text-slate-500">Pilih PO lalu supplier dan item terisi otomatis.</div>
                     </div>
-                    <button onClick={closeActualReceiveModal} className="text-slate-500 hover:text-slate-700">
-                      <XIcon size={18} />
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleDownloadActualReceiveTemplate}
+                        className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+                        disabled={!canEditSchedules}
+                        title={!canEditSchedules ? 'Anda tidak memiliki akses untuk download template.' : 'Download Template Excel'}
+                      >
+                        <FileSpreadsheet size={13} />
+                        <span>Template</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => actualReceiveImportRef.current?.click()}
+                        className="inline-flex items-center gap-1.5 rounded-md bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
+                        disabled={!canEditSchedules || actualReceiveImportLoading}
+                        title={!canEditSchedules ? 'Anda tidak memiliki akses import penerimaan aktual.' : 'Import penerimaan aktual dari Excel'}
+                      >
+                        <FileUp size={13} />
+                        <span>{actualReceiveImportLoading ? 'Mengimpor...' : 'Import Excel'}</span>
+                      </button>
+                      <button onClick={closeActualReceiveModal} className="text-slate-500 hover:text-slate-700">
+                        <XIcon size={18} />
+                      </button>
+                    </div>
                   </div>
 
                   {isStockOpnameLocked && (
@@ -2782,60 +3410,191 @@ const TabInbound = (props) => {
                     </div>
                   )}
 
+                  <input
+                    ref={actualReceiveImportRef}
+                    type="file"
+                    accept=".xlsx,.xls"
+                    className="hidden"
+                    onChange={handleImportActualReceiveExcel}
+                  />
+
+                  {(actualReceiveImportError || actualReceiveImportSummary) && (
+                    <div className="mt-3 space-y-2 text-xs">
+                      {actualReceiveImportError && (
+                        <div className={`rounded-lg border px-3 py-2 whitespace-pre-wrap ${actualReceiveImportSummary ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-rose-200 bg-rose-50 text-rose-700'}`}>
+                          {actualReceiveImportError}
+                        </div>
+                      )}
+
+                      {actualReceiveImportSummary && (
+                        <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <div className="font-semibold text-slate-800">Hasil Import</div>
+                              <div className="text-slate-500 break-words">{actualReceiveImportSummary.fileName || '-'}</div>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              <span className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2.5 py-1 font-semibold text-slate-700">
+                                Dokumen: {actualReceiveImportSummary.totalGroups || 0}
+                              </span>
+                              <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 font-semibold text-emerald-700">
+                                Berhasil: {actualReceiveImportSummary.successGroups || 0}
+                              </span>
+                              <span className="inline-flex items-center rounded-full border border-rose-200 bg-rose-50 px-2.5 py-1 font-semibold text-rose-700">
+                                Gagal: {actualReceiveImportSummary.failedGroups || 0}
+                              </span>
+                              <span className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2.5 py-1 font-semibold text-slate-700">
+                                Item: {actualReceiveImportSummary.totalLines || 0}
+                              </span>
+                              <span className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2.5 py-1 font-semibold text-slate-700">
+                                Qty: {formatNumber0(actualReceiveImportSummary.totalQty || 0)}
+                              </span>
+                              <span className={`inline-flex items-center rounded-full px-2.5 py-1 font-semibold ${actualReceiveImportSummary.failedGroups ? 'border border-amber-200 bg-amber-50 text-amber-700' : 'border border-emerald-200 bg-emerald-50 text-emerald-700'}`}>
+                                {actualReceiveImportSummary.failedGroups ? 'Perlu dicek' : 'Siap dipakai'}
+                              </span>
+                            </div>
+                          </div>
+
+                          {Array.isArray(actualReceiveImportSummary.validationRows) && actualReceiveImportSummary.validationRows.length > 0 && (
+                            <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-amber-800">
+                              <div className="font-semibold">Baris validasi ditolak: {actualReceiveImportSummary.validationRows.length}</div>
+                              <div className="mt-1 max-h-20 space-y-1 overflow-auto">
+                                {actualReceiveImportSummary.validationRows.map((row) => (
+                                  <div key={`validation-${row.no}-${row.errors}`} className="rounded border border-amber-200 bg-white px-2 py-1">
+                                    <span className="font-semibold">Baris {row.no}:</span> {row.errors}
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <div className="mt-3 space-y-3 text-sm">
                     <div className="rounded-lg border border-slate-200 bg-sky-50/60 p-3">
                       <div className="mb-2 rounded bg-sky-200/70 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-slate-700">
-                        BARIS 1: DATA UTAMA KONTRAK & WAKTU
+                        BARIS 1 & 2: DATA PENERIMAAN
                       </div>
                       <div className="grid grid-cols-1 gap-2 md:grid-cols-12">
-                        <div className="md:col-span-5 flex flex-col gap-1">
+                        <div ref={actualReceivePoPickerRef} className="relative flex flex-col gap-1 md:col-span-6">
                           <label className="text-xs font-semibold text-slate-600">No PO</label>
                           <div className="flex gap-2">
-                            <select
-                              className="h-[42px] w-full rounded border border-slate-200 bg-white px-3 py-2"
-                              value={actualReceivePoNumber}
-                              onChange={(e) => {
-                                const nextValue = e.target.value;
-                                setActualReceivePoNumber(nextValue);
-                                setActualReceivePoDetail(null);
-                                setActualReceivePoLines([]);
-                                setActualReceiveSupplier('');
-                                setActualReceiveRows([createActualReceiveRow()]);
-                                setActualReceivePoError('');
-                                if (nextValue) {
-                                  void loadActualReceivePo(nextValue);
-                                }
-                              }}
-                              disabled={actualReceivePoOptionsLoading}
-                            >
-                              <option value="">Pilih No PO</option>
-                              {actualReceivePoVisibleOptions.map((row) => (
-                                <option key={row.po_number} value={row.po_number}>
-                                  {row.po_number} | Sisa {formatNumber0(row.total_qty_remaining || 0)}
-                                </option>
-                              ))}
-                            </select>
+                            <div className="relative flex-1 rounded-xl border border-slate-200 bg-white shadow-sm transition focus-within:border-sky-300 focus-within:ring-2 focus-within:ring-sky-100">
+                              <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                              <input
+                                type="text"
+                                className="h-[42px] w-full rounded-xl border-0 bg-transparent py-2 pl-8 pr-20 text-sm outline-none placeholder:text-slate-400"
+                                value={actualReceivePoSearch}
+                                onChange={(e) => handleActualReceivePoSearchChange(e.target.value)}
+                                onFocus={() => setActualReceivePoPickerOpen(true)}
+                                onKeyDown={handleActualReceivePoKeyDown}
+                                placeholder="Ketik No PO / supplier untuk cari"
+                                aria-expanded={actualReceivePoPickerOpen}
+                                aria-controls="actual-receive-po-listbox"
+                                aria-autocomplete="list"
+                                autoComplete="off"
+                              />
+                              <div className="absolute right-1 top-1 flex items-center gap-1">
+                                {(actualReceivePoSearch || actualReceivePoNumber) && (
+                                  <button
+                                    type="button"
+                                    onClick={handleActualReceivePoClear}
+                                    className="flex h-9 w-9 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-400 hover:bg-slate-50 hover:text-slate-600"
+                                    title="Hapus pilihan"
+                                  >
+                                    <XIcon size={13} />
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => setActualReceivePoPickerOpen((prev) => !prev)}
+                                  className="flex h-9 w-9 items-center justify-center rounded-md border border-slate-200 bg-slate-50 text-slate-500 hover:bg-slate-100"
+                                  title="Lihat daftar PO"
+                                >
+                                  <ChevronDown size={14} className={`transition-transform ${actualReceivePoPickerOpen ? 'rotate-180' : ''}`} />
+                                </button>
+                              </div>
+                              {actualReceivePoPickerOpen && (
+                                <div
+                                  id="actual-receive-po-listbox"
+                                  role="listbox"
+                                  aria-label="Daftar No PO"
+                                  className="absolute left-0 right-0 top-[calc(100%+6px)] z-40 max-h-72 overflow-auto rounded-2xl border border-slate-200 bg-white shadow-2xl"
+                                >
+                                  <div className="flex items-center justify-between border-b border-slate-100 px-3 py-2 text-[11px] text-slate-500">
+                                    <span>{actualReceivePoMenuOptions.length ? `${actualReceivePoVisibleOptions.length} PO ditemukan` : 'Tidak ada PO yang sesuai'}</span>
+                                    <span>↑↓ Enter Esc</span>
+                                  </div>
+                                  {actualReceivePoOptionsLoading ? (
+                                    <div className="px-3 py-3 text-xs text-slate-500">Memuat daftar PO...</div>
+                                  ) : actualReceivePoMenuOptions.length > 0 ? (
+                                    actualReceivePoMenuOptions.map((row, index) => {
+                                      const isSelected = String(row.po_number || '').trim() === String(actualReceivePoNumber || '').trim();
+                                      const isActive = index === actualReceivePoActiveIndex;
+                                      return (
+                                        <button
+                                          key={row.po_number}
+                                          type="button"
+                                          role="option"
+                                          aria-selected={isSelected}
+                                          onMouseEnter={() => setActualReceivePoActiveIndex(index)}
+                                          onClick={() => handleActualReceivePoPick(row)}
+                                          className={`flex w-full items-start justify-between gap-3 border-b border-slate-100 px-3 py-2 text-left text-xs last:border-b-0 transition ${
+                                            isActive ? 'bg-sky-50' : 'hover:bg-slate-50'
+                                          } ${isSelected ? 'ring-inset ring-1 ring-sky-200' : ''}`}
+                                        >
+                                          <div className="min-w-0">
+                                            <div className="truncate font-semibold text-slate-800">{row.po_number}</div>
+                                            <div className="truncate text-slate-500">
+                                              {resolveSupplierLabel(row) || row.supplier_name || row.supplier_code || '-'}
+                                            </div>
+                                          </div>
+                                          <div className="flex shrink-0 flex-col items-end gap-1">
+                                            <span className={`rounded-full px-2 py-0.5 font-semibold ${isSelected ? 'bg-sky-100 text-sky-700' : 'bg-slate-100 text-slate-600'}`}>
+                                              {String(row.status || '').toUpperCase() || 'OPEN'}
+                                            </span>
+                                            <span className="text-slate-500">Sisa {formatNumber0(row.total_qty_remaining || 0)}</span>
+                                          </div>
+                                        </button>
+                                      );
+                                    })
+                                  ) : (
+                                    <div className="px-3 py-3 text-xs text-slate-500">Tidak ada PO open yang cocok dengan pencarian.</div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
                             <button
                               type="button"
                               onClick={fetchActualReceivePoOptions}
-                              className="h-[42px] rounded border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 disabled:opacity-60"
+                              className="inline-flex h-[42px] items-center justify-center rounded-xl border border-slate-200 bg-slate-900 px-3 text-xs font-semibold text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500"
                               disabled={actualReceivePoOptionsLoading}
                               title="Refresh daftar PO"
                             >
-                              {actualReceivePoOptionsLoading ? '...' : '↻'}
+                              <RefreshCw size={14} className={actualReceivePoOptionsLoading ? 'animate-spin' : ''} />
                             </button>
                           </div>
+                          {actualReceivePoNumber && (
+                            <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
+                              <span className="rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 font-semibold text-sky-700">
+                                Terpilih: {actualReceivePoNumber}
+                              </span>
+                              <span>Ketik untuk cari, panah atas/bawah lalu Enter untuk pilih.</span>
+                            </div>
+                          )}
                         </div>
-                        <div className="md:col-span-5 flex flex-col gap-1">
-                          <label className="text-xs font-semibold text-slate-600">Supplier</label>
+                        <div className="flex flex-col gap-1 md:col-span-4">
+                          <label className="text-xs font-semibold text-slate-600">Supplier (otomatis dari PO)</label>
                           <div className="flex h-[42px] items-center rounded border border-slate-200 bg-white px-3 text-slate-700">
                             {actualReceivePoDetail?.header
                               ? resolveSupplierLabel(actualReceivePoDetail.header)
                               : 'Pilih PO untuk memuat supplier'}
                           </div>
                         </div>
-                        <div className="md:col-span-2 flex flex-col gap-1">
-                          <label className="text-xs font-semibold text-slate-600">Tgl Tiba</label>
+                        <div className="flex flex-col gap-1 md:col-span-2">
+                          <label className="text-xs font-semibold text-slate-600">Tgl Kedatangan</label>
                           <input
                             type="date"
                             className="h-[42px] rounded border border-slate-200 bg-white px-3 py-2"
@@ -2853,40 +3612,61 @@ const TabInbound = (props) => {
                             className="h-4 w-4 rounded border-slate-300 text-rose-600"
                           />
                           <label htmlFor="allow-over-receive" className="font-semibold text-slate-700">
-                            Izinkan incoming over dari sisa PO
+                            Izin Over Qty
                           </label>
                           <span className="text-slate-500">
                             {canEditSchedules ? 'Aktifkan untuk menerima qty melebihi sisa PO pada line terpilih.' : 'Hanya user dengan akses inbound schedule yang dapat mengaktifkan mode ini.'}
                           </span>
                         </div>
-                      </div>
-                    </div>
-
-                    <div className="rounded-lg border border-emerald-200 bg-emerald-50/60 p-3">
-                      <div className="mb-2 rounded bg-emerald-200/70 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-emerald-800">
-                        BARIS 2: DATA LOGISTIK & LAPANGAN
-                      </div>
-                      <div className="grid grid-cols-1 gap-2 md:grid-cols-12">
-                        <div className="md:col-span-3 flex flex-col gap-1">
-                          <label className="text-xs font-semibold text-slate-600">No. SJ / DO</label>
+                        <div className="flex flex-col gap-1 md:col-span-4">
+                          <label className="text-xs font-semibold text-slate-600">No. SJ / DO *</label>
                           <input
                             className="h-[42px] rounded border border-slate-200 bg-white px-3 py-2"
                             value={actualReceiveDoNumber}
-                            onChange={(e) => setActualReceiveDoNumber(e.target.value)}
-                            placeholder="Nomor surat jalan"
+                            onChange={(e) => {
+                              const nextValue = e.target.value;
+                              setActualReceiveDoNumber(nextValue);
+                              const trimmed = normalizeReceiveDoNumber(nextValue);
+                              if (!trimmed) {
+                                setActualReceiveDoCheckStatus('idle');
+                                setActualReceiveDoCheckMessage('');
+                                return;
+                              }
+                              setActualReceiveDoCheckStatus('checking');
+                              setActualReceiveDoCheckMessage('Memeriksa duplikasi No. SJ / DO...');
+                            }}
+                            onBlur={() => {
+                              const supplier = String(actualReceiveSupplier || actualReceivePoDetail?.header?.supplier_id || actualReceivePoDetail?.header?.supplier_name || '').trim();
+                              const doNumber = normalizeReceiveDoNumber(actualReceiveDoNumber);
+                              if (supplier && doNumber) {
+                                void performActualReceiveDoCheck(supplier, doNumber);
+                              }
+                            }}
+                            placeholder="Wajib diisi"
                           />
+                          {actualReceiveDoCheckStatus === 'checking' && (
+                            <div className="text-[10px] text-slate-500">{actualReceiveDoCheckMessage || 'Memeriksa duplikasi No. SJ / DO...'}</div>
+                          )}
+                          {actualReceiveDoCheckStatus === 'block' && (
+                            <div className="text-[10px] font-semibold text-rose-600">
+                              {actualReceiveDoCheckMessage || 'Nomor surat jalan/DO sudah ada!'}
+                            </div>
+                          )}
+                          {actualReceiveDoCheckStatus === 'error' && actualReceiveDoCheckMessage && (
+                            <div className="text-[10px] text-amber-600">{actualReceiveDoCheckMessage}</div>
+                          )}
                         </div>
-                        <div className="md:col-span-3 flex flex-col gap-1">
-                          <label className="text-xs font-semibold text-slate-600">No Polisi</label>
+                        <div className="flex flex-col gap-1 md:col-span-4">
+                          <label className="text-xs font-semibold text-slate-600">No Polisi (opsional)</label>
                           <input
                             className="h-[42px] rounded border border-slate-200 bg-white px-3 py-2"
                             value={actualReceiveTruckNo}
                             onChange={(e) => setActualReceiveTruckNo(e.target.value)}
-                            placeholder="B 1234 XYZ"
+                            placeholder="Contoh: B 1234 CD"
                           />
                         </div>
-                        <div className="md:col-span-3 flex flex-col gap-1">
-                          <label className="text-xs font-semibold text-slate-600">Nama Sopir</label>
+                        <div className="flex flex-col gap-1 md:col-span-4">
+                          <label className="text-xs font-semibold text-slate-600">Nama Sopir (opsional)</label>
                           <input
                             className="h-[42px] rounded border border-slate-200 bg-white px-3 py-2"
                             value={actualReceiveDriverName}
@@ -2894,7 +3674,7 @@ const TabInbound = (props) => {
                             placeholder="Nama sopir"
                           />
                         </div>
-                        <div className="md:col-span-3 flex flex-col gap-1">
+                        <div className="flex flex-col gap-1 md:col-span-8">
                           <label className="text-xs font-semibold text-slate-600">Remarks</label>
                           <input
                             className="h-[42px] rounded border border-slate-200 bg-white px-3 py-2"
@@ -2934,17 +3714,17 @@ const TabInbound = (props) => {
 
                     <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
                       <div className="flex items-center justify-between bg-slate-100 px-4 py-2 text-xs font-semibold text-slate-700">
-                        <span>BARIS 3: TABEL DETAIL ITEM KONTRAK PO (FOKUS UTAMA)</span>
+                        <span>BARIS 3: ITEM YANG DITERIMA</span>
                         <button type="button" onClick={addActualReceiveRow} className="text-xs font-semibold text-slate-900" disabled={actualReceiveSelectableLines.length === 0}>
                           + Tambah Baris Baru
                         </button>
                       </div>
-                      <div className="max-h-[38vh] overflow-y-auto">
-                        <table className="min-w-full text-sm">
+                      <div className="max-h-[46vh] overflow-auto">
+                        <table className="min-w-[900px] text-sm">
                           <thead className="sticky top-0 bg-white border-b">
                             <tr className="text-left">
                               <th className="p-3">Item</th>
-                              <th className="p-3 w-[180px] text-right">Qty Aktual Datang</th>
+                              <th className="w-[220px] p-3 text-right">Qty Aktual Datang</th>
                               <th className="p-3">Detail</th>
                               <th className="p-3 w-[90px] text-center">Aksi</th>
                             </tr>
@@ -3000,7 +3780,7 @@ const TabInbound = (props) => {
                                       type="number"
                                       min="0"
                                       step="1"
-                                      className="w-full rounded border border-slate-200 bg-white px-3 py-2 text-right"
+                                      className="w-full min-w-[120px] rounded border border-slate-200 bg-white px-3 py-2 text-right"
                                       value={row.qty}
                                       onChange={(e) => updateActualReceiveRow(row.key, { qty: e.target.value })}
                                     />
@@ -3037,7 +3817,14 @@ const TabInbound = (props) => {
                       <button
                         onClick={handleActualReceiveSubmit}
                         className="rounded bg-emerald-600 px-4 py-2 text-sm text-white disabled:opacity-60"
-                        disabled={actualReceiveSubmitting || isStockOpnameLocked || actualReceiveSelectableLines.length === 0}
+                        disabled={
+                          actualReceiveSubmitting
+                          || isStockOpnameLocked
+                          || actualReceiveSelectableLines.length === 0
+                          || !String(actualReceiveDoNumber || '').trim()
+                          || actualReceiveDoCheckStatus === 'checking'
+                          || actualReceiveDoCheckStatus === 'block'
+                        }
                       >
                         {actualReceiveSubmitting ? 'Menyimpan...' : 'Simpan Inbound'}
                       </button>
@@ -3231,7 +4018,8 @@ const TabInbound = (props) => {
                               </button>
                               <button
                                 type="button"
-                                onClick={() => {
+                                onClick={(e) => {
+                                  e.stopPropagation();
                                   poImportRef.current?.click();
                                   setPoActionOpen(false);
                                 }}
@@ -3405,7 +4193,9 @@ const TabInbound = (props) => {
                 <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                   <div className="flex flex-col gap-1">
                     <div className="text-sm font-semibold text-slate-900">Daftar PO</div>
-                    <div className="text-xs text-slate-500">Total: {poTotal} PO • Default: bulan berjalan</div>
+                    <div className="text-xs text-slate-500">
+                      Total: {poTotal} PO • Rentang aktif: {poFilterStart ? formatDateID(poFilterStart) : '-'} s/d {poFilterEnd ? formatDateID(poFilterEnd) : '-'}
+                    </div>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     <input
@@ -3472,6 +4262,7 @@ const TabInbound = (props) => {
                           const totalReceived = Number(row.total_qty_received || 0);
                           const remaining = totalOrder - totalReceived;
                           const statusMeta = resolvePoStatusMeta(row.status);
+                          const lifecycleMeta = resolvePoLifecycleMeta(row);
                           const scheduleStatusMeta = resolvePoScheduleStatusMeta(row);
                           const canQuickSchedule = ['BELUM DIJADWALKAN', 'DIJADWALKAN SEBAGIAN'].includes(scheduleStatusMeta.label);
                           const isExpanded = Boolean(poExpanded[row.po_number]);
@@ -3499,10 +4290,16 @@ const TabInbound = (props) => {
                                   <div className="text-[11px] text-slate-400">{resolveSupplierMeta(row).id || '-'}</div>
                                 </td>
                                 <td className="p-3">
-                                  <span className={`inline-flex items-center gap-2 rounded-full border px-2 py-1 text-[10px] font-semibold ${statusMeta.className}`}>
-                                    <span className={`h-1.5 w-1.5 rounded-full ${statusMeta.dot}`} />
-                                    {statusMeta.label}
-                                  </span>
+                                  <div className="flex flex-col gap-1">
+                                    <span className={`inline-flex items-center gap-2 rounded-full border px-2 py-1 text-[10px] font-semibold ${statusMeta.className}`}>
+                                      <span className={`h-1.5 w-1.5 rounded-full ${statusMeta.dot}`} />
+                                      {statusMeta.label}
+                                    </span>
+                                    <span className={`inline-flex items-center gap-1 self-start rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide ${lifecycleMeta.className}`}>
+                                      <span className={`h-1.5 w-1.5 rounded-full ${lifecycleMeta.dot}`} />
+                                      {lifecycleMeta.label}
+                                    </span>
+                                  </div>
                                 </td>
                                 <td className="p-3">
                                   <span className={`inline-flex items-center gap-2 rounded-full border px-2 py-1 text-[10px] font-semibold ${scheduleStatusMeta.className}`}>
@@ -3797,10 +4594,21 @@ const TabInbound = (props) => {
                         <label className="text-xs font-semibold text-slate-600">Qty Plan</label>
                         <input
                           type="number"
+                          step={canUseLooseScheduleQty ? 'any' : '1'}
                           className="border border-slate-200 rounded-lg px-3 py-2 text-sm"
                           value={scheduleEditForm.requestQty ?? ''}
                           onChange={(e) => setScheduleEditForm((prev) => ({ ...prev, requestQty: e.target.value }))}
                         />
+                        {canUseLooseScheduleQty && (
+                          <label className="flex items-center gap-2 pt-1 text-[11px] text-slate-600">
+                            <input
+                              type="checkbox"
+                              checked={Boolean(scheduleEditForm.allowLooseQty)}
+                              onChange={(e) => setScheduleEditForm((prev) => ({ ...prev, allowLooseQty: e.target.checked }))}
+                            />
+                            Izinkan plus/minus (khusus admin & PPIC)
+                          </label>
+                        )}
                       </div>
                     </div>
                     <div className="flex flex-col gap-1">
@@ -3882,6 +4690,20 @@ const TabInbound = (props) => {
                           <option key={vendor.id} value={vendor.id}>{vendor.name || vendor.id}</option>
                         ))}
                       </datalist>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-xs font-semibold text-slate-600">Status Manual</label>
+                      <select
+                        className="border border-slate-200 rounded-lg px-3 py-2 text-sm bg-white"
+                        value={poEditForm.status || 'open'}
+                        onChange={(e) => setPoEditForm((prev) => ({ ...prev, status: e.target.value }))}
+                      >
+                        <option value="open">Open</option>
+                        <option value="close">Close</option>
+                      </select>
+                      <div className="text-[11px] text-slate-500">
+                        Close akan memaksa PO keluar dari daftar penerimaan, meski sisa qty masih ada.
+                      </div>
                     </div>
                     <div className="flex flex-col gap-1">
                       <label className="text-xs font-semibold text-slate-600">Catatan</label>

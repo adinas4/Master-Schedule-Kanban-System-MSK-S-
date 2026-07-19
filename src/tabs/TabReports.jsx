@@ -4,6 +4,7 @@ import {
   CartesianGrid,
   ComposedChart,
   Line,
+  LineChart,
   Legend,
   ReferenceLine,
   Tooltip,
@@ -28,6 +29,7 @@ import {
   X,
 } from 'lucide-react';
 import logoMatra from '../assets/logo-matra.png';
+import SearchableSelectDropdown from '../components/SearchableSelectDropdown';
 import TabReportInbound from './TabReportInbound';
 
 const SafeResponsiveContainer = ({ children }) => {
@@ -175,7 +177,11 @@ const TabReports = (props) => {
     masterAreas,
     masterCategories,
     masterLocations,
+    masterModelsMap,
     masterProcesses,
+    masterVendors,
+    formatModelCodes,
+    parseModelCodes,
     getWorkingDays,
     capacityPlanningMonth,
     setCapacityPlanningMonth,
@@ -198,6 +204,11 @@ const TabReports = (props) => {
   const formatQuantity = (value) => Number(value || 0).toLocaleString('id-ID', { maximumFractionDigits: 2 });
   const formatCount = (value) => Number(value || 0).toLocaleString('id-ID');
   const formatPercent = (value) => `${Number(value || 0).toFixed(1)}%`;
+  const getModelCodeText = (value) => {
+    const parsed = typeof parseModelCodes === 'function' ? parseModelCodes(value) : [];
+    const formatted = typeof formatModelCodes === 'function' ? formatModelCodes(masterModelsMap, parsed) : '';
+    return formatted || value || '-';
+  };
   const countWeekdaysInMonth = (monthKey, yearValue) => {
     const monthNum = monthKeyMap[String(monthKey || '').toLowerCase()];
     const yearNum = Number(yearValue || 0);
@@ -260,6 +271,128 @@ const TabReports = (props) => {
     ];
   }, [masterCategories]);
 
+  const [inboundReportTab, setInboundReportTab] = useState('transaction');
+
+  const toDateKey = (value) => {
+    if (!value) return '';
+    if (value instanceof Date) {
+      if (Number.isNaN(value.getTime())) return '';
+      const year = value.getFullYear();
+      const month = String(value.getMonth() + 1).padStart(2, '0');
+      const day = String(value.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    }
+    const text = String(value).trim();
+    if (!text) return '';
+    if (/^\d{4}-\d{2}-\d{2}/.test(text)) return text.slice(0, 10);
+    const date = new Date(text);
+    if (Number.isNaN(date.getTime())) return '';
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  };
+
+  const formatInboundDayLabel = (dateKey) => {
+    if (!dateKey || !/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) return '-';
+    const date = new Date(`${dateKey}T00:00:00`);
+    if (Number.isNaN(date.getTime())) return '-';
+    return new Intl.DateTimeFormat('id-ID', { day: '2-digit', month: 'short' }).format(date);
+  };
+
+  const buildDateKeys = (startValue, endValue, rows = []) => {
+    const rowDateKeys = rows
+      .flatMap((row) => [toDateKey(row?.arrivalDate), toDateKey(row?.requestDate)])
+      .filter(Boolean)
+      .sort();
+    let startKey = toDateKey(startValue) || rowDateKeys[0] || '';
+    let endKey = toDateKey(endValue) || rowDateKeys[rowDateKeys.length - 1] || startKey;
+    if (!startKey || !endKey) return [];
+    let startDate = new Date(`${startKey}T00:00:00`);
+    let endDate = new Date(`${endKey}T00:00:00`);
+    if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) return [];
+    if (startDate > endDate) {
+      [startDate, endDate] = [endDate, startDate];
+      [startKey, endKey] = [endKey, startKey];
+    }
+    const result = [];
+    const cursor = new Date(startDate);
+    while (cursor <= endDate) {
+      result.push(toDateKey(cursor));
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    return result;
+  };
+
+  const normalizeInboundStatus = (value) => String(value || '').toLowerCase().replace(/\s+/g, '');
+
+  const inboundDailyTrend = useMemo(() => {
+    const dateKeys = buildDateKeys(reportStart, reportEnd, inboundPerformanceRows);
+    const map = new Map(dateKeys.map((dateKey) => [dateKey, {
+      dateKey,
+      label: formatInboundDayLabel(dateKey),
+      onTime: 0,
+      late: 0,
+      total: 0,
+    }]));
+
+    inboundPerformanceRows.forEach((row) => {
+      const dateKey = toDateKey(row?.requestDate || row?.arrivalDate);
+      if (!dateKey || !map.has(dateKey)) return;
+      const bucket = map.get(dateKey);
+      const status = normalizeInboundStatus(row?.status);
+      if (status.includes('late')) {
+        bucket.late += 1;
+      } else if (status.includes('ontime') || status.includes('on-time')) {
+        bucket.onTime += 1;
+      }
+      bucket.total += 1;
+    });
+
+    return Array.from(map.values());
+  }, [inboundPerformanceRows, reportEnd, reportStart]);
+
+  const inboundSupplierKpiRows = useMemo(() => {
+    const grouped = new Map();
+    inboundPerformanceRows.forEach((row) => {
+      const supplier = String(row?.supplier || '').trim() || 'UNKNOWN';
+      if (!grouped.has(supplier)) {
+        grouped.set(supplier, {
+          supplier,
+          total: 0,
+          onTime: 0,
+          late: 0,
+          pending: 0,
+          tooEarly: 0,
+        });
+      }
+      const bucket = grouped.get(supplier);
+      bucket.total += 1;
+      const status = normalizeInboundStatus(row?.status);
+      if (status.includes('late')) bucket.late += 1;
+      else if (status.includes('ontime') || status.includes('on-time')) bucket.onTime += 1;
+      else if (status.includes('pending')) bucket.pending += 1;
+      else if (status.includes('tooearly')) bucket.tooEarly += 1;
+    });
+    return Array.from(grouped.values())
+      .map((row) => ({
+        ...row,
+        onTimeRate: row.total ? (row.onTime / row.total) * 100 : 0,
+        lateRate: row.total ? (row.late / row.total) * 100 : 0,
+      }))
+      .sort((left, right) => right.late - left.late || right.total - left.total || String(left.supplier).localeCompare(String(right.supplier), 'id'));
+  }, [inboundPerformanceRows]);
+
+  const inboundSupplierChartRows = useMemo(
+    () => inboundSupplierKpiRows.slice(0, 8).map((row) => ({
+      supplier: row.supplier,
+      onTime: row.onTime,
+      late: row.late,
+      total: row.total,
+    })),
+    [inboundSupplierKpiRows],
+  );
+
   const allMutationCategoryOptions = useMemo(() => {
     const options = [];
     const seen = new Set();
@@ -279,6 +412,28 @@ const TabReports = (props) => {
       ...options,
     ];
   }, [masterCategories]);
+
+  const masterSupplierOptions = useMemo(() => {
+    const seen = new Set();
+    return (Array.isArray(masterVendors) ? masterVendors : [])
+      .map((vendor) => {
+        const id = String(vendor?.id || '').trim();
+        const name = String(vendor?.name || '').trim();
+        const value = id || name;
+        if (!value) return null;
+        const key = value.toLowerCase();
+        if (seen.has(key)) return null;
+        seen.add(key);
+        return {
+          value,
+          label: id && name && id !== name ? `${id} - ${name}` : (name || id),
+          id,
+          name,
+        };
+      })
+      .filter(Boolean)
+      .sort((left, right) => String(left.label).localeCompare(String(right.label), 'id'));
+  }, [masterVendors]);
 
   const renderReportHeader = (title, periodStart, periodEnd) => (
     <div className="report-print-header print-only">
@@ -327,10 +482,19 @@ const TabReports = (props) => {
       const style = document.createElement('style');
       style.setAttribute('data-report-page', 'true');
       const orientation = orientationOverride || (reportPrintOrientation === 'landscape' ? 'landscape' : 'portrait');
-      style.innerHTML = `
+      style.innerHTML = orientation === 'landscape'
+        ? `
         @media print {
           @page {
-            size: A4 ${orientation};
+            size: 297mm 210mm;
+            margin: 10mm 12mm 12mm 12mm;
+          }
+        }
+      `
+        : `
+        @media print {
+          @page {
+            size: 210mm 297mm;
             margin: 15mm;
             margin-bottom: 25mm;
           }
@@ -340,17 +504,29 @@ const TabReports = (props) => {
     }
     if (typeof document !== 'undefined') {
       document.body.classList.add('report-print-active');
+      document.body.classList.toggle('report-print-landscape', (orientationOverride || reportPrintOrientation) === 'landscape');
+      if ((orientationOverride || reportPrintOrientation) === 'landscape') {
+        document.documentElement.classList.add('report-print-landscape-root');
+      } else {
+        document.documentElement.classList.remove('report-print-landscape-root');
+      }
     }
     const cleanup = () => {
       if (typeof document !== 'undefined') {
         document.body.classList.remove('report-print-active');
+        document.body.classList.remove('report-print-landscape');
+        document.documentElement.classList.remove('report-print-landscape-root');
         const existingStyle = document.querySelector('style[data-report-page]');
         if (existingStyle) existingStyle.remove();
       }
       window.removeEventListener('afterprint', cleanup);
     };
     window.addEventListener('afterprint', cleanup);
-    window.print();
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        window.print();
+      });
+    });
     setTimeout(cleanup, 800);
   };
 
@@ -596,8 +772,16 @@ const TabReports = (props) => {
                       <input type="date" className="border p-2 rounded w-full text-sm" value={reportEnd} onChange={(e) => setReportEnd(e.target.value)} />
                     </div>
                     <div>
-                      <label className="text-xs font-semibold text-gray-500">Supplier (opsional)</label>
-                      <input type="text" className="border p-2 rounded w-full text-sm" value={reportSupplier} onChange={(e) => setReportSupplier(e.target.value)} />
+                      <label className="text-xs font-semibold text-gray-500">Cari supplier (opsional)</label>
+                      <SearchableSelectDropdown
+                        value={reportSupplier}
+                        options={masterSupplierOptions}
+                        placeholder="Cari supplier..."
+                        searchPlaceholder="Ketik kode / nama supplier"
+                        emptyText="Supplier tidak ditemukan."
+                        className="w-full"
+                        onChange={(nextValue) => setReportSupplier(nextValue || '')}
+                      />
                     </div>
                     <div className="flex items-end">
                       <button onClick={fetchReport} className="bg-indigo-600 text-white px-4 py-2 rounded w-full text-sm">Terapkan Filter</button>
@@ -619,19 +803,19 @@ const TabReports = (props) => {
                         <div className="font-bold">{reportSummary.totalReceived}</div>
                       </div>
                       <div className="bg-white p-3 rounded border text-center">
-                        <div className="text-xs text-gray-400 uppercase">On Time</div>
+                        <div className="text-xs text-gray-400 uppercase">Tepat Waktu</div>
                         <div className="font-bold text-green-600">{reportSummary.totalOnTime}</div>
                       </div>
                       <div className="bg-white p-3 rounded border text-center">
-                        <div className="text-xs text-gray-400 uppercase">Late</div>
+                        <div className="text-xs text-gray-400 uppercase">Terlambat</div>
                         <div className="font-bold text-red-600">{reportSummary.totalLate}</div>
                       </div>
                       <div className="bg-white p-3 rounded border text-center">
-                        <div className="text-xs text-gray-400 uppercase">Too Early</div>
+                        <div className="text-xs text-gray-400 uppercase">Terlalu Awal</div>
                         <div className="font-bold text-blue-600">{reportSummary.totalTooEarly}</div>
                       </div>
                       <div className="bg-white p-3 rounded border text-center">
-                        <div className="text-xs text-gray-400 uppercase">Pending</div>
+                        <div className="text-xs text-gray-400 uppercase">Menunggu</div>
                         <div className="font-bold text-yellow-600">{reportSummary.totalPending}</div>
                       </div>
                     </div>
@@ -645,11 +829,11 @@ const TabReports = (props) => {
                           <th className="text-left p-3">No PO</th>
                           <th className="text-right p-3">Qty PO</th>
                           <th className="text-right p-3">Qty Incoming</th>
-                          <th className="text-right p-3">On Time</th>
-                          <th className="text-right p-3">Late</th>
-                          <th className="text-right p-3">Too Early</th>
-                          <th className="text-right p-3">Pending</th>
-                          <th className="text-right p-3">SNP Tidak Sesuai</th>
+                          <th className="text-right p-3">Tepat Waktu</th>
+                          <th className="text-right p-3">Terlambat</th>
+                          <th className="text-right p-3">Terlalu Awal</th>
+                          <th className="text-right p-3">Menunggu</th>
+                          <th className="text-right p-3">SNP Tidak Sesuai<br/><span className="text-[10px] font-normal text-slate-500">Khusus Kg ±25%</span></th>
                           <th className="text-center p-3">Packing/SNP %</th>
                           <th className="text-center p-3">Terpenuhi</th>
                         </tr>
@@ -699,12 +883,15 @@ const TabReports = (props) => {
                     <h3 className="font-bold text-slate-900 flex items-center gap-2"><Trophy size={18}/> Rapor Kinerja Supplier</h3>
                     <div className="flex gap-2 items-center">
                       <div className="flex gap-2 items-center print:hidden">
-                        <select className="border border-orange-300 rounded px-2 py-1 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-orange-500" value={scorecardFilterSupplier} onChange={(e) => setScorecardFilterSupplier(e.target.value)}>
-                        <option value="All">Filter nama supplier</option>
-                        {(scorecardSupplierOptions?.length ? scorecardSupplierOptions : getUniqueSuppliers().map((sup) => ({ value: sup, label: sup }))).map((sup) => (
-                          <option key={sup.value} value={sup.value}>{sup.label}</option>
-                        ))}
-                        </select>
+                        <SearchableSelectDropdown
+                          value={scorecardFilterSupplier === 'All' ? '' : scorecardFilterSupplier}
+                          options={masterSupplierOptions}
+                          placeholder="Filter nama supplier"
+                          searchPlaceholder="Ketik kode / nama supplier"
+                          emptyText="Supplier tidak ditemukan."
+                          className="w-[280px]"
+                          onChange={(nextValue) => setScorecardFilterSupplier(nextValue || 'All')}
+                        />
                         <input
                           type="month"
                           className="border border-orange-300 rounded px-2 py-1 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-orange-500"
@@ -786,10 +973,10 @@ const TabReports = (props) => {
                             )}
                             <div className="grid grid-cols-4 md:grid-cols-8 gap-4 text-sm border-t pt-3 text-center tabular-nums">
                               <div className="flex flex-col"><span className="text-gray-400 text-[10px] uppercase font-bold">Jadwal</span><span className="font-bold text-gray-800">{sup.totalSchedules}</span></div>
-                              <div className="flex flex-col"><span className="text-green-600 text-[10px] uppercase font-bold">On Time</span><span className="font-bold text-green-700">{sup.onTime}</span></div>
-                              <div className="flex flex-col"><span className="text-red-500 text-[10px] uppercase font-bold">Late</span><span className="font-bold text-red-600">{sup.late}</span></div>
-                              <div className="flex flex-col"><span className="text-blue-600 text-[10px] uppercase font-bold">Too Early</span><span className="font-bold text-blue-700">{sup.tooEarly}</span></div>
-                              <div className="flex flex-col"><span className="text-yellow-600 text-[10px] uppercase font-bold">Pending</span><span className="font-bold text-yellow-700">{sup.pending}</span></div>
+                              <div className="flex flex-col"><span className="text-green-600 text-[10px] uppercase font-bold">Tepat Waktu</span><span className="font-bold text-green-700">{sup.onTime}</span></div>
+                              <div className="flex flex-col"><span className="text-red-500 text-[10px] uppercase font-bold">Terlambat</span><span className="font-bold text-red-600">{sup.late}</span></div>
+                              <div className="flex flex-col"><span className="text-blue-600 text-[10px] uppercase font-bold">Terlalu Awal</span><span className="font-bold text-blue-700">{sup.tooEarly}</span></div>
+                              <div className="flex flex-col"><span className="text-yellow-600 text-[10px] uppercase font-bold">Menunggu</span><span className="font-bold text-yellow-700">{sup.pending}</span></div>
                               <div className="flex flex-col"><span className="text-rose-600 text-[10px] uppercase font-bold">SNP Tidak Sesuai</span><span className="font-bold text-rose-700">{sup.packingLoose || 0}</span></div>
                               <div className="flex flex-col pl-4 border-l"><span className="text-gray-400 text-[10px] uppercase font-bold">Qty Jadwal</span><span className="font-bold text-gray-800">{sup.totalOrdered.toLocaleString()}</span></div>
                               <div className="flex flex-col"><span className="text-gray-400 text-[10px] uppercase font-bold">Qty Dikirim</span><span className="font-bold text-gray-800">{sup.totalReceived.toLocaleString()}</span></div>
@@ -807,6 +994,9 @@ const TabReports = (props) => {
                             <div className="kpi-tile kpi-tile--packing">
                               <div className="text-2xl font-bold text-amber-700">{sup.packingScore === null || sup.packingScore === undefined ? '-' : `${sup.packingScore}%`}</div>
                               <div className="text-[10px] text-amber-500 uppercase tracking-wide font-bold text-center leading-tight">Packing/<br/>SNP</div>
+                              <div className="mt-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[9px] font-semibold text-amber-700">
+                                Khusus Kg: toleransi &plusmn;25%
+                              </div>
                             </div>
                             <div className="kpi-tile kpi-tile--rating">
                               <div className="flex mb-1">{[...Array(5)].map((_, i) => (<Star key={i} size={14} className={i < sup.rating ? "text-yellow-400 fill-yellow-400" : "text-gray-200"} />))}</div>
@@ -857,6 +1047,9 @@ const TabReports = (props) => {
                     </div>
                   </div>
                   <div className="bg-white rounded-lg border overflow-x-auto">
+                    <div className="border-b border-slate-200 bg-amber-50 px-4 py-2 text-[11px] font-semibold text-amber-700">
+                      Catatan: kolom SNP Tidak Sesuai memakai toleransi khusus item Kg sebesar ±25%.
+                    </div>
                     <table className="min-w-full text-sm">
                       <thead className="bg-slate-100">
                         <tr>
@@ -957,75 +1150,313 @@ const TabReports = (props) => {
 
               {reportTab === 'inbound-performance' && canViewReport && (
                 <div className="bg-white rounded-xl shadow-sm border p-4 report-print-scope">
-                  {renderReportHeader('LAPORAN INBOUND PERFORMANCE', reportStart, reportEnd)}
-                  <div className="flex items-center justify-between mb-4">
-                    <h3 className="font-bold text-slate-900 flex items-center gap-2"><ArrowDownUp size={18}/> Inbound Performance</h3>
-                    <div className="flex gap-2 items-center print:hidden">
-                      <button onClick={fetchInboundPerformanceReport} className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1 rounded text-xs">Refresh</button>
-                      <button onClick={handleExportInboundPerformanceExcel} className="bg-emerald-500 hover:bg-emerald-600 text-white px-3 py-1 rounded text-xs">Excel</button>
-                      <select
-                        className="border rounded px-2 py-1 text-xs text-slate-700"
-                        value={reportPrintOrientation}
-                        onChange={(e) => setReportPrintOrientation(e.target.value)}
-                      >
-                        <option value="portrait">Portrait</option>
-                        <option value="landscape">Landscape</option>
-                      </select>
-                      <button onClick={handlePrintReport} className="bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded text-xs">PDF</button>
+                  {renderReportHeader('LAPORAN PENERIMAAN AKTUAL', reportStart, reportEnd)}
+                  <div className="flex flex-col gap-4">
+                    <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+                      <div>
+                        <h3 className="font-bold text-slate-900 flex items-center gap-2">
+                          <ArrowDownUp size={18} />
+                          Modul Laporan Penerimaan Aktual
+                        </h3>
+                        <p className="text-xs text-slate-500">
+                          Satu layar untuk panduan input, laporan jadwal vs aktual SJ, dan grafik KPI supplier. Filter tanggal dan supplier berlaku di semua tab.
+                        </p>
+                      </div>
+                      <div className="flex gap-2 items-center print:hidden">
+                        <button onClick={fetchInboundPerformanceReport} className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1 rounded text-xs">Refresh</button>
+                        <button onClick={handleExportInboundPerformanceExcel} className="bg-emerald-500 hover:bg-emerald-600 text-white px-3 py-1 rounded text-xs">Excel</button>
+                        <select
+                          className="border rounded px-2 py-1 text-xs text-slate-700"
+                          value={reportPrintOrientation}
+                          onChange={(e) => setReportPrintOrientation(e.target.value)}
+                        >
+                          <option value="portrait">Portrait</option>
+                          <option value="landscape">Landscape</option>
+                        </select>
+                        <button onClick={handlePrintReport} className="bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded text-xs">PDF</button>
+                      </div>
                     </div>
-                  </div>
-                  <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4 print:hidden">
-                    <div>
-                      <label className="text-xs font-semibold text-gray-500">Start</label>
-                      <input type="date" className="border p-2 rounded w-full text-sm" value={reportStart} onChange={(e) => setReportStart(e.target.value)} />
+
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-3 print:hidden">
+                      <div>
+                        <label className="text-xs font-semibold text-gray-500">Tanggal awal</label>
+                        <input type="date" className="border p-2 rounded w-full text-sm" value={reportStart} onChange={(e) => setReportStart(e.target.value)} />
+                      </div>
+                      <div>
+                        <label className="text-xs font-semibold text-gray-500">Tanggal akhir</label>
+                        <input type="date" className="border p-2 rounded w-full text-sm" value={reportEnd} onChange={(e) => setReportEnd(e.target.value)} />
+                      </div>
+                      <div>
+                        <label className="text-xs font-semibold text-gray-500">Cari supplier (opsional)</label>
+                        <SearchableSelectDropdown
+                          value={reportSupplier}
+                          options={masterSupplierOptions}
+                          placeholder="Cari supplier..."
+                          searchPlaceholder="Ketik kode / nama supplier"
+                          emptyText="Supplier tidak ditemukan."
+                          className="w-full"
+                          onChange={(nextValue) => setReportSupplier(nextValue || '')}
+                        />
+                      </div>
+                      <div className="flex items-end">
+                        <button onClick={fetchInboundPerformanceReport} className="bg-indigo-600 text-white px-4 py-2 rounded w-full text-sm">Terapkan Filter</button>
+                      </div>
                     </div>
-                    <div>
-                      <label className="text-xs font-semibold text-gray-500">End</label>
-                      <input type="date" className="border p-2 rounded w-full text-sm" value={reportEnd} onChange={(e) => setReportEnd(e.target.value)} />
+
+                    <div className="flex flex-wrap gap-2 border-b border-slate-200 pb-3 print:hidden">
+                      {[
+                        { id: 'guide', label: 'Panduan Input' },
+                        { id: 'transaction', label: 'Laporan Jadwal vs Aktual SJ' },
+                        { id: 'kpi', label: 'Grafik KPI Supplier' },
+                      ].map((tab) => (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          onClick={() => setInboundReportTab(tab.id)}
+                          className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                            inboundReportTab === tab.id
+                              ? 'bg-slate-900 text-white shadow-sm'
+                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                          }`}
+                        >
+                          {tab.label}
+                        </button>
+                      ))}
                     </div>
-                    <div>
-                      <label className="text-xs font-semibold text-gray-500">Supplier (opsional)</label>
-                      <input type="text" className="border p-2 rounded w-full text-sm" value={reportSupplier} onChange={(e) => setReportSupplier(e.target.value)} />
-                    </div>
-                    <div className="flex items-end">
-                      <button onClick={fetchInboundPerformanceReport} className="bg-indigo-600 text-white px-4 py-2 rounded w-full text-sm">Terapkan Filter</button>
-                    </div>
-                  </div>
-                  <div className="bg-white rounded-lg border overflow-x-auto">
-                    <table className="min-w-full text-sm">
-                      <thead className="bg-slate-100">
-                        <tr>
-                          <th className="text-left p-3">Supplier</th>
-                          <th className="text-left p-3">No PO</th>
-                          <th className="text-left p-3">Item</th>
-                          <th className="text-center p-3">Plan</th>
-                          <th className="text-center p-3">Actual</th>
-                          <th className="text-right p-3">Order</th>
-                          <th className="text-right p-3">Received</th>
-                          <th className="text-center p-3">Status</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {reportLoading && (
-                          <tr><td colSpan="8" className="p-4 text-center text-gray-400">Memuat...</td></tr>
-                        )}
-                        {!reportLoading && inboundPerformanceRows.length === 0 && (
-                          <tr><td colSpan="8" className="p-4 text-center text-gray-400">Tidak ada data.</td></tr>
-                        )}
-                        {!reportLoading && inboundPerformanceRows.map((row, idx) => (
-                          <tr key={`${row.poNumber}-${idx}`} className="border-t">
-                            <td className="p-3">{row.supplier}</td>
-                            <td className="p-3">{row.poNumber}</td>
-                            <td className="p-3">{row.item}</td>
-                            <td className="p-3 text-center">{row.requestDate ? new Date(row.requestDate).toLocaleDateString('id-ID') : '-'}</td>
-                            <td className="p-3 text-center">{row.arrivalDate ? new Date(row.arrivalDate).toLocaleDateString('id-ID') : '-'}</td>
-                            <td className="p-3 text-right">{Number(row.requestQty || 0).toLocaleString()}</td>
-                            <td className="p-3 text-right">{Number(row.receivedQty || 0).toLocaleString()}</td>
-                            <td className="p-3 text-center">{row.status}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+
+                    {inboundReportTab === 'guide' && (
+                      <div className="grid gap-4 lg:grid-cols-[1.4fr_1fr]">
+                        <div className="rounded-2xl border border-slate-200 bg-gradient-to-br from-slate-50 to-white p-5">
+                          <div className="inline-flex items-center gap-2 rounded-full bg-sky-50 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-sky-700">
+                            Panduan Input Penerimaan Aktual
+                          </div>
+                          <h4 className="mt-3 text-xl font-bold text-slate-900">Input data tetap dilakukan di menu Penerimaan Aktual</h4>
+                          <p className="mt-2 text-sm text-slate-600">
+                            Tab ini menjadi panduan kerja agar tim PPIC dan gudang melihat alur yang sama antara input, laporan transaksi, dan KPI supplier.
+                          </p>
+                          <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                            <div className="rounded-xl border border-sky-100 bg-sky-50 p-4">
+                              <div className="text-xs font-semibold uppercase tracking-wide text-sky-600">1. Pilih No PO</div>
+                              <div className="mt-1 text-sm text-slate-700">Dropdown No PO hanya menampilkan PO OPEN/PARTIAL dengan sisa incoming &gt; 0.</div>
+                            </div>
+                            <div className="rounded-xl border border-emerald-100 bg-emerald-50 p-4">
+                              <div className="text-xs font-semibold uppercase tracking-wide text-emerald-600">2. Isi SJ / DO</div>
+                              <div className="mt-1 text-sm text-slate-700">Nomor Surat Jalan / DO wajib diisi dan dicek real-time agar tidak duplikat.</div>
+                            </div>
+                            <div className="rounded-xl border border-amber-100 bg-amber-50 p-4">
+                              <div className="text-xs font-semibold uppercase tracking-wide text-amber-700">3. Simpan</div>
+                              <div className="mt-1 text-sm text-slate-700">Setelah simpan, nomor lot dan histori mutasi tetap bisa ditelusuri dari laporan.</div>
+                            </div>
+                          </div>
+                        </div>
+                        <div className="rounded-2xl border border-slate-200 bg-slate-50 p-5">
+                          <div className="text-sm font-semibold text-slate-900">Ringkasan filter aktif</div>
+                          <div className="mt-4 space-y-3 text-sm text-slate-600">
+                            <div className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2 border border-slate-200">
+                              <span>Periode laporan</span>
+                              <span className="font-semibold text-slate-900">{formatPrintDate(reportStart)} s/d {formatPrintDate(reportEnd)}</span>
+                            </div>
+                            <div className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2 border border-slate-200">
+                              <span>Supplier</span>
+                              <span className="font-semibold text-slate-900">
+                                {masterSupplierOptions.find((option) => option.value === reportSupplier)?.label || 'Semua supplier'}
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2 border border-slate-200">
+                              <span>Jumlah transaksi</span>
+                              <span className="font-semibold text-slate-900">{formatCount(inboundPerformanceRows.length)}</span>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {inboundReportTab === 'transaction' && (
+                      <div className="space-y-4">
+                        <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+                          <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
+                            <div>
+                              <div className="text-sm font-semibold text-slate-900">Grafik Harian Tepat Waktu vs Terlambat</div>
+                              <div className="text-xs text-slate-500">Setiap titik mengikuti tanggal jadwal di rentang filter yang dipilih.</div>
+                            </div>
+                            <div className="text-xs text-slate-500">
+                              {formatCount(inboundDailyTrend.reduce((sum, row) => sum + Number(row.total || 0), 0))} baris transaksi ditampilkan
+                            </div>
+                          </div>
+                          <div className="h-[320px] px-2 py-4">
+                            {reportLoading ? (
+                              <div className="flex h-full items-center justify-center text-sm text-gray-400">
+                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                Memuat...
+                              </div>
+                            ) : inboundDailyTrend.length === 0 ? (
+                              <div className="flex h-full items-center justify-center text-sm text-gray-400">
+                                Tidak ada data untuk grafik.
+                              </div>
+                            ) : (
+                              <SafeResponsiveContainer>
+                                <LineChart data={inboundDailyTrend} margin={{ top: 16, right: 24, bottom: 8, left: 0 }}>
+                                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                                  <XAxis dataKey="label" tick={{ fontSize: 11 }} />
+                                  <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
+                                  <Tooltip
+                                    formatter={(value, name) => [formatCount(value), name]}
+                                    labelFormatter={(_, payload) => payload?.[0]?.payload?.dateKey || '-'}
+                                  />
+                                  <Legend />
+                                  <ReferenceLine y={0} stroke="#cbd5e1" strokeDasharray="4 4" />
+                                  <Line type="monotone" dataKey="onTime" name="Tepat Waktu" stroke="#16a34a" strokeWidth={2.5} dot={{ r: 2 }} activeDot={{ r: 4 }} />
+                                  <Line type="monotone" dataKey="late" name="Terlambat" stroke="#dc2626" strokeWidth={2.5} dot={{ r: 2 }} activeDot={{ r: 4 }} />
+                                </LineChart>
+                              </SafeResponsiveContainer>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="bg-white rounded-lg border overflow-x-auto">
+                          <table className="min-w-full text-sm">
+                            <thead className="bg-slate-100">
+                              <tr>
+                                <th className="text-left p-3">Supplier</th>
+                                <th className="text-left p-3">No PO</th>
+                                <th className="text-left p-3">No SJ / DO</th>
+                                <th className="text-left p-3">Item</th>
+                                <th className="text-center p-3">Jadwal</th>
+                                <th className="text-center p-3">Aktual SJ</th>
+                                <th className="text-right p-3">Qty Jadwal</th>
+                                <th className="text-right p-3">Qty Aktual</th>
+                                <th className="text-center p-3">Keterangan</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {reportLoading && (
+                                <tr><td colSpan="9" className="p-4 text-center text-gray-400">Memuat...</td></tr>
+                              )}
+                              {!reportLoading && inboundPerformanceRows.length === 0 && (
+                                <tr><td colSpan="9" className="p-4 text-center text-gray-400">Tidak ada data.</td></tr>
+                              )}
+                              {!reportLoading && inboundPerformanceRows.map((row, idx) => (
+                                <tr key={`${row.poNumber}-${idx}`} className="border-t">
+                                  <td className="p-3">{row.supplier}</td>
+                                  <td className="p-3">{row.poNumber}</td>
+                                  <td className="p-3">{row.doNumber || '-'}</td>
+                                  <td className="p-3">{row.item}</td>
+                                  <td className="p-3 text-center">{row.requestDate ? new Date(row.requestDate).toLocaleDateString('id-ID') : '-'}</td>
+                                  <td className="p-3 text-center">{row.arrivalDate ? new Date(row.arrivalDate).toLocaleDateString('id-ID') : '-'}</td>
+                                  <td className="p-3 text-right">{Number(row.requestQty || 0).toLocaleString()}</td>
+                                  <td className="p-3 text-right">{Number(row.receivedQty || 0).toLocaleString()}</td>
+                                  <td className="p-3 text-center">{row.status}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+
+                    {inboundReportTab === 'kpi' && (
+                      <div className="space-y-4">
+                        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                          <div className="rounded-xl border border-sky-100 bg-sky-50 px-4 py-3">
+                            <div className="text-xs font-semibold uppercase tracking-wide text-sky-600">Total Baris</div>
+                            <div className="mt-1 text-2xl font-bold text-slate-900">{formatCount(inboundPerformanceRows.length)}</div>
+                          </div>
+                          <div className="rounded-xl border border-emerald-100 bg-emerald-50 px-4 py-3">
+                            <div className="text-xs font-semibold uppercase tracking-wide text-emerald-600">Tepat Waktu</div>
+                            <div className="mt-1 text-2xl font-bold text-slate-900">
+                              {formatCount(inboundPerformanceRows.filter((row) => normalizeInboundStatus(row?.status).includes('ontime') || normalizeInboundStatus(row?.status).includes('on-time')).length)}
+                            </div>
+                          </div>
+                          <div className="rounded-xl border border-rose-100 bg-rose-50 px-4 py-3">
+                            <div className="text-xs font-semibold uppercase tracking-wide text-rose-600">Terlambat</div>
+                            <div className="mt-1 text-2xl font-bold text-slate-900">
+                              {formatCount(inboundPerformanceRows.filter((row) => normalizeInboundStatus(row?.status).includes('late')).length)}
+                            </div>
+                          </div>
+                          <div className="rounded-xl border border-amber-100 bg-amber-50 px-4 py-3">
+                            <div className="text-xs font-semibold uppercase tracking-wide text-amber-700">Rasio Terlambat</div>
+                            <div className="mt-1 text-2xl font-bold text-slate-900">
+                              {inboundPerformanceRows.length
+                                ? `${((inboundPerformanceRows.filter((row) => normalizeInboundStatus(row?.status).includes('late')).length / inboundPerformanceRows.length) * 100).toFixed(1)}%`
+                                : '0.0%'}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+                          <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
+                            <div>
+                              <div className="text-sm font-semibold text-slate-900">Rapor Supplier</div>
+                              <div className="text-xs text-slate-500">Distribusi Tepat Waktu dan Terlambat untuk supplier yang sedang difilter.</div>
+                            </div>
+                            <div className="text-xs text-slate-500">
+                              Top {Math.min(8, inboundSupplierChartRows.length)} supplier dengan keterlambatan tertinggi
+                            </div>
+                          </div>
+                          <div className="h-[320px] px-2 py-4">
+                            {reportLoading ? (
+                              <div className="flex h-full items-center justify-center text-sm text-gray-400">
+                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                Memuat...
+                              </div>
+                            ) : inboundSupplierChartRows.length === 0 ? (
+                              <div className="flex h-full items-center justify-center text-sm text-gray-400">
+                                Tidak ada data supplier untuk grafik.
+                              </div>
+                            ) : (
+                              <SafeResponsiveContainer>
+                                <ComposedChart data={inboundSupplierChartRows} margin={{ top: 16, right: 24, bottom: 8, left: 0 }}>
+                                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                                  <XAxis dataKey="supplier" tick={{ fontSize: 11 }} interval={0} angle={-12} textAnchor="end" height={60} />
+                                  <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
+                                  <Tooltip
+                                    formatter={(value, name) => [formatCount(value), name]}
+                                    labelFormatter={(label) => label}
+                                  />
+                                  <Legend />
+                                  <ReferenceLine y={0} stroke="#cbd5e1" strokeDasharray="4 4" />
+                                  <Bar dataKey="onTime" name="Tepat Waktu" fill="#16a34a" radius={[6, 6, 0, 0]} />
+                                  <Bar dataKey="late" name="Terlambat" fill="#dc2626" radius={[6, 6, 0, 0]} />
+                                </ComposedChart>
+                              </SafeResponsiveContainer>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="bg-white rounded-lg border overflow-x-auto">
+                          <table className="min-w-full text-sm">
+                            <thead className="bg-slate-100">
+                              <tr>
+                                <th className="text-left p-3">Supplier</th>
+                                <th className="text-right p-3">Total</th>
+                                <th className="text-right p-3">Tepat Waktu</th>
+                                <th className="text-right p-3">Terlambat</th>
+                                <th className="text-right p-3">Tepat Waktu %</th>
+                                <th className="text-right p-3">Terlambat %</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {reportLoading && (
+                                <tr><td colSpan="6" className="p-4 text-center text-gray-400">Memuat...</td></tr>
+                              )}
+                              {!reportLoading && inboundSupplierKpiRows.length === 0 && (
+                                <tr><td colSpan="6" className="p-4 text-center text-gray-400">Tidak ada data.</td></tr>
+                              )}
+                              {!reportLoading && inboundSupplierKpiRows.map((row) => (
+                                <tr key={row.supplier} className="border-t">
+                                  <td className="p-3 font-medium text-slate-900">{row.supplier}</td>
+                                  <td className="p-3 text-right">{formatCount(row.total)}</td>
+                                  <td className="p-3 text-right text-emerald-600">{formatCount(row.onTime)}</td>
+                                  <td className="p-3 text-right text-rose-600">{formatCount(row.late)}</td>
+                                  <td className="p-3 text-right">{row.onTimeRate.toFixed(1)}%</td>
+                                  <td className="p-3 text-right">{row.lateRate.toFixed(1)}%</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
                   </div>
                   {renderReportSignatures()}
                   <div className="report-page-footer print-only" />
@@ -1194,23 +1625,22 @@ const TabReports = (props) => {
                     </div>
                     <div>
                       <label className="text-xs font-semibold text-gray-500">Supplier</label>
-                      <select
-                        className="border p-2 rounded w-full text-sm"
+                      <SearchableSelectDropdown
                         value={supplierShortageSupplier}
-                        onChange={(e) => setSupplierShortageSupplier(e.target.value)}
-                      >
-                        <option value="">Semua Supplier</option>
-                        {supplierShortageSupplierOptions.map((option) => (
-                          <option key={option.value} value={option.value}>{option.label}</option>
-                        ))}
-                      </select>
+                        options={masterSupplierOptions}
+                        placeholder="Semua Supplier"
+                        searchPlaceholder="Ketik kode / nama supplier"
+                        emptyText="Supplier tidak ditemukan."
+                        className="w-full"
+                        onChange={(nextValue) => setSupplierShortageSupplier(nextValue || '')}
+                      />
                     </div>
                     <div className="flex items-end">
                       <button onClick={fetchSupplierShortageReport} className="bg-indigo-600 text-white px-4 py-2 rounded w-full text-sm">Terapkan</button>
                     </div>
                   </div>
                   <div className="mb-3 print:hidden text-xs text-slate-500">
-                    Supplier aktif: <span className="font-semibold text-slate-700">{supplierShortageSupplierOptions.find((option) => option.value === supplierShortageSupplier)?.label || 'Semua Supplier'}</span>
+                    Supplier aktif: <span className="font-semibold text-slate-700">{masterSupplierOptions.find((option) => option.value === supplierShortageSupplier)?.label || 'Semua Supplier'}</span>
                   </div>
                   <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
                     <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 min-w-0">
@@ -1964,7 +2394,7 @@ const TabReports = (props) => {
                               <div className="font-semibold">{row.itemCode}</div>
                               <div className="text-xs text-slate-500">{row.itemName}</div>
                             </td>
-                            <td className="p-3">{row.model || '-'}</td>
+                            <td className="p-3">{getModelCodeText(row.model)}</td>
                             <td className="p-3">{row.uom || '-'}</td>
                             <td className="p-3">{row.typePack || '-'}</td>
                             <td className="p-3 text-right">{Number(row.planQty || 0).toLocaleString()}</td>
@@ -1984,6 +2414,7 @@ const TabReports = (props) => {
                   schedules={schedules}
                   ensureSchedulesLoaded={ensureSchedulesLoaded}
                   scheduleLoading={scheduleLoading}
+                  masterVendors={masterVendors}
                 />
               )}
 

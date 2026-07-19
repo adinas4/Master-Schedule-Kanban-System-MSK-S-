@@ -7,6 +7,8 @@ import {
   Factory, Timer, Box, Search, LayoutDashboard, Copy, BarChart3, ArrowRight,
   Printer, FileCheck, Lock
 } from 'lucide-react';
+import ImportHistoryTable from './ImportHistoryTable';
+import ImportSummaryModal from './ImportSummaryModal';
 
 import {
   parseModelCodes,
@@ -51,6 +53,7 @@ const isProductionOrWorkCenter = (record) => {
 const normalizeMaterialType = (value, fallback = 'RAW MATERIAL') => {
   const normalized = String(value || '').trim().toUpperCase();
   if (normalized.includes('INDIRECT')) return 'INDIRECT MATERIAL';
+  if (normalized.includes('CONSUMABLE')) return 'INDIRECT MATERIAL';
   if (normalized.includes('RAW')) return 'RAW MATERIAL';
   return fallback;
 };
@@ -112,6 +115,218 @@ const inferBomBucketFromText = (value) => {
   return '';
 };
 
+const normalizeSearchableText = (value) => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+const SearchableSelectDropdown = ({
+  value = '',
+  options = [],
+  placeholder = '-- Pilih --',
+  searchPlaceholder = 'Ketik untuk mencari...',
+  emptyText = 'Tidak ada data yang cocok.',
+  disabled = false,
+  onChange,
+  getOptionLabel,
+  getOptionValue,
+  className = '',
+}) => {
+  const rootRef = useRef(null);
+  const inputRef = useRef(null);
+  const [isOpen, setIsOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const [activeIndex, setActiveIndex] = useState(0);
+
+  const normalizedValue = String(value || '').trim();
+  const selectedOption = useMemo(() => (
+    (Array.isArray(options) ? options : []).find((option) => getOptionValue(option) === normalizedValue) || null
+  ), [options, normalizedValue, getOptionValue]);
+  const selectedLabel = selectedOption ? getOptionLabel(selectedOption) : normalizedValue;
+
+  useEffect(() => {
+    setQuery(selectedLabel || '');
+  }, [selectedLabel]);
+
+  const filteredOptions = useMemo(() => {
+    const list = Array.isArray(options) ? options : [];
+    const keyword = normalizeSearchableText(query);
+    if (!keyword) return list;
+    return list.filter((option) => {
+      const candidateText = normalizeSearchableText([
+        getOptionLabel(option),
+        getOptionValue(option),
+        option?.code,
+        option?.name,
+        option?.unit,
+        option?.uom,
+      ].filter(Boolean).join(' '));
+      return candidateText.includes(keyword);
+    });
+  }, [options, query, getOptionLabel, getOptionValue]);
+
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    const handlePointerDown = (event) => {
+      if (rootRef.current && !rootRef.current.contains(event.target)) {
+        setIsOpen(false);
+        setQuery(selectedLabel || '');
+      }
+    };
+    document.addEventListener('mousedown', handlePointerDown);
+    return () => document.removeEventListener('mousedown', handlePointerDown);
+  }, [isOpen, selectedLabel]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      setActiveIndex(0);
+      return;
+    }
+    setActiveIndex((current) => (filteredOptions.length === 0 ? 0 : Math.min(current, filteredOptions.length - 1)));
+  }, [filteredOptions.length, isOpen]);
+
+  const selectOption = (option) => {
+    if (!option || disabled) return;
+    const nextValue = getOptionValue(option);
+    setQuery(getOptionLabel(option));
+    setIsOpen(false);
+    setActiveIndex(0);
+    onChange?.(nextValue, option);
+    requestAnimationFrame(() => inputRef.current?.blur());
+  };
+
+  const handleKeyDown = (event) => {
+    if (disabled) return;
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      setIsOpen(true);
+      setActiveIndex((current) => {
+        if (filteredOptions.length === 0) return 0;
+        return Math.min(current + 1, filteredOptions.length - 1);
+      });
+      return;
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      setIsOpen(true);
+      setActiveIndex((current) => Math.max(current - 1, 0));
+      return;
+    }
+    if (event.key === 'Enter') {
+      if (isOpen && filteredOptions[activeIndex]) {
+        event.preventDefault();
+        selectOption(filteredOptions[activeIndex]);
+      }
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      setIsOpen(false);
+      setQuery(selectedLabel || '');
+    }
+  };
+
+  const handleClear = () => {
+    if (disabled) return;
+    setQuery('');
+    setIsOpen(false);
+    setActiveIndex(0);
+    onChange?.('');
+    requestAnimationFrame(() => inputRef.current?.focus());
+  };
+
+  return (
+    <div ref={rootRef} className={`relative ${className}`}>
+      <div className="relative rounded border border-gray-300 bg-white shadow-sm transition focus-within:border-indigo-400 focus-within:ring-2 focus-within:ring-indigo-100">
+        <Search size={13} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+        <input
+          ref={inputRef}
+          type="text"
+          className="h-9 w-full rounded border-0 bg-transparent py-2 pl-8 pr-16 text-xs outline-none placeholder:text-gray-400"
+          value={query}
+          onChange={(event) => {
+            if (disabled) return;
+            setQuery(event.target.value);
+            setIsOpen(true);
+            setActiveIndex(0);
+          }}
+          onFocus={() => {
+            if (disabled) return;
+            setIsOpen(true);
+          }}
+          onKeyDown={handleKeyDown}
+          placeholder={isOpen ? searchPlaceholder : placeholder}
+          autoComplete="off"
+          disabled={disabled}
+        />
+        <div className="absolute right-1 top-1 flex items-center gap-1">
+          {normalizedValue && !disabled && (
+            <button
+              type="button"
+              onClick={handleClear}
+              className="flex h-7 w-7 items-center justify-center rounded border border-gray-200 bg-white text-gray-400 hover:bg-gray-50 hover:text-gray-600"
+              title="Hapus pilihan"
+            >
+              <X size={12} />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              if (disabled) return;
+              setIsOpen((prev) => !prev);
+              inputRef.current?.focus();
+            }}
+            className="flex h-7 w-7 items-center justify-center rounded border border-gray-200 bg-slate-50 text-gray-500 hover:bg-slate-100 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-gray-400"
+            title="Lihat daftar"
+            disabled={disabled}
+          >
+            <ChevronDown size={13} className={`transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+          </button>
+        </div>
+      </div>
+      {isOpen && !disabled && (
+        <div className="absolute left-0 right-0 top-[calc(100%+6px)] z-40 max-h-72 overflow-auto rounded-lg border border-gray-200 bg-white shadow-2xl">
+          <div className="flex items-center justify-between border-b border-gray-100 px-3 py-2 text-[11px] text-gray-500">
+            <span>{filteredOptions.length ? `${filteredOptions.length} opsi ditemukan` : emptyText}</span>
+            <span>↑↓ Enter Esc</span>
+          </div>
+          {filteredOptions.length > 0 ? (
+            filteredOptions.map((option, index) => {
+              const optionValue = getOptionValue(option);
+              const isSelected = optionValue === normalizedValue;
+              const isActive = index === activeIndex;
+              return (
+                <button
+                  key={optionValue || index}
+                  type="button"
+                  role="option"
+                  aria-selected={isSelected}
+                  onMouseEnter={() => setActiveIndex(index)}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => selectOption(option)}
+                  className={`flex w-full items-start justify-between gap-3 border-b border-gray-100 px-3 py-2 text-left text-xs last:border-b-0 transition ${
+                    isActive ? 'bg-indigo-50' : 'hover:bg-slate-50'
+                  } ${isSelected ? 'ring-inset ring-1 ring-indigo-200' : ''}`}
+                >
+                  <div className="min-w-0">
+                    <div className="truncate font-semibold text-slate-800">{getOptionLabel(option)}</div>
+                    <div className="truncate text-[11px] text-slate-500">{option?.code || optionValue || '-'}</div>
+                  </div>
+                  {isSelected && (
+                    <span className="shrink-0 rounded-full bg-indigo-100 px-2 py-0.5 text-[10px] font-semibold text-indigo-700">
+                      Terpilih
+                    </span>
+                  )}
+                </button>
+              );
+            })
+          ) : (
+            <div className="px-3 py-3 text-xs text-gray-500">{emptyText}</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 export default function BOMManager({
   apiFetch,
   allowEdit = false,
@@ -159,6 +374,10 @@ export default function BOMManager({
   }, [masterItems]);
   const masterItemsNormalized = useMemo(() => normalizeWithModels(masterItems), [masterItems]);
   const [bomRelations, setBomRelations] = useState([]);
+  const [bomImportSummary, setBomImportSummary] = useState(null);
+  const [bomImportHistoryRows, setBomImportHistoryRows] = useState([]);
+  const [bomImportHistoryLoading, setBomImportHistoryLoading] = useState(false);
+  const [bomImportHistoryError, setBomImportHistoryError] = useState('');
   const [whereUsedCode, setWhereUsedCode] = useState('');
 
   const pluralize = (count, label) => `${count} ${label}${count === 1 ? '' : 's'}`;
@@ -392,6 +611,9 @@ export default function BOMManager({
   const [showDataMenu, setShowDataMenu] = useState(false);
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
+  const [bomTablePagination, setBomTablePagination] = useState({ page: 1, perPage: 25 });
+  const [bomTreePagination, setBomTreePagination] = useState({ page: 1, perPage: 25 });
+  const [structureParentFilter, setStructureParentFilter] = useState('');
   
   // State AI
   const [isAiLoading, setIsAiLoading] = useState(false);
@@ -489,7 +711,7 @@ export default function BOMManager({
     originalCode: '',
   });
   const createBulkProcessConsumable = (processCode = '') => ({
-    ...createBulkMaterial('INDIRECT MATERIAL'),
+    ...createBulkMaterial('CONSUMABLE'),
     processCode,
     consumptionBasis: 'PER_PCS',
   });
@@ -737,6 +959,49 @@ export default function BOMManager({
     );
   }, [items, searchTerm]);
 
+  const bomTableRowsPerPageOptions = [25, 50, 75, 100];
+  const bomTablePaginationMeta = useMemo(() => {
+    const total = filteredItems.length;
+    const perPage = Number(bomTablePagination.perPage || 25);
+    const totalPages = Math.max(1, Math.ceil(total / perPage));
+    const page = Math.min(Math.max(1, Number(bomTablePagination.page || 1)), totalPages);
+    const startIndex = total === 0 ? 0 : (page - 1) * perPage + 1;
+    const endIndex = Math.min(total, page * perPage);
+    const rows = filteredItems.slice((page - 1) * perPage, (page - 1) * perPage + perPage);
+    return { page, perPage, total, totalPages, startIndex, endIndex, rows };
+  }, [filteredItems, bomTablePagination.page, bomTablePagination.perPage]);
+
+  const buildBomPageSequence = (current, total) => {
+    const itemsSequence = [];
+    const maxButtons = 5;
+    let start = Math.max(1, current - 2);
+    let end = Math.min(total, start + maxButtons - 1);
+    if (end - start < maxButtons - 1) {
+      start = Math.max(1, end - maxButtons + 1);
+    }
+    if (start > 1) {
+      itemsSequence.push({ type: 'page', value: 1 });
+      if (start > 2) itemsSequence.push({ type: 'ellipsis' });
+    }
+    for (let page = start; page <= end; page += 1) {
+      itemsSequence.push({ type: 'page', value: page });
+    }
+    if (end < total) {
+      if (end < total - 1) itemsSequence.push({ type: 'ellipsis' });
+      itemsSequence.push({ type: 'page', value: total });
+    }
+    return itemsSequence;
+  };
+
+  useEffect(() => {
+    setBomTablePagination((prev) => {
+      const totalPages = Math.max(1, Math.ceil(filteredItems.length / (prev.perPage || 25)));
+      const safePage = Math.min(Math.max(1, prev.page || 1), totalPages);
+      if (safePage === prev.page) return prev;
+      return { ...prev, page: safePage };
+    });
+  }, [filteredItems.length]);
+
   const isBomHeaderActiveOnDate = (headerMeta, dateValue = todayDateInput) => {
     const targetDate = String(dateValue || '').trim();
     const startDate = String(headerMeta?.effective_start_date || headerMeta?.effectiveStartDate || '').trim();
@@ -794,14 +1059,27 @@ export default function BOMManager({
     });
     return rows;
   }, [bomHeaderRowsByParent, todayDateInput]);
+  const activeBomRelationIds = useMemo(
+    () => new Set(activeBomRelations.map((relation) => Number(relation.id || 0)).filter(Boolean)),
+    [activeBomRelations],
+  );
   const parentOptionsSingle = useMemo(() => bomPickerOptions.FG, [bomPickerOptions]);
   const parentOptionsMulti = useMemo(() => bomPickerOptions.SUB_ASSY, [bomPickerOptions]);
   const childPartOptions = useMemo(() => bomPickerOptions.CP, [bomPickerOptions]);
   const rawMaterialOptions = useMemo(() => bomPickerOptions.RM, [bomPickerOptions]);
   const indirectMaterialOptions = useMemo(() => bomPickerOptions.INDIRECT, [bomPickerOptions]);
+  const modelSearchOptions = useMemo(() => (
+    [...localModels, { code: '__new__', name: '+ New Master Model' }]
+  ), [localModels]);
   const getBomOptionLabel = (item) => {
     const unit = item?.unit || item?.uom || '';
     return [item?.code, item?.name].filter(Boolean).join(' - ') + (unit ? ` (${unit})` : '');
+  };
+  const getModelOptionLabel = (item) => {
+    const code = String(item?.code || '').trim();
+    const name = String(item?.name || '').trim();
+    if (code === '__new__') return '+ New Master Model';
+    return [code, name].filter(Boolean).join(' - ');
   };
   const getMaterialOptionsForType = (typeValue) => (
     normalizeMaterialType(typeValue, 'RAW MATERIAL') === 'INDIRECT MATERIAL'
@@ -913,6 +1191,34 @@ export default function BOMManager({
     }
   };
 
+  const fetchBomImportHistory = async () => {
+    if (!apiFetch) return;
+    setBomImportHistoryLoading(true);
+    setBomImportHistoryError('');
+    try {
+      const data = await apiFetch('/api/bom/imports?limit=25');
+      setBomImportHistoryRows(Array.isArray(data) ? data : []);
+    } catch (error) {
+      setBomImportHistoryRows([]);
+      setBomImportHistoryError(error.message || 'Gagal memuat riwayat import BOM.');
+    } finally {
+      setBomImportHistoryLoading(false);
+    }
+  };
+
+  const saveBomImportBatch = async (payload) => {
+    if (!apiFetch) return null;
+    try {
+      return await apiFetch('/api/bom/imports', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+    } catch (error) {
+      console.warn('Failed to save BOM import batch:', error?.message || error);
+      return null;
+    }
+  };
+
   const handleResetAllBom = async () => {
     if (!apiFetch) {
       alert('API belum tersedia untuk reset BOM.');
@@ -943,7 +1249,34 @@ export default function BOMManager({
     refreshBomRelations();
   }, [apiFetch]);
 
-  useEffect(() => { if (searchTerm) setViewMode('table'); }, [searchTerm]);
+  useEffect(() => {
+    fetchBomImportHistory();
+  }, [apiFetch]);
+
+  useEffect(() => {
+    const keyword = normalizeSearchableText(searchTerm);
+    if (!keyword) {
+      setStructureParentFilter('');
+      return;
+    }
+    const parentMatches = filteredItems.filter((item) => {
+      const itemCode = String(item.code || '').trim();
+      return itemCode && configuredParentCodes.has(itemCode);
+    });
+    const exactParent = parentMatches.find((item) => normalizeSearchableText(item.code) === keyword);
+    const targetParent = exactParent || (parentMatches.length === 1 ? parentMatches[0] : null);
+    if (!targetParent) {
+      setStructureParentFilter('');
+      setViewMode('table');
+      return;
+    }
+    const targetCode = String(targetParent.code || '').trim();
+    setStructureParentFilter(targetCode);
+    setRevisionAuditParentCode(targetCode);
+    setTreeRevisionMode('active');
+    setViewMode('tree');
+    setBomTreePagination((prev) => (prev.page === 1 ? prev : { ...prev, page: 1 }));
+  }, [searchTerm, filteredItems, configuredParentCodes]);
 
   useEffect(() => {
     if (bulkMode !== 'single') return;
@@ -1207,6 +1540,95 @@ export default function BOMManager({
       })
       .filter(Boolean)
   );
+
+  const normalizeImportItemType = ({ rowType = '', typeValue = '', level = null } = {}) => {
+    const normalizedType = String(typeValue || '').trim().toUpperCase().replace(/\s+/g, ' ');
+    if (normalizedType.includes('RAW')) return 'RAW MATERIAL';
+    if (normalizedType.includes('INDIRECT') || normalizedType.includes('CONSUMABLE')) return 'INDIRECT MATERIAL';
+    if (normalizedType === 'FG' || normalizedType.includes('FINISHED')) return 'FG';
+    if (normalizedType.includes('SUB') && normalizedType.includes('ASSY')) return 'SUB_ASSY';
+    if (normalizedType === 'CP' || normalizedType.includes('CHILD PART') || normalizedType.includes('COMPONENT')) return 'CP';
+
+    const normalizedRowType = String(rowType || '').trim().toUpperCase();
+    if (normalizedRowType === 'PROCESS_CONSUMABLE') return 'INDIRECT MATERIAL';
+    if (normalizedRowType === 'MATERIAL') return 'RAW MATERIAL';
+    if (normalizedRowType === 'ROOT') return 'FG';
+    if (normalizedRowType === 'COMPONENT') return Number(level || 0) <= 1 ? 'SUB_ASSY' : 'CP';
+    return normalizedType || (normalizedRowType === 'ROOT' ? 'FG' : 'CP');
+  };
+
+  const splitImportProcessList = (value) => (
+    String(value || '')
+      .split(/[|,;\n]+/)
+      .map((entry) => String(entry || '').trim())
+      .filter(Boolean)
+  );
+
+  const parseOptionalNumber = (value) => {
+    const text = String(value ?? '').trim();
+    if (!text) return null;
+    const parsed = Number(text);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+
+  const buildImportItemDraft = (row) => {
+    const code = String(row?.code || '').trim();
+    if (!code) return null;
+    const processFlow = splitImportProcessList(row?.processList);
+    return {
+      code,
+      name: String(row?.name || '').trim() || code,
+      partNo: '',
+      type: normalizeImportItemType({
+        rowType: row?.rowType,
+        typeValue: row?.type,
+        level: row?.level,
+      }),
+      unit: String(row?.uom || '').trim() || 'PCS',
+      model: String(row?.model || '').trim() || '',
+      weight: parseOptionalNumber(row?.weight),
+      leadTimeDays: parseOptionalNumber(row?.leadTime),
+      cycleTimeSeconds: parseOptionalNumber(row?.cycleTime),
+      lineProduction: String(row?.line || '').trim() || '',
+      packingName: String(row?.packing || '').trim() || '',
+      processFlow,
+      processRouting: buildProcessRoutingSnapshot(processFlow),
+    };
+  };
+
+  const buildImportMasterItemPayload = (draft) => {
+    const code = String(draft?.code || '').trim();
+    const processFlow = Array.isArray(draft?.processFlow) ? draft.processFlow : [];
+    return {
+      code,
+      name: String(draft?.name || '').trim() || code,
+      partNo: String(draft?.partNo || '').trim() || null,
+      type: String(draft?.type || '').trim() || 'CP',
+      unit: String(draft?.unit || '').trim() || 'PCS',
+      model: String(draft?.model || '').trim() || null,
+      weight: parseOptionalNumber(draft?.weight),
+      lineProduction: String(draft?.lineProduction || '').trim() || null,
+      packingName: String(draft?.packingName || '').trim() || null,
+      leadTimeDays: parseOptionalNumber(draft?.leadTimeDays),
+      cycleTimeSeconds: parseOptionalNumber(draft?.cycleTimeSeconds),
+      processFlow: processFlow.length > 0 ? processFlow : null,
+      processRouting: Array.isArray(draft?.processRouting) && draft.processRouting.length > 0 ? draft.processRouting : null,
+    };
+  };
+
+  const upsertImportMasterItem = async (draft) => {
+    if (!apiFetch) {
+      throw new Error('API belum tersedia untuk import master item.');
+    }
+    const payload = buildImportMasterItemPayload(draft);
+    if (!payload.code || !payload.name || !payload.type || !payload.unit) {
+      throw new Error(`Data master item ${payload.code || '-'} belum lengkap.`);
+    }
+    return apiFetch('/api/master/items/import-upsert', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  };
 
   const updateBulkParentDetails = (patch) => {
     setBulkParentDetails((prev) => ({ ...prev, ...patch }));
@@ -1954,6 +2376,7 @@ export default function BOMManager({
   };
   const openRevisionInStructure = (header) => {
     if (!header) return;
+    setStructureParentFilter('');
     setRevisionAuditParentCode(String(header.parentCode || '').trim());
     setRevisionAuditHeaderId(String(header.headerId || ''));
     setTreeRevisionMode('selected');
@@ -1963,9 +2386,11 @@ export default function BOMManager({
   const openParentInStructure = (parentCode) => {
     const normalizedParentCode = String(parentCode || '').trim();
     if (!normalizedParentCode) return;
+    setStructureParentFilter(normalizedParentCode);
     setRevisionAuditParentCode(normalizedParentCode);
     setTreeRevisionMode('active');
     setShowWhereUsedPanel(false);
+    setBomTreePagination((prev) => (prev.page === 1 ? prev : { ...prev, page: 1 }));
     focusStructureView();
   };
 
@@ -2062,8 +2487,8 @@ export default function BOMManager({
           alert('Parent utama belum terdaftar di master item.');
           return;
         }
-        if (getBomItemBucket(parentItem) !== 'FG') {
-          alert('Mode Single-Level hanya boleh memakai parent kategori FG.');
+        if (['RM', 'INDIRECT'].includes(getBomItemBucket(parentItem))) {
+          alert('Mode Single-Level hanya boleh dipakai untuk parent kategori assembly (FG/Sub-Assy/Child Part).');
           return;
         }
         const parentProcessCodes = mapProcessFlowToCodes(bulkParentDetails.processCodes || []);
@@ -2454,26 +2879,34 @@ export default function BOMManager({
   const whereUsedTargetCode = String(whereUsedCode || currentFormCode || '').trim();
   const whereUsedRows = useMemo(() => {
     if (!whereUsedTargetCode) return [];
-    return activeBomRelations
+    return (bomRelations || [])
       .filter((rel) => String(rel.child_code || '').trim() === whereUsedTargetCode)
       .map((rel) => {
         const parentItem = itemsByCode.get(rel.parent_code) || {};
+        const isActive = activeBomRelationIds.has(Number(rel.id || 0));
         return {
           id: rel.id,
           parentCode: rel.parent_code,
           parentName: parentItem.name || '-',
           parentType: parentItem.type || '-',
+          headerId: Number(rel.header_id || 0) || null,
           qtyUse: Number(rel.quantity || 0),
           scrap: Number(rel.scrap_factor || 0),
           yieldFactor: Number(rel.yield_factor || 1),
           positionCode: rel.position_code || '',
           substituteCodes: formatSubstituteCodes(rel.substitute_material_codes || []),
           revisionNo: Number(rel.revision_no || 1),
+          isActive,
           note: rel.assembly_note || '',
         };
       })
-      .sort((a, b) => a.parentCode.localeCompare(b.parentCode));
-  }, [activeBomRelations, itemsByCode, whereUsedTargetCode]);
+      .sort((a, b) => {
+        if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+        const parentCompare = a.parentCode.localeCompare(b.parentCode);
+        if (parentCompare !== 0) return parentCompare;
+        return Number(b.revisionNo || 0) - Number(a.revisionNo || 0);
+      });
+  }, [bomRelations, activeBomRelationIds, itemsByCode, whereUsedTargetCode]);
   const buildBomHeaderPayload = (headerState, parentCodeValue, extra = {}) => {
     const normalizedRevision = Number(headerState?.revisionNo || 1) || 1;
     return {
@@ -2661,13 +3094,38 @@ export default function BOMManager({
       const children = childRels.map((rel) => buildNode(rel.child_code, rel, nextPath));
       return { ...item, type: String(relation?.component_type || item.type || '').trim(), relation, children };
     };
+    const requestedParentCode = treeRevisionMode === 'selected' ? '' : String(structureParentFilter || '').trim();
+    if (requestedParentCode) {
+      return [buildNode(requestedParentCode)];
+    }
     const allRoots = rootCodes.map((code) => buildNode(code));
     if (treeRevisionMode !== 'selected') return allRoots;
     const previewParentCode = String(revisionAuditParentCode || '').trim();
     if (!previewParentCode) return allRoots;
     const previewRootOnly = allRoots.find((node) => String(node.code || '').trim() === previewParentCode);
     return previewRootOnly ? [previewRootOnly] : allRoots;
-  }, [treePreviewRelations, itemsByCode, treeRevisionMode, revisionAuditParentCode]);
+  }, [treePreviewRelations, items, itemsByCode, treeRevisionMode, revisionAuditParentCode, structureParentFilter]);
+
+  const bomTreeRowsPerPageOptions = [10, 25, 50, 100];
+  const bomTreePaginationMeta = useMemo(() => {
+    const total = bomTreeData.length;
+    const perPage = Number(bomTreePagination.perPage || 25);
+    const totalPages = Math.max(1, Math.ceil(total / perPage));
+    const page = Math.min(Math.max(1, Number(bomTreePagination.page || 1)), totalPages);
+    const startIndex = total === 0 ? 0 : (page - 1) * perPage + 1;
+    const endIndex = Math.min(total, page * perPage);
+    const rows = bomTreeData.slice((page - 1) * perPage, (page - 1) * perPage + perPage);
+    return { page, perPage, total, totalPages, startIndex, endIndex, rows };
+  }, [bomTreeData, bomTreePagination.page, bomTreePagination.perPage]);
+
+  useEffect(() => {
+    setBomTreePagination((prev) => {
+      const totalPages = Math.max(1, Math.ceil(bomTreeData.length / (prev.perPage || 25)));
+      const safePage = Math.min(Math.max(1, prev.page || 1), totalPages);
+      if (safePage === prev.page) return prev;
+      return { ...prev, page: safePage };
+    });
+  }, [bomTreeData.length]);
 
   // --- TREE STRUCTURE ---
   const buildTree = (parentId = null) => items.filter(i => i.parentId === parentId).map(i => ({ ...i, children: buildTree(i.id) }));
@@ -2809,6 +3267,8 @@ export default function BOMManager({
     const relation = node.relation;
     const categoryLabel = resolveCategoryLabel(node.category);
     const meta = getBomNodeMeta(node, level, hasChildren);
+    const nodeBucket = getBomItemBucket(node);
+    const canAddChildPart = allowEdit && nodeBucket === 'SUB_ASSY';
     const processSnapshots = buildProcessRoutingSnapshot(node.processes || []);
     const isLeafRaw = meta.kind === 'raw' && !hasChildren;
     const displayLevel = level + 1;
@@ -2994,15 +3454,17 @@ export default function BOMManager({
                 <span className="hidden sm:inline text-[10px] font-semibold">Hapus</span>
               </button>
             )}
-            <button
-              type="button"
-              onClick={() => handleSelectParent(node)}
-              className="h-6 px-1.5 sm:px-2 inline-flex items-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
-              title="Add Child"
-            >
-              <Plus size={12} />
-              <span className="hidden sm:inline text-[10px] font-semibold">Child</span>
-            </button>
+            {canAddChildPart && (
+              <button
+                type="button"
+                onClick={() => handleSelectParent(node)}
+                className="h-6 px-1.5 sm:px-2 inline-flex items-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
+                title="Add Child"
+              >
+                <Plus size={12} />
+                <span className="hidden sm:inline text-[10px] font-semibold">Child</span>
+              </button>
+            )}
           </div>
           </div>
         </div>
@@ -3231,58 +3693,182 @@ export default function BOMManager({
     printWindow.print();
   };
 
-  // --- IMPORT / EXPORT (HANYA XLS HTML) ---
-  const handleFileUpload = (e) => {
+  // --- IMPORT / EXPORT (XLS HTML + XLSX) ---
+  const handleFileUpload = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
-    
-    if (file.name.toLowerCase().endsWith('.xlsx')) {
-        alert("Maaf, sistem ini hanya mendukung format .xls (Excel 97-2003 / Web Format).");
-        e.target.value = null;
-        return;
+    try {
+      const fileName = String(file.name || '').toLowerCase();
+      if (fileName.endsWith('.xlsx')) {
+        const XLSX = await import('xlsx');
+        const data = await file.arrayBuffer();
+        const workbook = XLSX.read(data, { type: 'array' });
+        const sheetName = workbook.SheetNames[0];
+        const htmlContent = XLSX.utils.sheet_to_html(workbook.Sheets[sheetName]);
+        await processHTMLImport(htmlContent, file.name);
+      } else {
+        const reader = new FileReader();
+        reader.onload = async (evt) => {
+          await processHTMLImport(evt.target.result, file.name);
+        };
+        reader.readAsText(file);
+      }
+    } catch (error) {
+      setBomImportSummary({
+        open: true,
+        fileName: file.name || '-',
+        totalRows: 0,
+        inserted: 0,
+        updated: 0,
+        duplicate: 0,
+        skipped: 0,
+        status: 'failed',
+        message: `Import BOM gagal: ${error.message || 'Unknown error'}`,
+        detailRows: [],
+      });
+    } finally {
+      e.target.value = null;
     }
-
-    const reader = new FileReader();
-    reader.onload = async (evt) => {
-      await processHTMLImport(evt.target.result);
-    };
-    reader.readAsText(file);
-    e.target.value = null;
   };
 
-  const finalizeImport = async (relationDrafts, rootCodes) => {
+  const finalizeImport = async (relationDrafts, rootCodes, importMeta = {}) => {
     if (!apiFetch) {
-      alert('API belum tersedia untuk import relasi BOM.');
+      setBomImportSummary({
+        open: true,
+        fileName: importMeta.fileName || '-',
+        totalRows: relationDrafts.length,
+        inserted: 0,
+        updated: 0,
+        duplicate: importMeta.duplicateDraftRows?.length || 0,
+        skipped: 0,
+        status: 'failed',
+        message: 'API belum tersedia untuk import relasi BOM.',
+        detailRows: [],
+      });
       return;
     }
     if (!allowEdit) {
-      alert('Anda tidak memiliki akses untuk import relasi BOM.');
+      setBomImportSummary({
+        open: true,
+        fileName: importMeta.fileName || '-',
+        totalRows: relationDrafts.length,
+        inserted: 0,
+        updated: 0,
+        duplicate: importMeta.duplicateDraftRows?.length || 0,
+        skipped: 0,
+        status: 'failed',
+        message: 'Anda tidak memiliki akses untuk import relasi BOM.',
+        detailRows: [],
+      });
       return;
     }
     if (relationDrafts.length === 0) {
-      alert('Tidak ada relasi BOM valid ditemukan. Gunakan Template .xls.');
+      setBomImportSummary({
+        open: true,
+        fileName: importMeta.fileName || '-',
+        totalRows: 0,
+        inserted: 0,
+        updated: 0,
+        duplicate: 0,
+        skipped: 0,
+        status: 'failed',
+        message: 'Tidak ada relasi BOM valid ditemukan. Gunakan Template .xls.',
+        detailRows: [],
+      });
       return;
     }
 
     const validationErrors = [];
     const aggregatedMap = new Map();
+    const duplicateRows = Array.isArray(importMeta.duplicateDraftRows) ? importMeta.duplicateDraftRows : [];
+    const importedMasterItems = Array.isArray(importMeta.itemDrafts) ? importMeta.itemDrafts : [];
+    const preparedMasterItemsByCode = new Map(masterItemsByCode);
+    let createdMasterItems = 0;
+    let updatedMasterItems = 0;
 
-    rootCodes.forEach((rootCode) => {
-      if (!masterItemsByCode.get(rootCode)) {
-        validationErrors.push(`Parent root ${rootCode} belum ada di Master Ref Item.`);
+    for (const draft of importedMasterItems) {
+      const itemDraft = buildImportItemDraft(draft);
+      if (!itemDraft) continue;
+      const existingItem = preparedMasterItemsByCode.get(itemDraft.code);
+      try {
+        const savedItem = await upsertImportMasterItem(itemDraft);
+        if (existingItem) {
+          updatedMasterItems += 1;
+        } else {
+          createdMasterItems += 1;
+        }
+        preparedMasterItemsByCode.set(itemDraft.code, {
+          ...(existingItem || {}),
+          ...(savedItem || {}),
+          code: itemDraft.code,
+          name: savedItem?.name || itemDraft.name,
+          type: savedItem?.type || itemDraft.type,
+          unit: savedItem?.unit || itemDraft.unit,
+          model: savedItem?.model || itemDraft.model,
+          weight: Number(savedItem?.weight ?? itemDraft.weight ?? 0) || 0,
+          lead_time_days: Number(savedItem?.lead_time_days ?? itemDraft.leadTimeDays ?? 0) || 0,
+          cycle_time_seconds: Number(savedItem?.cycle_time_seconds ?? itemDraft.cycleTimeSeconds ?? 0) || 0,
+          line_production: savedItem?.line_production || itemDraft.lineProduction || '',
+          packing_name: savedItem?.packing_name || itemDraft.packingName || '',
+          process_flow: Array.isArray(savedItem?.process_flow) ? savedItem.process_flow : itemDraft.processFlow,
+          process_routing: Array.isArray(savedItem?.process_routing) ? savedItem.process_routing : itemDraft.processRouting,
+        });
+      } catch (error) {
+        validationErrors.push(`Master item ${itemDraft.code}: ${error.message || 'gagal disimpan'}`);
       }
-    });
+    }
+
+    if (validationErrors.length > 0) {
+      const preview = validationErrors.slice(0, 10).join('\n');
+      const message = `Import dibatalkan.\n${preview}${validationErrors.length > 10 ? `\n... dan ${validationErrors.length - 10} error lainnya.` : ''}`;
+      setBomImportSummary({
+        open: true,
+        fileName: importMeta.fileName || '-',
+        totalRows: relationDrafts.length,
+        inserted: 0,
+        updated: 0,
+        duplicate: duplicateRows.length,
+        skipped: validationErrors.length,
+        status: 'failed',
+        message,
+        detailRows: [
+          ...duplicateRows.map((row) => ({ ...row, type: 'duplicate' })),
+          ...validationErrors.slice(0, 20).map((reason, index) => ({
+            rowNumber: index + 1,
+            parentCode: '',
+            childCode: '',
+            type: 'skipped',
+            reason,
+          })),
+        ],
+      });
+      await saveBomImportBatch({
+        fileName: importMeta.fileName || null,
+        totalRows: relationDrafts.length,
+        insertedRows: 0,
+        updatedRows: 0,
+        duplicateRows: duplicateRows.length,
+        skippedRows: validationErrors.length,
+        status: 'failed',
+        errorMessage: message,
+        errorDetails: [
+          ...duplicateRows.map((row) => ({ type: 'duplicate', ...row })),
+          ...validationErrors.map((reason, index) => ({ type: 'skipped', rowNumber: index + 1, reason })),
+        ],
+      });
+      return;
+    }
 
     relationDrafts.forEach((draft, index) => {
       const parentCode = String(draft.parentCode || '').trim();
       const childCode = String(draft.childCode || '').trim();
       if (!parentCode || !childCode) return;
 
-      if (!masterItemsByCode.get(parentCode)) {
+      if (!preparedMasterItemsByCode.get(parentCode)) {
         validationErrors.push(`Baris ${index + 1}: Parent ${parentCode} belum ada di Master Ref Item.`);
         return;
       }
-      if (!masterItemsByCode.get(childCode)) {
+      if (!preparedMasterItemsByCode.get(childCode)) {
         validationErrors.push(`Baris ${index + 1}: Child ${childCode} belum ada di Master Ref Item.`);
         return;
       }
@@ -3331,7 +3917,42 @@ export default function BOMManager({
 
     if (validationErrors.length > 0) {
       const preview = validationErrors.slice(0, 10).join('\n');
-      alert(`Import dibatalkan.\n${preview}${validationErrors.length > 10 ? `\n... dan ${validationErrors.length - 10} error lainnya.` : ''}`);
+      const message = `Import dibatalkan.\n${preview}${validationErrors.length > 10 ? `\n... dan ${validationErrors.length - 10} error lainnya.` : ''}`;
+      setBomImportSummary({
+        open: true,
+        fileName: importMeta.fileName || '-',
+        totalRows: relationDrafts.length,
+        inserted: 0,
+        updated: 0,
+        duplicate: duplicateRows.length,
+        skipped: validationErrors.length,
+        status: 'failed',
+        message,
+        detailRows: [
+          ...duplicateRows.map((row) => ({ ...row, type: 'duplicate' })),
+          ...validationErrors.slice(0, 20).map((reason, index) => ({
+            rowNumber: index + 1,
+            parentCode: '',
+            childCode: '',
+            type: 'skipped',
+            reason,
+          })),
+        ],
+      });
+      await saveBomImportBatch({
+        fileName: importMeta.fileName || null,
+        totalRows: relationDrafts.length,
+        insertedRows: 0,
+        updatedRows: 0,
+        duplicateRows: duplicateRows.length,
+        skippedRows: validationErrors.length,
+        status: 'failed',
+        errorMessage: message,
+        errorDetails: [
+          ...duplicateRows.map((row) => ({ type: 'duplicate', ...row })),
+          ...validationErrors.map((reason, index) => ({ type: 'skipped', rowNumber: index + 1, reason })),
+        ],
+      });
       return;
     }
 
@@ -3342,8 +3963,10 @@ export default function BOMManager({
     if (!confirmed) return;
 
     try {
+      let insertedRows = 0;
+      let updatedRows = 0;
       for (const relation of aggregatedRelations) {
-        const childItem = masterItemsByCode.get(relation.childCode) || {};
+        const childItem = preparedMasterItemsByCode.get(relation.childCode) || {};
         const processCodes = mapProcessFlowToCodes(
           Array.isArray(childItem.process_flow) && childItem.process_flow.length
             ? childItem.process_flow
@@ -3351,7 +3974,7 @@ export default function BOMManager({
               ? childItem.processes
               : [],
         );
-        await upsertBomRelation({
+        const upsertResult = await upsertBomRelation({
           parentCode: relation.parentCode,
           childCode: relation.childCode,
           quantity: Number(relation.qty || 0),
@@ -3379,27 +4002,103 @@ export default function BOMManager({
           }),
           mergeOnDuplicate: true,
         });
+        if (upsertResult?.merged) {
+          updatedRows += 1;
+        } else {
+          insertedRows += 1;
+        }
       }
       await refreshBomRelations();
-      alert(`Import BOM selesai. ${aggregatedRelations.length} relasi berhasil diproses.`);
+      const summaryMessage = [
+        `Inserted: ${insertedRows}`,
+        `Updated: ${updatedRows}`,
+        `Duplicate: ${duplicateRows.length}`,
+        `Skipped: ${Math.max(0, relationDrafts.length - aggregatedRelations.length - duplicateRows.length)}`,
+        `Master item baru: ${createdMasterItems}`,
+        `Master item diupdate: ${updatedMasterItems}`,
+      ].join(', ');
+      setBomImportSummary({
+        open: true,
+        fileName: importMeta.fileName || '-',
+        totalRows: relationDrafts.length,
+        inserted: insertedRows,
+        updated: updatedRows,
+        duplicate: duplicateRows.length,
+        skipped: Math.max(0, relationDrafts.length - aggregatedRelations.length - duplicateRows.length),
+        status: 'success',
+        message: summaryMessage,
+        detailRows: [
+          ...duplicateRows.map((row) => ({ ...row, type: 'duplicate' })),
+        ],
+      });
+      await saveBomImportBatch({
+        fileName: importMeta.fileName || null,
+        totalRows: relationDrafts.length,
+        insertedRows,
+        updatedRows,
+        duplicateRows: duplicateRows.length,
+        skippedRows: Math.max(0, relationDrafts.length - aggregatedRelations.length - duplicateRows.length),
+        status: 'success',
+        errorMessage: summaryMessage,
+        errorDetails: duplicateRows.map((row) => ({ type: 'duplicate', ...row })),
+      });
+      await fetchBomImportHistory();
+      await syncMasterRefContext();
     } catch (error) {
-      alert(`Gagal import BOM: ${error.message || 'Unknown error'}`);
+      const message = `Gagal import BOM: ${error.message || 'Unknown error'}`;
+      setBomImportSummary({
+        open: true,
+        fileName: importMeta.fileName || '-',
+        totalRows: relationDrafts.length,
+        inserted: 0,
+        updated: 0,
+        duplicate: duplicateRows.length,
+        skipped: 0,
+        status: 'failed',
+        message,
+        detailRows: duplicateRows.map((row) => ({ ...row, type: 'duplicate' })),
+      });
+      await saveBomImportBatch({
+        fileName: importMeta.fileName || null,
+        totalRows: relationDrafts.length,
+        insertedRows: 0,
+        updatedRows: 0,
+        duplicateRows: duplicateRows.length,
+        skippedRows: 0,
+        status: 'failed',
+        errorMessage: message,
+        errorDetails: duplicateRows.map((row) => ({ type: 'duplicate', ...row })),
+      });
     }
   };
 
-  const processHTMLImport = async (htmlContent) => {
+  const processHTMLImport = async (htmlContent, fileName = '') => {
     try {
       const parser = new DOMParser();
       const doc = parser.parseFromString(htmlContent, 'text/html');
       const rows = Array.from(doc.querySelectorAll('tr'));
       
       if (rows.length < 2) {
-          alert("Gagal membaca file. Pastikan menggunakan format .xls dari Template.");
+          setBomImportSummary({
+            open: true,
+            fileName: fileName || '-',
+            totalRows: 0,
+            inserted: 0,
+            updated: 0,
+            duplicate: 0,
+            skipped: 0,
+            status: 'failed',
+            message: 'Gagal membaca file. Pastikan menggunakan format .xls atau .xlsx dari Template.',
+            detailRows: [],
+          });
           return;
       }
 
       const relationDrafts = [];
+      const duplicateDraftRows = [];
       const rootCodes = new Set();
+      const seenRelationKeys = new Map();
+      const itemDraftMap = new Map();
       const normalizeHeader = (value) => String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
       const headerRowIndex = rows.findIndex((row) => {
         const texts = Array.from(row.children || []).map((cell) => normalizeHeader(cell.textContent || cell.innerText || ''));
@@ -3429,37 +4128,105 @@ export default function BOMManager({
         const pCode = getText(['Parent Code', 'Parent'], headerMap.size ? -1 : 1);
         const code = getText(['Kode Item', 'Item Code', 'Child Code', 'Code'], headerMap.size ? -1 : 2);
         const rowType = getText(['Row Type', 'Line Type'], -1).toUpperCase();
+        const levelValue = parseInt(getText(['Level'], 0), 10);
         
         if (!code) continue;
+
+        const itemDraft = buildImportItemDraft({
+          code,
+          name: getText(['Nama Item', 'Item Name', 'Name'], headerMap.size ? -1 : 4),
+          model: getText(['Model'], headerMap.size ? -1 : 5),
+          type: getText(['Tipe', 'Type'], headerMap.size ? -1 : 6),
+          uom: getText(['UOM', 'Unit'], headerMap.size ? -1 : 8),
+          weight: parseFloat(getText(['Berat (Kg)', 'Weight'], headerMap.size ? -1 : 9)) || 0,
+          leadTime: parseFloat(getText(['Lead Time', 'Lead Time Days'], headerMap.size ? -1 : 11)) || 0,
+          line: getText(['Line'], headerMap.size ? -1 : 12),
+          processList: getText(['Process List', 'Process'], headerMap.size ? -1 : 13),
+          cycleTime: parseFloat(getText(['Cycle Time (s)', 'Cycle Time'], headerMap.size ? -1 : 16)) || 0,
+          packing: getText(['Packing'], headerMap.size ? -1 : 17),
+          level: Number.isFinite(levelValue) ? levelValue : 0,
+          rowType,
+        });
+        if (itemDraft) {
+          itemDraftMap.set(itemDraft.code, itemDraft);
+        }
 
         if (!pCode || pCode === '-') {
           rootCodes.add(code);
           continue;
         }
 
+        const qty = parseFloat(getText(['Qty (Use)', 'Qty Use', 'Qty', 'Quantity'], headerMap.size ? -1 : 6)) || 0;
+        const scrap = parseFloat(getText(['Scrap %', 'Scrap'], headerMap.size ? -1 : 9)) || 0;
+        const revisionNo = parseInt(getText(['Revision No', 'Revision'], headerMap.size ? -1 : 15), 10) || 1;
+        const effectiveStartDate = getText(['Effective Start', 'Effective Start Date'], headerMap.size ? -1 : 16) || todayDateInput;
+        const effectiveEndDate = getText(['Effective End', 'Effective End Date'], headerMap.size ? -1 : 17) || '';
+        const yieldFactor = parseFloat(getText(['Yield Factor', 'Yield'], headerMap.size ? -1 : 18)) || 1;
+        const positionCode = getText(['Position Code', 'Position'], headerMap.size ? -1 : 19) || '';
+        const substituteCodesText = getText(['Substitute Codes', 'Substitutes'], headerMap.size ? -1 : 20) || '';
+        const componentType = rowType === 'PROCESS_CONSUMABLE'
+          ? 'PROCESS CONSUMABLE'
+          : getText(['Component Type', 'Tipe', 'Type'], headerMap.size ? -1 : 5);
+        const processCode = getText(['Process Code', 'Proses Consumable', 'Process'], -1);
+        const consumptionBasis = getText(['Consumption Basis', 'Basis Konsumsi', 'Basis'], -1);
+        const bomVersion = getText(['BOM Version', 'Version'], headerMap.size ? -1 : 21) || '';
+        const reference = getText(['Reference', 'Ref'], headerMap.size ? -1 : 22) || '';
+        const relationKey = [
+          pCode,
+          code,
+          revisionNo,
+          effectiveStartDate,
+          effectiveEndDate,
+          componentType,
+          processCode,
+          consumptionBasis,
+        ].join('::');
+        if (seenRelationKeys.has(relationKey)) {
+          duplicateDraftRows.push({
+            rowNumber: i + 1,
+            parentCode: pCode,
+            childCode: code,
+            reason: `Duplikat baris pada file. Sama dengan row ${seenRelationKeys.get(relationKey)}.`,
+          });
+          continue;
+        }
+        seenRelationKeys.set(relationKey, i + 1);
         relationDrafts.push({
           parentCode: pCode,
           childCode: code,
-          qty: parseFloat(getText(['Qty (Use)', 'Qty Use', 'Qty', 'Quantity'], headerMap.size ? -1 : 6)) || 0,
-          scrap: parseFloat(getText(['Scrap %', 'Scrap'], headerMap.size ? -1 : 9)) || 0,
-          revisionNo: parseInt(getText(['Revision No', 'Revision'], headerMap.size ? -1 : 15), 10) || 1,
-          effectiveStartDate: getText(['Effective Start', 'Effective Start Date'], headerMap.size ? -1 : 16) || todayDateInput,
-          effectiveEndDate: getText(['Effective End', 'Effective End Date'], headerMap.size ? -1 : 17) || '',
-          yieldFactor: parseFloat(getText(['Yield Factor', 'Yield'], headerMap.size ? -1 : 18)) || 1,
-          positionCode: getText(['Position Code', 'Position'], headerMap.size ? -1 : 19) || '',
-          substituteCodesText: getText(['Substitute Codes', 'Substitutes'], headerMap.size ? -1 : 20) || '',
-          componentType: rowType === 'PROCESS_CONSUMABLE'
-            ? 'PROCESS CONSUMABLE'
-            : getText(['Component Type', 'Tipe', 'Type'], headerMap.size ? -1 : 5),
-          processCode: getText(['Process Code', 'Proses Consumable', 'Process'], -1),
-          consumptionBasis: getText(['Consumption Basis', 'Basis Konsumsi', 'Basis'], -1),
-          bomVersion: getText(['BOM Version', 'Version'], headerMap.size ? -1 : 21) || '',
-          reference: getText(['Reference', 'Ref'], headerMap.size ? -1 : 22) || '',
+          qty,
+          scrap,
+          revisionNo,
+          effectiveStartDate,
+          effectiveEndDate,
+          yieldFactor,
+          positionCode,
+          substituteCodesText,
+          componentType,
+          processCode,
+          consumptionBasis,
+          bomVersion,
+          reference,
         });
       }
-      await finalizeImport(relationDrafts, Array.from(rootCodes));
+      await finalizeImport(relationDrafts, Array.from(rootCodes), {
+        fileName,
+        duplicateDraftRows,
+        itemDrafts: Array.from(itemDraftMap.values()),
+      });
     } catch (e) { 
-        alert("Error membaca file."); 
+        setBomImportSummary({
+          open: true,
+          fileName: fileName || '-',
+          totalRows: 0,
+          inserted: 0,
+          updated: 0,
+          duplicate: 0,
+          skipped: 0,
+          status: 'failed',
+          message: `Error membaca file: ${e.message || 'Unknown error'}`,
+          detailRows: [],
+        });
         console.error(e);
     }
   };
@@ -3518,12 +4285,13 @@ export default function BOMManager({
       <tbody>`;
     rows.forEach((item) => {
        const procStr = item.processes ? item.processes.join(' | ') : '';
+       const modelText = formatModelCodes(modelMap, item.modelCodes || parseModelCodes(item.model)) || item.model || '';
        tableHTML += `<tr>
          <td>${item.level}</td>
          <td>${item.rowType}</td>
          <td>${item.parentCode}</td>
          <td style="mso-number-format:'\@'">${item.code}</td>
-         <td>${item.name}</td><td>${item.model}</td><td>${item.type}</td>
+         <td>${item.name}</td><td>${modelText}</td><td>${item.type}</td>
          <td>${item.qty}</td><td>${item.uom}</td>
          <td>${item.weight}</td><td>${item.scrap}</td><td>${item.leadTime}</td>
          <td>${item.line}</td><td>${procStr}</td><td>${item.processCode}</td><td>${item.consumptionBasis}</td><td>${item.cycleTime}</td><td>${item.packing}</td>
@@ -3819,9 +4587,10 @@ export default function BOMManager({
     ];
     const buildRow = (row) => {
       const processes = Array.isArray(row.processes) ? row.processes.join(' | ') : row.processes || '';
+      const modelText = formatModelCodes(modelMap, row.modelCodes || parseModelCodes(row.model)) || row.model || '';
       return `
         <tr>
-          <td>${row.level}</td><td>${row.rowType || ''}</td><td>${row.parentCode}</td><td>${row.code}</td><td>${row.name}</td><td>${row.model}</td><td>${row.type}</td>
+          <td>${row.level}</td><td>${row.rowType || ''}</td><td>${row.parentCode}</td><td>${row.code}</td><td>${row.name}</td><td>${modelText}</td><td>${row.type}</td>
           <td>${row.qty}</td><td>${row.uom}</td><td>${row.weight}</td><td>${row.scrap}</td><td>${row.leadTime}</td>
           <td>${row.line}</td><td>${processes}</td><td>${row.processCode || ''}</td><td>${row.consumptionBasis || ''}</td><td>${row.cycleTime}</td><td>${row.packing}</td>
           <td>${row.revisionNo || 1}</td><td>${row.effectiveStartDate || todayDateInput}</td><td>${row.effectiveEndDate || ''}</td><td>${row.yieldFactor || 1}</td><td>${row.positionCode || ''}</td><td>${row.substituteCodesText || ''}</td><td>${row.bomVersion || ''}</td><td>${row.reference || ''}</td>
@@ -3987,8 +4756,10 @@ export default function BOMManager({
                 <Database size={16}/> Data <ChevronDown size={12}/>
              </button>
              {showDataMenu && (
-               <div className="absolute top-full right-0 mt-2 w-56 bg-white shadow-xl rounded-lg border border-gray-100 z-50 py-1 text-xs font-medium">
-                 <input type="file" ref={fileInputRef} className="hidden" accept=".xls,.xml" onChange={handleFileUpload} />
+               <div
+                 className="absolute top-full right-0 mt-2 w-56 bg-white shadow-xl rounded-lg border border-gray-100 z-50 py-1 text-xs font-medium"
+                 onClick={(e) => e.stopPropagation()}
+               >
                  <button
                    onClick={() => {
                      setShowRevisionAuditPanel(true);
@@ -4009,11 +4780,21 @@ export default function BOMManager({
                  </button>
                  <button onClick={exportImportTemplate} className="w-full text-left px-4 py-2 hover:bg-indigo-50 flex gap-2"><FileSpreadsheet size={14}/> Download Template Relasi .xls</button>
                  {allowEdit && (
-                   <button onClick={() => { fileInputRef.current.click(); setShowDataMenu(false); }} className="w-full text-left px-4 py-2 hover:bg-indigo-50 flex gap-2"><Upload size={14}/> Import Relasi BOM .xls</button>
+                   <button
+                     onClick={(e) => {
+                       e.stopPropagation();
+                       fileInputRef.current.click();
+                       setShowDataMenu(false);
+                     }}
+                     className="w-full text-left px-4 py-2 hover:bg-indigo-50 flex gap-2"
+                   >
+                     <Upload size={14}/> Import Relasi BOM .xls
+                   </button>
                  )}
                  <button onClick={() => { exportExcel(); setShowDataMenu(false); }} className="w-full text-left px-4 py-2 hover:bg-indigo-50 flex gap-2 border-t"><Download size={14}/> Export .xls</button>
                </div>
              )}
+             <input type="file" ref={fileInputRef} className="hidden" accept=".xls,.xlsx,.xml" onChange={handleFileUpload} />
            </div>
            
            <div className="h-6 w-px bg-gray-300 mx-1"></div>
@@ -4048,17 +4829,17 @@ export default function BOMManager({
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                   <div className="md:col-span-2">
                     <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Induk (Parent)</label>
-                    <select
+                    <SearchableSelectDropdown
                       value={selectedParent?.code || newItem.parentId || ''}
-                      onChange={(e) => handleParentSelectChange(e.target.value)}
-                      className="w-full p-2 border border-gray-300 rounded text-xs focus:ring-2 focus:ring-indigo-500 outline-none disabled:bg-gray-100 disabled:text-gray-500"
+                      options={parentOptionsSingle}
+                      onChange={(value) => handleParentSelectChange(value)}
+                      placeholder="-- Level Teratas (FG) --"
+                      searchPlaceholder="Ketik kode parent / nama parent"
+                      emptyText="Master item FG belum tersedia."
                       disabled={!!editingRelation}
-                    >
-                      <option value="">-- Level Teratas (FG) --</option>
-                      {parentOptionsSingle.map(item => (
-                        <option key={`parent-${item.code}`} value={item.code}>{item.code} - {item.name}</option>
-                      ))}
-                    </select>
+                      getOptionValue={(item) => String(item?.code || '').trim()}
+                      getOptionLabel={(item) => getBomOptionLabel(item)}
+                    />
                   </div>
                   <div>
                     <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Tipe Komponen Baru (Master Category)</label>
@@ -4135,20 +4916,18 @@ export default function BOMManager({
                         {(newItem.modelCodes && newItem.modelCodes.length ? newItem.modelCodes : ['']).map((modelCode, idx) => (
                           <div key={`model-row-${idx}`} className="flex gap-1 items-center">
                             <span className="text-[10px] text-gray-400 w-4">{idx + 1}.</span>
-                            <select
-                              className={`flex-1 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none ${getLockedFieldClass(isCurrentFormMasterLocked)}`}
+                            <SearchableSelectDropdown
+                              className="flex-1"
                               value={modelCode || ''}
-                              onChange={(e) => handleModelSelectChange(idx, e.target.value)}
+                              options={modelSearchOptions}
+                              onChange={(value) => handleModelSelectChange(idx, value)}
+                              placeholder="- Pilih Model -"
+                              searchPlaceholder="Ketik kode model / nama model"
+                              emptyText="Master model masih kosong."
                               disabled={isCurrentFormMasterLocked}
-                            >
-                              <option value="">- Pilih Model -</option>
-                              {localModels.map((model) => (
-                                <option key={`model-opt-${model.code}`} value={model.code}>
-                                  {model.code}{model.name ? ` - ${model.name}` : ''}
-                                </option>
-                              ))}
-                              <option value="__new__">+ New Master Model</option>
-                            </select>
+                              getOptionValue={(item) => String(item?.code || '').trim()}
+                              getOptionLabel={(item) => getModelOptionLabel(item)}
+                            />
                             {!isCurrentFormMasterLocked && (newItem.modelCodes?.length || 0) > 1 && (
                               <button type="button" onClick={() => removeModelRow(idx)} className="text-red-400 hover:text-red-600">
                                 <X size={12}/>
@@ -4170,23 +4949,17 @@ export default function BOMManager({
                         {newItem.processes.map((proc, idx) => (
                           <div key={idx} className="flex gap-1 items-center">
                             <span className="text-[10px] text-gray-400 w-4">{idx+1}.</span>
-                            <select
-                              className="flex-1 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none bg-white"
+                            <SearchableSelectDropdown
+                              className="flex-1"
                               value={proc || ''}
-                              onChange={(e) => handleProcessChange(idx, e.target.value)}
-                            >
-                              <option value="">- Pilih proses -</option>
-                              {String(proc || '').trim() && !bomProcessOptionsAll.some((item) => String(item.code || '').trim() === String(proc || '').trim()) && (
-                                <option value={proc}>
-                                  {proc} (Custom)
-                                </option>
-                              )}
-                              {bomProcessOptionsAll.map((item) => (
-                                <option key={`proc-opt-${item.code}`} value={item.code}>
-                                  {getProcessDisplayLabel(item)}
-                                </option>
-                              ))}
-                            </select>
+                              options={bomProcessOptionsAll}
+                              onChange={(value) => handleProcessChange(idx, value)}
+                              placeholder="- Pilih proses -"
+                              searchPlaceholder="Ketik kode proses / nama proses"
+                              emptyText="Master process masih kosong."
+                              getOptionValue={(item) => String(item?.code || '').trim()}
+                              getOptionLabel={(item) => getProcessDisplayLabel(item)}
+                            />
                             {!isCurrentFormMasterLocked && newItem.processes.length > 1 && (<button type="button" onClick={() => removeProcessField(idx)} className="text-red-400 hover:text-red-600"><X size={12}/></button>)}
                           </div>
                         ))}
@@ -4244,16 +5017,18 @@ export default function BOMManager({
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                     <div className="md:col-span-2">
                       <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Parent Utama (Level 0)</label>
-                      <select
+                      <SearchableSelectDropdown
                         value={bulkParentCode}
-                        onChange={(e) => handleBulkParentSelectChange(e.target.value)}
-                        className="w-full p-2 border border-gray-300 rounded text-xs focus:ring-2 focus:ring-indigo-500 outline-none"
-                      >
-                        <option value="">-- Pilih Parent --</option>
-                        {(bulkMode === 'single' ? parentOptionsSingle : parentOptionsMulti).map(item => (
-                          <option key={`bulk-parent-${item.code}`} value={item.code}>{getBomOptionLabel(item)}</option>
-                        ))}
-                      </select>
+                        options={bulkMode === 'single' ? parentOptionsSingle : parentOptionsMulti}
+                        onChange={(value) => handleBulkParentSelectChange(value)}
+                        placeholder="-- Pilih Parent --"
+                        searchPlaceholder="Ketik kode parent / nama parent"
+                        emptyText={bulkMode === 'single'
+                          ? 'Tidak ada FG di Master Ref Item.'
+                          : 'Tidak ada Sub-Assy di Master Ref Item.'}
+                        getOptionValue={(item) => String(item?.code || '').trim()}
+                        getOptionLabel={(item) => getBomOptionLabel(item)}
+                      />
                       {!bomLoading && (bulkMode === 'single' ? parentOptionsSingle : parentOptionsMulti).length === 0 && (
                         <div className="mt-1 text-[10px] text-amber-600">
                           {bulkMode === 'single'
@@ -4353,23 +5128,17 @@ export default function BOMManager({
                             {(bulkParentDetails.processCodes || ['']).map((procCode, procIdx) => (
                               <div key={`parent-visible-proc-${procIdx}`} className="flex gap-2 items-center">
                                 <span className="text-[10px] text-gray-400 w-4">{procIdx + 1}.</span>
-                                <select
-                                  className="flex-1 min-w-0 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none bg-white"
+                                <SearchableSelectDropdown
+                                  className="flex-1 min-w-0"
                                   value={procCode || ''}
-                                  onChange={(e) => updateBulkParentProcess(procIdx, e.target.value)}
-                                >
-                                  <option value="">- Pilih proses -</option>
-                                  {String(procCode || '').trim() && !bomProcessOptionsForMode.some((item) => String(item.code || '').trim() === String(procCode || '').trim()) && (
-                                    <option value={procCode}>
-                                      {procCode} (Custom)
-                                    </option>
-                                  )}
-                                  {bomProcessOptionsForMode.map((item) => (
-                                    <option key={`parent-visible-proc-opt-${item.code}`} value={item.code}>
-                                      {getProcessDisplayLabel(item)}
-                                    </option>
-                                  ))}
-                                </select>
+                                  options={bomProcessOptionsForMode}
+                                  onChange={(value) => updateBulkParentProcess(procIdx, value)}
+                                  placeholder="- Pilih proses -"
+                                  searchPlaceholder="Ketik kode proses / nama proses"
+                                  emptyText="Master process masih kosong."
+                                  getOptionValue={(item) => String(item?.code || '').trim()}
+                                  getOptionLabel={(item) => getProcessDisplayLabel(item)}
+                                />
                                 {renderProcessCycleTimeBadge(procCode, `parent-ct-${procIdx}`)}
                                 {(bulkParentDetails.processCodes || []).length > 1 && (
                                   <button type="button" onClick={() => removeBulkParentProcess(procIdx)} className="text-red-400 hover:text-red-600">
@@ -4397,12 +5166,16 @@ export default function BOMManager({
                                 <div className="md:col-span-2">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Mengacu Proses</label>
                                   {parentProcessCodes.length > 1 ? (
-                                    <select className="w-full p-2 border border-gray-300 rounded text-xs bg-white" value={resolvedProcessCode} onChange={(e) => updateBulkParentProcessConsumable(consIdx, { processCode: e.target.value })}>
-                                      <option value="">- Pilih proses -</option>
-                                      {parentProcessCodes.map((procCode) => (
-                                        <option key={`parent-cons-proc-${consIdx}-${procCode}`} value={procCode}>{getProcessNodeLabel(procCode)}</option>
-                                      ))}
-                                    </select>
+                                    <SearchableSelectDropdown
+                                      value={resolvedProcessCode}
+                                      options={parentProcessCodes.map((procCode) => ({ code: procCode, name: getProcessNodeLabel(procCode) || procCode }))}
+                                      onChange={(value) => updateBulkParentProcessConsumable(consIdx, { processCode: value })}
+                                      placeholder="- Pilih proses -"
+                                      searchPlaceholder="Ketik kode proses"
+                                      emptyText="Tidak ada proses BOM."
+                                      getOptionValue={(item) => String(item?.code || '').trim()}
+                                      getOptionLabel={(item) => String(item?.name || '').trim()}
+                                    />
                                   ) : (
                                     <div className="w-full p-2 border border-gray-200 rounded text-xs bg-gray-50 text-gray-600">
                                       {resolvedProcessCode ? getProcessNodeLabel(resolvedProcessCode) : 'Pilih proses BOM dulu'}
@@ -4412,18 +5185,22 @@ export default function BOMManager({
                                 <div>
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Tipe</label>
                                   <select className="w-full p-2 border border-gray-300 rounded text-xs bg-white" value={normalizeMaterialType(consumable.type, 'INDIRECT MATERIAL')} onChange={(e) => updateBulkParentProcessConsumable(consIdx, { type: normalizeMaterialType(e.target.value, 'INDIRECT MATERIAL'), code: '', name: '', uom: 'PCS' })}>
-                                    <option value="INDIRECT MATERIAL">Indirect</option>
-                                    <option value="RAW MATERIAL">Raw</option>
+                                    <option value="INDIRECT MATERIAL">Consumable / Indirect</option>
                                   </select>
                                 </div>
                                 <div className="md:col-span-2">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Consumable</label>
-                                  <select className="w-full p-2 border border-gray-300 rounded text-xs bg-white" value={consumable.code || ''} onChange={(e) => handleBulkParentProcessConsumableSelect(consIdx, e.target.value)}>
-                                    <option value="">- Pilih material -</option>
-                                    {getMaterialOptionsForType(consumable.type).map((item) => (
-                                      <option key={`parent-cons-mat-${consIdx}-${item.code}`} value={item.code}>{getBomOptionLabel(item)}</option>
-                                    ))}
-                                  </select>
+                                  <SearchableSelectDropdown
+                                    value={consumable.code || ''}
+                                    options={getMaterialOptionsForType(consumable.type)}
+                                    onChange={(value) => handleBulkParentProcessConsumableSelect(consIdx, value)}
+                                    placeholder="- Pilih material -"
+                                    searchPlaceholder="Ketik kode material / nama material"
+                                    emptyText="Material belum tersedia."
+                                    getOptionValue={(item) => String(item?.code || '').trim()}
+                                    getOptionLabel={(item) => getBomOptionLabel(item)}
+                                  />
+                                  <div className="mt-1 text-[10px] text-gray-400">Kosongkan jika tidak dipakai.</div>
                                 </div>
                                 <div>
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Qty Konsumsi</label>
@@ -4471,20 +5248,18 @@ export default function BOMManager({
                                 {(bulkParentDetails.modelCodes && bulkParentDetails.modelCodes.length ? bulkParentDetails.modelCodes : ['']).map((modelCode, modelIdx) => (
                                   <div key={`parent-model-${modelIdx}`} className="flex gap-2 items-center">
                                     <span className="text-[10px] text-gray-400 w-4">{modelIdx + 1}.</span>
-                                    <select
-                                      className={`flex-1 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none ${getLockedFieldClass(isBulkParentMasterLocked)}`}
+                                    <SearchableSelectDropdown
+                                      className="flex-1"
                                       value={modelCode || ''}
-                                      onChange={(e) => handleBulkParentModelSelectChange(modelIdx, e.target.value)}
+                                      options={modelSearchOptions}
+                                      onChange={(value) => handleBulkParentModelSelectChange(modelIdx, value)}
+                                      placeholder="- Pilih Model -"
+                                      searchPlaceholder="Ketik kode model / nama model"
+                                      emptyText="Master model masih kosong."
                                       disabled={isBulkParentMasterLocked}
-                                    >
-                                      <option value="">- Pilih Model -</option>
-                                      {localModels.map((model) => (
-                                        <option key={`parent-model-opt-${model.code}`} value={model.code}>
-                                          {model.code}{model.name ? ` - ${model.name}` : ''}
-                                        </option>
-                                      ))}
-                                      <option value="__new__">+ New Master Model</option>
-                                    </select>
+                                      getOptionValue={(item) => String(item?.code || '').trim()}
+                                      getOptionLabel={(item) => getModelOptionLabel(item)}
+                                    />
                                     {!isBulkParentMasterLocked && (bulkParentDetails.modelCodes || []).length > 1 && (
                                       <button type="button" onClick={() => removeBulkParentModelRow(modelIdx)} className="text-red-400 hover:text-red-600">
                                         <X size={12}/>
@@ -4506,23 +5281,17 @@ export default function BOMManager({
                                 {(bulkParentDetails.processCodes || ['']).map((procCode, procIdx) => (
                                   <div key={`parent-proc-${procIdx}`} className="flex gap-2 items-center">
                                     <span className="text-[10px] text-gray-400 w-4">{procIdx + 1}.</span>
-                                    <select
-                                      className="flex-1 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none bg-white"
+                                    <SearchableSelectDropdown
+                                      className="flex-1"
                                       value={procCode || ''}
-                                      onChange={(e) => updateBulkParentProcess(procIdx, e.target.value)}
-                                    >
-                                      <option value="">- Pilih proses -</option>
-                                      {String(procCode || '').trim() && !bomProcessOptionsForMode.some((item) => String(item.code || '').trim() === String(procCode || '').trim()) && (
-                                        <option value={procCode}>
-                                          {procCode} (Custom)
-                                        </option>
-                                      )}
-                                      {bomProcessOptionsForMode.map((item) => (
-                                        <option key={`parent-proc-opt-${item.code}`} value={item.code}>
-                                          {getProcessDisplayLabel(item)}
-                                        </option>
-                                      ))}
-                                    </select>
+                                      options={bomProcessOptionsForMode}
+                                      onChange={(value) => updateBulkParentProcess(procIdx, value)}
+                                      placeholder="- Pilih proses -"
+                                      searchPlaceholder="Ketik kode proses / nama proses"
+                                      emptyText="Master process masih kosong."
+                                      getOptionValue={(item) => String(item?.code || '').trim()}
+                                      getOptionLabel={(item) => getProcessDisplayLabel(item)}
+                                    />
                                     {!isBulkParentMasterLocked && (bulkParentDetails.processCodes || []).length > 1 && (
                                       <button type="button" onClick={() => removeBulkParentProcess(procIdx)} className="text-red-400 hover:text-red-600">
                                         <X size={12}/>
@@ -4565,12 +5334,11 @@ export default function BOMManager({
                               <div key={`parent-mat-${material.id || matIdx}`} className="grid grid-cols-1 gap-2 items-end md:grid-cols-7">
                                 <div className="md:col-span-2">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Material</label>
-                                  <select
-                                    className={`w-full p-2 border border-gray-300 rounded text-xs ${material.isExisting ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''}`}
+                                  <SearchableSelectDropdown
                                     value={material.code}
-                                    onChange={(e) => {
+                                    options={getMaterialOptionsForType(material.type)}
+                                    onChange={(nextCode) => {
                                       if (material.isExisting) return;
-                                      const nextCode = e.target.value;
                                       const normalizedCode = String(nextCode || '').trim().toUpperCase();
                                       const originalCode = String(material.originalCode || material.code || '').trim().toUpperCase();
                                       if (normalizedCode && existingCodes.has(normalizedCode) && !(material.isExisting && originalCode === normalizedCode)) {
@@ -4578,20 +5346,13 @@ export default function BOMManager({
                                       }
                                       handleBulkParentMaterialSelect(matIdx, nextCode);
                                     }}
+                                    placeholder="- Pilih material -"
+                                    searchPlaceholder="Ketik kode material / nama material"
+                                    emptyText="Material belum tersedia."
                                     disabled={material.isExisting}
-                            >
-                              <option value="">- Pilih material -</option>
-                              {material.code && !getMaterialOptionsForType(material.type).some((item) => String(item.code || '').trim() === String(material.code || '').trim()) && (
-                                <option value={material.code}>
-                                  {material.code}{material.name ? ` - ${material.name}` : ''}
-                                </option>
-                              )}
-                              {getMaterialOptionsForType(material.type).map((item) => (
-                                <option key={`parent-material-${material.id || matIdx}-${item.code}`} value={item.code}>
-                                  {getBomOptionLabel(item)}
-                                      </option>
-                                    ))}
-                                  </select>
+                                    getOptionValue={(item) => String(item?.code || '').trim()}
+                                    getOptionLabel={(item) => getBomOptionLabel(item)}
+                                  />
                                 </div>
                                 <div className="md:col-span-2">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Nama Material</label>
@@ -4711,23 +5472,16 @@ export default function BOMManager({
                         <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
                           <div className="md:col-span-2">
                             <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Child Part (CP)</label>
-                            <select
-                              className="w-full p-2 border border-gray-300 rounded text-xs"
+                            <SearchableSelectDropdown
                               value={child.code}
-                              onChange={(e) => handleBulkChildSelect(childIdx, e.target.value)}
-                            >
-                              <option value="">- Pilih CP dari Master Ref -</option>
-                              {child.code && !childPartOptions.some((item) => String(item.code || '').trim() === String(child.code || '').trim()) && (
-                                <option value={child.code}>
-                                  {child.code}{child.name ? ` - ${child.name}` : ''}
-                                </option>
-                              )}
-                              {childPartOptions.map((item) => (
-                                <option key={`bulk-child-${child.id}-${item.code}`} value={item.code}>
-                                  {getBomOptionLabel(item)}
-                                </option>
-                              ))}
-                            </select>
+                              options={childPartOptions}
+                              onChange={(value) => handleBulkChildSelect(childIdx, value)}
+                              placeholder="- Pilih CP dari Master Ref -"
+                              searchPlaceholder="Ketik kode CP / nama CP"
+                              emptyText="Master CP belum tersedia."
+                              getOptionValue={(item) => String(item?.code || '').trim()}
+                              getOptionLabel={(item) => getBomOptionLabel(item)}
+                            />
                           </div>
                           <div>
                             <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Nama Child</label>
@@ -4760,27 +5514,21 @@ export default function BOMManager({
                             <button type="button" onClick={() => addBulkProcess(childIdx)} disabled={!childSelected} className="text-indigo-600 hover:text-indigo-800 text-[9px] flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed">+ Tambah Proses</button>
                           </div>
                           <div className="space-y-2">
-                            {(child.processCodes || ['']).map((procCode, procIdx) => (
+                                {(child.processCodes || ['']).map((procCode, procIdx) => (
                               <div key={`child-visible-proc-${child.id}-${procIdx}`} className="flex gap-2 items-center">
                                 <span className="text-[10px] text-gray-400 w-4">{procIdx + 1}.</span>
-                                <select
-                                  className="flex-1 min-w-0 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none bg-white"
+                                <SearchableSelectDropdown
+                                  className="flex-1 min-w-0"
                                   value={procCode || ''}
-                                  onChange={(e) => updateBulkProcess(childIdx, procIdx, e.target.value)}
+                                  options={bomProcessOptionsForMode}
+                                  onChange={(value) => updateBulkProcess(childIdx, procIdx, value)}
+                                  placeholder="- Pilih proses -"
+                                  searchPlaceholder="Ketik kode proses / nama proses"
+                                  emptyText="Master process masih kosong."
                                   disabled={!childSelected}
-                                >
-                                  <option value="">- Pilih proses -</option>
-                                  {String(procCode || '').trim() && !bomProcessOptionsForMode.some((item) => String(item.code || '').trim() === String(procCode || '').trim()) && (
-                                    <option value={procCode}>
-                                      {procCode} (Custom)
-                                    </option>
-                                  )}
-                                  {bomProcessOptionsForMode.map((item) => (
-                                    <option key={`child-visible-proc-opt-${child.id}-${item.code}`} value={item.code}>
-                                      {getProcessDisplayLabel(item)}
-                                    </option>
-                                  ))}
-                                </select>
+                                  getOptionValue={(item) => String(item?.code || '').trim()}
+                                  getOptionLabel={(item) => getProcessDisplayLabel(item)}
+                                />
                                 {renderProcessCycleTimeBadge(procCode, `child-ct-${child.id}-${procIdx}`)}
                                 {(child.processCodes || []).length > 1 && (
                                   <button type="button" onClick={() => removeBulkProcess(childIdx, procIdx)} className="text-red-400 hover:text-red-600">
@@ -4808,12 +5556,17 @@ export default function BOMManager({
                                 <div className="md:col-span-2">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Mengacu Proses</label>
                                   {childProcessCodes.length > 1 ? (
-                                    <select className="w-full p-2 border border-gray-300 rounded text-xs bg-white disabled:bg-gray-100 disabled:text-gray-400" value={resolvedProcessCode} onChange={(e) => updateBulkProcessConsumable(childIdx, consIdx, { processCode: e.target.value })} disabled={!childSelected}>
-                                      <option value="">- Pilih proses -</option>
-                                      {childProcessCodes.map((procCode) => (
-                                        <option key={`child-cons-proc-${child.id}-${consIdx}-${procCode}`} value={procCode}>{getProcessNodeLabel(procCode)}</option>
-                                      ))}
-                                    </select>
+                                    <SearchableSelectDropdown
+                                      value={resolvedProcessCode}
+                                      options={childProcessCodes.map((procCode) => ({ code: procCode, name: getProcessNodeLabel(procCode) || procCode }))}
+                                      onChange={(value) => updateBulkProcessConsumable(childIdx, consIdx, { processCode: value })}
+                                      placeholder="- Pilih proses -"
+                                      searchPlaceholder="Ketik kode proses"
+                                      emptyText="Tidak ada proses BOM."
+                                      disabled={!childSelected}
+                                      getOptionValue={(item) => String(item?.code || '').trim()}
+                                      getOptionLabel={(item) => String(item?.name || '').trim()}
+                                    />
                                   ) : (
                                     <div className="w-full p-2 border border-gray-200 rounded text-xs bg-gray-50 text-gray-600">
                                       {resolvedProcessCode ? getProcessNodeLabel(resolvedProcessCode) : 'Pilih proses BOM dulu'}
@@ -4823,18 +5576,23 @@ export default function BOMManager({
                                 <div>
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Tipe</label>
                                   <select className="w-full p-2 border border-gray-300 rounded text-xs bg-white disabled:bg-gray-100 disabled:text-gray-400" value={normalizeMaterialType(consumable.type, 'INDIRECT MATERIAL')} onChange={(e) => updateBulkProcessConsumable(childIdx, consIdx, { type: normalizeMaterialType(e.target.value, 'INDIRECT MATERIAL'), code: '', name: '', uom: 'PCS' })} disabled={!childSelected}>
-                                    <option value="INDIRECT MATERIAL">Indirect</option>
-                                    <option value="RAW MATERIAL">Raw</option>
+                                    <option value="INDIRECT MATERIAL">Consumable / Indirect</option>
                                   </select>
                                 </div>
                                 <div className="md:col-span-2">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Consumable</label>
-                                  <select className="w-full p-2 border border-gray-300 rounded text-xs bg-white disabled:bg-gray-100 disabled:text-gray-400" value={consumable.code || ''} onChange={(e) => handleBulkProcessConsumableSelect(childIdx, consIdx, e.target.value)} disabled={!childSelected}>
-                                    <option value="">- Pilih material -</option>
-                                    {getMaterialOptionsForType(consumable.type).map((item) => (
-                                      <option key={`child-cons-mat-${child.id}-${consIdx}-${item.code}`} value={item.code}>{getBomOptionLabel(item)}</option>
-                                    ))}
-                                  </select>
+                                  <SearchableSelectDropdown
+                                    value={consumable.code || ''}
+                                    options={getMaterialOptionsForType(consumable.type)}
+                                    onChange={(value) => handleBulkProcessConsumableSelect(childIdx, consIdx, value)}
+                                    placeholder="- Pilih material -"
+                                    searchPlaceholder="Ketik kode material / nama material"
+                                    emptyText="Material belum tersedia."
+                                    disabled={!childSelected}
+                                    getOptionValue={(item) => String(item?.code || '').trim()}
+                                    getOptionLabel={(item) => getBomOptionLabel(item)}
+                                  />
+                                  <div className="mt-1 text-[10px] text-gray-400">Kosongkan jika tidak dipakai.</div>
                                 </div>
                                 <div>
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Qty Konsumsi</label>
@@ -4883,20 +5641,18 @@ export default function BOMManager({
                                 {(child.modelCodes && child.modelCodes.length ? child.modelCodes : ['']).map((modelCode, modelIdx) => (
                                   <div key={`model-${child.id}-${modelIdx}`} className="flex gap-2 items-center">
                                     <span className="text-[10px] text-gray-400 w-4">{modelIdx + 1}.</span>
-                                    <select
-                                      className={`flex-1 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none ${getLockedFieldClass(childMasterLocked)}`}
+                                    <SearchableSelectDropdown
+                                      className="flex-1"
                                       value={modelCode || ''}
-                                      onChange={(e) => handleBulkModelSelectChange(childIdx, modelIdx, e.target.value)}
+                                      options={modelSearchOptions}
+                                      onChange={(value) => handleBulkModelSelectChange(childIdx, modelIdx, value)}
+                                      placeholder="- Pilih Model -"
+                                      searchPlaceholder="Ketik kode model / nama model"
+                                      emptyText="Master model masih kosong."
                                       disabled={childMasterLocked}
-                                    >
-                                      <option value="">- Pilih Model -</option>
-                                      {localModels.map((model) => (
-                                        <option key={`bulk-model-${model.code}`} value={model.code}>
-                                          {model.code}{model.name ? ` - ${model.name}` : ''}
-                                        </option>
-                                      ))}
-                                      <option value="__new__">+ New Master Model</option>
-                                    </select>
+                                      getOptionValue={(item) => String(item?.code || '').trim()}
+                                      getOptionLabel={(item) => getModelOptionLabel(item)}
+                                    />
                                     {!childMasterLocked && (child.modelCodes || []).length > 1 && (
                                       <button type="button" onClick={() => removeBulkModelRow(childIdx, modelIdx)} className="text-red-400 hover:text-red-600">
                                         <X size={12}/>
@@ -4918,23 +5674,17 @@ export default function BOMManager({
                                 {(child.processCodes || ['']).map((procCode, procIdx) => (
                                   <div key={`proc-${child.id}-${procIdx}`} className="flex gap-2 items-center">
                                     <span className="text-[10px] text-gray-400 w-4">{procIdx + 1}.</span>
-                                    <select
-                                      className="flex-1 min-w-0 p-1.5 border rounded text-xs focus:ring-1 focus:ring-indigo-300 outline-none bg-white"
+                                    <SearchableSelectDropdown
+                                      className="flex-1 min-w-0"
                                       value={procCode || ''}
-                                      onChange={(e) => updateBulkProcess(childIdx, procIdx, e.target.value)}
-                                    >
-                                      <option value="">- Pilih proses -</option>
-                                      {String(procCode || '').trim() && !bomProcessOptionsForMode.some((item) => String(item.code || '').trim() === String(procCode || '').trim()) && (
-                                        <option value={procCode}>
-                                          {procCode} (Custom)
-                                        </option>
-                                      )}
-                                      {bomProcessOptionsForMode.map((item) => (
-                                        <option key={`child-proc-opt-${item.code}`} value={item.code}>
-                                          {getProcessDisplayLabel(item)}
-                                        </option>
-                                      ))}
-                                    </select>
+                                      options={bomProcessOptionsForMode}
+                                      onChange={(value) => updateBulkProcess(childIdx, procIdx, value)}
+                                      placeholder="- Pilih proses -"
+                                      searchPlaceholder="Ketik kode proses / nama proses"
+                                      emptyText="Master process masih kosong."
+                                      getOptionValue={(item) => String(item?.code || '').trim()}
+                                      getOptionLabel={(item) => getProcessDisplayLabel(item)}
+                                    />
                                     {renderProcessCycleTimeBadge(procCode, `child-edit-ct-${child.id}-${procIdx}`)}
                                     {!childMasterLocked && (child.processCodes || []).length > 1 && (
                                       <button type="button" onClick={() => removeBulkProcess(childIdx, procIdx)} className="text-red-400 hover:text-red-600">
@@ -4996,24 +5746,17 @@ export default function BOMManager({
                               <div key={`mat-${material.id}`} className="grid grid-cols-1 gap-2 items-end md:grid-cols-7">
                                 <div className="md:col-span-2">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Material</label>
-                                  <select
-                                    className="w-full p-2 border border-gray-300 rounded text-xs"
+                                  <SearchableSelectDropdown
                                     value={material.code}
-                                    onChange={(e) => handleBulkMaterialSelect(childIdx, matIdx, e.target.value)}
+                                    options={getMaterialOptionsForType(material.type)}
+                                    onChange={(value) => handleBulkMaterialSelect(childIdx, matIdx, value)}
+                                    placeholder="- Pilih material -"
+                                    searchPlaceholder="Ketik kode material / nama material"
+                                    emptyText="Material belum tersedia."
                                     disabled={!childSelected}
-                                  >
-                                    <option value="">- Pilih material -</option>
-                                    {material.code && !getMaterialOptionsForType(material.type).some((item) => String(item.code || '').trim() === String(material.code || '').trim()) && (
-                                      <option value={material.code}>
-                                        {material.code}{material.name ? ` - ${material.name}` : ''}
-                                      </option>
-                                    )}
-                                    {getMaterialOptionsForType(material.type).map((item) => (
-                                      <option key={`child-material-${child.id}-${material.id}-${item.code}`} value={item.code}>
-                                        {getBomOptionLabel(item)}
-                                      </option>
-                                    ))}
-                                  </select>
+                                    getOptionValue={(item) => String(item?.code || '').trim()}
+                                    getOptionLabel={(item) => getBomOptionLabel(item)}
+                                  />
                                 </div>
                                 <div className="md:col-span-2">
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Nama Material</label>
@@ -5405,7 +6148,7 @@ export default function BOMManager({
             ) : (
               <div className="space-y-3">
                 <div className="text-xs text-slate-500">
-                  <span className="font-semibold text-slate-700">{whereUsedTargetCode}</span> dipakai di {whereUsedRows.length} parent.
+                  <span className="font-semibold text-slate-700">{whereUsedTargetCode}</span> dipakai di {whereUsedRows.length} baris BOM.
                 </div>
                 <div className="overflow-x-auto">
                   <table className="w-full text-xs">
@@ -5420,6 +6163,7 @@ export default function BOMManager({
                         <th className="p-2 text-left">Posisi</th>
                         <th className="p-2 text-left">Substitusi</th>
                         <th className="p-2 text-center">Rev</th>
+                        <th className="p-2 text-center">Status</th>
                         <th className="p-2 text-left">Note</th>
                         <th className="p-2 text-center">Aksi</th>
                       </tr>
@@ -5436,6 +6180,11 @@ export default function BOMManager({
                           <td className="p-2">{row.positionCode || '-'}</td>
                           <td className="p-2">{row.substituteCodes || '-'}</td>
                           <td className="p-2 text-center font-mono">{row.revisionNo}</td>
+                          <td className="p-2 text-center">
+                            <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold ${row.isActive ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
+                              {row.isActive ? 'Aktif' : 'Revisi'}
+                            </span>
+                          </td>
                           <td className="p-2">{row.note || '-'}</td>
                           <td className="p-2 text-center">
                             <button
@@ -5471,6 +6220,19 @@ export default function BOMManager({
                    {treeRevisionMode === 'selected' && revisionAuditParentCode && (
                      <span className="px-2 py-1 rounded-full bg-slate-100 text-slate-600 text-[9px] font-semibold">
                        Parent: {revisionAuditParentCode}
+                     </span>
+                   )}
+                   {treeRevisionMode !== 'selected' && structureParentFilter && (
+                     <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-indigo-100 text-indigo-700 text-[9px] font-semibold normal-case">
+                       Parent: {structureParentFilter}
+                       <button
+                         type="button"
+                         onClick={() => setStructureParentFilter('')}
+                         className="text-indigo-500 hover:text-indigo-800"
+                         title="Tampilkan semua struktur"
+                       >
+                         <X size={10} />
+                       </button>
                      </span>
                    )}
                  </div>
@@ -5516,20 +6278,72 @@ export default function BOMManager({
                  ) : bomTreeData.length === 0 ? (
                    <div className="p-6 text-center text-gray-400 text-xs">Belum ada struktur BOM. Tambah parent terlebih dahulu.</div>
                  ) : (
-                   bomTreeData.map((node, idx) => (
-                     <BomTreeNode
-                       key={`${node.code}-${idx}`}
-                       node={node}
-                       level={0}
-                       isLast={idx === bomTreeData.length - 1}
-                       ancestorHasSibling={[]}
-                     />
-                   ))
+                   <>
+                     {bomTreePaginationMeta.rows.map((node, idx) => (
+                       <BomTreeNode
+                         key={`${node.code}-${idx}`}
+                         node={node}
+                         level={0}
+                         isLast={idx === bomTreePaginationMeta.rows.length - 1}
+                         ancestorHasSibling={[]}
+                       />
+                     ))}
+                     <div className="pagination-component flex flex-col gap-3 border-t border-gray-200 bg-white px-3 py-3 text-xs sm:flex-row sm:items-center sm:justify-between">
+                       <div className="flex flex-wrap items-center gap-2">
+                         <span className="text-slate-500">Rows per page</span>
+                         <select
+                           value={bomTreePaginationMeta.perPage}
+                           onChange={(event) => setBomTreePagination({ page: 1, perPage: Number(event.target.value) || 25 })}
+                           className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700"
+                         >
+                           {bomTreeRowsPerPageOptions.map((option) => (
+                             <option key={option} value={option}>{option}</option>
+                           ))}
+                         </select>
+                         <span className="text-slate-500">
+                           Showing {bomTreePaginationMeta.startIndex} to {bomTreePaginationMeta.endIndex} of {bomTreePaginationMeta.total} entries
+                         </span>
+                       </div>
+                       <div className="flex flex-wrap items-center gap-1">
+                         <button
+                           type="button"
+                           onClick={() => setBomTreePagination((prev) => ({ ...prev, page: Math.max(1, bomTreePaginationMeta.page - 1) }))}
+                           disabled={bomTreePaginationMeta.page <= 1}
+                           className="rounded-md border border-slate-200 px-3 py-1.5 font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+                         >
+                           Previous
+                         </button>
+                         {buildBomPageSequence(bomTreePaginationMeta.page, bomTreePaginationMeta.totalPages).map((entry, index) => (
+                           entry.type === 'ellipsis' ? (
+                             <span key={`tree-ellipsis-${index}`} className="px-2 text-slate-400">…</span>
+                           ) : (
+                             <button
+                               key={`tree-page-${entry.value}`}
+                               type="button"
+                               onClick={() => setBomTreePagination((prev) => ({ ...prev, page: entry.value }))}
+                               className={`min-w-9 rounded-md border px-3 py-1.5 font-semibold ${bomTreePaginationMeta.page === entry.value ? 'border-indigo-500 bg-indigo-600 text-white' : 'border-slate-200 text-slate-700 hover:bg-slate-50'}`}
+                             >
+                               {entry.value}
+                             </button>
+                           )
+                         ))}
+                         <button
+                           type="button"
+                           onClick={() => setBomTreePagination((prev) => ({ ...prev, page: Math.min(bomTreePaginationMeta.totalPages, bomTreePaginationMeta.page + 1) }))}
+                           disabled={bomTreePaginationMeta.page >= bomTreePaginationMeta.totalPages}
+                           className="rounded-md border border-slate-200 px-3 py-1.5 font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+                         >
+                           Next
+                         </button>
+                       </div>
+                     </div>
+                   </>
                  )}
                </div>
             </div>
-          ) : (
-            <div className="overflow-x-auto flex-1">
+           ) : (
+             <>
+             <div className="overflow-x-auto flex-1">
               <table className="w-full text-xs text-left whitespace-nowrap">
                 <thead className="bg-gray-50 text-gray-600 font-bold border-b border-gray-200 sticky top-0 z-10 shadow-sm">
                   <tr>
@@ -5539,7 +6353,7 @@ export default function BOMManager({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
-                      {filteredItems.map(i => {
+                      {bomTablePaginationMeta.rows.map(i => {
                     const typeMeta = getBomDisplayMeta(i);
                     const itemCode = String(i.code || '').trim();
                     const canDeleteStructure = configuredParentCodes.has(itemCode);
@@ -5584,6 +6398,16 @@ export default function BOMManager({
                             <Layers size={14} />
                           </button>
                         )}
+                        {canDeleteStructure && (
+                          <button
+                            type="button"
+                            onClick={() => openParentInStructure(i.code)}
+                            className="text-indigo-500 hover:text-indigo-700"
+                            title="Buka Struktur BOM"
+                          >
+                            <FolderTree size={14} />
+                          </button>
+                        )}
                         <button onClick={() => openWhereUsed(i.code)} className="text-sky-500 hover:text-sky-700" title="Where Used"><BookOpenText size={14}/></button>
                         {allowEdit && canDeleteStructure && (
                           <button
@@ -5600,10 +6424,97 @@ export default function BOMManager({
                   )})}
                 </tbody>
               </table>
+              <div className="flex flex-col gap-3 border-t border-gray-200 bg-white px-3 py-3 text-xs sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-slate-500">Rows per page</span>
+                  <select
+                    value={bomTablePaginationMeta.perPage}
+                    onChange={(event) => setBomTablePagination({ page: 1, perPage: Number(event.target.value) || 25 })}
+                    className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700"
+                  >
+                    {bomTableRowsPerPageOptions.map((option) => (
+                      <option key={option} value={option}>{option}</option>
+                    ))}
+                  </select>
+                  <span className="text-slate-500">
+                    Showing {bomTablePaginationMeta.startIndex} to {bomTablePaginationMeta.endIndex} of {bomTablePaginationMeta.total} entries
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setBomTablePagination((prev) => ({ ...prev, page: Math.max(1, bomTablePaginationMeta.page - 1) }))}
+                    disabled={bomTablePaginationMeta.page <= 1}
+                    className="rounded-md border border-slate-200 px-3 py-1.5 font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    Previous
+                  </button>
+                  {buildBomPageSequence(bomTablePaginationMeta.page, bomTablePaginationMeta.totalPages).map((entry, index) => (
+                    entry.type === 'ellipsis' ? (
+                      <span key={`ellipsis-${index}`} className="px-2 text-slate-400">…</span>
+                    ) : (
+                      <button
+                        key={`page-${entry.value}`}
+                        type="button"
+                        onClick={() => setBomTablePagination((prev) => ({ ...prev, page: entry.value }))}
+                        className={`min-w-9 rounded-md border px-3 py-1.5 font-semibold ${bomTablePaginationMeta.page === entry.value ? 'border-indigo-500 bg-indigo-600 text-white' : 'border-slate-200 text-slate-700 hover:bg-slate-50'}`}
+                      >
+                        {entry.value}
+                      </button>
+                    )
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => setBomTablePagination((prev) => ({ ...prev, page: Math.min(bomTablePaginationMeta.totalPages, bomTablePaginationMeta.page + 1) }))}
+                    disabled={bomTablePaginationMeta.page >= bomTablePaginationMeta.totalPages}
+                    className="rounded-md border border-slate-200 px-3 py-1.5 font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
             </div>
+            <div className="mt-4 space-y-4">
+              <ImportHistoryTable
+                title="Riwayat Import BOM"
+                subtitle="Menampilkan batch upload BOM terakhir beserta status dan error detail."
+                rows={bomImportHistoryRows}
+                loading={bomImportHistoryLoading}
+                error={bomImportHistoryError}
+                onRefresh={fetchBomImportHistory}
+                noDataMessage="Belum ada riwayat import BOM."
+                columns={[
+                  { key: 'created_at', label: 'Upload Time' },
+                  { key: 'file_name', label: 'File Name', render: (row) => row.file_name || '-' },
+                  { key: 'total_rows', label: 'Rows', className: 'text-right', render: (row) => Number(row.total_rows || 0) },
+                  { key: 'status', label: 'Status' },
+                  { key: 'created_by_name', label: 'User', render: (row) => row.created_by_name || '-' },
+                  { key: 'error_message', label: 'Error', render: (row) => row.error_message || '-' },
+                ]}
+              />
+            </div>
+             </>
           )}
         </div>
       </div>
+
+      {bomImportSummary?.open && (
+        <ImportSummaryModal
+          open={Boolean(bomImportSummary?.open)}
+          title="Hasil Import BOM"
+          subtitle="Ringkasan eksekusi import dan baris bermasalah."
+          summary={bomImportSummary}
+          detailRows={Array.isArray(bomImportSummary.detailRows) ? bomImportSummary.detailRows : []}
+          detailColumns={[
+            { key: 'rowNumber', label: 'Row', className: 'text-right' },
+            { key: 'parentCode', label: 'Parent' },
+            { key: 'childCode', label: 'Child' },
+            { key: 'type', label: 'Type', render: (row) => String(row.type || '-').toUpperCase() },
+            { key: 'reason', label: 'Reason' },
+          ]}
+          onClose={() => setBomImportSummary(null)}
+        />
+      )}
 
       {/* Hidden Modals */}
 
@@ -5663,10 +6574,16 @@ export default function BOMManager({
                 <div className="bg-indigo-50 p-3 rounded-lg border border-indigo-100">
                   <h4 className="font-bold text-sm mb-2 text-indigo-800">1. Tambah Rencana</h4>
                   <div className="space-y-2">
-                    <select className="w-full p-2 border rounded text-xs" value={newPlan.fgId} onChange={e=>setNewPlan({...newPlan, fgId:e.target.value})}>
-                      <option value="">- Pilih FG -</option>
-                      {bomPickerOptions.FG.map(i => <option key={i.id} value={i.id}>{i.code} - {i.name}</option>)}
-                    </select>
+                    <SearchableSelectDropdown
+                      value={newPlan.fgId || ''}
+                      options={bomPickerOptions.FG}
+                      onChange={(value) => setNewPlan({ ...newPlan, fgId: value })}
+                      placeholder="- Pilih FG -"
+                      searchPlaceholder="Ketik kode FG / nama FG"
+                      emptyText="Master FG belum tersedia."
+                      getOptionValue={(item) => String(item?.id || '').trim()}
+                      getOptionLabel={(item) => getBomOptionLabel(item)}
+                    />
                     <input type="text" className="w-full p-2 border rounded text-xs" placeholder="Periode (Mis: Jan 2025)" value={newPlan.period} onChange={e=>setNewPlan({...newPlan, period:e.target.value})}/>
                     <div className="flex gap-2">
                       <input type="number" className="w-1/2 p-2 border rounded text-xs" placeholder="Qty" value={newPlan.qty} onChange={e=>setNewPlan({...newPlan, qty:e.target.value})}/>

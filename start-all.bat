@@ -11,3 +11,6 @@ if %errorlevel% neq 0 (
 ) else (
   echo Backend + Frontend berhasil dijalankan via PM2.
 )
+
+timeout /t 6 /nobreak >nul
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT_DIR%\scripts\open-dev-browser.ps1"

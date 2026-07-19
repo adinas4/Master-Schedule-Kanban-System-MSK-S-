@@ -9,6 +9,26 @@ const buildDefaultPeriod = () => {
   return `${label}-${now.getFullYear()}`;
 };
 
+const normalizeStockOpnameMode = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (['scan', 'scan_lot', 'scan-lot', 'lot'].includes(normalized)) return 'scan_lot';
+  if (['fallback', 'manual', 'fallback_count'].includes(normalized)) return 'fallback';
+  return 'blind_count';
+};
+
+const getStockOpnameModeLabel = (value) => {
+  const mode = normalizeStockOpnameMode(value);
+  if (mode === 'scan_lot') return 'Scan Lot';
+  if (mode === 'fallback') return 'Fallback';
+  return 'Blind Count';
+};
+
+const getStockOpnameStatusLabel = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return '-';
+  return normalized.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+};
+
 const TabStockOpname = (props) => {
   const {
     apiFetch,
@@ -17,8 +37,6 @@ const TabStockOpname = (props) => {
     formatRupiah,
     masterLocations = [],
     masterWarehouses = [],
-    soOpenSession,
-    fetchSoOpenSession,
     ensureAiConfigured,
     canUseAI,
     showToastMessage,
@@ -30,6 +48,9 @@ const TabStockOpname = (props) => {
   const [selectedSessionId, setSelectedSessionId] = useState(null);
   const [selectedSession, setSelectedSession] = useState(null);
   const [periodInput, setPeriodInput] = useState(buildDefaultPeriod());
+  const [sessionModeInput, setSessionModeInput] = useState('blind_count');
+  const [sessionLocationId, setSessionLocationId] = useState('');
+  const [stockOpnameOpenSession, setStockOpnameOpenSession] = useState(null);
 
   const [itemsLoading, setItemsLoading] = useState(false);
   const [itemsError, setItemsError] = useState('');
@@ -81,6 +102,13 @@ const TabStockOpname = (props) => {
     const parts = [location.id, getProcessLocationTypeLabel(location), location.fifo_lane || location.machine_note || ''].filter(Boolean);
     return parts.join(' - ');
   };
+  const getSessionLocationLabel = (location) => {
+    if (!location) return '-';
+    const locationId = String(location.id || '').trim();
+    const locationName = String(location.name || location.location_name || location.line_description || location.lineDescription || '').trim();
+    return [locationId, locationName].filter(Boolean).join(' - ');
+  };
+  const getSessionPeriodLabel = (session) => String(session?.opnamePeriod || session?.period || '').trim();
   const masterLocationById = useMemo(() => {
     const map = new Map();
     (masterLocations || []).forEach((location) => {
@@ -89,6 +117,13 @@ const TabStockOpname = (props) => {
     });
     return map;
   }, [masterLocations]);
+  useEffect(() => {
+    if (sessionLocationId) return;
+    const firstLocation = (masterLocations || [])[0];
+    if (firstLocation?.id) {
+      setSessionLocationId(String(firstLocation.id));
+    }
+  }, [masterLocations, sessionLocationId]);
   const matchAnyValue = (sourceValue, candidates = []) => {
     const normalizedSource = normalizeValue(sourceValue);
     if (!normalizedSource) return false;
@@ -226,7 +261,7 @@ const TabStockOpname = (props) => {
     setSessionsLoading(true);
     setSessionError('');
     try {
-      const data = await apiFetch('/api/so-sessions');
+      const data = await apiFetch('/api/stock-opname/sessions');
       setSessions(Array.isArray(data) ? data : []);
     } catch (error) {
       setSessionError(error.message || 'Gagal memuat session.');
@@ -238,27 +273,41 @@ const TabStockOpname = (props) => {
     }
   };
 
+  const loadOpenSession = async () => {
+    try {
+      const data = await apiFetch('/api/stock-opname/sessions/open');
+      setStockOpnameOpenSession(data || null);
+    } catch (error) {
+      setStockOpnameOpenSession(null);
+    }
+  };
+
   const loadItems = async (sessionId) => {
     if (!sessionId) return;
     setItemsLoading(true);
     setItemsError('');
     try {
-      const data = await apiFetch(`/api/so-sessions/${sessionId}/items`);
+      const data = await apiFetch(`/api/stock-opname/sessions/${sessionId}/lines`);
       const mapped = (Array.isArray(data) ? data : []).map((row) => ({
         id: row.id,
         itemCode: row.item_code,
-        itemName: row.item_name || '',
+        itemName: row.item_name || row.itemName || '',
         partNo: row.part_no || '-',
-        locationName: row.location_name || row.line_production || row.location_id || '',
+        locationName: row.location_name || row.locationName || row.line_production || row.lineProduction || row.location_id || row.locationId || '',
         locationId: row.location_id || '',
-        lineProduction: row.line_production || '',
+        lineProduction: row.line_production || row.lineProduction || '',
         unit: row.unit || '',
-        snp: Number(row.snp || 0),
+        snp: Number(row.snapshot_qty ?? row.snapshotQty ?? row.snp ?? 0),
         price: Number(row.price || 0),
-        bookQty: Number(row.book_qty || 0),
-        inputBox: Number(row.input_box || 0),
-        inputLoose: Number(row.input_loose || 0),
-        reason: row.reason || '',
+        bookQty: Number(row.snapshot_qty ?? row.snapshotQty ?? row.book_qty ?? row.bookQty ?? 0),
+        inputBox: Number(row.input_box || row.inputBox || 0),
+        inputLoose: Number(row.input_loose || row.inputLoose || 0),
+        countedQty: Number(row.counted_qty ?? row.countedQty ?? 0),
+        lotNo: row.lot_no || row.lotNo || '',
+        scanMode: row.scan_mode || row.scanMode || '',
+        scanSource: row.scan_source || row.scanSource || '',
+        scanValue: row.scan_value || row.scanValue || '',
+        reason: row.remarks || row.reason || '',
         hidden: false,
       }));
       setRows(mapped);
@@ -275,6 +324,7 @@ const TabStockOpname = (props) => {
 
   useEffect(() => {
     loadSessions();
+    loadOpenSession();
   }, []);
 
   useEffect(() => {
@@ -290,14 +340,25 @@ const TabStockOpname = (props) => {
 
   useEffect(() => {
     if (selectedSessionId) return;
-    if (soOpenSession?.id) {
-      setSelectedSessionId(soOpenSession.id);
+    if (stockOpnameOpenSession?.id) {
+      setSelectedSessionId(stockOpnameOpenSession.id);
       return;
     }
     if (sessions.length > 0) {
       setSelectedSessionId(sessions[0].id);
     }
-  }, [sessions, soOpenSession?.id, selectedSessionId]);
+  }, [sessions, stockOpnameOpenSession?.id, selectedSessionId]);
+
+  useEffect(() => {
+    if (!selectedSession) return;
+    setSessionModeInput(normalizeStockOpnameMode(selectedSession.mode));
+    if (selectedSession.locationId) {
+      setSessionLocationId(String(selectedSession.locationId));
+    }
+  }, [selectedSession]);
+
+  const sessionMode = normalizeStockOpnameMode(selectedSession?.mode || sessionModeInput);
+  const isScanLotMode = sessionMode === 'scan_lot';
 
   useEffect(() => {
     if (typeof document === 'undefined') return undefined;
@@ -326,10 +387,46 @@ const TabStockOpname = (props) => {
     const snpValue = Number(row.snp || 0);
     const inputBox = Number(row.inputBox || 0);
     const inputLoose = Number(row.inputLoose || 0);
-    const actualQty = inputBox * snpValue + inputLoose;
-    const difference = actualQty - Number(row.bookQty || 0);
-    return { ...row, actualQty, difference };
-  }), [visibleRows]);
+    const countedQty = Number.isFinite(Number(row.countedQty)) ? Number(row.countedQty) : 0;
+    const actualQty = sessionMode === 'scan_lot'
+      ? countedQty
+      : inputBox * snpValue + inputLoose;
+    const snapshotQty = Number(row.bookQty || 0);
+    const difference = actualQty - snapshotQty;
+    return { ...row, countedQty: actualQty, actualQty, snapshotQty, difference };
+  }), [visibleRows, sessionMode]);
+
+  const rowValidationMap = useMemo(() => {
+    const map = new Map();
+    computedRows.forEach((row) => {
+      const issues = [];
+      const lotNo = String(row.lotNo || '').trim();
+      const countedQty = Number(row.countedQty);
+      const inputBox = Number(row.inputBox || 0);
+      const inputLoose = Number(row.inputLoose || 0);
+      const reason = String(row.reason || '').trim();
+
+      if (isScanLotMode) {
+        if (!lotNo) issues.push('Lot No wajib diisi');
+        if (!Number.isFinite(countedQty) || countedQty < 0) issues.push('Qty fisik tidak valid');
+      } else {
+        if (!Number.isFinite(inputBox) || inputBox < 0) issues.push('KBN/Box tidak valid');
+        if (!Number.isFinite(inputLoose) || inputLoose < 0) issues.push('Remain tidak valid');
+      }
+
+      if (row.difference !== 0 && !reason) {
+        issues.push('Reason wajib diisi saat ada selisih');
+      }
+
+      map.set(row.id, issues);
+    });
+    return map;
+  }, [computedRows, isScanLotMode]);
+
+  const hasRowValidationIssues = useMemo(
+    () => Array.from(rowValidationMap.values()).some((issues) => Array.isArray(issues) && issues.length > 0),
+    [rowValidationMap],
+  );
 
   const varianceCount = useMemo(
     () => computedRows.filter((row) => row.difference !== 0).length,
@@ -397,19 +494,30 @@ const TabStockOpname = (props) => {
 
   const handleStartSession = async () => {
     const period = String(periodInput || '').trim();
+    const locationId = String(sessionLocationId || '').trim();
     if (!period) {
       setSessionError('Period wajib diisi.');
       return;
     }
+    if (!locationId) {
+      setSessionError('Location wajib dipilih.');
+      return;
+    }
     setSessionError('');
     try {
-      const result = await apiFetch('/api/so-sessions/start', {
+      const selectedLocation = (masterLocations || []).find((location) => String(location.id || '').trim() === locationId) || null;
+      const result = await apiFetch('/api/stock-opname/sessions', {
         method: 'POST',
-        body: JSON.stringify({ period }),
+        body: JSON.stringify({
+          period,
+          locationId,
+          locationName: selectedLocation?.name || selectedLocation?.location_name || '',
+          mode: sessionModeInput,
+        }),
       });
       await loadSessions();
+      await loadOpenSession();
       setSelectedSessionId(result?.id || null);
-      await fetchSoOpenSession?.();
     } catch (error) {
       setSessionError(error.message || 'Gagal start session.');
       if (showToastMessage) {
@@ -428,11 +536,12 @@ const TabStockOpname = (props) => {
       }
       return;
     }
-    const invalid = computedRows.find((row) => row.difference !== 0 && !String(row.reason || '').trim());
-    if (invalid) {
-      setItemsError(`Reason wajib diisi untuk item ${invalid.itemCode}.`);
+    const invalidRow = computedRows.find((row) => (rowValidationMap.get(row.id) || []).length > 0);
+    if (invalidRow) {
+      const firstIssue = rowValidationMap.get(invalidRow.id)?.[0] || 'Data baris belum valid.';
+      setItemsError(`Item ${invalidRow.itemCode}: ${firstIssue}.`);
       if (showToastMessage) {
-        showToastMessage(`Reason wajib diisi untuk item ${invalid.itemCode}.`);
+        showToastMessage(`Item ${invalidRow.itemCode}: ${firstIssue}.`);
       }
       return;
     }
@@ -441,18 +550,32 @@ const TabStockOpname = (props) => {
     try {
       const payload = computedRows.map((row) => ({
         itemCode: row.itemCode,
-        inputBox: Number(row.inputBox || 0),
-        inputLoose: Number(row.inputLoose || 0),
-        snp: Number(row.snp || 0),
+        itemName: row.itemName || '',
+        partNo: row.partNo || '',
+        unit: row.unit || '',
+        locationId: row.locationId || selectedSession?.locationId || '',
+        locationName: row.locationName || selectedSession?.locationName || '',
+        lotNo: sessionMode === 'scan_lot' ? String(row.lotNo || '').trim() : '',
+        batchId: row.batchId || null,
+        countedQty: sessionMode === 'scan_lot'
+          ? Number(row.countedQty || row.actualQty || 0)
+          : Number(row.actualQty || 0),
+        snapshotQty: Number(row.snapshotQty ?? row.bookQty ?? 0),
+        scanMode: sessionMode,
+        scanSource: sessionMode === 'scan_lot' ? 'scan' : 'manual',
+        scanValue: sessionMode === 'scan_lot' ? String(row.lotNo || '').trim() : '',
+        qualityStatus: 'ok',
         reason: row.reason || '',
+        remarks: row.reason || '',
       }));
-      await apiFetch(`/api/so-sessions/${selectedSessionId}/upload`, {
+      const result = await apiFetch(`/api/stock-opname/sessions/${selectedSessionId}/lines`, {
         method: 'POST',
-        body: JSON.stringify({ items: payload }),
+        body: JSON.stringify({ items: payload, mode: sessionMode }),
       });
       await loadSessions();
+      await loadOpenSession();
       await loadItems(selectedSessionId);
-      alert('Upload batch SO berhasil.');
+      alert(result?.ok ? 'Data stock opname tersimpan.' : 'Data stock opname tersimpan.');
     } catch (error) {
       setItemsError(error.message || 'Gagal upload SO.');
       if (showToastMessage) {
@@ -466,15 +589,22 @@ const TabStockOpname = (props) => {
   const handleFinalize = async () => {
     if (!selectedSessionId) return;
     if (finalizing) return;
+    if (hasRowValidationIssues) {
+      setItemsError('Lengkapi validasi baris terlebih dahulu sebelum finalize.');
+      if (showToastMessage) {
+        showToastMessage('Lengkapi validasi baris terlebih dahulu sebelum finalize.');
+      }
+      return;
+    }
     const ok = window.confirm('Finalize & Post? Stok akan disesuaikan.');
     if (!ok) return;
     setFinalizing(true);
     setItemsError('');
     try {
-      await apiFetch(`/api/so-sessions/${selectedSessionId}/finalize`, { method: 'POST' });
+      await apiFetch(`/api/stock-opname/sessions/${selectedSessionId}/post`, { method: 'POST' });
       await loadSessions();
+      await loadOpenSession();
       await loadItems(selectedSessionId);
-      await fetchSoOpenSession?.();
       alert('Stock Opname POSTED.');
     } catch (error) {
       setItemsError(error.message || 'Gagal finalize SO.');
@@ -522,10 +652,11 @@ const TabStockOpname = (props) => {
     try {
       const payload = {
         pageKey: 'stock_opname_variance',
-        title: `Stock Opname ${selectedSession?.period || ''}`,
+        title: `Stock Opname ${getSessionPeriodLabel(selectedSession) || ''}`,
         filters: {
-          period: selectedSession?.period || '',
+          period: getSessionPeriodLabel(selectedSession) || '',
           status: selectedSession?.status || '',
+          mode: selectedSession?.mode || sessionMode,
         },
         columns: [
           { key: 'itemCode', label: 'Kode Item' },
@@ -535,6 +666,8 @@ const TabStockOpname = (props) => {
           { key: 'snp', label: 'SNP' },
           { key: 'inputBox', label: 'Input KBN/Box' },
           { key: 'inputLoose', label: 'Input Eceran/Remain' },
+          { key: 'lotNo', label: 'Lot No' },
+          { key: 'countedQty', label: 'Qty Fisik' },
           { key: 'actualQty', label: 'Total Fisik' },
           { key: 'difference', label: 'Selisih' },
           { key: 'reason', label: 'Catatan' },
@@ -547,6 +680,8 @@ const TabStockOpname = (props) => {
           snp: Number(row.snp || 0),
           inputBox: Number(row.inputBox || 0),
           inputLoose: Number(row.inputLoose || 0),
+          lotNo: row.lotNo || '',
+          countedQty: Number(row.countedQty || 0),
           actualQty: Number(row.actualQty || 0),
           difference: Number(row.difference || 0),
           reason: row.reason || '',
@@ -583,28 +718,56 @@ const TabStockOpname = (props) => {
     }
     const XLSX = await ensureXlsx?.();
     if (!XLSX) return;
-    const exportRows = exportSourceRows.map((row, index) => ({
-      No: index + 1,
-      'Kode Item': row.itemCode,
-      'Nama Item': row.itemName || '',
-      'Lokasi Virtual': row.locationName || '',
-      'Kategori SO': selectedBlankoTarget ? printScopeLabel : 'Laporan',
-      Target: selectedBlankoTarget ? printTargetLabel : '',
-      'SNP (Qty/KBN)': Number(row.snp || 0),
-      'Input KBN/Box': '',
-      'Input Eceran/Remain': '',
-      'Total Fisik': '',
-      Selisih: '',
-      Status: '',
-      Catatan: '',
-    }));
+    const exportRows = selectedBlankoTarget
+      ? exportSourceRows.map((row, index) => ({
+        No: index + 1,
+        'Kode Item': row.itemCode,
+        'Nama Item': row.itemName || '',
+        'Lokasi Virtual': row.locationName || '',
+        'Kategori SO': printScopeLabel,
+        Target: printTargetLabel,
+        'SNP (Qty/KBN)': Number(row.snp || 0),
+        'Input KBN/Box': '',
+        'Input Eceran/Remain': '',
+        'Lot No': '',
+        'Qty Fisik': '',
+        'Total Fisik': '',
+        Selisih: '',
+        Status: '',
+        Catatan: '',
+      }))
+      : exportSourceRows.map((row, index) => isScanLotMode ? ({
+        No: index + 1,
+        'Kode Item': row.itemCode,
+        'Nama Item': row.itemName || '',
+        'Lokasi Virtual': row.locationName || '',
+        'Stok Sistem': Number(row.bookQty || 0),
+        'Lot No': row.lotNo || '',
+        'Qty Fisik': Number(row.actualQty || 0),
+        Selisih: Number(row.difference || 0),
+        Status: row.difference === 0 ? 'Cocok' : 'Selisih',
+        Catatan: row.reason || '',
+      }) : ({
+        No: index + 1,
+        'Kode Item': row.itemCode,
+        'Nama Item': row.itemName || '',
+        'Lokasi Virtual': row.locationName || '',
+        'Stok Sistem': Number(row.bookQty || 0),
+        'SNP (Qty/KBN)': Number(row.snp || 0),
+        'Input KBN/Box': Number(row.inputBox || 0),
+        'Input Eceran/Remain': Number(row.inputLoose || 0),
+        'Total Fisik': Number(row.actualQty || 0),
+        Selisih: Number(row.difference || 0),
+        Status: row.difference === 0 ? 'Cocok' : 'Selisih',
+        Catatan: row.reason || '',
+      }));
     const ws = XLSX.utils.json_to_sheet(exportRows);
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Blanko SO');
-    const periodTag = selectedSession?.period ? String(selectedSession.period).replace(/\s+/g, '_') : 'SO';
+    XLSX.utils.book_append_sheet(wb, ws, selectedBlankoTarget ? 'Blanko SO' : (isScanLotMode ? 'Scan Lot' : 'Blind Count'));
+    const periodTag = getSessionPeriodLabel(selectedSession) ? String(getSessionPeriodLabel(selectedSession)).replace(/\s+/g, '_') : 'SO';
     const dateTag = new Date().toISOString().split('T')[0];
-    const scopeTag = selectedBlankoTarget ? normalizeValue(printScopeLabel).replace(/\s+/g, '_') : 'report';
-    XLSX.writeFile(wb, `Blanko_Stock_Opname_${scopeTag}_${periodTag}_${dateTag}.xlsx`);
+    const scopeTag = selectedBlankoTarget ? normalizeValue(printScopeLabel).replace(/\s+/g, '_') : (isScanLotMode ? 'scan_lot' : 'blind_count');
+    XLSX.writeFile(wb, `Stock_Opname_${scopeTag}_${periodTag}_${dateTag}.xlsx`);
   };
 
   const handlePrintCurrentView = () => {
@@ -628,15 +791,15 @@ const TabStockOpname = (props) => {
         </div>
       </div>
 
-      {soOpenSession && (
+      {stockOpnameOpenSession && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
-          Stock Opname sedang OPEN ({soOpenSession.period}). Hindari input produksi/receiving sampai selesai.
+          Stock Opname sedang OPEN ({getSessionPeriodLabel(stockOpnameOpenSession)}). Hindari input produksi/receiving sampai selesai.
         </div>
       )}
 
       <div className="bg-white rounded-xl border p-4 space-y-4">
         <div className="text-sm font-semibold">Start Session</div>
-        <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-3 items-end">
+        <div className="grid grid-cols-1 md:grid-cols-[1fr_1fr_1fr_auto] gap-3 items-end">
           <div>
             <label className="block text-[10px] uppercase text-slate-400 mb-1">Period</label>
             <input
@@ -646,6 +809,33 @@ const TabStockOpname = (props) => {
               onChange={(e) => setPeriodInput(e.target.value)}
             />
           </div>
+          <div>
+            <label className="block text-[10px] uppercase text-slate-400 mb-1">Location</label>
+            <select
+              className="border p-2 rounded w-full text-sm bg-white"
+              value={sessionLocationId}
+              onChange={(e) => setSessionLocationId(e.target.value)}
+            >
+              <option value="">Pilih location</option>
+              {(masterLocations || []).map((location) => (
+                <option key={location.id} value={location.id}>
+                  {getSessionLocationLabel(location)}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-[10px] uppercase text-slate-400 mb-1">Mode</label>
+            <select
+              className="border p-2 rounded w-full text-sm bg-white"
+              value={sessionModeInput}
+              onChange={(e) => setSessionModeInput(normalizeStockOpnameMode(e.target.value))}
+            >
+              <option value="blind_count">Blind Count</option>
+              <option value="scan_lot">Scan Lot</option>
+              <option value="fallback">Fallback</option>
+            </select>
+          </div>
           <button
             type="button"
             onClick={handleStartSession}
@@ -653,6 +843,11 @@ const TabStockOpname = (props) => {
           >
             <Play size={14} /> Start Stock Opname
           </button>
+        </div>
+        <div className="text-[11px] text-slate-500">
+          {sessionModeInput === 'scan_lot'
+            ? 'Mode Scan Lot menuntut input Lot No dan Qty fisik per baris.'
+            : 'Mode Blind Count fokus ke input KBN/Box + remain, lalu sistem hitung total fisik.'}
         </div>
         {sessionError && <div className="text-xs text-red-600">{sessionError}</div>}
       </div>
@@ -676,9 +871,12 @@ const TabStockOpname = (props) => {
             <table className="min-w-full text-xs">
               <thead className="bg-slate-100 text-slate-600">
                 <tr>
-                  <th className="text-left p-2">Period</th>
+                  <th className="text-left p-2">Session</th>
+                  <th className="text-left p-2">Location</th>
+                  <th className="text-left p-2">Mode</th>
                   <th className="text-left p-2">Status</th>
                   <th className="text-right p-2">Items</th>
+                  <th className="text-right p-2">Lines</th>
                   <th className="text-right p-2">Variance</th>
                   <th className="text-left p-2">Created</th>
                   <th className="text-left p-2">Action</th>
@@ -687,11 +885,14 @@ const TabStockOpname = (props) => {
               <tbody>
                 {sessions.map((session) => (
                   <tr key={session.id} className="border-t">
-                    <td className="p-2 font-semibold">{session.period}</td>
-                    <td className="p-2">{session.status}</td>
-                    <td className="p-2 text-right">{formatNumber0(session.item_count || 0)}</td>
-                    <td className="p-2 text-right">{formatNumber0(session.variance_count || 0)}</td>
-                    <td className="p-2">{session.created_at ? new Date(session.created_at).toLocaleDateString('id-ID') : '-'}</td>
+                    <td className="p-2 font-semibold">{session.sessionNo || session.session_no || '-'}</td>
+                    <td className="p-2">{session.locationName || session.location_name || '-'}</td>
+                    <td className="p-2">{getStockOpnameModeLabel(session.mode)}</td>
+                    <td className="p-2">{getStockOpnameStatusLabel(session.status)}</td>
+                    <td className="p-2 text-right">{formatNumber0(session.itemCount || session.item_count || 0)}</td>
+                    <td className="p-2 text-right">{formatNumber0(session.lineCount || session.line_count || 0)}</td>
+                    <td className="p-2 text-right">{formatNumber0(session.varianceCount || session.variance_count || 0)}</td>
+                    <td className="p-2">{session.createdAt || session.created_at ? new Date(session.createdAt || session.created_at).toLocaleDateString('id-ID') : '-'}</td>
                     <td className="p-2">
                       <button
                         type="button"
@@ -704,7 +905,7 @@ const TabStockOpname = (props) => {
                   </tr>
                 ))}
                 {sessions.length === 0 && (
-                  <tr><td colSpan="6" className="p-3 text-center text-slate-400">Belum ada session.</td></tr>
+                  <tr><td colSpan="9" className="p-3 text-center text-slate-400">Belum ada session.</td></tr>
                 )}
               </tbody>
             </table>
@@ -717,7 +918,7 @@ const TabStockOpname = (props) => {
           <div>
             <div className="text-sm font-semibold">Tally Input</div>
             <div className="text-xs text-slate-500">
-              {selectedSession ? `Session ${selectedSession.period} (${selectedSession.status})` : 'Pilih session terlebih dahulu.'}
+              {selectedSession ? `Session ${getSessionPeriodLabel(selectedSession)} (${getStockOpnameStatusLabel(selectedSession.status)}) - ${getStockOpnameModeLabel(selectedSession.mode)}` : 'Pilih session terlebih dahulu.'}
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -733,7 +934,7 @@ const TabStockOpname = (props) => {
               type="button"
               onClick={handleUploadBatch}
               className="px-3 py-1.5 text-xs bg-indigo-600 text-white rounded flex items-center gap-2"
-              disabled={!selectedSessionId || uploading}
+              disabled={!selectedSessionId || uploading || hasRowValidationIssues}
             >
               <Upload size={12} />
               {uploading ? 'Uploading...' : 'Upload Batch SO'}
@@ -786,7 +987,7 @@ const TabStockOpname = (props) => {
               type="button"
               onClick={handleFinalize}
               className="px-3 py-1.5 text-xs bg-emerald-600 text-white rounded flex items-center gap-2"
-              disabled={!selectedSessionId || finalizing}
+              disabled={!selectedSessionId || finalizing || hasRowValidationIssues}
             >
               <CheckCircle size={12} />
               {finalizing ? 'Posting...' : 'Finalize & Post'}
@@ -852,6 +1053,12 @@ const TabStockOpname = (props) => {
 
         {itemsError && <div className="text-xs text-red-600">{itemsError}</div>}
 
+        {hasRowValidationIssues && (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+            Lengkapi Lot No / Qty fisik / Reason sesuai mode sebelum upload atau finalize.
+          </div>
+        )}
+
         {itemsLoading && <div className="text-xs text-slate-400">Memuat item...</div>}
 
         {!itemsLoading && selectedSessionId && (
@@ -864,9 +1071,18 @@ const TabStockOpname = (props) => {
                   {showSystemQty && (
                     <th className="text-right p-3 border w-[130px]">Stok Sistem</th>
                   )}
-                  <th className="text-right p-3 border w-[120px]">SNP (Qty/KBN)</th>
-                  <th className="text-right p-3 border w-[130px]">Input KBN / Box</th>
-                  <th className="text-right p-3 border w-[150px]">Input Eceran / Remain</th>
+                  {sessionMode === 'scan_lot' ? (
+                    <>
+                      <th className="text-left p-3 border w-[180px]">Lot No</th>
+                      <th className="text-right p-3 border w-[130px]">Qty Fisik</th>
+                    </>
+                  ) : (
+                    <>
+                      <th className="text-right p-3 border w-[120px]">SNP (Qty/KBN)</th>
+                      <th className="text-right p-3 border w-[130px]">Input KBN / Box</th>
+                      <th className="text-right p-3 border w-[150px]">Input Eceran / Remain</th>
+                    </>
+                  )}
                   <th className="text-right p-3 border w-[140px]">Total Fisik</th>
                   <th className="text-right p-3 border w-[130px]">Selisih</th>
                   <th className="text-center p-3 border w-[130px]">Status</th>
@@ -881,6 +1097,7 @@ const TabStockOpname = (props) => {
                   const isDiff = diff !== 0;
                   const snpValue = Number(row.snp || 0);
                   const snpMissing = !Number.isFinite(snpValue) || snpValue <= 0;
+                  const rowIssues = rowValidationMap.get(row.id) || [];
                   return (
                     <tr key={row.id} className={`border-t ${isDiff ? 'bg-rose-50' : ''}`}>
                       <td className="p-3 border">
@@ -894,31 +1111,62 @@ const TabStockOpname = (props) => {
                       {showSystemQty && (
                         <td className="p-3 border text-right">{formatNumber0(row.bookQty)}</td>
                       )}
-                      <td className="p-3 border text-right">
-                        {formatNumber0(row.snp)}
-                      </td>
-                      <td className="p-3 border text-right">
-                        <input
-                          type="number"
-                          className={`border rounded px-2 py-2 w-full text-right text-[12px] ${snpMissing ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : ''}`}
-                          value={row.inputBox}
-                          min={0}
-                          disabled={snpMissing}
-                          onChange={(e) => handleRowChange(row.id, 'inputBox', Number(e.target.value || 0))}
-                        />
-                        {snpMissing && (
-                          <div className="mt-1 text-[10px] text-rose-500">Master SNP 0</div>
-                        )}
-                      </td>
-                      <td className="p-3 border text-right">
-                        <input
-                          type="number"
-                          className="border rounded px-2 py-2 w-full text-right text-[12px]"
-                          value={row.inputLoose}
-                          min={0}
-                          onChange={(e) => handleRowChange(row.id, 'inputLoose', Number(e.target.value || 0))}
-                        />
-                      </td>
+                      {sessionMode === 'scan_lot' ? (
+                        <>
+                          <td className="p-3 border">
+                            <input
+                              type="text"
+                              className={`border rounded px-2 py-2 w-full text-[12px] ${rowIssues.some((issue) => issue.includes('Lot No')) ? 'border-amber-400 bg-amber-50' : ''}`}
+                              value={row.lotNo}
+                              onChange={(e) => handleRowChange(row.id, 'lotNo', e.target.value)}
+                              placeholder="Scan / isi lot"
+                            />
+                            {rowIssues.some((issue) => issue.includes('Lot No')) && (
+                              <div className="mt-1 text-[10px] text-amber-600">{rowIssues.find((issue) => issue.includes('Lot No'))}</div>
+                            )}
+                          </td>
+                          <td className="p-3 border text-right">
+                            <input
+                              type="number"
+                              className={`border rounded px-2 py-2 w-full text-right text-[12px] ${rowIssues.some((issue) => issue.includes('Qty fisik')) ? 'border-amber-400 bg-amber-50' : ''}`}
+                              value={row.countedQty}
+                              min={0}
+                              onChange={(e) => handleRowChange(row.id, 'countedQty', Number(e.target.value || 0))}
+                            />
+                            {rowIssues.some((issue) => issue.includes('Qty fisik')) && (
+                              <div className="mt-1 text-[10px] text-amber-600">{rowIssues.find((issue) => issue.includes('Qty fisik'))}</div>
+                            )}
+                          </td>
+                        </>
+                      ) : (
+                        <>
+                          <td className="p-3 border text-right">
+                            {formatNumber0(row.snp)}
+                          </td>
+                          <td className="p-3 border text-right">
+                            <input
+                              type="number"
+                              className={`border rounded px-2 py-2 w-full text-right text-[12px] ${snpMissing ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : ''}`}
+                              value={row.inputBox}
+                              min={0}
+                              disabled={snpMissing}
+                              onChange={(e) => handleRowChange(row.id, 'inputBox', Number(e.target.value || 0))}
+                            />
+                            {snpMissing && (
+                              <div className="mt-1 text-[10px] text-rose-500">Master SNP 0</div>
+                            )}
+                          </td>
+                          <td className="p-3 border text-right">
+                            <input
+                              type="number"
+                              className="border rounded px-2 py-2 w-full text-right text-[12px]"
+                              value={row.inputLoose}
+                              min={0}
+                              onChange={(e) => handleRowChange(row.id, 'inputLoose', Number(e.target.value || 0))}
+                            />
+                          </td>
+                        </>
+                      )}
                       <td className="p-3 border text-right text-[13px] font-semibold">{formatNumber0(row.actualQty)}</td>
                       <td className={`p-3 border text-right text-[13px] font-semibold ${diffTone}`}>
                         {diff > 0 ? `+${formatNumber0(diff)}` : formatNumber0(diff)}
@@ -934,14 +1182,17 @@ const TabStockOpname = (props) => {
                           </span>
                         )}
                       </td>
-                      <td className="p-3 border">
-                        <input
-                          className={`border rounded px-2 py-2 w-full text-[11px] ${isDiff && !row.reason ? 'border-rose-400' : ''}`}
-                          value={row.reason}
-                          onChange={(e) => handleRowChange(row.id, 'reason', e.target.value)}
-                          placeholder={isDiff ? 'Wajib isi reason' : ''}
-                        />
-                      </td>
+                          <td className="p-3 border">
+                            <input
+                              className={`border rounded px-2 py-2 w-full text-[11px] ${rowIssues.some((issue) => issue.includes('Reason wajib')) ? 'border-rose-400 bg-rose-50' : ''}`}
+                              value={row.reason}
+                              onChange={(e) => handleRowChange(row.id, 'reason', e.target.value)}
+                              placeholder={isDiff ? 'Wajib isi reason' : ''}
+                            />
+                            {rowIssues.some((issue) => issue.includes('Reason wajib')) && (
+                              <div className="mt-1 text-[10px] text-rose-600">{rowIssues.find((issue) => issue.includes('Reason wajib'))}</div>
+                            )}
+                          </td>
                       <td className="p-3 border text-center">
                         <button
                           type="button"
@@ -955,7 +1206,7 @@ const TabStockOpname = (props) => {
                   );
                 })}
                 {tallyRows.length === 0 && (
-                  <tr><td colSpan={showSystemQty ? 11 : 10} className="p-3 text-center text-slate-400">Belum ada item.</td></tr>
+                  <tr><td colSpan={sessionMode === 'scan_lot' ? (showSystemQty ? 10 : 9) : (showSystemQty ? 11 : 10)} className="p-3 text-center text-slate-400">Belum ada item.</td></tr>
                 )}
               </tbody>
             </table>
@@ -1003,11 +1254,14 @@ const TabStockOpname = (props) => {
                     <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                       <div className="flex items-start gap-3">
                         <img src={logoPrl} alt="Logo MRP" className="h-12 w-auto object-contain" />
-                        <div>
-                          <div className="text-lg font-bold tracking-wide text-slate-900">{printTitle}</div>
-                          <div className="text-[11px] text-slate-600">Master Schedule &amp; Kanban System (MSK-S)</div>
+                          <div>
+                            <div className="text-lg font-bold tracking-wide text-slate-900">{printTitle}</div>
+                            <div className="text-[11px] text-slate-600">Master Schedule &amp; Kanban System (MSK-S)</div>
+                            <div className="mt-1 text-[11px] text-slate-600">
+                              <span className="font-semibold">Mode:</span> {getStockOpnameModeLabel(selectedSession?.mode || sessionMode)}
+                            </div>
                           <div className="mt-1 text-[11px] text-slate-600">
-                            <span className="font-semibold">Period:</span> {selectedSession?.period || '-'}
+                            <span className="font-semibold">Period:</span> {getSessionPeriodLabel(selectedSession) || '-'}
                           </div>
                           <div className="text-[11px] text-slate-600">
                             <span className="font-semibold">Status:</span> {selectedSession?.status || '-'}
@@ -1040,8 +1294,9 @@ const TabStockOpname = (props) => {
                 </div>
                 <div className="flex items-start justify-between border-b pb-3 mb-3 print:hidden">
                   <div>
-                    <div className="text-lg font-bold">{printTitle}</div>
-                    <div className="text-xs text-slate-600">Period: {selectedSession?.period || '-'}</div>
+                  <div className="text-lg font-bold">{printTitle}</div>
+                    <div className="text-xs text-slate-600">Mode: {getStockOpnameModeLabel(selectedSession?.mode || sessionMode)}</div>
+                    <div className="text-xs text-slate-600">Period: {getSessionPeriodLabel(selectedSession) || '-'}</div>
                     <div className="text-xs text-slate-600">Status: {selectedSession?.status || '-'}</div>
                     {printMode === 'blanko' && (
                       <div className="mt-1 text-xs text-slate-600">
@@ -1113,7 +1368,7 @@ const TabStockOpname = (props) => {
                         </div>
                         <div>
                           <div className="uppercase tracking-wide text-slate-400">Periode</div>
-                          <div className="mt-1 font-semibold text-slate-900">{selectedSession?.period || '-'}</div>
+                          <div className="mt-1 font-semibold text-slate-900">{getSessionPeriodLabel(selectedSession) || '-'}</div>
                         </div>
                         <div>
                           <div className="uppercase tracking-wide text-slate-400">Status</div>
@@ -1138,13 +1393,35 @@ const TabStockOpname = (props) => {
                         {printMode !== 'blanko' && (
                           <th className="text-right p-2 border">Stok Sistem</th>
                         )}
-                        <th className="text-right p-2 border">SNP</th>
-                        <th className="text-right p-2 border">KBN/Box</th>
-                        <th className="text-right p-2 border">Remain</th>
-                        <th className="text-right p-2 border">Total Fisik</th>
-                        <th className="text-right p-2 border">Selisih</th>
-                        <th className="text-center p-2 border">Status</th>
-                        <th className="text-left p-2 border">Catatan</th>
+                        {printMode === 'blanko' ? (
+                          <>
+                            <th className="text-right p-2 border">SNP</th>
+                            <th className="text-right p-2 border">KBN/Box</th>
+                            <th className="text-right p-2 border">Remain</th>
+                            <th className="text-right p-2 border">Total Fisik</th>
+                            <th className="text-right p-2 border">Selisih</th>
+                            <th className="text-center p-2 border">Status</th>
+                            <th className="text-left p-2 border">Catatan</th>
+                          </>
+                        ) : isScanLotMode ? (
+                          <>
+                            <th className="text-left p-2 border">Lot No</th>
+                            <th className="text-right p-2 border">Qty Fisik</th>
+                            <th className="text-right p-2 border">Selisih</th>
+                            <th className="text-center p-2 border">Status</th>
+                            <th className="text-left p-2 border">Catatan</th>
+                          </>
+                        ) : (
+                          <>
+                            <th className="text-right p-2 border">SNP</th>
+                            <th className="text-right p-2 border">KBN/Box</th>
+                            <th className="text-right p-2 border">Remain</th>
+                            <th className="text-right p-2 border">Total Fisik</th>
+                            <th className="text-right p-2 border">Selisih</th>
+                            <th className="text-center p-2 border">Status</th>
+                            <th className="text-left p-2 border">Catatan</th>
+                          </>
+                        )}
                       </tr>
                     </thead>
                     <tbody>
@@ -1177,26 +1454,49 @@ const TabStockOpname = (props) => {
                           <td className="p-2 border font-semibold">{row.itemCode}</td>
                           <td className="p-2 border">{row.locationName || '-'}</td>
                           <td className="p-2 border text-right">{formatNumber0(row.bookQty)}</td>
-                          <td className="p-2 border text-right">{formatNumber0(row.snp)}</td>
-                          <td className="p-2 border text-right">{formatNumber0(row.inputBox)}</td>
-                          <td className="p-2 border text-right">{formatNumber0(row.inputLoose)}</td>
-                          <td className="p-2 border text-right">{formatNumber0(row.actualQty)}</td>
-                          <td className="p-2 border text-right">{row.difference > 0 ? `+${formatNumber0(row.difference)}` : formatNumber0(row.difference)}</td>
-                          <td className="p-2 border text-center">{row.difference === 0 ? 'Cocok' : 'Selisih'}</td>
-                          <td className="p-2 border">{row.reason || '-'}</td>
+                          {isScanLotMode ? (
+                            <>
+                              <td className="p-2 border">{row.lotNo || '-'}</td>
+                              <td className="p-2 border text-right">{formatNumber0(row.actualQty)}</td>
+                              <td className="p-2 border text-right">{row.difference > 0 ? `+${formatNumber0(row.difference)}` : formatNumber0(row.difference)}</td>
+                              <td className="p-2 border text-center">{row.difference === 0 ? 'Cocok' : 'Selisih'}</td>
+                              <td className="p-2 border">{row.reason || '-'}</td>
+                            </>
+                          ) : (
+                            <>
+                              <td className="p-2 border text-right">{formatNumber0(row.snp)}</td>
+                              <td className="p-2 border text-right">{formatNumber0(row.inputBox)}</td>
+                              <td className="p-2 border text-right">{formatNumber0(row.inputLoose)}</td>
+                              <td className="p-2 border text-right">{formatNumber0(row.actualQty)}</td>
+                              <td className="p-2 border text-right">{row.difference > 0 ? `+${formatNumber0(row.difference)}` : formatNumber0(row.difference)}</td>
+                              <td className="p-2 border text-center">{row.difference === 0 ? 'Cocok' : 'Selisih'}</td>
+                              <td className="p-2 border">{row.reason || '-'}</td>
+                            </>
+                          )}
                         </tr>
                       ))}
                       {filteredBlankoRows.length === 0 && (
-                        <tr><td colSpan={printMode !== 'blanko' ? 11 : 10} className="p-3 text-center text-slate-400">Belum ada data.</td></tr>
+                        <tr><td colSpan={printMode !== 'blanko' ? (isScanLotMode ? 9 : 11) : 10} className="p-3 text-center text-slate-400">Belum ada data.</td></tr>
                       )}
                     </tbody>
                     {filteredBlankoRows.length > 0 && printMode !== 'blanko' && (
                       <tfoot>
                         <tr className="bg-slate-50">
-                          <td className="p-2 border text-right font-semibold" colSpan="7">Total</td>
-                          <td className="p-2 border text-right font-semibold">{formatNumber0(totalActualQty)}</td>
-                          <td className="p-2 border text-right font-semibold">{totalDiffQty > 0 ? `+${formatNumber0(totalDiffQty)}` : formatNumber0(totalDiffQty)}</td>
-                          <td className="p-2 border" colSpan="2" />
+                          {isScanLotMode ? (
+                            <>
+                              <td className="p-2 border text-right font-semibold" colSpan="5">Total</td>
+                              <td className="p-2 border text-right font-semibold">{formatNumber0(totalActualQty)}</td>
+                              <td className="p-2 border text-right font-semibold">{totalDiffQty > 0 ? `+${formatNumber0(totalDiffQty)}` : formatNumber0(totalDiffQty)}</td>
+                              <td className="p-2 border" colSpan="2" />
+                            </>
+                          ) : (
+                            <>
+                              <td className="p-2 border text-right font-semibold" colSpan="7">Total</td>
+                              <td className="p-2 border text-right font-semibold">{formatNumber0(totalActualQty)}</td>
+                              <td className="p-2 border text-right font-semibold">{totalDiffQty > 0 ? `+${formatNumber0(totalDiffQty)}` : formatNumber0(totalDiffQty)}</td>
+                              <td className="p-2 border" colSpan="2" />
+                            </>
+                          )}
                         </tr>
                       </tfoot>
                     )}

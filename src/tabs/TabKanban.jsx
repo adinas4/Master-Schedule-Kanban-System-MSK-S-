@@ -30,6 +30,7 @@ import {
 import { QRCodeCanvas, QRCodeSVG } from 'qrcode.react';
 import logoPrl from '../assets/kop-mrp.png';
 import logoMatra from '../assets/logo-matra.png';
+import SearchableSelectDropdown from '../components/SearchableSelectDropdown';
 
 const normalizeReceiveDoNumber = (value) => String(value || '').trim();
 
@@ -65,11 +66,13 @@ const TabKanban = (props) => {
     deliveryNotesLoading,
     dnDetailEditable,
     dnDetailEdits,
+    dnHeaderEdits,
     dnDetailLoading,
     dnDetailRows,
     dnForm,
     dnPrintLoading,
     dnPrintPayload,
+    dnPrintMode,
     dnStatusFlowList,
     emptyKanbanForm,
     extractAreaNote,
@@ -87,6 +90,8 @@ const TabKanban = (props) => {
     getKanbanCardsLabel,
     getRequestIdLabel,
     handleApproveKanban,
+    handleBatchApproveKanban,
+    handleBatchApproveAndDn,
     handleApproveAndCreateDn,
     handleBatchSubmit,
     handleCreateDn,
@@ -100,6 +105,9 @@ const TabKanban = (props) => {
     handleDnPrintPdf,
     handleEmptyKanbanSubmit,
     handleManualRequest,
+    queueManualRequestFromForm,
+    closeManualRequestModal,
+    updateManualRequestQueueRow,
     handleProcessScan,
     handleReceive,
     handleRejectKanban,
@@ -109,21 +117,29 @@ const TabKanban = (props) => {
     handleKanbanProcessStart,
     handleKanbanProcessFinish,
     items,
+    itemSupplierMap,
     kanbanCategory,
     kanbanCategoryFilter,
     kanbanDashboardCategoryFilter,
+    kanbanDnFilters,
     kanbanDnPaginationMeta,
+    kanbanDnStatusOptions,
+    kanbanDnSupplierOptions,
     kanbanEditMode,
     kanbanEmptyPaginationMeta,
     kanbanError,
     kanbanLoading,
     kanbanPaginationMeta,
     kanbanRequestStatusFilter,
+    kanbanRequestCategoryFilter,
+    kanbanRequestFlowFilter,
     kanbanRequestQuickFilter,
     kanbanRequestFilters,
     kanbanReceivingPaginationMeta,
     kanbanRequests,
     getKanbanRequestHealth,
+    getKanbanRequestCategoryMeta,
+    getKanbanRequestFlowMeta,
     kanbanSearch,
     kanbanSettings,
     kanbanSettingsByCode,
@@ -133,6 +149,8 @@ const TabKanban = (props) => {
     isStockOpnameLocked,
     mainTab,
     manualRequestForm,
+    manualRequestQueue,
+    setManualRequestQueue,
     masterAreas,
     masterDeliveries,
     masterCategories,
@@ -164,11 +182,15 @@ const TabKanban = (props) => {
     resolveVendorFromSupplier,
     scanActiveResult,
     scanError,
+    scanCameraStatus,
     scanInput,
     scanMode,
     scanResults,
     scanVideoRef,
+    startScanner,
+    stopScanner,
     scheduleForm,
+    selectedKanban,
     selectedDnDetail,
     selectedRequestIds,
     setMainTab,
@@ -177,12 +199,16 @@ const TabKanban = (props) => {
     setConsumeQty,
     setDnDetailEdits,
     setDnForm,
+    setDnHeaderEdits,
     setEmptyKanbanForm,
     setKanbanCategory,
     setKanbanCategoryFilter,
     setKanbanDashboardCategoryFilter,
+    setKanbanDnFilters,
     setKanbanEditMode,
     setKanbanRequestStatusFilter,
+    setKanbanRequestCategoryFilter,
+    setKanbanRequestFlowFilter,
     setKanbanRequestQuickFilter,
     setKanbanRequestFilters,
     setKanbanSearch,
@@ -200,6 +226,7 @@ const TabKanban = (props) => {
     setScanInput,
     setScanMode,
     setScheduleForm,
+    setTablePagination,
     setSelectedRequestIds,
     setShowBatchModal,
     setShowConsumeModal,
@@ -227,9 +254,227 @@ const TabKanban = (props) => {
   } = props;
 
   const getDisplayPrlQty = (row) => row?.effective_prl_qty ?? row?.prl_month_qty;
+  const updateKanbanDnFilter = (key, value) => {
+    setKanbanDnFilters?.((prev) => ({
+      ...(prev || {}),
+      [key]: value,
+    }));
+    setTablePagination?.((prev) => ({
+      ...prev,
+      kanbanDn: { ...(prev.kanbanDn || {}), page: 1 },
+    }));
+  };
+  const resetKanbanDnFilters = () => {
+    setKanbanDnFilters?.({ search: '', supplier: 'all', status: 'all' });
+    setTablePagination?.((prev) => ({
+      ...prev,
+      kanbanDn: { ...(prev.kanbanDn || {}), page: 1 },
+    }));
+  };
+  const parseDnDateOnly = (value) => {
+    if (!value) return null;
+    const [year, month, day] = String(value).slice(0, 10).split('-').map(Number);
+    if (!year || !month || !day) return null;
+    return new Date(year, month - 1, day);
+  };
+  const formatDnDate = (value) => {
+    const date = parseDnDateOnly(value);
+    return date ? date.toLocaleDateString('id-ID') : '-';
+  };
+  const getDnDateInputValue = (value) => String(value || '').slice(0, 10);
+  const getTodayDnDateInput = () => {
+    const date = new Date();
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  };
+  const compareDnDateInput = (left, right) => {
+    const a = getDnDateInputValue(left);
+    const b = getDnDateInputValue(right);
+    if (!a || !b) return null;
+    return a.localeCompare(b);
+  };
+  const normalizeDnDeliveryType = (value) => {
+    const raw = String(value || '').trim().toLowerCase();
+    if (raw === 'urgent') return 'urgent';
+    if (raw === 'additional') return 'additional';
+    return 'normal';
+  };
+  const getDnDeliveryTypeForDisplay = (dn) => {
+    const type = normalizeDnDeliveryType(dn?.delivery_type || dn?.deliveryType);
+    if (type !== 'normal') return type;
+    const remarksText = String(dn?.remarks || '').toLowerCase();
+    if (remarksText.includes('urgent')) return 'urgent';
+    if (remarksText.includes('additional')) return 'additional';
+    return compareDnDateInput(dn?.planned_date || dn?.plannedDate, dn?.created_at || dn?.createdAt) === 0 ? 'additional' : 'normal';
+  };
+  const getDnArrivalWarning = (dn) => {
+    const status = String(dn?.status || '').trim().toLowerCase();
+    const doneStatuses = new Set(['closed', 'received', 'done', 'cancelled']);
+    if (doneStatuses.has(status)) return null;
+    if (!['sent', 'in_transit', 'partial'].includes(status)) {
+      return { label: 'DN has not been emailed to supplier', className: 'border-sky-200 bg-sky-50 text-sky-700' };
+    }
+    const planned = parseDnDateOnly(dn?.planned_date || dn?.plannedDate);
+    if (!planned) {
+      return { label: 'Planned delivery date is not set', className: 'border-slate-200 bg-slate-50 text-slate-600' };
+    }
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    planned.setHours(0, 0, 0, 0);
+    const diffDays = Math.round((planned.getTime() - today.getTime()) / 86400000);
+    if (diffDays < 0) {
+      return { label: `Delivery overdue by ${Math.abs(diffDays)} day(s)`, className: 'border-rose-200 bg-rose-50 text-rose-700' };
+    }
+    if (diffDays === 0) {
+      return { label: 'Delivery scheduled for today', className: 'border-amber-200 bg-amber-50 text-amber-700' };
+    }
+    if (diffDays === 1) {
+      return { label: 'Delivery scheduled for tomorrow', className: 'border-orange-200 bg-orange-50 text-orange-700' };
+    }
+    return null;
+  };
+  const masterVendorById = useMemo(() => {
+    const map = new Map();
+    (masterVendors || []).forEach((vendor) => {
+      const id = String(vendor?.id || '').trim();
+      if (id) map.set(id, vendor);
+    });
+    return map;
+  }, [masterVendors]);
+  const resolveMasterItemSupplier = (itemCode) => {
+    const code = String(itemCode || '').trim();
+    const relations = itemSupplierMap?.get(code) || [];
+    const primaryRelation = [...relations].sort((left, right) => Number(right.sharePercent || 0) - Number(left.sharePercent || 0))[0] || null;
+    const item = masterItemsByCode.get(code);
+    const supplierRaw = String(primaryRelation?.vendorId || item?.vendor_id || '').trim();
+    const vendor = (supplierRaw && masterVendorById.get(supplierRaw))
+      || (masterVendors || []).find((row) => String(row?.name || '').trim().toLowerCase() === String(primaryRelation?.vendorName || item?.supplier_name || '').trim().toLowerCase())
+      || null;
+    const supplierCode = String(vendor?.id || primaryRelation?.vendorId || supplierRaw || '').trim();
+    const supplierName = String(vendor?.name || primaryRelation?.vendorName || item?.supplier_name || '').trim();
+    return {
+      supplierCode,
+      supplierName,
+      supplier: supplierCode || supplierName || '',
+      label: supplierName && supplierCode && supplierName !== supplierCode ? `${supplierName} (${supplierCode})` : supplierName || supplierCode || '-',
+      role: vendor?.role || '',
+      vendor,
+    };
+  };
+  const isScheduleVendorRole = (role) => String(role || '').trim().toLowerCase() === 'schedule';
+  const resolveRequestVendor = (row = {}) => {
+    const directSupplier = row.supplier_id
+      || row.supplier
+      || row.supplier_name
+      || row.supplierName
+      || row.default_supplier
+      || '';
+    const directVendor = resolveVendorFromSupplier?.(directSupplier);
+    if (directVendor) return directVendor;
+    return resolveMasterItemSupplier(row.item_code || row.itemCode || row.item || '').vendor || null;
+  };
+  const getRequestSupplierMeta = (row = {}) => {
+    const itemCode = row.item_code || row.itemCode || row.item || '';
+    const supplierMeta = resolveMasterItemSupplier(itemCode);
+    const vendor = resolveRequestVendor(row) || supplierMeta.vendor || null;
+    const supplierCode = String(vendor?.id || supplierMeta.supplierCode || '').trim();
+    const supplierName = String(vendor?.name || supplierMeta.supplierName || '').trim();
+    return {
+      vendor,
+      supplierCode,
+      supplierName,
+      codeLabel: supplierCode || supplierName || '-',
+      label: supplierName && supplierCode && supplierName !== supplierCode
+        ? `${supplierCode} - ${supplierName}`
+        : supplierCode || supplierName || '-',
+    };
+  };
+  const [schedulePoRows, setSchedulePoRows] = useState([]);
+  const [schedulePoLoading, setSchedulePoLoading] = useState(false);
+  const [schedulePoError, setSchedulePoError] = useState('');
+  const scheduleRequestSupplier = getRequestSupplierMeta(selectedKanban || {});
+  const schedulePoOptions = useMemo(() => (
+    (schedulePoRows || []).map((row) => {
+      const poNumber = row.po_number || row.poNumber || '';
+      const supplierCode = row.supplier_code || row.supplierCode || '';
+      const supplierName = row.supplier_name || row.supplierName || '';
+      const poDate = row.po_date ? new Date(row.po_date).toLocaleDateString('id-ID') : '-';
+      const remaining = row.total_qty_remaining ?? row.totalQtyRemaining;
+      const remainingText = Number.isFinite(Number(remaining)) ? ` | Sisa ${formatNumber2(remaining)}` : '';
+      return {
+        ...row,
+        value: poNumber,
+        label: `${poNumber} | ${supplierCode}${supplierName ? ` - ${supplierName}` : ''} | ${poDate}${remainingText}`,
+      };
+    }).filter((row) => row.value)
+  ), [schedulePoRows, formatNumber2]);
+  useEffect(() => {
+    if (!showScheduleModal) {
+      setSchedulePoRows([]);
+      setSchedulePoError('');
+      setSchedulePoLoading(false);
+      return undefined;
+    }
+    const itemCode = String(selectedKanban?.item_code || selectedKanban?.itemCode || selectedKanban?.item || '').trim();
+    const supplierCode = scheduleRequestSupplier.supplierCode;
+    if (!itemCode || !supplierCode) {
+      setSchedulePoRows([]);
+      setSchedulePoError('Item atau supplier request belum lengkap.');
+      return undefined;
+    }
+    let cancelled = false;
+    const loadSchedulePoRows = async () => {
+      setSchedulePoLoading(true);
+      setSchedulePoError('');
+      try {
+        const params = new URLSearchParams({
+          status: 'open,partial',
+          openOnly: '1',
+          includeTotal: '1',
+          limit: '500',
+          itemCode,
+          supplierId: supplierCode,
+        });
+        const payload = await apiFetch(`/api/po?${params.toString()}`);
+        const rows = Array.isArray(payload?.rows) ? payload.rows : (Array.isArray(payload) ? payload : []);
+        if (cancelled) return;
+        setSchedulePoRows(rows);
+        setScheduleForm((prev) => {
+          const options = rows.map((row) => String(row.po_number || row.poNumber || '').trim()).filter(Boolean);
+          if (prev.poNumber && options.includes(prev.poNumber)) return prev;
+          return { ...prev, poNumber: options.length === 1 ? options[0] : '' };
+        });
+      } catch (error) {
+        if (cancelled) return;
+        setSchedulePoRows([]);
+        setSchedulePoError(error.message || 'Gagal memuat PO aktif.');
+      } finally {
+        if (!cancelled) setSchedulePoLoading(false);
+      }
+    };
+    loadSchedulePoRows();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    apiFetch,
+    scheduleRequestSupplier.supplierCode,
+    selectedKanban?.id,
+    selectedKanban?.item_code,
+    selectedKanban?.itemCode,
+    selectedKanban?.item,
+    setScheduleForm,
+    showScheduleModal,
+  ]);
   const isProductionUser = String(user?.role || '').trim().toLowerCase() === 'production';
+  const canOpenDeliveryTab = canEditSchedules;
+  const getLockedActionTitle = (allowed, label) => (allowed ? label : `${label} - tidak tersedia untuk role ini`);
+  const getLockedButtonClassName = (baseClassName, disabled) => `${baseClassName}${disabled ? ' opacity-50 cursor-not-allowed' : ''}`;
   const kanbanBoardTabs = isProductionUser
     ? [
+      { key: 'dashboard', label: 'Dashboard' },
       { key: 'empty', label: 'Kanban Kosong' },
       { key: 'scan', label: 'Scan QR' },
     ]
@@ -238,11 +483,12 @@ const TabKanban = (props) => {
       { key: 'items', label: 'Kanban Items' },
       { key: 'requests', label: 'Requests' },
       { key: 'dn', label: 'DN Register' },
+      { key: 'delivery', label: 'Delivery', disabled: !canOpenDeliveryTab, disabledTitle: 'Delivery hanya tersedia untuk role schedule.' },
       { key: 'receiving', label: 'Receiving Notes' },
       { key: 'empty', label: 'Kanban Kosong' },
       { key: 'scan', label: 'Scan QR' },
-      canProduction ? { key: 'production', label: 'Produksi' } : null,
-    ].filter(Boolean);
+      { key: 'production', label: 'Produksi', disabled: !canProduction, disabledTitle: 'Produksi hanya tersedia untuk role produksi.' },
+    ];
 
   const emptyLogRef = useRef(null);
   const [emptyScrollTop, setEmptyScrollTop] = useState(0);
@@ -267,13 +513,58 @@ const TabKanban = (props) => {
     { value: 'closed', label: 'Closed' },
   ]), []);
   const requestQuickFilterOptions = useMemo(() => ([
-    { value: 'all', label: 'Semua' },
+    { value: 'all', label: 'All' },
     { value: 'overdue', label: 'Overdue' },
     { value: 'blocked', label: 'Over PRL' },
     { value: 'stock-gap', label: 'Stock Gap' },
   ]), []);
+  const requestCategoryFilterOptions = useMemo(() => ([
+    { value: 'all', label: 'All Category' },
+    { value: 'rm', label: 'RM' },
+    { value: 'child', label: 'Child Part' },
+    { value: 'subassy', label: 'Subassy' },
+    { value: 'fg', label: 'FG' },
+  ]), []);
+  const requestFlowFilterOptions = useMemo(() => ([
+    { value: 'all', label: 'All Flow' },
+    { value: 'supplier-dn', label: 'Supplier DN' },
+    { value: 'production', label: 'Production' },
+    { value: 'subcon', label: 'Subcon' },
+    { value: 'schedule', label: 'Schedule' },
+    { value: 'blocked', label: 'Blocked' },
+  ]), []);
+  const resolveRequestFlowMeta = (row) => {
+    if (typeof getKanbanRequestFlowMeta === 'function') return getKanbanRequestFlowMeta(row);
+    const category = typeof getKanbanRequestCategoryMeta === 'function'
+      ? getKanbanRequestCategoryMeta(row)
+      : { key: 'other', label: row?.item_type || 'Unmapped' };
+    return {
+      key: 'blocked',
+      label: 'Review Master',
+      actionLabel: 'Review Master',
+      category,
+      canCreateDn: false,
+      reason: 'Request flow is not available.',
+    };
+  };
+  const getRequestFlowBadgeClass = (key) => {
+    if (key === 'supplier-dn') return 'border-indigo-200 bg-indigo-50 text-indigo-700';
+    if (key === 'production') return 'border-emerald-200 bg-emerald-50 text-emerald-700';
+    if (key === 'subcon') return 'border-violet-200 bg-violet-50 text-violet-700';
+    if (key === 'schedule') return 'border-sky-200 bg-sky-50 text-sky-700';
+    return 'border-amber-200 bg-amber-50 text-amber-700';
+  };
   const [localKanbanSearch, setLocalKanbanSearch] = useState(kanbanSearch || '');
   const [localRnSearch, setLocalRnSearch] = useState(rnSearch || '');
+  const deliveryUploadInputRef = useRef(null);
+  const [deliveryUploads, setDeliveryUploads] = useState([]);
+  const [deliveryUploadsLoading, setDeliveryUploadsLoading] = useState(false);
+  const [deliveryUploadsError, setDeliveryUploadsError] = useState('');
+  const [deliveryUploadLoading, setDeliveryUploadLoading] = useState(false);
+  const [deliveryUploadError, setDeliveryUploadError] = useState('');
+  const [deliveryUploadResult, setDeliveryUploadResult] = useState(null);
+  const [deliveryWorkflowTab, setDeliveryWorkflowTab] = useState('upload-dn');
+  const [selectedDeliveryUploadId, setSelectedDeliveryUploadId] = useState(null);
   const kanbanActiveStatusMeta = useMemo(() => ([
     {
       key: 'triggered',
@@ -326,6 +617,37 @@ const TabKanban = (props) => {
     },
   ]), []);
   const kanbanActiveStatusSet = useMemo(() => new Set(kanbanActiveStatusMeta.map((meta) => meta.key)), [kanbanActiveStatusMeta]);
+  const deliveryUploadsById = useMemo(() => {
+    const map = new Map();
+    deliveryUploads.forEach((row) => {
+      if (row?.id != null) map.set(Number(row.id), row);
+    });
+    return map;
+  }, [deliveryUploads]);
+  const selectedDeliveryUpload = useMemo(() => {
+    const selectedId = Number(selectedDeliveryUploadId || 0);
+    if (selectedId > 0 && deliveryUploadsById.has(selectedId)) return deliveryUploadsById.get(selectedId);
+    if (deliveryUploadResult?.id && deliveryUploadsById.has(Number(deliveryUploadResult.id))) {
+      return deliveryUploadsById.get(Number(deliveryUploadResult.id));
+    }
+    return deliveryUploads[0] || deliveryUploadResult || null;
+  }, [deliveryUploads, deliveryUploadsById, deliveryUploadResult, selectedDeliveryUploadId]);
+  const selectedDeliveryUploadItems = useMemo(() => {
+    if (!selectedDeliveryUpload) return [];
+    return Array.isArray(selectedDeliveryUpload.items) ? selectedDeliveryUpload.items : [];
+  }, [selectedDeliveryUpload]);
+  const deliveryUploadSummary = useMemo(() => {
+    return deliveryUploads.reduce((acc, row) => {
+      const status = String(row?.status || '').trim().toLowerCase();
+      acc.total += 1;
+      acc.orderQty += Number(row?.total_qty_order || 0);
+      acc.fulfilledQty += Number(row?.total_qty_fulfilled || 0);
+      acc.shortageQty += Number(row?.total_qty_shortage || 0);
+      if (status === 'full') acc.full += 1;
+      if (status === 'partial_backorder') acc.partial += 1;
+      return acc;
+    }, { total: 0, full: 0, partial: 0, orderQty: 0, fulfilledQty: 0, shortageQty: 0 });
+  }, [deliveryUploads]);
   const kanbanActiveRows = useMemo(
     () => kanbanRequests.filter((row) => kanbanActiveStatusSet.has(String(row?.status || '').trim().toLowerCase())),
     [kanbanRequests, kanbanActiveStatusSet],
@@ -572,6 +894,30 @@ const TabKanban = (props) => {
     () => resolveScheduleRowsForSupplier(dnForm?.supplier),
     [dnForm?.supplier, masterVendors],
   );
+  const dnDetailScheduleRows = useMemo(
+    () => resolveScheduleRowsForSupplier(selectedDnDetail?.supplier),
+    [selectedDnDetail?.supplier, masterVendors],
+  );
+  const handleDnDetailScheduleChange = (value) => {
+    const selected = dnDetailScheduleRows[Number(value)];
+    if (!selected) {
+      setDnHeaderEdits((prev) => ({
+        ...(prev || {}),
+        scheduleIndex: '',
+        cycle: '',
+        rit: '',
+        deliveryTime: '',
+      }));
+      return;
+    }
+    setDnHeaderEdits((prev) => ({
+      ...(prev || {}),
+      scheduleIndex: value,
+      cycle: selected.cycle || '',
+      rit: selected.rit || '',
+      deliveryTime: selected.time || '',
+    }));
+  };
   const masterItemOptions = useMemo(
     () => (Array.isArray(masterItems) ? masterItems : []).filter((item) => item?.code),
     [masterItems],
@@ -658,8 +1004,9 @@ const TabKanban = (props) => {
     const item = masterItemsByCode.get(itemCode);
     const itemSetting = kanbanSettingsByCode.get(itemCode);
     const lotQty = itemSetting?.lot_qty ?? item?.pack_qty ?? item?.packQty ?? item?.order_lot_size ?? item?.orderLotSize ?? '';
-    const defaultSupplier = itemSetting?.default_supplier ?? item?.vendor_id ?? item?.supplier_name ?? item?.supplierName ?? '';
-    const vendorCycle = resolveVendorCycleDefaults(defaultSupplier);
+    const supplierMeta = resolveMasterItemSupplier(itemCode);
+    const supplierValue = supplierMeta.supplierCode || supplierMeta.supplierName || '';
+    const vendorCycle = resolveVendorCycleDefaults(supplierValue);
     setKanbanSettingsForm((prev) => ({
       ...prev,
       itemCode,
@@ -674,7 +1021,6 @@ const TabKanban = (props) => {
       cycleX: itemSetting?.cycle_x ?? vendorCycle.x,
       cycleY: itemSetting?.cycle_y ?? vendorCycle.y,
       cycleZ: itemSetting?.cycle_z ?? vendorCycle.z,
-      defaultSupplier,
       dropZone: itemSetting?.drop_zone ?? item?.location_id ?? item?.line_production ?? item?.location_name ?? '',
     }));
     const categoryValue = item?.type || itemSetting?.item_type || '';
@@ -699,6 +1045,42 @@ const TabKanban = (props) => {
       return;
     }
     setManualRequestForm((prev) => ({ ...prev, kanbanId: value }));
+  };
+  const manualKanbanOptions = useMemo(() => (
+    (kanbanSettings || []).map((row) => {
+      const kanbanId = buildKanbanDisplayId(row.item_code, row.item_type, row);
+      return {
+        value: kanbanId,
+        label: `${kanbanId} - ${row.item_code} - ${row.item_name || '-'}`,
+        row,
+      };
+    })
+  ), [kanbanSettings, buildKanbanDisplayId]);
+  const openKanbanInScan = (kanbanIdValue) => {
+    const kanbanId = String(kanbanIdValue || '').trim();
+    if (!kanbanId) {
+      setScanError('Kanban ID belum tersedia untuk discan.');
+      return;
+    }
+    setScanMode('manual');
+    setScanInput(kanbanId);
+    setKanbanSubTab('scan');
+    setScanError('');
+  };
+  const openRequestDnDetail = (row) => {
+    const dnId = Number(row?.dn_id || 0);
+    if (!dnId) return;
+    const existingDn = (kanbanDnPaginationMeta?.rows || []).find((dn) => Number(dn?.id || 0) === dnId);
+    const supplierMeta = getRequestSupplierMeta(row);
+    const fallbackDn = {
+      id: dnId,
+      dn_number: row?.dn_number || `DN-${dnId}`,
+      supplier: supplierMeta.supplierCode || supplierMeta.supplierName || '',
+      planned_date: row?.planned_date || row?.plannedDate || row?.created_at || null,
+      status: row?.dn_status || 'open',
+    };
+    setKanbanSubTab('dn');
+    openDnDetailModal(existingDn || fallbackDn, false);
   };
 
   const handleDnSupplierChange = (value) => {
@@ -837,7 +1219,7 @@ const TabKanban = (props) => {
 
   useEffect(() => {
     setSelectedRequestIds([]);
-  }, [kanbanRequestStatusFilter, setSelectedRequestIds]);
+  }, [kanbanRequestStatusFilter, kanbanRequestCategoryFilter, kanbanRequestFlowFilter, setSelectedRequestIds]);
 
   const formatDnQty = (value, fallback = '-') => {
     if (value === null || value === undefined || value === '') return fallback;
@@ -882,6 +1264,20 @@ const TabKanban = (props) => {
     };
     window.addEventListener('afterprint', cleanup);
     window.print();
+  };
+
+  const handleDnPreviewPrint = async () => {
+    if (!dnPrintPayload) return;
+    const filename = buildPrintFileName('DN', dnPrintPayload?.dnNumber);
+    const dnStatus = String(dnPrintPayload?.sourceDn?.status || '').toLowerCase();
+    const canPrintCards = dnPrintMode === 'cards' && ['open', 'in_transit', 'partial', 'published'].includes(dnStatus);
+    if (canPrintCards && !dnPrintCardsReady) {
+      setDnPrintCardsReady(true);
+      await new Promise((resolve) => setTimeout(resolve, 220));
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    }
+    triggerPrintWithTitle(filename);
   };
 
   const formatProductionDateValue = (value) => {
@@ -960,6 +1356,7 @@ const TabKanban = (props) => {
   const [receiveScanError, setReceiveScanError] = useState('');
   const [receiveScanLogs, setReceiveScanLogs] = useState([]);
   const receiveScanSetRef = useRef(new Set());
+  const receiveAutoLoadRef = useRef(false);
   const [receiveFlashKey, setReceiveFlashKey] = useState('');
   const [receiveSubmitting, setReceiveSubmitting] = useState(false);
   const [receiveTruckNo, setReceiveTruckNo] = useState('');
@@ -1007,10 +1404,34 @@ const TabKanban = (props) => {
   const [selectedRnDetail, setSelectedRnDetail] = useState(null);
   const [showRnPrintModal, setShowRnPrintModal] = useState(false);
   const [rnPrintPayload, setRnPrintPayload] = useState(null);
+  const [dnPrintCardsReady, setDnPrintCardsReady] = useState(false);
+  const dnPrintCardsTimerRef = useRef(null);
   const [qrSimulationLoading, setQrSimulationLoading] = useState(false);
   const [qrSimulationError, setQrSimulationError] = useState('');
   const [qrSimulationResult, setQrSimulationResult] = useState(null);
   const [qrSimulationRefreshNonce, setQrSimulationRefreshNonce] = useState(0);
+
+  useEffect(() => {
+    if (dnPrintCardsTimerRef.current) {
+      clearTimeout(dnPrintCardsTimerRef.current);
+      dnPrintCardsTimerRef.current = null;
+    }
+    if (!showDnPrintModal || !dnPrintPayload) {
+      setDnPrintCardsReady(false);
+      return undefined;
+    }
+    setDnPrintCardsReady(false);
+    dnPrintCardsTimerRef.current = setTimeout(() => {
+      setDnPrintCardsReady(true);
+      dnPrintCardsTimerRef.current = null;
+    }, 160);
+    return () => {
+      if (dnPrintCardsTimerRef.current) {
+        clearTimeout(dnPrintCardsTimerRef.current);
+        dnPrintCardsTimerRef.current = null;
+      }
+    };
+  }, [dnPrintPayload, showDnPrintModal]);
 
   useEffect(() => {
     if (typeof document === 'undefined') return undefined;
@@ -1028,8 +1449,8 @@ const TabKanban = (props) => {
     style.innerHTML = `
       @media print {
         @page {
-          size: A4;
-          margin: 10mm 15mm 15mm 15mm;
+          size: ${showDnPrintModal ? 'A4 landscape' : 'A4'};
+          margin: ${showDnPrintModal ? '8mm 10mm 10mm 10mm' : '10mm 15mm 15mm 15mm'};
         }
       }
     `;
@@ -1185,6 +1606,49 @@ const TabKanban = (props) => {
     alert(message);
   };
 
+  const buildLotSummaryText = (rows, { label = 'Lot', limit = 3 } = {}) => {
+    const list = Array.isArray(rows) ? rows : [];
+    const parts = list
+      .map((row) => {
+        const lotCode = String(
+          row?.batchNo
+          || row?.batch_no
+          || row?.lotNumber
+          || row?.lot_no
+          || row?.batchId
+          || row?.batch_id
+          || '',
+        ).trim();
+        if (!lotCode) return '';
+        const qtyValue = Number(row?.qty ?? row?.receivedQty ?? row?.consumedQty ?? row?.remainingQty ?? 0);
+        const qtyText = Number.isFinite(qtyValue) && qtyValue > 0 ? ` x ${qtyValue.toLocaleString('id-ID', { maximumFractionDigits: 0 })}` : '';
+        return `${lotCode}${qtyText}`;
+      })
+      .filter(Boolean);
+    if (!parts.length) return '';
+    const visible = parts.slice(0, limit).join(', ');
+    const extra = parts.length > limit ? ` +${parts.length - limit} lainnya` : '';
+    return `${label}: ${visible}${extra}`;
+  };
+
+  const normalizeImportText = (value) => String(value ?? '').trim();
+  const normalizeImportKey = (value) => String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+
+  const getImportedRowValue = (row, aliases = []) => {
+    const entries = Object.entries(row || {});
+    for (const alias of aliases) {
+      const normalizedAlias = normalizeImportKey(alias);
+      const match = entries.find(([key]) => normalizeImportKey(key) === normalizedAlias);
+      if (match && match[1] !== undefined && match[1] !== null && String(match[1]).trim() !== '') {
+        return match[1];
+      }
+    }
+    return '';
+  };
+
   const fetchOpenDns = async (supplierValue, options = {}) => {
     const preserveHeaderFields = Boolean(options.preserveHeaderFields);
     if (!supplierValue) {
@@ -1219,6 +1683,10 @@ const TabKanban = (props) => {
   };
 
   useEffect(() => {
+    if (receiveAutoLoadRef.current) {
+      receiveAutoLoadRef.current = false;
+      return;
+    }
     if (receiveSupplier) {
       fetchOpenDns(receiveSupplier);
     } else {
@@ -1333,8 +1801,17 @@ const TabKanban = (props) => {
   useEffect(() => {
     if (kanbanSubTab === 'production') {
       setProductionTab('fg');
+    } else if (kanbanSubTab === 'delivery') {
+      setDeliveryWorkflowTab('upload-dn');
     }
   }, [kanbanSubTab]);
+
+  useEffect(() => {
+    if (!isProductionUser) return;
+    if (kanbanView !== 'board') {
+      setKanbanView('board');
+    }
+  }, [isProductionUser, kanbanView, setKanbanView]);
 
   useEffect(() => {
     if (kanbanSubTab !== 'production') return;
@@ -1346,6 +1823,11 @@ const TabKanban = (props) => {
       fetchProductionCompare({ silent: true });
     }
   }, [kanbanSubTab, productionTab]);
+
+  useEffect(() => {
+    if (kanbanSubTab !== 'delivery') return;
+    fetchDeliveryUploads();
+  }, [kanbanSubTab]);
 
   const fetchProductionImportHistory = async () => {
     if (!canProduction) return;
@@ -1385,6 +1867,52 @@ const TabKanban = (props) => {
       setWipImportHistoryError(safeMessage);
     } finally {
       setWipImportHistoryLoading(false);
+    }
+  };
+
+  const fetchDeliveryUploads = async ({ silent = false } = {}) => {
+    if (!canOpenDeliveryTab) return;
+    if (!silent) setDeliveryUploadsLoading(true);
+    setDeliveryUploadsError('');
+    try {
+      const data = await apiFetch('/api/delivery/uploads?limit=20&offset=0');
+      const rows = Array.isArray(data?.rows) ? data.rows : [];
+      setDeliveryUploads(rows);
+      if (!selectedDeliveryUploadId && rows.length > 0) {
+        setSelectedDeliveryUploadId(rows[0].id);
+      }
+    } catch (error) {
+      setDeliveryUploads([]);
+      setDeliveryUploadsError(error.message || 'Gagal memuat delivery uploads.');
+    } finally {
+      if (!silent) setDeliveryUploadsLoading(false);
+    }
+  };
+
+  const handleDeliveryUpload = async () => {
+    const file = deliveryUploadInputRef.current?.files?.[0] || null;
+    if (!file) {
+      setDeliveryUploadError('Pilih file foto / PDF DN terlebih dahulu.');
+      return;
+    }
+    setDeliveryUploadLoading(true);
+    setDeliveryUploadError('');
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const result = await apiFetch('/api/delivery/upload-dn', {
+        method: 'POST',
+        body: formData,
+      });
+      setDeliveryUploadResult(result?.upload || null);
+      await fetchDeliveryUploads({ silent: true });
+      if (deliveryUploadInputRef.current) deliveryUploadInputRef.current.value = '';
+      setSelectedDeliveryUploadId(result?.upload?.id || null);
+      notifyMessage('DN customer berhasil diproses.');
+    } catch (error) {
+      setDeliveryUploadError(error.message || 'Gagal upload DN.');
+    } finally {
+      setDeliveryUploadLoading(false);
     }
   };
 
@@ -1730,9 +2258,11 @@ const TabKanban = (props) => {
     const resolveKey = (keys) => keys.find((key) => parsed[key] !== undefined && parsed[key] !== null);
     const itemKey = resolveKey(['item', 'item_code', 'code', 'uniq', 'part', 'part_no']);
     const dnKey = resolveKey(['dn', 'dn_number', 'order', 'order_number']);
+    const supplierKey = resolveKey(['supplier', 'supplier_id', 'vendor', 'vendor_id']);
     const qtyKey = resolveKey(['qty', 'snp', 'pack', 'quantity']);
     let itemCode = itemKey ? String(parsed[itemKey] || '').trim() : '';
     const dnNumber = dnKey ? String(parsed[dnKey] || '').trim() : '';
+    const supplier = supplierKey ? String(parsed[supplierKey] || '').trim() : '';
     let qty = qtyKey ? Number(parsed[qtyKey]) : NaN;
 
     if (!itemCode && Array.isArray(itemList)) {
@@ -1745,7 +2275,7 @@ const TabKanban = (props) => {
     }
 
     if (!Number.isFinite(qty)) qty = NaN;
-    return { raw, itemCode, dnNumber, qty };
+    return { raw, itemCode, dnNumber, supplier, qty };
   };
 
   const handleToggleDnSelection = (id) => {
@@ -1754,16 +2284,17 @@ const TabKanban = (props) => {
     ));
   };
 
-  const handleLoadReceiveItems = async () => {
-    if (!receiveSelectedDnIds.length) {
+  const loadReceiveItemsByDnIds = async (dnIds = []) => {
+    const selectedIds = Array.isArray(dnIds) ? dnIds.filter(Boolean) : [];
+    if (!selectedIds.length) {
       setReceiveError('Pilih minimal satu DN.');
-      return;
+      return [];
     }
     setReceiveLoading(true);
     setReceiveError('');
     setReceiveScanError('');
     try {
-      const query = receiveSelectedDnIds.join(',');
+      const query = selectedIds.join(',');
       const rows = await apiFetch(`/api/delivery-notes/items?dnIds=${encodeURIComponent(query)}`);
       const mapped = (Array.isArray(rows) ? rows : []).map((row) => {
         const itemCode = row.item_code || '-';
@@ -1794,27 +2325,69 @@ const TabKanban = (props) => {
       setReceiveItems(mapped);
       setReceiveScanLogs([]);
       receiveScanSetRef.current = new Set();
+      return mapped;
     } catch (error) {
       setReceiveError(error.message || 'Gagal memuat item DN.');
       setReceiveItems([]);
+      return [];
     } finally {
       setReceiveLoading(false);
     }
   };
 
-  const handleReceiveScan = () => {
-    if (!receiveItems.length) {
-      setReceiveScanError('Load item DN terlebih dahulu.');
-      return;
-    }
+  const handleLoadReceiveItems = async () => {
+    await loadReceiveItemsByDnIds(receiveSelectedDnIds);
+  };
+
+  const handleReceiveScan = async () => {
     const lines = receiveScanInput
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter(Boolean);
     if (lines.length === 0) return;
+    let workingItems = [...receiveItems];
+    if (!workingItems.length) {
+      const initialParsed = lines.map((raw) => parseReceiveScanPayload(raw, [])).filter(Boolean);
+      const firstWithDn = initialParsed.find((entry) => entry.dnNumber);
+      if (!firstWithDn?.dnNumber) {
+        setReceiveScanError('Label incoming harus memuat nomor DN. Load item DN terlebih dahulu jika QR lama tidak punya DN.');
+        return;
+      }
+      const supplierForScan = firstWithDn.supplier || receiveSupplier;
+      if (!supplierForScan) {
+        setReceiveScanError('Label incoming harus memuat supplier. Cetak ulang label dari Supplier Portal terbaru.');
+        return;
+      }
+      setReceiveDnLoading(true);
+      setReceiveDnError('');
+      try {
+        const data = await apiFetch(`/api/delivery-notes/open?supplier=${encodeURIComponent(supplierForScan)}`);
+        const rows = Array.isArray(data) ? data : [];
+        const matchedDn = rows.find((dn) => String(dn.dn_number || '').toLowerCase() === String(firstWithDn.dnNumber || '').toLowerCase());
+        if (!matchedDn?.id) {
+          setReceiveScanError(`DN ${firstWithDn.dnNumber} tidak ditemukan/open untuk supplier ${supplierForScan}.`);
+          setReceiveDnOptions(rows);
+          return;
+        }
+        receiveAutoLoadRef.current = true;
+        setReceiveSupplier(supplierForScan);
+        setReceiveDnOptions(rows);
+        setReceiveSelectedDnIds([matchedDn.id]);
+        workingItems = await loadReceiveItemsByDnIds([matchedDn.id]);
+        if (!workingItems.length) {
+          setReceiveScanError(`Item DN ${firstWithDn.dnNumber} tidak bisa dimuat.`);
+          return;
+        }
+      } catch (error) {
+        setReceiveScanError(error.message || 'Gagal auto-load DN dari QR.');
+        return;
+      } finally {
+        setReceiveDnLoading(false);
+      }
+    }
     let latestError = '';
     const nextLogs = [...receiveScanLogs];
-    let updatedItems = [...receiveItems];
+    let updatedItems = [...workingItems];
     lines.forEach((raw) => {
       const parsed = parseReceiveScanPayload(raw, updatedItems);
       if (!parsed) return;
@@ -1969,7 +2542,7 @@ const TabKanban = (props) => {
     setReceiveSubmitting(true);
     setReceiveError('');
     try {
-      await apiFetch('/api/receive-notes/merge', {
+      const result = await apiFetch('/api/receive-notes/merge', {
         method: 'POST',
         body: JSON.stringify({
           supplier: receiveSupplier,
@@ -1986,7 +2559,8 @@ const TabKanban = (props) => {
       await fetchOpenDns(receiveSupplier);
       resetReceiveState();
       setReceiveSelectedDnIds([]);
-      alert('Receiving berhasil disimpan.');
+      const lotSummary = buildLotSummaryText(result?.postResult?.postedLines, { label: 'Batch/Lot' });
+      notifyMessage(lotSummary ? `Receiving berhasil disimpan. ${lotSummary}.` : 'Receiving berhasil disimpan.');
     } catch (error) {
       setReceiveError(error.message || 'Gagal menyimpan receiving.');
     } finally {
@@ -2267,16 +2841,17 @@ const TabKanban = (props) => {
 
   const renderDnPrintDocument = () => {
     if (dnPrintLoading) {
-      return <div className="text-xs text-slate-400">Memuat...</div>;
+      return <div className="text-xs text-slate-400">Loading...</div>;
     }
     if (!dnPrintPayload) {
-      return <div className="text-xs text-slate-400">Data tidak tersedia.</div>;
+      return <div className="text-xs text-slate-400">Data is not available.</div>;
     }
     const {
       dnNumber,
       supplierName,
       dateLabel,
       deliveryDateLabel,
+      deliveryType,
       deliveryAddress,
       recipientLabel,
       areaLabel,
@@ -2290,6 +2865,52 @@ const TabKanban = (props) => {
       items,
       totals,
     } = dnPrintPayload;
+    const dnStatus = String(dnPrintPayload?.sourceDn?.status || '').toLowerCase();
+    const dnStatusLabel = dnStatus ? dnStatus.toUpperCase() : 'UNKNOWN';
+    const dnDeliveryTypeLabel = String(deliveryType || dnPrintPayload?.sourceDn?.delivery_type || 'normal').toUpperCase();
+    const dnStatusNotice = (() => {
+      if (dnStatus === 'draft') {
+        return {
+          title: 'DN is still in Draft.',
+          detail: 'Review the delivery date and rit/time, then use Print/PDF or Email to release the DN before sending it to the supplier.',
+          className: 'border-amber-200 bg-amber-50 text-amber-800',
+        };
+      }
+      if (dnStatus === 'open') {
+        return {
+          title: 'DN is open and ready to send.',
+          detail: 'Use Email to send the DN to the supplier. After it is emailed, the DN status will move to SENT and delivery monitoring will start.',
+          className: 'border-sky-200 bg-sky-50 text-sky-800',
+        };
+      }
+      if (dnStatus === 'sent') {
+        return {
+          title: 'DN has been sent to the supplier.',
+          detail: 'Monitor the planned delivery date and continue with receiving once the shipment arrives.',
+          className: 'border-emerald-200 bg-emerald-50 text-emerald-800',
+        };
+      }
+      if (dnStatus === 'partial') {
+        return {
+          title: 'DN is partially received.',
+          detail: 'Review remaining quantity and close the DN only after the delivery is completed or approved for force close.',
+          className: 'border-orange-200 bg-orange-50 text-orange-800',
+        };
+      }
+      if (dnStatus === 'closed' || dnStatus === 'received') {
+        return {
+          title: 'DN is completed.',
+          detail: 'No further delivery action is required for this DN.',
+          className: 'border-slate-200 bg-slate-50 text-slate-700',
+        };
+      }
+      return {
+        title: 'DN status requires review.',
+        detail: 'Check the DN status and delivery schedule before sending or receiving this document.',
+        className: 'border-slate-200 bg-slate-50 text-slate-700',
+      };
+    })();
+    const canPrintCards = ['open', 'in_transit', 'partial', 'published'].includes(dnStatus);
 
     const primaryDelivery = masterDeliveries?.[0] || null;
     const deliveryArea = masterAreas?.find((area) => area.id === primaryDelivery?.area_id) || null;
@@ -2297,142 +2918,70 @@ const TabKanban = (props) => {
     const plantCode = deliveryPlant?.id || '-';
     const deliveryCode = primaryDelivery?.id || deliveryArea?.id || '-';
     const destinationPlant = [plantCode, deliveryCode].filter(Boolean).join(' ') || '-';
-    const itemsByCode = new Map(items.map((item) => [item.uniq, item]));
-    const cardRows = Array.isArray(dnPrintPayload.cards) ? dnPrintPayload.cards : [];
-    const cardRowsSorted = [...cardRows].sort((a, b) => {
-      const codeA = String(a.item_code || '');
-      const codeB = String(b.item_code || '');
-      if (codeA !== codeB) return codeA.localeCompare(codeB);
-      const seqA = Number(a.card_seq || 0);
-      const seqB = Number(b.card_seq || 0);
-      if (seqA !== seqB) return seqA - seqB;
-      return Number(a.id || 0) - Number(b.id || 0);
-    });
-    const cardTotalsByItem = new Map();
-    cardRowsSorted.forEach((row) => {
-      const itemCode = row.item_code || '';
-      if (!itemCode) return;
-      cardTotalsByItem.set(itemCode, (cardTotalsByItem.get(itemCode) || 0) + 1);
-    });
-    const cardSeqByItem = new Map();
-    const cardPayloads = [];
-
-    if (cardRowsSorted.length > 0) {
-      cardRowsSorted.forEach((cardRow) => {
-        const itemCode = cardRow.item_code;
-        const itemRow = itemsByCode.get(itemCode) || {};
-        const masterItem = masterItemsByCode?.get(itemCode);
-        const masterLocation = masterLocationsById?.get(masterItem?.location_id);
-        const categoryCode = masterItem?.type || masterItem?.item_type || masterItem?.category || '-';
-        const slocLabel = masterLocation?.warehouse_id || masterLocation?.id || '-';
-        const locationLabel = masterLocation?.fifo_lane || masterLocation?.id || '-';
-        const qtyBox = Number(cardRow.card_qty || itemRow.qtyKbn || 0);
-        const orderNumber = dnNumber || '-';
-        const lotBatch = cardRow.lot_batch || itemRow.requestCode || dnNumber || '';
-        const partNo = itemRow.partNo || masterItem?.part_no || itemCode || '-';
-        const uniqueCode = itemCode || partNo || '-';
-        const mainQrValue = `${partNo}|${qtyBox}|${orderNumber}|${supplierCode || ''}|${lotBatch || ''}`;
-        const secondaryQrValue = cardRow.card_uid || `${dnNumber}-${uniqueCode}-${cardRow.card_seq}`;
-        const nextSeq = (cardSeqByItem.get(itemCode) || 0) + 1;
-        cardSeqByItem.set(itemCode, nextSeq);
-        const totalCards = Number(cardRow.total_cards || 0) || cardTotalsByItem.get(itemCode) || 0;
-        cardPayloads.push({
-          key: `${itemCode}-${cardRow.card_seq}-${dnNumber}`,
-          supplier: supplierName,
-          supplierCode: supplierCode || '-',
-          destinationPlant,
-          dockCode: itemRow.dropZone || deliveryCode || '-',
-          gateCode: deliveryCode || '-',
-          categoryCode,
-          itemName: itemRow.partName || masterItem?.name || itemCode || '',
-          partNo,
-          uniqueCode,
-          qtyBox,
-          areaId: itemRow.dropZone || '-',
-          slocLabel,
-          locationLabel,
-          packing: itemRow.packing || '-',
-          orderNumber,
-          orderDate: dateLabel || '-',
-          cycleLabel,
-          deliveryDateLabel,
-          timeLabel,
-          ritLabel,
-          seq: nextSeq,
-          total: totalCards,
-          lotBatch,
-          mainQrValue,
-          secondaryQrValue,
-        });
-      });
-    } else {
-      items.forEach((row) => {
-        const perCard = Number(row.qtyKbn || 0);
-        const orderUnit = Number(row.orderUnit || 0);
-        if (!Number.isFinite(perCard) || perCard <= 0) return;
-        const totalCards = Math.max(0, Math.ceil(orderUnit / perCard));
-        const sidNumber = row.uniq || row.partNo || 'ITEM';
-        const itemName = row.partName || row.partNo || '';
-        const masterItem = masterItemsByCode?.get(row.uniq);
-        const masterLocation = masterLocationsById?.get(masterItem?.location_id);
-        const categoryCode = masterItem?.type || masterItem?.item_type || masterItem?.category || '-';
-        const slocLabel = masterLocation?.warehouse_id || masterLocation?.id || '-';
-        const locationLabel = masterLocation?.fifo_lane || masterLocation?.id || '-';
-        Array.from({ length: totalCards }).forEach((_, idx) => {
-          const seq = idx + 1;
-          const remaining = orderUnit - perCard * (seq - 1);
-          const qtyBox = seq === totalCards ? Math.max(remaining, 0) : perCard;
-          const lotBatch = row.requestCode || dnNumber || '';
-          const orderNumber = dnNumber || '-';
-          const mainQrValue = `${row.partNo || sidNumber}|${qtyBox}|${orderNumber}|${supplierCode || ''}|${lotBatch || ''}`;
-          const secondaryQrValue = `${dnNumber}-${sidNumber}-${String(seq).padStart(3, '0')}`;
-          cardPayloads.push({
-            key: `${sidNumber}-${seq}-${dnNumber}`,
-            supplier: supplierName,
-            supplierCode: supplierCode || '-',
-            destinationPlant,
-            dockCode: row.dropZone || deliveryCode || '-',
-            gateCode: deliveryCode || '-',
-            categoryCode,
-            itemName,
-            partNo: row.partNo || '-',
-            uniqueCode: sidNumber,
-            qtyBox,
-            areaId: row.dropZone || '-',
-            slocLabel,
-            locationLabel,
-            packing: row.packing || '-',
-            orderNumber,
-            orderDate: dateLabel || '-',
-            cycleLabel,
-            deliveryDateLabel,
-            timeLabel,
-            ritLabel,
-            seq,
-            total: totalCards,
-            lotBatch,
-            mainQrValue,
-            secondaryQrValue,
-          });
-        });
-      });
-    }
-
-    const cardsPerPage = 4;
-    const cardPages = [];
-    for (let i = 0; i < cardPayloads.length; i += cardsPerPage) {
-      cardPages.push(cardPayloads.slice(i, i + cardsPerPage));
-    }
-    const dnStatus = String(dnPrintPayload?.sourceDn?.status || '').toLowerCase();
-    const canPrintCards = ['open', 'in_transit', 'partial', 'published'].includes(dnStatus);
+    const summaryRows = items.map((row, index) => ({
+      no: index + 1,
+      uniq: row.uniq || '-',
+      partNo: row.partNo || '-',
+      partName: row.partName || '-',
+      packing: row.packing || '-',
+      dropZone: row.dropZone || '-',
+      unit: row.unit || '-',
+      qtyKbn: row.qtyKbn,
+      orderKbn: row.orderKbn,
+      orderUnit: row.orderUnit,
+    }));
     const printDateLabel = new Date().toLocaleDateString('id-ID', {
       day: 'numeric',
       month: 'long',
       year: 'numeric',
     });
+    const cardRows = Array.isArray(dnPrintPayload.cards) ? dnPrintPayload.cards : [];
+    const cardItemsByCode = new Map(summaryRows.map((item) => [item.uniq, item]));
+    const showCardSection = canPrintCards && dnPrintMode === 'cards' && cardRows.length > 0;
+    const cardPayloads = showCardSection && dnPrintCardsReady
+      ? cardRows.map((card, index) => {
+        const item = cardItemsByCode.get(card.item_code || '') || null;
+        const seq = Number(card.card_seq || index + 1) || index + 1;
+        const total = Number(card.total_cards || 1) || 1;
+        const qtyBox = Number(card.card_qty || item?.orderUnit || 0);
+        const lotBatch = String(card.lot_batch || item?.requestCode || '').trim();
+        return {
+          key: `${card.item_code || item?.uniq || 'item'}-${seq}-${card.card_uid || index}`,
+          seq,
+          total,
+          destinationPlant,
+          supplier: supplierName || '-',
+          partNo: card.part_no || item?.partNo || card.item_code || '-',
+          itemName: item?.partName || card.item_name || '-',
+          uniqueCode: item?.uniq || card.item_code || '-',
+          qtyBox,
+          orderNumber: lotBatch || dnNumber || '-',
+          locationLabel: companyName || deliveryAddress || '-',
+          cycleLabel: cycleLabel || '-',
+          dockGateLabel: areaLabel || '-',
+          mainQrValue: card.card_uid || `${dnNumber}-${card.item_code || item?.uniq || 'item'}-${seq}`,
+          secondaryQrValue: qrValue || dnNumber || '',
+          deliveryTimeLabel: [deliveryDateLabel, timeLabel].filter(Boolean).join(' ') || '-',
+          orderDate: dateLabel || '-',
+          lotBatch: lotBatch || '-',
+        };
+      })
+      : [];
+    const cardsPerPage = 4;
+    const cardPages = [];
+    for (let index = 0; index < cardPayloads.length; index += cardsPerPage) {
+      cardPages.push(cardPayloads.slice(index, index + cardsPerPage));
+    }
 
     return (
-      <div className="mx-auto bg-white text-slate-900 print-body dn-print-page" style={{ width: '100%', maxWidth: '210mm' }}>
+      <div
+        className="mx-auto bg-white text-slate-900 print-body dn-print-page"
+        style={{ width: '100%', maxWidth: showCardSection ? '285mm' : '210mm' }}
+      >
+        <div className={`mb-3 rounded-lg border px-3 py-2 text-[11px] print:hidden ${dnStatusNotice.className}`}>
+          <div className="font-semibold">Status {dnStatusLabel}: {dnStatusNotice.title}</div>
+          <div className="mt-0.5">{dnStatusNotice.detail}</div>
+        </div>
         <div style={{ padding: 0 }}>
         <table className="w-full border border-slate-900 dn-print-table">
           <colgroup>
@@ -2455,13 +3004,16 @@ const TabKanban = (props) => {
                       <img src={logoPrl} alt="MRP Logo" className="dn-logo" />
                       <div className="dn-brand-text">
                         <div className="dn-company">PT. MATRA RODA PIRANTI</div>
-                        <div className="dn-dept">Departement Logistik (PPIC)</div>
+                        <div className="dn-dept">Department Logistics (PPIC)</div>
                       </div>
                     </div>
                     <div className="dn-doc">
                       <div className="dn-title">DELIVERY NOTE</div>
                       <div className="dn-number">{dnNumber}</div>
                       <div className="dn-print-date">PRINT DATE : {printDateLabel}</div>
+                      <div className="mt-1 inline-block border border-slate-900 px-2 py-0.5 text-[8px] font-bold">
+                        STATUS : {dnStatusLabel}
+                      </div>
                     </div>
                   </div>
                   <div className="dn-header-info">
@@ -2513,6 +3065,11 @@ const TabKanban = (props) => {
                         <div className="dn-info-sep">:</div>
                         <div className="dn-info-value break-words">{areaLabel || '-'}</div>
                       </div>
+                      <div className="dn-info-row">
+                        <div className="dn-info-label">TYPE</div>
+                        <div className="dn-info-sep">:</div>
+                        <div className="dn-info-value">{dnDeliveryTypeLabel}</div>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -2533,7 +3090,7 @@ const TabKanban = (props) => {
             </tr>
           </thead>
           <tbody>
-            {items.map((row) => (
+            {summaryRows.map((row) => (
               <tr key={`${row.uniq}-${row.no}`}>
                 <td className="border border-slate-900 p-1 text-center">{row.no}</td>
                 <td className="border border-slate-900 p-1 text-center font-semibold">{row.uniq}</td>
@@ -2542,23 +3099,23 @@ const TabKanban = (props) => {
                   <div className="dn-part-name">{row.partName}</div>
                 </td>
                 <td className="border border-slate-900 p-1 text-center">{row.packing}</td>
-                <td className="border border-slate-900 p-1 text-right">{formatDnQty(row.qtyKbn)}</td>
-                <td className="border border-slate-900 p-1 text-center">{row.unit}</td>
                 <td className="border border-slate-900 p-1 text-center">{row.dropZone || '-'}</td>
+                <td className="border border-slate-900 p-1 text-center">{row.unit}</td>
+                <td className="border border-slate-900 p-1 text-right">{formatDnQty(row.qtyKbn)}</td>
                 <td className="border border-slate-900 p-1 text-right">
                   {row.qtyKbn ? formatDnQty(row.orderKbn) : '-'}
                 </td>
                 <td className="border border-slate-900 p-1 text-right">{formatDnQty0(row.orderUnit)}</td>
               </tr>
             ))}
-            {items.length === 0 && (
+            {summaryRows.length === 0 && (
               <tr>
                 <td colSpan="9" className="border border-slate-900 p-2 text-center text-slate-500">
-                  Tidak ada item.
+                  No items.
                 </td>
               </tr>
             )}
-            {items.length > 0 && (
+            {summaryRows.length > 0 && (
               <tr className="font-semibold">
                 <td colSpan="7" className="border border-slate-900 p-1 text-right">Total</td>
                 <td className="border border-slate-900 p-1 text-right">{formatDnQty(totals.orderKbn)}</td>
@@ -2593,8 +3150,8 @@ const TabKanban = (props) => {
             <div className="grid grid-cols-2">
               <div className="border-r border-slate-900 px-2 py-1">Date:</div>
               <div className="px-2 py-1">Date:</div>
-        </div>
-      </div>
+             </div>
+          </div>
           <div className="border border-slate-900">
             <div className="text-center font-semibold py-1">SUPPLIER</div>
             <div className="grid grid-cols-2 border-t border-b border-slate-900 text-center font-semibold">
@@ -2613,132 +3170,97 @@ const TabKanban = (props) => {
         </div>
         </div>
 
-        {canPrintCards && cardPages.map((page, pageIndex) => (
-          <div
-            key={`dn-cards-${pageIndex}`}
-            style={{
-              width: '297mm',
-              minHeight: '210mm',
-              padding: '6mm',
-              pageBreakBefore: pageIndex === 0 ? 'always' : 'always',
-            }}
-          >
+        {showCardSection && (
+          <div className="mt-4 dn-card-section">
             <div className="text-xs font-semibold mb-2">KANBAN CARDS - {dnNumber}</div>
-            <div className="grid grid-cols-2 grid-rows-2 gap-[4mm]">
-              {page.map((card) => {
-                const dockGateLabel = card.dockCode && card.gateCode && card.dockCode !== card.gateCode
-                  ? `${card.dockCode} / ${card.gateCode}`
-                  : (card.dockCode || card.gateCode || '-');
-                const deliveryTimeLabel = [card.deliveryDateLabel, card.timeLabel].filter(Boolean).join(' ');
-                const partNoSize = String(card.partNo || '').length > 16 ? '36pt' : '48pt';
-                const qtySize = String(formatDnQty(card.qtyBox) || '').length > 4 ? '40pt' : '48pt';
-                return (
-                  <div
-                    key={card.key}
-                    className="bg-white text-black font-sans border-2 border-black"
-                    style={{ width: '148mm', height: '105mm' }}
-                  >
-                    <div className="grid grid-rows-[18mm_1fr_8mm] h-full">
-                      <div className="grid grid-cols-[1fr_1fr_32mm] border-b-2 border-black">
-                        <div className="border-r-2 border-black flex items-center justify-center text-[12pt] font-bold">
-                          {card.destinationPlant || '-'}
-                        </div>
-                        <div className="border-r-2 border-black flex flex-col items-center justify-center leading-tight">
-                          <div className="text-[10pt] font-bold">E-KANBAN CARD</div>
-                          <div className="text-[8pt] font-semibold">PT MRP</div>
-                        </div>
-                        <div className="flex items-center justify-center">
-                          <QRCodeSVG value={card.secondaryQrValue} size={48} />
-                        </div>
-                      </div>
-
-                      <div className="grid grid-cols-[14mm_1fr_42mm] border-b-2 border-black">
-                        <div className="border-r-2 border-black flex flex-col items-center justify-between py-1">
-                          <div
-                            className="text-[7pt] font-bold"
-                            style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}
-                          >
-                            SUPPLIER
-                          </div>
-                          <div
-                            className="text-[7pt] font-bold"
-                            style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}
-                          >
-                            {card.supplier}
-                          </div>
-                        </div>
-
-                        <div className="grid grid-rows-[1fr_1fr_1fr] border-r-2 border-black">
-                          <div className="grid grid-cols-[1fr_42mm] border-b border-black">
-                            <div className="p-1">
-                              <div className="text-[7pt] font-semibold uppercase">PART NO</div>
-                              <div className="font-extrabold leading-none tracking-tight" style={{ fontSize: partNoSize }}>
-                                {card.partNo}
+            {!dnPrintCardsReady ? (
+              <div className="border border-dashed border-slate-300 rounded-lg p-4 text-[11px] text-slate-500 bg-slate-50">
+                Menyiapkan kartu kanban untuk cetak...
+              </div>
+            ) : cardPages.length > 0 ? (
+              cardPages.map((page, pageIndex) => (
+                <div
+                  key={`dn-cards-${pageIndex}`}
+                  className="dn-card-sheet"
+                >
+                  <div className="dn-card-grid">
+                    {page.map((card) => {
+                      const partNoSize = String(card.partNo || '').length > 16 ? '18pt' : '22pt';
+                      const qtySize = String(formatDnQty(card.qtyBox) || '').length > 4 ? '18pt' : '22pt';
+                      return (
+                        <div
+                          key={card.key}
+                          className="dn-kanban-card"
+                        >
+                          <div className="dn-kanban-card__body">
+                            <div className="dn-kanban-card__top">
+                              <div className="border-r-2 border-black flex flex-col items-center justify-center gap-0.25 text-center px-1">
+                                <div className="text-[8.5pt] font-bold leading-tight">{card.destinationPlant || '-'}</div>
+                                <div className="text-[5pt] font-semibold uppercase tracking-wide text-slate-700">{card.supplier}</div>
                               </div>
-                              <div className="text-[8pt] font-semibold">{card.itemName}</div>
-                            </div>
-                            <div className="border-l border-black p-1 text-center">
-                              <div className="text-[7pt] font-semibold uppercase">UNIQUE</div>
-                              <div className="text-[16pt] font-bold leading-tight">{card.uniqueCode}</div>
-                            </div>
-                          </div>
-                          <div className="grid grid-cols-[1fr_1fr] border-b border-black">
-                            <div className="p-1">
-                              <div className="text-[7pt] font-semibold uppercase">QTY</div>
-                              <div className="font-extrabold leading-none tracking-tight" style={{ fontSize: qtySize }}>
-                                {formatDnQty(card.qtyBox)}
+                              <div className="border-r-2 border-black flex flex-col items-center justify-center leading-tight px-1">
+                                <div className="text-[7pt] font-bold">E-KANBAN CARD</div>
+                                <div className="text-[5pt] font-semibold">PT MRP</div>
+                              </div>
+                              <div className="flex items-center justify-center">
+                                <QRCodeSVG value={card.secondaryQrValue} size={28} />
                               </div>
                             </div>
-                            <div className="border-l border-black p-1">
-                              <div className="text-[7pt] font-semibold uppercase">ORDER NO</div>
-                              <div className="text-[11pt] font-bold break-all">{card.orderNumber}</div>
-                              <div className="text-[7pt] font-semibold uppercase mt-1">LOCATION</div>
-                              <div className="text-[9pt] font-semibold">{card.slocLabel || card.locationLabel}</div>
-                            </div>
-                          </div>
-                          <div className="grid grid-cols-2">
-                            <div className="border-r border-black p-1">
-                              <div className="text-[7pt] font-semibold uppercase">DELIVERY TIME</div>
-                              <div className="text-[9pt] font-bold">{deliveryTimeLabel || '-'}</div>
-                            </div>
-                            <div className="p-1">
-                              <div className="text-[7pt] font-semibold uppercase">ORDER DATE</div>
-                              <div className="text-[9pt] font-bold">{card.orderDate}</div>
-                            </div>
-                          </div>
-                        </div>
 
-                        <div className="grid grid-rows-[1fr_1fr_2fr]">
-                          <div className="border-b border-black p-1 text-center">
-                            <div className="text-[7pt] font-semibold uppercase">CYCLE</div>
-                            <div className="text-[14pt] font-bold">{card.cycleLabel}</div>
-                          </div>
-                          <div className="border-b border-black p-1 text-center">
-                            <div className="text-[7pt] font-semibold uppercase">DOCK/GATE</div>
-                            <div className="text-[12pt] font-bold">{dockGateLabel}</div>
-                          </div>
-                          <div className="p-1 flex flex-col items-center justify-center">
-                            <div className="text-[7pt] font-semibold uppercase">QR</div>
-                            <QRCodeSVG value={card.mainQrValue} size={90} />
-                          </div>
-                        </div>
-                      </div>
+                            <div className="dn-kanban-card__middle">
+                              <div className="dn-kanban-card__main">
+                                <div className="dn-part-group">
+                                  <div className="text-[6pt] font-semibold uppercase tracking-wide text-slate-700">PART NO</div>
+                                  <div className="font-extrabold leading-none tracking-tight" style={{ fontSize: partNoSize }}>
+                                    {card.partNo}
+                                  </div>
+                                  <div className="text-[6pt] font-semibold leading-tight text-slate-700">{card.itemName}</div>
+                                </div>
+                                <div className="dn-grid-info">
+                                  <div className="dn-qty-panel">
+                                    <div className="text-[6pt] font-semibold uppercase tracking-wide text-slate-700">QTY</div>
+                                    <div className="font-extrabold leading-none tracking-tight" style={{ fontSize: qtySize }}>
+                                      {formatDnQty(card.qtyBox)}
+                                    </div>
+                                  </div>
+                                  <div className="dn-order-panel">
+                                    <div className="text-[6pt] font-semibold uppercase tracking-wide text-slate-700">ORDER NO</div>
+                                    <div className="text-[8pt] font-bold break-all">{card.orderNumber}</div>
+                                    <div className="text-[6pt] font-semibold uppercase tracking-wide mt-1 text-slate-700">LOCATION</div>
+                                    <div className="text-[7pt] font-semibold">{card.locationLabel}</div>
+                                  </div>
+                                </div>
+                              </div>
 
-                      <div className="grid grid-cols-[1fr_1fr]">
-                        <div className="border-r-2 border-black p-1 text-[9pt] font-bold">
-                          CARD {String(card.seq).padStart(2, '0')} OF {card.total}
+                              <div className="dn-kanban-card__meta">
+                                <div className="dn-meta-line">
+                                  <span>CYCLE</span>
+                                  <strong>{card.cycleLabel}</strong>
+                                </div>
+                                <div className="dn-meta-line">
+                                  <span>AREA</span>
+                                  <strong>{card.dockGateLabel}</strong>
+                                </div>
+                                <div className="dn-meta-chip">UNIQUE {card.uniqueCode}</div>
+                                <div className="dn-meta-qr">
+                                  <QRCodeSVG value={card.mainQrValue} size={48} />
+                                </div>
+                              </div>
+                            </div>
+                          </div>
                         </div>
-                        <div className="p-1 text-[8pt] font-semibold text-right">
-                          LOT {card.lotBatch || '-'}
-                        </div>
-                      </div>
-                    </div>
+                      );
+                    })}
                   </div>
-                );
-              })}
-            </div>
+                </div>
+              ))
+            ) : (
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-[11px] text-slate-500">
+                Tidak ada kartu kanban yang bisa dicetak untuk DN ini.
+              </div>
+            )}
           </div>
-        ))}
+        )}
       </div>
     );
   };
@@ -2770,7 +3292,8 @@ const TabKanban = (props) => {
     return kanbanSettings.filter((row) => {
       const itemCode = String(row.item_code || '').toLowerCase();
       const itemName = String(row.item_name || '').toLowerCase();
-      const supplier = String(row.default_supplier || '').toLowerCase();
+      const supplierMeta = resolveMasterItemSupplier(row.item_code);
+      const supplier = `${supplierMeta.supplierCode} ${supplierMeta.supplierName}`.toLowerCase();
       const category = String(row.item_type || '').toLowerCase();
       const dropZone = String(row.drop_zone || '').toLowerCase();
       return itemCode.includes(query)
@@ -2779,7 +3302,7 @@ const TabKanban = (props) => {
         || category.includes(query)
         || dropZone.includes(query);
     });
-  }, [kanbanSettings, masterSearch]);
+  }, [kanbanSettings, masterSearch, itemSupplierMap, masterItemsByCode, masterVendors]);
   const visibleKanbanBoardItems = useMemo(
     () => filteredKanbanItems.slice(0, kanbanItemVisibleLimit),
     [filteredKanbanItems, kanbanItemVisibleLimit],
@@ -2930,7 +3453,7 @@ const TabKanban = (props) => {
   const [showDnBatchModal, setShowDnBatchModal] = useState(false);
   const [dnBatchGroups, setDnBatchGroups] = useState([]);
   const [dnBatchRemarks, setDnBatchRemarks] = useState({});
-  const [dnBatchWarnings, setDnBatchWarnings] = useState({ missingSupplier: [], invalidRole: [] });
+  const [dnBatchWarnings, setDnBatchWarnings] = useState({ missingSupplier: [], invalidRole: [], invalidFlow: [] });
 
   const openRequestFilter = (key) => {
     setRequestFilterOpen((prev) => (prev === key ? null : key));
@@ -3008,18 +3531,24 @@ const TabKanban = (props) => {
   const buildDnBatchGroups = () => {
     const missingSupplier = [];
     const invalidRole = [];
+    const invalidFlow = [];
     const groupMap = new Map();
     const eligibleRows = selectedRequestIds
       .map((id) => kanbanRequests.find((row) => row.id === id))
       .filter((row) => row && isRequestSelectable(row));
     eligibleRows.forEach((row) => {
-      const setting = kanbanSettingsByCode.get(row.item_code);
-      const supplierKey = String(setting?.default_supplier || '').trim();
+      const flowMeta = resolveRequestFlowMeta(row);
+      if (flowMeta.key !== 'supplier-dn') {
+        invalidFlow.push(`${row.item_code} (${flowMeta.label})`);
+        return;
+      }
+      const supplierMeta = resolveMasterItemSupplier(row.item_code);
+      const supplierKey = String(supplierMeta.supplierCode || supplierMeta.supplierName || '').trim();
       if (!supplierKey) {
         missingSupplier.push(row.item_code);
         return;
       }
-      const vendor = masterVendors.find((v) =>
+      const vendor = supplierMeta.vendor || masterVendors.find((v) =>
         String(v.id).toLowerCase() === supplierKey.toLowerCase()
         || String(v.name || '').toLowerCase() === supplierKey.toLowerCase(),
       );
@@ -3028,7 +3557,7 @@ const TabKanban = (props) => {
         invalidRole.push(row.item_code);
         return;
       }
-      const supplierLabel = vendor?.name || supplierKey;
+      const supplierLabel = supplierMeta.label || vendor?.name || supplierKey;
       if (!groupMap.has(supplierKey)) {
         groupMap.set(supplierKey, { supplierKey, supplierLabel, ids: [] });
       }
@@ -3038,20 +3567,40 @@ const TabKanban = (props) => {
       ...group,
       count: group.ids.length,
     }));
-    return { groups, missingSupplier, invalidRole };
+    return { groups, missingSupplier, invalidRole, invalidFlow };
   };
 
   const openDnBatchModal = () => {
-    const { groups, missingSupplier, invalidRole } = buildDnBatchGroups();
+    const { groups, missingSupplier, invalidRole, invalidFlow } = buildDnBatchGroups();
     if (groups.length === 0) {
-      alert('Tidak ada request valid untuk dibuat DN. Pastikan status masih Pending/Approved dan supplier terisi.');
+      const reasons = [];
+      if (invalidFlow.length > 0) {
+        const preview = Array.from(new Set(invalidFlow)).slice(0, 3).join(', ');
+        const suffix = invalidFlow.length > 3 ? ` dan ${invalidFlow.length - 3} lainnya` : '';
+        reasons.push(`Flow bukan Supplier DN: ${preview}${suffix}.`);
+      }
+      if (missingSupplier.length > 0) {
+        const preview = Array.from(new Set(missingSupplier)).slice(0, 3).join(', ');
+        const suffix = missingSupplier.length > 3 ? ` dan ${missingSupplier.length - 3} lainnya` : '';
+        reasons.push(`Supplier Master Item belum diisi untuk item: ${preview}${suffix}.`);
+      }
+      if (invalidRole.length > 0) {
+        const preview = Array.from(new Set(invalidRole)).slice(0, 3).join(', ');
+        const suffix = invalidRole.length > 3 ? ` dan ${invalidRole.length - 3} lainnya` : '';
+        reasons.push(`Role supplier bukan Delivery Note untuk item: ${preview}${suffix}.`);
+      }
+      if (reasons.length === 0) {
+        reasons.push('Kemungkinan status belum Pending/Approved, sudah punya DN, atau request belum eligible untuk DN.');
+      }
+      alert(`Tidak ada request valid untuk dibuat DN.
+${reasons.join('\n')}`);
       return;
     }
     const initialRemarks = {};
     groups.forEach((group) => {
       initialRemarks[group.supplierKey] = dnBatchRemarks[group.supplierKey] || '';
     });
-    setDnBatchWarnings({ missingSupplier, invalidRole });
+    setDnBatchWarnings({ missingSupplier, invalidRole, invalidFlow });
     setDnBatchGroups(groups);
     setDnBatchRemarks(initialRemarks);
     setShowDnBatchModal(true);
@@ -3101,6 +3650,29 @@ const TabKanban = (props) => {
     }
   };
 
+  const selectedRequestRows = selectedRequestIds
+    .map((id) => kanbanRequests.find((row) => row.id === id))
+    .filter(Boolean);
+  const selectedBatchApproveIds = selectedRequestRows
+    .filter((row) => {
+      const statusKey = String(row?.status || '').trim().toLowerCase();
+      return ['triggered', 'requested'].includes(statusKey) && !row?.dn_id;
+    })
+    .map((row) => row.id);
+  const selectedBatchApproveCount = selectedBatchApproveIds.length;
+  const selectedSupplierDnIds = selectedRequestRows
+    .filter((row) => isRequestSelectable(row) && resolveRequestFlowMeta(row).key === 'supplier-dn')
+    .map((row) => row.id);
+  const selectedSupplierDnCount = selectedSupplierDnIds.length;
+  const selectedStockGapIds = requestRows
+    .filter((row) => {
+      if (!isRequestSelectable(row)) return false;
+      const health = getKanbanRequestHealth(row);
+      return Boolean(health?.hasStockGap);
+    })
+    .map((row) => row.id);
+  const selectedStockGapCount = selectedStockGapIds.length;
+
   return (
     <>
             {/* Kanban Board */}
@@ -3119,14 +3691,19 @@ const TabKanban = (props) => {
                   </div>
                 </div>
                 <div className="flex gap-2 text-xs">
+                  {!isProductionUser && (
+                    <button
+                      onClick={() => setKanbanView('master')}
+                      className={`px-3 py-1.5 rounded border ${kanbanView === 'master' ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600'}`}
+                    >
+                      Master Kanban
+                    </button>
+                  )}
                   <button
-                    onClick={() => setKanbanView('master')}
-                    className={`px-3 py-1.5 rounded border ${kanbanView === 'master' ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600'}`}
-                  >
-                    Master Kanban
-                  </button>
-                  <button
-                    onClick={() => setKanbanView('board')}
+                    onClick={() => {
+                      setKanbanView('board');
+                      setKanbanSubTab('dashboard');
+                    }}
                     className={`px-3 py-1.5 rounded border ${kanbanView === 'board' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600'}`}
                   >
                     Kanban Board
@@ -3169,10 +3746,14 @@ const TabKanban = (props) => {
                           <Download size={14} /> Ekspor / Template / Import <ChevronDown size={12} />
                         </button>
                         {masterToolsOpen && (
-                          <div className="absolute right-0 mt-2 w-56 rounded-lg border border-slate-200 bg-white shadow-lg z-20 text-left text-xs overflow-hidden">
+                          <div
+                            className="absolute right-0 mt-2 w-56 rounded-lg border border-slate-200 bg-white shadow-lg z-20 text-left text-xs overflow-hidden"
+                            onClick={(e) => e.stopPropagation()}
+                          >
                             <button
                               className="w-full px-3 py-2 hover:bg-slate-50 flex items-center gap-2"
-                              onClick={async () => {
+                              onClick={async (e) => {
+                                e.stopPropagation();
                                 if (!canImportExport) { alert("Anda tidak memiliki akses export/import."); return; }
                                 const XLSX = await ensureXlsx();
                                 if (!XLSX) return;
@@ -3195,7 +3776,7 @@ const TabKanban = (props) => {
                                   "Calculated Regular": row.effective_regular_kanban ?? row.calculated_regular_kanban ?? '',
                                   "Calculated Safety": row.effective_safety_kanban ?? row.calculated_safety_kanban ?? '',
                                   "Calculated Max Qty": row.effective_max_qty ?? row.calculated_max_qty ?? '',
-                                  "Default Supplier": row.default_supplier || '',
+                                  "Supplier Master Item": resolveMasterItemSupplier(row.item_code).label,
                                   "Drop Zone": row.drop_zone || '',
                                   "Active": row.active ? 'Yes' : 'No',
                                 }));
@@ -3229,7 +3810,7 @@ const TabKanban = (props) => {
                                   "Cycle X": "1",
                                   "Cycle Y": "4",
                                   "Cycle Z": "4",
-                                  "Default Supplier": "",
+                                  "Supplier Master Item": "",
                                   "Drop Zone": "",
                                   "Active": "Yes",
                                 }]);
@@ -3274,7 +3855,6 @@ const TabKanban = (props) => {
                                       cycleX: row["Cycle X"] ?? row["cycle_x"] ?? row["cycleX"],
                                       cycleY: row["Cycle Y"] ?? row["cycle_y"] ?? row["cycleY"],
                                       cycleZ: row["Cycle Z"] ?? row["cycle_z"] ?? row["cycleZ"],
-                                      defaultSupplier: row["Default Supplier"] || row["default_supplier"] || row["defaultSupplier"],
                                       dropZone: row["Drop Zone"] || row["drop_zone"] || row["dropZone"] || row["line_code"] || row["lineCode"],
                                       active: String(row["Active"] ?? row["active"] ?? "Yes").toLowerCase() !== 'no',
                                     })).filter((row) => row.itemCode);
@@ -3318,7 +3898,6 @@ const TabKanban = (props) => {
                             cycleX: '1',
                             cycleY: '4',
                             cycleZ: '4',
-                            defaultSupplier: '',
                             dropZone: '',
                             active: true,
                           });
@@ -3516,7 +4095,7 @@ const TabKanban = (props) => {
                           </div>
                           <div>
                             <div className="text-[10px] uppercase text-slate-400">Supplier</div>
-                            <div className="font-semibold text-slate-700">{row.default_supplier || '-'}</div>
+                            <div className="font-semibold text-slate-700">{resolveMasterItemSupplier(row.item_code).label}</div>
                           </div>
                           <div>
                             <div className="text-[10px] uppercase text-slate-400">Quantities</div>
@@ -3568,7 +4147,6 @@ const TabKanban = (props) => {
                               cycleX: String(row.cycle_x ?? '1'),
                               cycleY: String(row.cycle_y ?? '4'),
                               cycleZ: String(row.cycle_z ?? '4'),
-                              defaultSupplier: row.default_supplier || '',
                               dropZone: row.drop_zone || '',
                               active: Boolean(row.active),
                             });
@@ -3634,33 +4212,12 @@ const TabKanban = (props) => {
                         value={masterItemsByCode.get(kanbanSettingsForm.itemCode)?.name || ''}
                         readOnly
                       />
-                      <label className="block text-[10px] uppercase text-slate-400">Supplier/Subcon Default</label>
-                      <select
-                        className="border p-2 rounded w-full text-xs"
-                        value={kanbanSettingsForm.defaultSupplier}
-                        onChange={(e) => {
-                          const nextSupplier = e.target.value;
-                          const vendorCycle = resolveVendorCycleDefaults(nextSupplier);
-                          setKanbanSettingsForm({
-                            ...kanbanSettingsForm,
-                            defaultSupplier: nextSupplier,
-                            cycleX: vendorCycle.x,
-                            cycleY: vendorCycle.y,
-                            cycleZ: vendorCycle.z,
-                          });
-                        }}
-                      >
-                        <option value="">Pilih supplier dari Master Vendor</option>
-                        {kanbanSettingsForm.defaultSupplier && !masterVendorOptions.some((vendor) => [vendor.id, vendor.name].includes(kanbanSettingsForm.defaultSupplier)) && (
-                          <option value={kanbanSettingsForm.defaultSupplier}>{kanbanSettingsForm.defaultSupplier}</option>
-                        )}
-                        {masterVendorOptions.map((vendor) => (
-                          <option key={vendor.id || vendor.name} value={vendor.id || vendor.name}>
-                            {vendor.id ? `${vendor.id} - ${vendor.name || vendor.id}` : vendor.name}
-                            {vendor.role ? ` (${vendor.role})` : ''}
-                          </option>
-                        ))}
-                      </select>
+                      <label className="block text-[10px] uppercase text-slate-400">Supplier Master Item</label>
+                      <input
+                        className="border p-2 rounded w-full text-xs bg-slate-50"
+                        value={resolveMasterItemSupplier(kanbanSettingsForm.itemCode).label}
+                        readOnly
+                      />
                       <label className="block text-[10px] uppercase text-slate-400">Drop Zone / Line</label>
                       <select
                         className="border p-2 rounded w-full text-xs"
@@ -3767,7 +4324,6 @@ const TabKanban = (props) => {
                             cycleX: '1',
                             cycleY: '4',
                             cycleZ: '4',
-                            defaultSupplier: '',
                             dropZone: '',
                             active: true,
                           });
@@ -3791,15 +4347,24 @@ const TabKanban = (props) => {
                   {kanbanBoardTabs.map((tab) => (
                     <button
                       key={tab.key}
-                      onClick={() => setKanbanSubTab(tab.key)}
-                      className={`px-3 py-1.5 rounded ${kanbanSubTab === tab.key ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600'}`}
+                      type="button"
+                      disabled={tab.disabled}
+                      title={tab.disabled ? tab.disabledTitle : undefined}
+                      onClick={() => {
+                        if (tab.disabled) return;
+                        setKanbanSubTab(tab.key);
+                      }}
+                      className={getLockedButtonClassName(
+                        `px-3 py-1.5 rounded ${kanbanSubTab === tab.key ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600'}`,
+                        tab.disabled,
+                      )}
                     >
                       {tab.label}
                     </button>
                   ))}
                 </div>
 
-                {!isProductionUser && kanbanSubTab === 'dashboard' && (
+                {kanbanSubTab === 'dashboard' && (
                   <div className="space-y-4">
                     <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-7 gap-3">
                       {[
@@ -4006,6 +4571,7 @@ const TabKanban = (props) => {
                       <div className="flex gap-2 ml-auto">
                         <button
                           onClick={() => {
+                            if (!canEditSchedules) return;
                             setShowKanbanEdit(true);
                             setKanbanEditMode('new');
                             setKanbanCategory('');
@@ -4022,24 +4588,35 @@ const TabKanban = (props) => {
                               cycleX: '1',
                               cycleY: '4',
                               cycleZ: '4',
-                              defaultSupplier: '',
                               dropZone: '',
                               active: true,
                             });
                           }}
-                          className="px-3 py-2 text-xs bg-slate-900 text-white rounded flex items-center gap-2"
+                          disabled={!canEditSchedules}
+                          title={getLockedActionTitle(canEditSchedules, 'New Item')}
+                          className={getLockedButtonClassName('px-3 py-2 text-xs bg-slate-900 text-white rounded flex items-center gap-2', !canEditSchedules)}
                         >
                           <Plus size={14} /> New Item
                         </button>
                         <button
-                          className="px-3 py-2 text-xs border rounded flex items-center gap-2"
-                          onClick={() => setShowTriggerChoiceModal(true)}
+                          className={getLockedButtonClassName('px-3 py-2 text-xs border rounded flex items-center gap-2', !canEditSchedules)}
+                          disabled={!canEditSchedules}
+                          title={getLockedActionTitle(canEditSchedules, 'Auto/Manual Request')}
+                          onClick={() => {
+                            if (!canEditSchedules) return;
+                            setShowTriggerChoiceModal(true);
+                          }}
                         >
                           <ArrowDownUp size={14} /> Auto/Manual Request
                         </button>
                         <button
-                          className="px-3 py-2 text-xs border rounded flex items-center gap-2"
-                          onClick={() => setShowKanbanCardModal(true)}
+                          className={getLockedButtonClassName('px-3 py-2 text-xs border rounded flex items-center gap-2', !canEditSchedules)}
+                          disabled={!canEditSchedules}
+                          title={getLockedActionTitle(canEditSchedules, 'Print Cards')}
+                          onClick={() => {
+                            if (!canEditSchedules) return;
+                            setShowKanbanCardModal(true);
+                          }}
                         >
                           <Printer size={14} /> Print Cards
                         </button>
@@ -4156,7 +4733,7 @@ const TabKanban = (props) => {
                               </div>
                             </div>
                             <div className="mt-3 flex items-center justify-between text-[10px] text-slate-500">
-                              <div>Supplier: {row.default_supplier || '-'}</div>
+                              <div>Supplier: {resolveMasterItemSupplier(row.item_code).label}</div>
                               <div>Lead Time: {row.lead_time_days || 0} days</div>
                             </div>
                             <div className="mt-3 flex items-center gap-2 justify-end">
@@ -4231,6 +4808,20 @@ const TabKanban = (props) => {
                             >
                               <ArrowDownUp size={14} /> Buat DN (Batch)
                             </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (selectedStockGapIds.length === 0) {
+                                  alert('Tidak ada request Stock Gap yang eligible untuk dipilih.');
+                                  return;
+                                }
+                                setSelectedRequestIds(Array.from(new Set(selectedStockGapIds)));
+                              }}
+                              className="px-3 py-1.5 text-xs border rounded hover:bg-slate-50 flex items-center gap-2"
+                              title="Pilih semua request Stock Gap yang masih bisa diproses"
+                            >
+                              <CheckCircle size={14} /> Select Stock Gap Eligible
+                            </button>
                             <button onClick={() => setShowManualRequestModal(true)} className="px-3 py-1.5 text-xs bg-white border rounded hover:bg-slate-50 flex items-center gap-2">
                               <Plus size={14} /> Manual Request
                             </button>
@@ -4266,9 +4857,119 @@ const TabKanban = (props) => {
                             </button>
                           ))}
                           <div className="text-xs text-slate-500">
-                            Quick filter: <span className="font-semibold text-slate-700">{requestQuickFilterOptions.find((option) => option.value === kanbanRequestQuickFilter)?.label || 'Semua'}</span>
+                            Quick filter: <span className="font-semibold text-slate-700">{requestQuickFilterOptions.find((option) => option.value === kanbanRequestQuickFilter)?.label || 'All'}</span>
                           </div>
                         </div>
+                        <div className="rounded-xl border border-slate-200 bg-white px-3 py-2 shadow-sm">
+                          <div className="grid grid-cols-1 gap-2 lg:grid-cols-[72px_1fr_44px_1fr] lg:items-center">
+                            <span className="text-[10px] font-semibold uppercase text-slate-500">Category</span>
+                            <div className="flex flex-wrap items-center gap-1.5">
+                            {requestCategoryFilterOptions.map((option) => (
+                              <button
+                                key={option.value}
+                                type="button"
+                                onClick={() => {
+                                  setKanbanRequestCategoryFilter?.(option.value);
+                                  setTablePagination?.((prev) => ({
+                                    ...prev,
+                                    kanbanRequests: { ...(prev.kanbanRequests || {}), page: 1 },
+                                  }));
+                                }}
+                                className={`h-8 rounded-lg border px-3 text-xs font-medium transition ${
+                                  (kanbanRequestCategoryFilter || 'all') === option.value
+                                    ? 'border-slate-900 bg-slate-900 text-white'
+                                    : 'border-slate-200 bg-slate-50 text-slate-600 hover:border-slate-300 hover:bg-white'
+                                }`}
+                              >
+                                {option.label}
+                              </button>
+                            ))}
+                            </div>
+                            <span className="text-[10px] font-semibold uppercase text-slate-500">Flow</span>
+                            <div className="flex flex-wrap items-center gap-1.5">
+                            {requestFlowFilterOptions.map((option) => (
+                              <button
+                                key={option.value}
+                                type="button"
+                                onClick={() => {
+                                  setKanbanRequestFlowFilter?.(option.value);
+                                  setTablePagination?.((prev) => ({
+                                    ...prev,
+                                    kanbanRequests: { ...(prev.kanbanRequests || {}), page: 1 },
+                                  }));
+                                }}
+                                className={`h-8 rounded-lg border px-3 text-xs font-medium transition ${
+                                  (kanbanRequestFlowFilter || 'all') === option.value
+                                    ? 'border-slate-900 bg-slate-900 text-white'
+                                    : 'border-slate-200 bg-slate-50 text-slate-600 hover:border-slate-300 hover:bg-white'
+                                }`}
+                              >
+                                {option.label}
+                              </button>
+                            ))}
+                            </div>
+                          </div>
+                        </div>
+                        {selectedRequestIds.length > 0 && (
+                          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                            <div className="text-xs text-slate-600">
+                              {selectedRequestIds.length} request dipilih
+                              {selectedBatchApproveCount < selectedRequestIds.length && (
+                                <span className="ml-2 text-amber-600">
+                                  ({selectedBatchApproveCount} siap di-approve)
+                                </span>
+                              )}
+                              {selectedSupplierDnCount < selectedRequestIds.length && (
+                                <span className="ml-2 text-indigo-600">
+                                  ({selectedSupplierDnCount} Supplier DN)
+                                </span>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setSelectedRequestIds([])}
+                                className="px-3 py-1.5 text-xs border rounded bg-white text-slate-600 hover:bg-slate-50"
+                              >
+                                Clear
+                              </button>
+                              <button
+                                type="button"
+                                disabled={!canEditSchedules || selectedBatchApproveCount === 0}
+                                onClick={async () => {
+                                  if (!canEditSchedules || selectedBatchApproveCount === 0) return;
+                                  const ok = await handleBatchApproveKanban?.();
+                                  if (ok) setSelectedRequestIds([]);
+                                }}
+                                className={`px-3 py-1.5 text-xs rounded border ${
+                                  !canEditSchedules || selectedBatchApproveCount === 0
+                                    ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                                    : 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
+                                }`}
+                                title={!canEditSchedules ? getLockedActionTitle(canEditSchedules, 'Batch approve') : 'Approve selected requests'}
+                                >
+                                  Batch Approve
+                                </button>
+                              <button
+                                type="button"
+                                disabled={!canEditSchedules || selectedSupplierDnCount === 0}
+                                onClick={async () => {
+                                  if (!canEditSchedules || selectedSupplierDnCount === 0) return;
+                                  const ok = await handleBatchApproveAndDn?.();
+                                  if (ok) setSelectedRequestIds([]);
+                                }}
+                                className={`px-3 py-1.5 text-xs rounded border ${
+                                  !canEditSchedules || selectedSupplierDnCount === 0
+                                    ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                                    : 'bg-indigo-600 text-white border-indigo-600 hover:bg-indigo-700'
+                                }`}
+                                title={!canEditSchedules ? getLockedActionTitle(canEditSchedules, 'Batch approve + DN') : 'Approve selected requests and create DN'}
+                              >
+                                Batch Approve + DN
+                              </button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                       <div className="overflow-x-auto">
                         <table className="min-w-full text-xs">
@@ -4291,6 +4992,9 @@ const TabKanban = (props) => {
                               <th className="text-left p-2">{renderFilterHeader('Date/Time', 'date')}</th>
                               <th className="text-left p-2">{renderFilterHeader('Kanban ID', 'kanbanId')}</th>
                               <th className="text-left p-2">{renderFilterHeader('Item', 'item')}</th>
+                              <th className="text-left p-2">{renderFilterHeader('Category', 'category')}</th>
+                              <th className="text-left p-2">{renderFilterHeader('Flow', 'flow')}</th>
+                              <th className="text-left p-2">{renderFilterHeader('Supplier', 'supplier')}</th>
                               <th className="text-left p-2">{renderFilterHeader('Trigger', 'trigger')}</th>
                               <th className="text-right p-2">{renderFilterHeader('On Hand', 'onHand', 'right')}</th>
                               <th className="text-right p-2">{renderFilterHeader('Order Qty', 'suggested', 'right')}</th>
@@ -4308,6 +5012,12 @@ const TabKanban = (props) => {
                               const groupTriggerLabel = firstRow?.trigger_type === 'manual' ? 'Manual' : 'Auto';
                               const groupDate = firstRow?.created_at ? new Date(firstRow.created_at).toLocaleString('id-ID') : '-';
                               const groupKanbanId = firstRow ? buildKanbanDisplayId(firstRow.item_code, firstRow.item_type, firstRow) : '-';
+                              const groupSupplierMeta = getRequestSupplierMeta(firstRow || {});
+                              const groupFlowMeta = resolveRequestFlowMeta(firstRow || {});
+                              const groupFlowKeys = new Set(group.rows.map((row) => resolveRequestFlowMeta(row).key));
+                              const groupFlowLabel = groupFlowKeys.size > 1 ? 'Mixed' : groupFlowMeta.label;
+                              const groupCategoryKeys = new Set(group.rows.map((row) => resolveRequestFlowMeta(row).category?.key || 'other'));
+                              const groupCategoryLabel = groupCategoryKeys.size > 1 ? 'Mixed' : groupFlowMeta.category?.label || '-';
                               const groupSelectableIds = group.rows.filter((row) => isRequestSelectable(row)).map((row) => row.id);
                               const groupSelectedCount = groupSelectableIds.filter((id) => selectedRequestIds.includes(id)).length;
                               const groupAllSelected = groupSelectableIds.length > 0 && groupSelectedCount === groupSelectableIds.length;
@@ -4321,6 +5031,7 @@ const TabKanban = (props) => {
                                 : groupHasBlocked
                                   ? 'Pending - Over PRL'
                                   : group.progressLabel;
+                              const groupDnRow = group.rows.find((row) => row?.dn_id);
                               return (
                                 <React.Fragment key={group.key}>
                                   <tr className="border-t bg-slate-50">
@@ -4350,6 +5061,17 @@ const TabKanban = (props) => {
                                     <td className="p-2 text-slate-500">{groupDate}</td>
                                     <td className="p-2 text-slate-500">{groupKanbanId}</td>
                                     <td className="p-2">{group.itemLabel}</td>
+                                    <td className="p-2">
+                                      <span className="inline-flex rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-slate-600">
+                                        {groupCategoryLabel}
+                                      </span>
+                                    </td>
+                                    <td className="p-2">
+                                      <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold ${groupFlowKeys.size > 1 ? 'border-slate-200 bg-white text-slate-600' : getRequestFlowBadgeClass(groupFlowMeta.key)}`}>
+                                        {groupFlowLabel}
+                                      </span>
+                                    </td>
+                                    <td className="p-2 text-slate-700 font-semibold">{groupSupplierMeta.codeLabel}</td>
                                     <td className="p-2">{groupTriggerLabel}</td>
                                     <td className="p-2 text-right">{groupOnHand}</td>
                                     <td className="p-2 text-right font-semibold">{formatNumber2(group.totalQty || 0)}</td>
@@ -4389,7 +5111,20 @@ const TabKanban = (props) => {
                                         {groupStatusLabel}
                                       </span>
                                     </td>
-                                    <td className="p-2 text-slate-400">—</td>
+                                    <td className="p-2">
+                                      {groupDnRow ? (
+                                        <button
+                                          type="button"
+                                          onClick={() => openRequestDnDetail(groupDnRow)}
+                                          className="px-2 py-1 border rounded text-indigo-700 bg-indigo-50 hover:bg-indigo-100 text-[11px] font-semibold"
+                                          title={`Buka DN-${groupDnRow.dn_id} di DN Register`}
+                                        >
+                                          DN
+                                        </button>
+                                      ) : (
+                                        <span className="text-slate-400">-</span>
+                                      )}
+                                    </td>
                                   </tr>
                                   {expanded && group.rows.map((row) => {
                                     const health = getKanbanRequestHealth(row);
@@ -4419,6 +5154,12 @@ const TabKanban = (props) => {
                                             : 'bg-slate-100 text-slate-700';
                                     const canApproveRequest = ['triggered', 'requested'].includes(statusKey);
                                     const allowApproveAndDn = dnStatusFlowList.length === 0 || dnStatusFlowList.includes('APPROVE') || dnStatusFlowList.includes('APPROVED');
+                                    const rowKanbanId = extractKanbanIdNote(row.notes) || buildKanbanDisplayId(row.item_code, row.item_type, row);
+                                    const scheduleVendor = resolveRequestVendor(row);
+                                    const canCreateScheduleForRow = isScheduleVendorRole(scheduleVendor?.role);
+                                    const rowSupplierMeta = getRequestSupplierMeta(row);
+                                    const rowFlowMeta = resolveRequestFlowMeta(row);
+                                    const canCreateDnForRow = Boolean(rowFlowMeta.canCreateDn);
                                     return (
                                       <tr key={row.id} className="border-t text-[11px] bg-white">
                                         <td className="p-2">
@@ -4431,8 +5172,19 @@ const TabKanban = (props) => {
                                         </td>
                                         <td className="p-2 font-semibold pl-6">{getRequestIdLabel(row)}</td>
                                         <td className="p-2">{row.created_at ? new Date(row.created_at).toLocaleString('id-ID') : '-'}</td>
-                                        <td className="p-2">{buildKanbanDisplayId(row.item_code, row.item_type, row)}</td>
+                                        <td className="p-2">{rowKanbanId}</td>
                                         <td className="p-2">{row.item_code} - {row.item_name || '-'}</td>
+                                        <td className="p-2">
+                                          <span className="inline-flex rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
+                                            {rowFlowMeta.category?.label || '-'}
+                                          </span>
+                                        </td>
+                                        <td className="p-2">
+                                          <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold ${getRequestFlowBadgeClass(rowFlowMeta.key)}`} title={rowFlowMeta.reason || rowFlowMeta.actionLabel || ''}>
+                                            {rowFlowMeta.label}
+                                          </span>
+                                        </td>
+                                        <td className="p-2 text-slate-700 font-semibold">{rowSupplierMeta.codeLabel}</td>
                                         <td className="p-2">{triggerLabel}</td>
                                         <td className="p-2 text-right">{onHand}</td>
                                         <td className="p-2 text-right font-semibold">{formatNumber2(row.request_qty || 0)}</td>
@@ -4477,15 +5229,30 @@ const TabKanban = (props) => {
                                           <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] ${statusClass}`}>
                                             {statusLabel}
                                           </span>
+                                          {row.dn_id && (
+                                            <div className="mt-1 text-[10px] font-semibold text-indigo-600">DN-{row.dn_id}</div>
+                                          )}
                                         </td>
                                         <td className="p-2">
                                           <div className="flex gap-1 flex-wrap items-center">
+                                            <button
+                                              type="button"
+                                              onClick={() => openKanbanInScan(rowKanbanId)}
+                                              className="px-2 py-1 border rounded text-indigo-700 bg-indigo-50 hover:bg-indigo-100"
+                                              title="Ambil Kanban ID ini untuk scan"
+                                            >
+                                              Scan
+                                            </button>
                                             {health.hasStockGap && (
                                               <button
                                                 type="button"
-                                                onClick={() => openKanbanShortageInPrl(row)}
-                                                className="px-2 py-1 border rounded text-orange-700 bg-orange-50 hover:bg-orange-100"
-                                                title="Buka PRL auto draft untuk item ini"
+                                                disabled={!canEditSchedules}
+                                                onClick={() => {
+                                                  if (!canEditSchedules) return;
+                                                  openKanbanShortageInPrl(row);
+                                                }}
+                                                className={getLockedButtonClassName('px-2 py-1 border rounded text-orange-700 bg-orange-50 hover:bg-orange-100', !canEditSchedules)}
+                                                title={getLockedActionTitle(canEditSchedules, 'Buka PRL auto draft untuk item ini')}
                                                 aria-label="Open stock gap in PRL"
                                               >
                                                 PRL
@@ -4494,36 +5261,72 @@ const TabKanban = (props) => {
                                             {canApproveRequest && (
                                               <>
                                                 <button
-                                                  onClick={() => handleApproveKanban(row)}
-                                                  className="px-2 py-1 border rounded text-emerald-700 bg-emerald-50 hover:bg-emerald-100"
-                                                  title="Approve request"
+                                                  disabled={!canEditSchedules}
+                                                  onClick={() => {
+                                                    if (!canEditSchedules) return;
+                                                    handleApproveKanban(row);
+                                                  }}
+                                                  className={getLockedButtonClassName('px-2 py-1 border rounded text-emerald-700 bg-emerald-50 hover:bg-emerald-100', !canEditSchedules)}
+                                                  title={getLockedActionTitle(canEditSchedules, 'Approve request')}
                                                   aria-label="Approve request"
                                                 >
                                                   Approve
                                                 </button>
-                                                {allowApproveAndDn && !health.hasStockGap && (
+                                                {allowApproveAndDn && canCreateDnForRow && !health.hasStockGap && (
                                                   <button
-                                                    onClick={() => handleApproveAndCreateDn(row)}
-                                                    className="px-2 py-1 border rounded text-indigo-700 bg-indigo-50 hover:bg-indigo-100"
-                                                    title="Approve + DN"
+                                                    disabled={!canEditSchedules}
+                                                    onClick={() => {
+                                                      if (!canEditSchedules) return;
+                                                      handleApproveAndCreateDn(row);
+                                                    }}
+                                                    className={getLockedButtonClassName('px-2 py-1 border rounded text-indigo-700 bg-indigo-50 hover:bg-indigo-100', !canEditSchedules)}
+                                                    title={getLockedActionTitle(canEditSchedules, 'Approve + DN')}
                                                     aria-label="Approve and create DN"
                                                   >
                                                     Approve + DN
                                                   </button>
                                                 )}
+                                                {!canCreateDnForRow && rowFlowMeta.key === 'production' && (
+                                                  <button
+                                                    type="button"
+                                                    onClick={() => setKanbanSubTab('production')}
+                                                    className="px-2 py-1 border rounded text-emerald-700 bg-emerald-50 hover:bg-emerald-100"
+                                                    title={rowFlowMeta.reason || 'Open Production flow'}
+                                                  >
+                                                    Production
+                                                  </button>
+                                                )}
+                                                {!canCreateDnForRow && rowFlowMeta.key === 'subcon' && (
+                                                  <button
+                                                    type="button"
+                                                    onClick={() => setMainTab?.('subcon')}
+                                                    className="px-2 py-1 border rounded text-violet-700 bg-violet-50 hover:bg-violet-100"
+                                                    title={rowFlowMeta.reason || 'Open Subcon flow'}
+                                                  >
+                                                    Subcon
+                                                  </button>
+                                                )}
                                                 <button
-                                                  onClick={() => handleRejectKanban(row)}
-                                                  className="p-2 border rounded text-amber-600 hover:text-amber-700"
-                                                  title="Reject"
+                                                  disabled={!canEditSchedules}
+                                                  onClick={() => {
+                                                    if (!canEditSchedules) return;
+                                                    handleRejectKanban(row);
+                                                  }}
+                                                  className={getLockedButtonClassName('p-2 border rounded text-amber-600 hover:text-amber-700', !canEditSchedules)}
+                                                  title={getLockedActionTitle(canEditSchedules, 'Reject')}
                                                   aria-label="Reject request"
                                                 >
                                                   <XIcon size={12} />
                                                 </button>
                                                 {canDeleteRecords && (
                                                   <button
-                                                    onClick={() => handleDeleteKanbanRequest(row)}
-                                                    className="p-2 border rounded text-red-600 hover:text-red-700"
-                                                    title="Delete"
+                                                    disabled={!canDeleteRecords}
+                                                    onClick={() => {
+                                                      if (!canDeleteRecords) return;
+                                                      handleDeleteKanbanRequest(row);
+                                                    }}
+                                                    className={getLockedButtonClassName('p-2 border rounded text-red-600 hover:text-red-700', !canDeleteRecords)}
+                                                    title={getLockedActionTitle(canDeleteRecords, 'Delete')}
                                                     aria-label="Delete request"
                                                   >
                                                     <Trash2 size={12} />
@@ -4533,9 +5336,13 @@ const TabKanban = (props) => {
                                             )}
                                             {canDeleteRecords && row.status === 'approved' && !row.dn_id && (
                                               <button
-                                                onClick={() => handleDeleteKanbanRequest(row)}
-                                                className="p-2 border rounded text-red-600 hover:text-red-700"
-                                                title="Delete"
+                                                disabled={!canDeleteRecords}
+                                                onClick={() => {
+                                                  if (!canDeleteRecords) return;
+                                                  handleDeleteKanbanRequest(row);
+                                                }}
+                                                className={getLockedButtonClassName('p-2 border rounded text-red-600 hover:text-red-700', !canDeleteRecords)}
+                                                title={getLockedActionTitle(canDeleteRecords, 'Delete')}
                                                 aria-label="Delete request"
                                               >
                                                 <Trash2 size={12} />
@@ -4548,8 +5355,12 @@ const TabKanban = (props) => {
                                                 </summary>
                                                 <div className="absolute right-0 mt-1 w-28 bg-white border rounded shadow-md z-10">
                                                   <button
-                                                    onClick={() => handleDeleteKanbanRequest(row)}
-                                                    className="w-full text-left px-3 py-2 text-xs text-red-600 hover:bg-red-50"
+                                                    disabled={!canDeleteRecords}
+                                                    onClick={() => {
+                                                      if (!canDeleteRecords) return;
+                                                      handleDeleteKanbanRequest(row);
+                                                    }}
+                                                    className={getLockedButtonClassName('w-full text-left px-3 py-2 text-xs text-red-600 hover:bg-red-50', !canDeleteRecords)}
                                                   >
                                                     Hapus
                                                   </button>
@@ -4559,21 +5370,60 @@ const TabKanban = (props) => {
                                             {row.status === 'approved' && row.dn_id && (
                                               <span className="text-[10px] text-indigo-600 font-semibold">DN-{row.dn_id}</span>
                                             )}
-                                            {row.status === 'approved' && !row.dn_id && (
+                                            {row.status === 'approved' && !row.dn_id && canCreateDnForRow && (
                                               <button
-                                                onClick={() => openDnModal(row)}
-                                                className="p-2 border rounded text-slate-600 hover:text-slate-900"
-                                                title="Create DN"
+                                                disabled={!canEditSchedules}
+                                                onClick={() => {
+                                                  if (!canEditSchedules) return;
+                                                  openDnModal(row);
+                                                }}
+                                                className={getLockedButtonClassName('p-2 border rounded text-slate-600 hover:text-slate-900', !canEditSchedules)}
+                                                title={getLockedActionTitle(canEditSchedules, 'Create DN')}
                                                 aria-label="Create DN"
                                               >
                                                 <Plus size={12} />
                                               </button>
                                             )}
+                                            {row.status === 'approved' && !row.dn_id && !canCreateDnForRow && rowFlowMeta.key === 'production' && (
+                                              <button
+                                                type="button"
+                                                onClick={() => setKanbanSubTab('production')}
+                                                className="px-2 py-1 border rounded text-emerald-700 bg-emerald-50 hover:bg-emerald-100"
+                                                title={rowFlowMeta.reason || 'Open Production flow'}
+                                              >
+                                                Production
+                                              </button>
+                                            )}
+                                            {row.status === 'approved' && !row.dn_id && !canCreateDnForRow && rowFlowMeta.key === 'subcon' && (
+                                              <button
+                                                type="button"
+                                                onClick={() => setMainTab?.('subcon')}
+                                                className="px-2 py-1 border rounded text-violet-700 bg-violet-50 hover:bg-violet-100"
+                                                title={rowFlowMeta.reason || 'Open Subcon flow'}
+                                              >
+                                                Subcon
+                                              </button>
+                                            )}
                                             {row.status === 'dn_created' && row.dn_id && (
                                               <button
-                                                onClick={() => openScheduleModal(row)}
-                                                className="p-2 border rounded text-slate-600 hover:text-slate-900"
-                                                title="Create Schedule"
+                                                type="button"
+                                                onClick={() => openRequestDnDetail(row)}
+                                                className="px-2 py-1 border rounded text-indigo-700 bg-indigo-50 hover:bg-indigo-100 font-semibold"
+                                                title={`Buka DN-${row.dn_id} di DN Register`}
+                                                aria-label="Open DN register detail"
+                                              >
+                                                DN
+                                              </button>
+                                            )}
+                                            {row.status === 'dn_created' && row.dn_id && canCreateScheduleForRow && (
+                                              <button
+                                                disabled={!canEditSchedules}
+                                                onClick={() => {
+                                                  if (!canEditSchedules) return;
+                                                  openScheduleModal(row);
+                                                }}
+                                                className={getLockedButtonClassName('p-2 border rounded text-slate-600 hover:text-slate-900', !canEditSchedules)}
+                                                title={getLockedActionTitle(canEditSchedules, 'Create Schedule')}
                                                 aria-label="Create schedule"
                                               >
                                                 <Plus size={12} />
@@ -4581,9 +5431,13 @@ const TabKanban = (props) => {
                                             )}
                                             {(row.status === 'scheduled' || row.status === 'in_transit') && row.schedule_id && (
                                               <button
-                                                onClick={() => openReceiveModal(row)}
-                                                className="p-2 border rounded text-slate-600 hover:text-slate-900"
-                                                title="Receive/RN"
+                                                disabled={!canEditSchedules}
+                                                onClick={() => {
+                                                  if (!canEditSchedules) return;
+                                                  openReceiveModal(row);
+                                                }}
+                                                className={getLockedButtonClassName('p-2 border rounded text-slate-600 hover:text-slate-900', !canEditSchedules)}
+                                                title={getLockedActionTitle(canEditSchedules, 'Receive/RN')}
                                                 aria-label="Receive or RN"
                                               >
                                                 <Plus size={12} />
@@ -4598,7 +5452,7 @@ const TabKanban = (props) => {
                               );
                             })}
                             {groupedKanbanRequests.length === 0 && (
-                              <tr><td colSpan="12" className="p-3 text-center text-gray-400">Belum ada request.</td></tr>
+                              <tr><td colSpan="15" className="p-3 text-center text-gray-400">No requests found.</td></tr>
                             )}
                           </tbody>
                         </table>
@@ -4612,52 +5466,104 @@ const TabKanban = (props) => {
 
                 {!isProductionUser && kanbanSubTab === 'dn' && (
                   <div className="bg-white rounded-xl border p-4">
-                    <div className="text-sm font-semibold mb-3">DN Register</div>
+                    <div className="mb-3 flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+                      <div>
+                        <div className="text-sm font-semibold">DN Register</div>
+                        <div className="text-xs text-slate-500">
+                          {kanbanDnPaginationMeta.total} DN tampil dari filter aktif.
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(220px,1fr)_180px_150px_auto] lg:min-w-[720px]">
+                        <label className="relative block">
+                          <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                          <input
+                            className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-xs outline-none focus:border-slate-400"
+                            placeholder="Cari DN / supplier / tanggal / status"
+                            value={kanbanDnFilters?.search || ''}
+                            onChange={(event) => updateKanbanDnFilter('search', event.target.value)}
+                          />
+                        </label>
+                        <select
+                          className="rounded-lg border border-slate-200 px-3 py-2 text-xs outline-none focus:border-slate-400"
+                          value={kanbanDnFilters?.supplier || 'all'}
+                          onChange={(event) => updateKanbanDnFilter('supplier', event.target.value)}
+                        >
+                          <option value="all">Semua supplier</option>
+                          {(kanbanDnSupplierOptions || []).map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
+                        <select
+                          className="rounded-lg border border-slate-200 px-3 py-2 text-xs outline-none focus:border-slate-400"
+                          value={kanbanDnFilters?.status || 'all'}
+                          onChange={(event) => updateKanbanDnFilter('status', event.target.value)}
+                        >
+                          <option value="all">Semua status</option>
+                          {(kanbanDnStatusOptions || []).map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          onClick={resetKanbanDnFilters}
+                          className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                        >
+                          Reset
+                        </button>
+                      </div>
+                    </div>
                     <div className="overflow-x-auto">
                       <table className="min-w-full text-xs">
                         <thead className="bg-slate-100">
                           <tr>
-                            <th className="text-left p-2">No DN</th>
+                            <th className="text-left p-2">DN Number</th>
                             <th className="text-left p-2">Supplier</th>
-                            <th className="text-left p-2">Date</th>
+                            <th className="text-left p-2">Created Date</th>
+                            <th className="text-left p-2">Delivery Date</th>
                             <th className="text-right p-2">Qty</th>
                             <th className="text-left p-2">Status</th>
+                            <th className="text-left p-2">Type</th>
+                            <th className="text-left p-2">Alert</th>
                             <th className="text-left p-2">Actions</th>
                           </tr>
                         </thead>
                         <tbody>
                           {deliveryNotesLoading && (
-                            <tr><td colSpan="6" className="p-3 text-center text-gray-400">Memuat...</td></tr>
+                            <tr><td colSpan="9" className="p-3 text-center text-gray-400">Loading...</td></tr>
                           )}
                           {!deliveryNotesLoading && kanbanDnPaginationMeta.rows.map((dn) => {
                             const supplierVendor = resolveVendorFromSupplier(dn.supplier);
                             const supplierLabel = supplierVendor?.name || dn.supplier || '-';
                             const supplierCode = supplierVendor?.id || '';
-                            const plannedDate = dn.planned_date ? new Date(dn.planned_date).toLocaleDateString('id-ID') : '-';
+                            const createdDate = formatDnDate(dn.created_at);
+                            const plannedDate = formatDnDate(dn.planned_date);
                             const statusValue = String(dn.status || '').toLowerCase();
                             const statusLabel = statusValue ? statusValue.toUpperCase() : '-';
+                            const deliveryTypeLabel = getDnDeliveryTypeForDisplay(dn).toUpperCase();
                             const isDraft = statusValue === 'draft';
+                            const canEditDnHeader = ['draft', 'open'].includes(statusValue);
+                            const arrivalWarning = getDnArrivalWarning(dn);
                             return (
                             <tr key={dn.id} className="border-t">
                               <td className="p-2 font-semibold">{dn.dn_number}</td>
                               <td className="p-2">
-                                {supplierVendor ? (
-                                  <button
-                                    type="button"
-                                    onClick={() => openVendorDetail(supplierVendor)}
-                                    className="text-indigo-600 hover:underline text-left"
-                                    title="Buka detail supplier"
-                                  >
-                                    <div className="font-semibold">{supplierLabel}</div>
-                                    {supplierCode && <div className="text-[10px] text-slate-400">{supplierCode}</div>}
-                                  </button>
-                                ) : (
-                                  <span>{supplierLabel}</span>
-                                )}
+                                <div className="font-semibold text-slate-800">{supplierLabel}</div>
+                                {supplierCode && <div className="text-[10px] text-slate-400">{supplierCode}</div>}
                               </td>
+                              <td className="p-2 text-slate-600">{createdDate}</td>
                               <td className="p-2">{plannedDate}</td>
                               <td className="p-2 text-right">{formatNumber0(dn.total_qty)}</td>
                               <td className="p-2">{statusLabel}</td>
+                              <td className="p-2">{deliveryTypeLabel}</td>
+                              <td className="p-2">
+                                {arrivalWarning ? (
+                                  <span className={`inline-flex whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-semibold ${arrivalWarning.className}`}>
+                                    {arrivalWarning.label}
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-300">-</span>
+                                )}
+                              </td>
                               <td className="p-2">
                                 <div className="flex items-center gap-1">
                                   <button
@@ -4684,12 +5590,12 @@ const TabKanban = (props) => {
                                   >
                                     <Mail size={14} />
                                   </button>
-                                  {isDraft && (
+                                  {canEditDnHeader && (
                                     <button
                                       type="button"
                                       onClick={() => openDnDetailModal(dn, true)}
                                       className="p-1.5 border rounded text-slate-600 hover:text-slate-900"
-                                      title="Edit DN"
+                                      title="Edit tanggal / rit DN"
                                     >
                                       <Edit size={14} />
                                     </button>
@@ -4717,7 +5623,7 @@ const TabKanban = (props) => {
                             </tr>
                           )})}
                           {!deliveryNotesLoading && kanbanDnPaginationMeta.total === 0 && (
-                            <tr><td colSpan="6" className="p-3 text-center text-gray-400">Belum ada DN.</td></tr>
+                            <tr><td colSpan="9" className="p-3 text-center text-gray-400">No DN found.</td></tr>
                           )}
                         </tbody>
                       </table>
@@ -4726,6 +5632,344 @@ const TabKanban = (props) => {
                       {renderPaginationControls('kanbanDn', kanbanDnPaginationMeta)}
                     </div>
                   </div>
+                )}
+
+                {!isProductionUser && kanbanSubTab === 'delivery' && (
+                  canOpenDeliveryTab ? (
+                  <div className="space-y-4">
+                    <div className="bg-white rounded-xl border p-3 flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold">Delivery Workflow</div>
+                        <div className="text-xs text-slate-500">Pisahkan alur upload DN, import penerimaan aktual, dan histori agar lebih cepat dipakai operator.</div>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        {[
+                          { key: 'upload-dn', label: 'Upload DN' },
+                          { key: 'import-aktual', label: 'Import Aktual' },
+                          { key: 'history', label: 'History' },
+                        ].map((tab) => (
+                          <button
+                            key={tab.key}
+                            type="button"
+                            onClick={() => setDeliveryWorkflowTab(tab.key)}
+                            className={`px-3 py-2 text-xs rounded border transition ${
+                              deliveryWorkflowTab === tab.key
+                                ? 'bg-slate-900 text-white border-slate-900'
+                                : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                            }`}
+                          >
+                            {tab.label}
+                          </button>
+                        ))}
+                        <button
+                          type="button"
+                          className="px-3 py-2 text-xs border rounded"
+                          onClick={() => fetchDeliveryUploads()}
+                          disabled={deliveryUploadsLoading}
+                        >
+                          {deliveryUploadsLoading ? 'Memuat...' : 'Refresh'}
+                        </button>
+                      </div>
+                    </div>
+
+                    {deliveryWorkflowTab === 'upload-dn' && (
+                      <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_minmax(0,0.8fr)] gap-4">
+                        <div className="bg-white rounded-xl border p-4 space-y-4">
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <div className="text-sm font-semibold">Upload Delivery Note</div>
+                              <div className="text-xs text-slate-500">Upload foto atau PDF DN customer. Sistem akan baca teks, potong stok parent, lalu trigger backorder BOM jika kurang.</div>
+                            </div>
+                          </div>
+                          <div className="rounded-xl border border-dashed bg-slate-50 p-4">
+                            <input
+                              ref={deliveryUploadInputRef}
+                              type="file"
+                              accept="image/*,application/pdf"
+                              className="block w-full text-xs"
+                            />
+                            <div className="mt-2 text-[11px] text-slate-500">
+                              Format: foto JPG/PNG/WEBP atau PDF hasil scan customer.
+                            </div>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={handleDeliveryUpload}
+                                disabled={deliveryUploadLoading}
+                                className="px-3 py-2 text-xs bg-slate-900 text-white rounded flex items-center gap-2 disabled:opacity-60"
+                              >
+                                <FileUp size={14} />
+                                {deliveryUploadLoading ? 'Memproses...' : 'Upload & Proses'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (deliveryUploadInputRef.current) deliveryUploadInputRef.current.value = '';
+                                  setDeliveryUploadError('');
+                                }}
+                                className="px-3 py-2 text-xs border rounded"
+                              >
+                                Reset
+                              </button>
+                            </div>
+                            {deliveryUploadError && (
+                              <div className="mt-3 text-xs text-red-600 whitespace-pre-wrap">{deliveryUploadError}</div>
+                            )}
+                            {deliveryUploadResult && (
+                              <div className="mt-4 rounded-xl border bg-white p-3 space-y-3">
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="text-xs font-semibold text-slate-700">Hasil Upload Terakhir</div>
+                                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                                    String(deliveryUploadResult.status || '').toLowerCase() === 'full'
+                                      ? 'bg-emerald-100 text-emerald-700'
+                                      : 'bg-amber-100 text-amber-700'
+                                  }`}>
+                                    {String(deliveryUploadResult.status || '-').toUpperCase()}
+                                  </span>
+                                </div>
+                                <div className="grid grid-cols-2 gap-2 text-[11px]">
+                                  <div className="rounded-lg bg-slate-50 p-2">
+                                    <div className="text-slate-400">Customer</div>
+                                    <div className="font-semibold text-slate-800 break-words">{deliveryUploadResult.customer_name || '-'}</div>
+                                  </div>
+                                  <div className="rounded-lg bg-slate-50 p-2">
+                                    <div className="text-slate-400">DN Number</div>
+                                    <div className="font-semibold text-slate-800 break-words">{deliveryUploadResult.dn_number || '-'}</div>
+                                  </div>
+                                  <div className="rounded-lg bg-slate-50 p-2">
+                                    <div className="text-slate-400">Qty Order</div>
+                                    <div className="font-semibold text-slate-800">{formatNumber0(deliveryUploadResult.total_qty_order || 0)}</div>
+                                  </div>
+                                  <div className="rounded-lg bg-slate-50 p-2">
+                                    <div className="text-slate-400">Qty Kurang</div>
+                                    <div className="font-semibold text-slate-800">{formatNumber0(deliveryUploadResult.total_qty_shortage || 0)}</div>
+                                  </div>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                          {deliveryUploadsError && (
+                            <div className="text-xs text-red-600">{deliveryUploadsError}</div>
+                          )}
+                          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                            <div className="rounded-xl border bg-slate-50 p-3">
+                              <div className="text-[10px] uppercase tracking-wide text-slate-400">Upload</div>
+                              <div className="mt-1 text-xl font-bold text-slate-900">{deliveryUploadSummary.total}</div>
+                            </div>
+                            <div className="rounded-xl border bg-emerald-50 p-3">
+                              <div className="text-[10px] uppercase tracking-wide text-emerald-600">Full</div>
+                              <div className="mt-1 text-xl font-bold text-emerald-700">{deliveryUploadSummary.full}</div>
+                            </div>
+                            <div className="rounded-xl border bg-amber-50 p-3">
+                              <div className="text-[10px] uppercase tracking-wide text-amber-600">Partial</div>
+                              <div className="mt-1 text-xl font-bold text-amber-700">{deliveryUploadSummary.partial}</div>
+                            </div>
+                            <div className="rounded-xl border bg-rose-50 p-3">
+                              <div className="text-[10px] uppercase tracking-wide text-rose-600">Shortage Qty</div>
+                              <div className="mt-1 text-xl font-bold text-rose-700">{formatNumber0(deliveryUploadSummary.shortageQty || 0)}</div>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="bg-white rounded-xl border p-4">
+                          <div className="text-sm font-semibold mb-2">Ringkasan DN</div>
+                          <div className="text-xs text-slate-500 mb-3">Data upload DN terakhir dan ringkasan proses akan tampil di sini.</div>
+                          <div className="space-y-2 text-xs">
+                            <div className="rounded-lg border bg-slate-50 p-3">
+                              <div className="text-[10px] uppercase text-slate-400">Total Upload</div>
+                              <div className="font-semibold">{deliveryUploads.length}</div>
+                            </div>
+                            <div className="rounded-lg border bg-slate-50 p-3">
+                              <div className="text-[10px] uppercase text-slate-400">Last Customer</div>
+                              <div className="font-semibold break-words">{deliveryUploadResult?.customer_name || '-'}</div>
+                            </div>
+                            <div className="rounded-lg border bg-slate-50 p-3">
+                              <div className="text-[10px] uppercase text-slate-400">Last DN</div>
+                              <div className="font-semibold break-words">{deliveryUploadResult?.dn_number || '-'}</div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {deliveryWorkflowTab === 'history' && (
+                      <div className="space-y-4">
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                          <div className="rounded-xl border bg-slate-50 p-3">
+                            <div className="text-[10px] uppercase tracking-wide text-slate-400">Upload</div>
+                            <div className="mt-1 text-xl font-bold text-slate-900">{deliveryUploadSummary.total}</div>
+                          </div>
+                          <div className="rounded-xl border bg-emerald-50 p-3">
+                            <div className="text-[10px] uppercase tracking-wide text-emerald-600">Full</div>
+                            <div className="mt-1 text-xl font-bold text-emerald-700">{deliveryUploadSummary.full}</div>
+                          </div>
+                          <div className="rounded-xl border bg-amber-50 p-3">
+                            <div className="text-[10px] uppercase tracking-wide text-amber-600">Partial</div>
+                            <div className="mt-1 text-xl font-bold text-amber-700">{deliveryUploadSummary.partial}</div>
+                          </div>
+                          <div className="rounded-xl border bg-rose-50 p-3">
+                            <div className="text-[10px] uppercase tracking-wide text-rose-600">Shortage Qty</div>
+                            <div className="mt-1 text-xl font-bold text-rose-700">{formatNumber0(deliveryUploadSummary.shortageQty || 0)}</div>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)] gap-4">
+                          <div className="bg-white rounded-xl border p-4">
+                            <div className="flex items-center justify-between gap-3 mb-3">
+                              <div>
+                                <div className="text-sm font-semibold">Histori Upload DN</div>
+                                <div className="text-xs text-slate-500">Klik baris untuk melihat detail item dan backorder BOM.</div>
+                              </div>
+                              <div className="text-xs text-slate-500">{deliveryUploads.length} record</div>
+                            </div>
+                            <div className="overflow-x-auto">
+                              <table className="min-w-[960px] w-full text-xs">
+                                <thead className="bg-slate-100 text-slate-600">
+                                  <tr>
+                                    <th className="p-2 text-left">Waktu</th>
+                                    <th className="p-2 text-left">Customer</th>
+                                    <th className="p-2 text-left">DN Number</th>
+                                    <th className="p-2 text-right">Order</th>
+                                    <th className="p-2 text-right">Fulfilled</th>
+                                    <th className="p-2 text-right">Shortage</th>
+                                    <th className="p-2 text-left">Status</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {deliveryUploadsLoading && (
+                                    <tr>
+                                      <td colSpan="7" className="p-3 text-center text-slate-400">Memuat...</td>
+                                    </tr>
+                                  )}
+                                  {!deliveryUploadsLoading && deliveryUploads.map((row) => {
+                                    const statusKey = String(row.status || '').toLowerCase();
+                                    const active = Number(selectedDeliveryUpload?.id || 0) === Number(row.id || 0);
+                                    const statusTone = statusKey === 'full'
+                                      ? 'bg-emerald-100 text-emerald-700'
+                                      : statusKey === 'partial_backorder'
+                                        ? 'bg-amber-100 text-amber-700'
+                                        : 'bg-rose-100 text-rose-700';
+                                    return (
+                                      <tr
+                                        key={row.id}
+                                        className={`border-t cursor-pointer ${active ? 'bg-slate-50' : 'hover:bg-slate-50'}`}
+                                        onClick={() => setSelectedDeliveryUploadId(row.id)}
+                                      >
+                                        <td className="p-2">{row.created_at ? new Date(row.created_at).toLocaleString('id-ID') : '-'}</td>
+                                        <td className="p-2">{row.customer_name || '-'}</td>
+                                        <td className="p-2 font-semibold">{row.dn_number || '-'}</td>
+                                        <td className="p-2 text-right">{formatNumber0(row.total_qty_order || 0)}</td>
+                                        <td className="p-2 text-right">{formatNumber0(row.total_qty_fulfilled || 0)}</td>
+                                        <td className="p-2 text-right">{formatNumber0(row.total_qty_shortage || 0)}</td>
+                                        <td className="p-2">
+                                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${statusTone}`}>
+                                            {statusKey ? statusKey.replace(/_/g, ' ').toUpperCase() : '-'}
+                                          </span>
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                  {!deliveryUploadsLoading && deliveryUploads.length === 0 && (
+                                    <tr>
+                                      <td colSpan="7" className="p-3 text-center text-slate-400">Belum ada upload DN.</td>
+                                    </tr>
+                                  )}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+
+                          <div className="bg-white rounded-xl border p-4">
+                            <div className="flex items-center justify-between gap-3 mb-3">
+                              <div>
+                                <div className="text-sm font-semibold">Detail DN Terpilih</div>
+                                <div className="text-xs text-slate-500">Detail item per baris dan request BOM yang dibuat.</div>
+                              </div>
+                              <div className="text-xs text-slate-500">{selectedDeliveryUpload?.file_name || '-'}</div>
+                            </div>
+                            {selectedDeliveryUpload ? (
+                              <div className="space-y-4">
+                                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                                  <div className="rounded-xl border bg-slate-50 p-3">
+                                    <div className="text-[10px] uppercase tracking-wide text-slate-400">Customer</div>
+                                    <div className="mt-1 font-semibold break-words">{selectedDeliveryUpload.customer_name || '-'}</div>
+                                  </div>
+                                  <div className="rounded-xl border bg-slate-50 p-3">
+                                    <div className="text-[10px] uppercase tracking-wide text-slate-400">DN Number</div>
+                                    <div className="mt-1 font-semibold break-words">{selectedDeliveryUpload.dn_number || '-'}</div>
+                                  </div>
+                                  <div className="rounded-xl border bg-slate-50 p-3">
+                                    <div className="text-[10px] uppercase tracking-wide text-slate-400">File</div>
+                                    <div className="mt-1 font-semibold break-words">{selectedDeliveryUpload.file_name || '-'}</div>
+                                  </div>
+                                  <div className="rounded-xl border bg-slate-50 p-3">
+                                    <div className="text-[10px] uppercase tracking-wide text-slate-400">Status</div>
+                                    <div className="mt-1 font-semibold">{String(selectedDeliveryUpload.status || '-').toUpperCase()}</div>
+                                  </div>
+                                </div>
+                                <div className="overflow-x-auto">
+                                  <table className="min-w-[980px] w-full text-xs">
+                                    <thead className="bg-slate-100 text-slate-600">
+                                      <tr>
+                                        <th className="p-2 text-left">No</th>
+                                        <th className="p-2 text-left">Part No</th>
+                                        <th className="p-2 text-left">Part Name</th>
+                                        <th className="p-2 text-right">Qty Order</th>
+                                        <th className="p-2 text-right">Stock</th>
+                                        <th className="p-2 text-right">Fulfilled</th>
+                                        <th className="p-2 text-right">Shortage</th>
+                                        <th className="p-2 text-left">Status</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {selectedDeliveryUploadItems.map((item) => {
+                                        const statusKey = String(item.status || '').toLowerCase();
+                                        const tone = statusKey === 'full'
+                                          ? 'bg-emerald-100 text-emerald-700'
+                                          : statusKey === 'partial_backorder'
+                                            ? 'bg-amber-100 text-amber-700'
+                                            : statusKey === 'missing_item'
+                                              ? 'bg-rose-100 text-rose-700'
+                                              : 'bg-slate-100 text-slate-700';
+                                        return (
+                                          <tr key={item.id} className="border-t">
+                                            <td className="p-2">{item.lineNo || '-'}</td>
+                                            <td className="p-2 font-semibold">{item.partNo || '-'}</td>
+                                            <td className="p-2">{item.itemName || '-'}</td>
+                                            <td className="p-2 text-right">{formatNumber0(item.qtyOrder || 0)}</td>
+                                            <td className="p-2 text-right">{formatNumber0(item.qtyAvailable || 0)}</td>
+                                            <td className="p-2 text-right">{formatNumber0(item.qtyFulfilled || 0)}</td>
+                                            <td className="p-2 text-right">{formatNumber0(item.qtyShortage || 0)}</td>
+                                            <td className="p-2">
+                                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${tone}`}>
+                                                {statusKey ? statusKey.replace(/_/g, ' ').toUpperCase() : '-'}
+                                              </span>
+                                            </td>
+                                          </tr>
+                                        );
+                                      })}
+                                      {selectedDeliveryUploadItems.length === 0 && (
+                                        <tr>
+                                          <td colSpan="8" className="p-3 text-center text-slate-400">Belum ada detail item.</td>
+                                        </tr>
+                                      )}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="text-sm text-slate-400 py-8 text-center">Belum ada data delivery yang dipilih.</div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  ) : (
+                    <div className="rounded-xl border bg-white p-4 text-sm text-slate-500">
+                      Delivery hanya tersedia untuk role dengan akses penjadwalan.
+                    </div>
+                  )
                 )}
 
                 {!isProductionUser && kanbanSubTab === 'receiving' && (
@@ -4877,10 +6121,10 @@ const TabKanban = (props) => {
                         <div className="mt-4 space-y-3">
                           <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-3 items-end">
                             <div>
-                              <label className="block text-[10px] uppercase text-slate-400 mb-1">Scan QR Kanban Box</label>
+                              <label className="block text-[10px] uppercase text-slate-400 mb-1">Scan QR Label Incoming</label>
                               <input
                                 className="border p-2 rounded w-full text-sm"
-                                placeholder="Scan QR kanban"
+                                placeholder="Scan label supplier; DN/item/qty akan terbaca"
                                 value={receiveScanInput}
                                 onChange={(e) => setReceiveScanInput(e.target.value)}
                                 onKeyDown={(e) => {
@@ -4992,9 +6236,9 @@ const TabKanban = (props) => {
                           type="button"
                           onClick={() => setShowReceiveFormModal(true)}
                           className="px-3 py-1.5 text-xs bg-slate-900 text-white rounded"
-                        >
-                          Terima Barang
-                        </button>
+                          >
+                            Terima Barang
+                          </button>
                         <input
                           className="border rounded px-3 py-1.5 text-xs w-48"
                           placeholder="Search RN / Supplier / DN"
@@ -5229,14 +6473,14 @@ const TabKanban = (props) => {
                       <div className="text-xs text-slate-500 mb-3">{isProductionUser ? 'Riwayat ringkas kartu kanban kosong.' : 'Riwayat semua kartu kanban kosong.'}</div>
                       <div className="overflow-x-auto">
                         <div className={`${isProductionUser ? 'min-w-[720px]' : 'min-w-[980px]'} text-xs`}>
-                          <div className="bg-slate-100 grid items-center" style={{ gridTemplateColumns: isProductionUser ? '170px 180px minmax(220px, 1fr) 120px 140px' : emptyLogGrid }}>
+                          <div className="bg-slate-100 grid items-center" style={{ gridTemplateColumns: isProductionUser ? '170px 180px minmax(220px, 1fr) 120px' : emptyLogGrid }}>
                             <div className="text-left p-2">Waktu</div>
                             <div className="text-left p-2">ID Kanban</div>
                             <div className="text-left p-2">Item</div>
                             {!isProductionUser && <><div className="text-left p-2">Area/Lini</div><div className="text-left p-2">Kategori</div></>}
                             <div className="text-left p-2">Status</div>
                             {!isProductionUser && <div className="text-left p-2">Referensi DN</div>}
-                            <div className="text-left p-2">Aksi</div>
+                            {!isProductionUser && <div className="text-left p-2">Aksi</div>}
                           </div>
                           {kanbanEmptyPaginationMeta.total === 0 ? (
                             <div className="p-3 text-center text-gray-400">Belum ada kanban kosong.</div>
@@ -5257,7 +6501,7 @@ const TabKanban = (props) => {
                                     <div
                                       key={row.id}
                                       className="grid items-center border-t"
-                                      style={{ gridTemplateColumns: isProductionUser ? '170px 180px minmax(220px, 1fr) 120px 140px' : emptyLogGrid, position: 'absolute', top: rowIndex * emptyRowHeight, height: emptyRowHeight, width: '100%' }}
+                                      style={{ gridTemplateColumns: isProductionUser ? '170px 180px minmax(220px, 1fr) 120px' : emptyLogGrid, position: 'absolute', top: rowIndex * emptyRowHeight, height: emptyRowHeight, width: '100%' }}
                                     >
                                       <div className="p-2">{row.created_at ? new Date(row.created_at).toLocaleString('id-ID') : '-'}</div>
                                       <div className="p-2 font-semibold">{extractKanbanIdNote(row.notes) || buildKanbanDisplayId(row.item_code, row.item_type, row)}</div>
@@ -5266,32 +6510,34 @@ const TabKanban = (props) => {
                                       {!isProductionUser && <div className="p-2">{getCategoryLabel(setting?.item_type)}</div>}
                                       <div className="p-2">{row.status}</div>
                                       {!isProductionUser && <div className="p-2">{row.dn_id ? `DN-${row.dn_id}` : '-'}</div>}
-                                      <div className="p-2 flex flex-wrap items-center gap-1">
-                                        {canApproveRequest && allowApprove && (
-                                          <button
-                                            onClick={() => handleApproveAndCreateDn(row)}
-                                            className="px-2 py-1 text-[10px] bg-emerald-600 text-white rounded"
-                                            title="Approve + DN"
-                                          >
-                                            Approve
-                                          </button>
-                                        )}
-                                        {canApproveRequest && (
-                                          <button
-                                            onClick={() => handleRejectKanban(row)}
-                                            className="px-2 py-1 text-[10px] border border-amber-200 text-amber-700 rounded"
-                                            title="Reject request"
-                                          >
-                                            Reject
-                                          </button>
-                                        )}
-                                        {statusKey === 'approved' && !row.dn_id && (
-                                          <button onClick={() => openDnModal(row)} className="px-2 py-1 text-[10px] bg-indigo-600 text-white rounded">Buat DN</button>
-                                        )}
-                                        {statusKey === 'approved' && row.dn_id && (
-                                          <span className="text-[10px] text-indigo-600 font-semibold">DN-{row.dn_id}</span>
-                                        )}
-                                      </div>
+                                      {!isProductionUser && (
+                                        <div className="p-2 flex flex-wrap items-center gap-1">
+                                          {canApproveRequest && allowApprove && (
+                                            <button
+                                              onClick={() => handleApproveAndCreateDn(row)}
+                                              className="px-2 py-1 text-[10px] bg-emerald-600 text-white rounded"
+                                              title="Approve + DN"
+                                            >
+                                              Approve
+                                            </button>
+                                          )}
+                                          {canApproveRequest && (
+                                            <button
+                                              onClick={() => handleRejectKanban(row)}
+                                              className="px-2 py-1 text-[10px] border border-amber-200 text-amber-700 rounded"
+                                              title="Reject request"
+                                            >
+                                              Reject
+                                            </button>
+                                          )}
+                                          {statusKey === 'approved' && !row.dn_id && (
+                                            <button onClick={() => openDnModal(row)} className="px-2 py-1 text-[10px] bg-indigo-600 text-white rounded">Buat DN</button>
+                                          )}
+                                          {statusKey === 'approved' && row.dn_id && (
+                                            <span className="text-[10px] text-indigo-600 font-semibold">DN-{row.dn_id}</span>
+                                          )}
+                                        </div>
+                                      )}
                                     </div>
                                   );
                                 })}
@@ -5773,18 +7019,29 @@ const TabKanban = (props) => {
                             </div>
                             <div className="flex gap-2">
                               <button
-                                onClick={() => setScanCameraEnabled(true)}
+                                onClick={() => {
+                                  setScanCameraEnabled(true);
+                                  void startScanner?.();
+                                }}
                                 className="flex-1 bg-slate-900 text-white py-2 rounded text-xs flex items-center justify-center gap-2"
                               >
                                 <QrCode size={14} /> Mulai Kamera
                               </button>
                               <button
-                                onClick={() => setScanCameraEnabled(false)}
+                                onClick={() => {
+                                  setScanCameraEnabled(false);
+                                  void stopScanner?.();
+                                }}
                                 className="flex-1 border py-2 rounded text-xs"
                               >
                                 Hentikan
                               </button>
                             </div>
+                            {scanCameraStatus && (
+                              <div className="text-[11px] text-slate-500">
+                                {scanCameraStatus}
+                              </div>
+                            )}
                           </div>
                         )}
 
@@ -6118,7 +7375,7 @@ const TabKanban = (props) => {
                     <form onSubmit={handleCreateDn} className="space-y-3">
                       {dnScheduleRows.length > 0 && !String(dnForm.scheduleIndex || '').trim() && (
                         <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">
-                          Rit/Jam wajib dipilih untuk vendor ini.
+                          Rit/time must be selected for this vendor.
                         </div>
                       )}
                       <input
@@ -6134,7 +7391,7 @@ const TabKanban = (props) => {
                         value={dnForm.supplier}
                         onChange={(e) => handleDnSupplierChange(e.target.value)}
                       >
-                        <option value="">Pilih supplier dari Master Vendor</option>
+                        <option value="">Select supplier from Master Vendor</option>
                         {dnForm.supplier && !deliveryNoteVendorOptions.some((vendor) => [vendor.id, vendor.name].includes(dnForm.supplier)) && (
                           <option value={dnForm.supplier}>{dnForm.supplier}</option>
                         )}
@@ -6145,14 +7402,44 @@ const TabKanban = (props) => {
                           </option>
                         ))}
                       </select>
-                      <input type="date" className="border p-2 rounded text-sm w-full" value={dnForm.plannedDate} onChange={(e) => setDnForm({ ...dnForm, plannedDate: e.target.value })} />
+                      <input
+                        type="date"
+                        className="border p-2 rounded text-sm w-full"
+                        min={getTodayDnDateInput()}
+                        value={dnForm.plannedDate}
+                        onChange={(e) => {
+                          const nextDate = e.target.value;
+                          const today = getTodayDnDateInput();
+                          setDnForm({
+                            ...dnForm,
+                            plannedDate: nextDate,
+                            deliveryType: compareDnDateInput(nextDate, today) === 0 && normalizeDnDeliveryType(dnForm.deliveryType) === 'normal'
+                              ? 'additional'
+                              : dnForm.deliveryType,
+                          });
+                        }}
+                      />
+                      <select
+                        className="border p-2 rounded text-sm w-full"
+                        value={dnForm.deliveryType || 'normal'}
+                        onChange={(e) => setDnForm({ ...dnForm, deliveryType: e.target.value })}
+                      >
+                        <option value="normal">Normal Delivery</option>
+                        <option value="additional">Additional Delivery</option>
+                        <option value="urgent">Urgent Delivery</option>
+                      </select>
+                      {compareDnDateInput(dnForm.plannedDate, getTodayDnDateInput()) === 0 && normalizeDnDeliveryType(dnForm.deliveryType) === 'normal' && (
+                        <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">
+                          Same-day delivery must be marked as Additional or Urgent.
+                        </div>
+                      )}
                       <select
                         className="border p-2 rounded text-sm w-full"
                         value={dnForm.scheduleIndex ?? ''}
                         onChange={(e) => handleDnScheduleChange(e.target.value)}
                         disabled={dnScheduleRows.length === 0}
                       >
-                        <option value="">{dnScheduleRows.length === 0 ? 'Tidak ada schedule' : 'Pilih Rit/Time'}</option>
+                        <option value="">{dnScheduleRows.length === 0 ? 'No supplier schedule' : 'Select Rit/Time'}</option>
                         {dnScheduleRows.map((row, idx) => (
                           <option key={`dn-schedule-${idx}`} value={String(idx)}>
                             Rit {row.rit || '-'} {row.time ? `(${row.time})` : ''}{row.cycle ? ` • ${row.cycle}` : ''}
@@ -6166,13 +7453,13 @@ const TabKanban = (props) => {
                         onChange={(e) => setDnForm({ ...dnForm, remarks: e.target.value })}
                       />
                       <div className="flex justify-end gap-2">
-                        <button type="button" onClick={() => setShowDnModal(false)} className="px-3 py-2 text-sm border rounded">Batal</button>
+                        <button type="button" onClick={() => setShowDnModal(false)} className="px-3 py-2 text-sm border rounded">Cancel</button>
                         <button
                           type="submit"
                           className="px-3 py-2 text-sm bg-indigo-600 text-white rounded disabled:opacity-60"
                           disabled={dnScheduleRows.length > 0 && !String(dnForm.scheduleIndex || '').trim()}
                         >
-                          Simpan
+                          Save
                         </button>
                       </div>
                     </form>
@@ -6185,7 +7472,7 @@ const TabKanban = (props) => {
                   <div className="bg-white rounded-xl w-full max-w-3xl p-5">
                     <div className="flex items-start justify-between mb-3">
                       <div>
-                        <div className="text-sm font-semibold">Detail DN</div>
+                        <div className="text-sm font-semibold">DN Detail</div>
                         <div className="text-xs text-slate-500">{selectedDnDetail?.dn_number || '-'}</div>
                       </div>
                       <button onClick={closeDnDetailModal}><X size={16} /></button>
@@ -6201,29 +7488,97 @@ const TabKanban = (props) => {
                         </div>
                       </div>
                       <div>
+                        <div className="text-[10px] uppercase text-slate-400">Created Date</div>
+                        <div className="font-semibold">{formatDnDate(selectedDnDetail?.created_at || selectedDnDetail?.createdAt)}</div>
+                      </div>
+                      <div>
                         <div className="text-[10px] uppercase text-slate-400">Planned Date</div>
-                        <div className="font-semibold">
-                          {selectedDnDetail?.planned_date
-                            ? new Date(selectedDnDetail.planned_date).toLocaleDateString('id-ID')
-                            : '-'}
-                        </div>
+                        {dnDetailEditable ? (
+                          <input
+                            type="date"
+                            className="mt-1 w-full rounded border border-slate-200 px-2 py-1.5 text-xs font-semibold"
+                            min={getDnDateInputValue(selectedDnDetail?.created_at || selectedDnDetail?.createdAt)}
+                            value={dnHeaderEdits?.plannedDate || ''}
+                            onChange={(event) => {
+                              const nextDate = event.target.value;
+                              const createdDate = getDnDateInputValue(selectedDnDetail?.created_at || selectedDnDetail?.createdAt);
+                              setDnHeaderEdits((prev) => ({
+                                ...(prev || {}),
+                                plannedDate: nextDate,
+                                deliveryType: compareDnDateInput(nextDate, createdDate) === 0 && normalizeDnDeliveryType(prev?.deliveryType) === 'normal'
+                                  ? 'additional'
+                                  : prev?.deliveryType,
+                              }));
+                            }}
+                          />
+                        ) : (
+                          <div className="font-semibold">
+                            {selectedDnDetail?.planned_date
+                              ? new Date(selectedDnDetail.planned_date).toLocaleDateString('id-ID')
+                              : '-'}
+                          </div>
+                        )}
                       </div>
                       <div>
                         <div className="text-[10px] uppercase text-slate-400">Status</div>
                         <div className="font-semibold">{String(selectedDnDetail?.status || '').toUpperCase() || '-'}</div>
                       </div>
                       <div>
+                        <div className="text-[10px] uppercase text-slate-400">Delivery Type</div>
+                        {dnDetailEditable ? (
+                          <select
+                            className="mt-1 w-full rounded border border-slate-200 px-2 py-1.5 text-xs font-semibold"
+                            value={dnHeaderEdits?.deliveryType || 'normal'}
+                            onChange={(event) => setDnHeaderEdits((prev) => ({ ...(prev || {}), deliveryType: event.target.value }))}
+                          >
+                            <option value="normal">Normal Delivery</option>
+                            <option value="additional">Additional Delivery</option>
+                            <option value="urgent">Urgent Delivery</option>
+                          </select>
+                        ) : (
+                          <div className="font-semibold">{getDnDeliveryTypeForDisplay(selectedDnDetail).toUpperCase()}</div>
+                        )}
+                      </div>
+                      <div>
                         <div className="text-[10px] uppercase text-slate-400">Cycle</div>
-                        <div className="font-semibold">{selectedDnDetail?.cycle || '-'}</div>
+                        <div className="font-semibold">{dnDetailEditable ? (dnHeaderEdits?.cycle || '-') : (selectedDnDetail?.cycle || '-')}</div>
                       </div>
                       <div>
                         <div className="text-[10px] uppercase text-slate-400">Rit/Time</div>
-                        <div className="font-semibold">{selectedDnDetail?.rit || '-'} / {selectedDnDetail?.delivery_time || '-'}</div>
+                        {dnDetailEditable ? (
+                          <select
+                            className="mt-1 w-full rounded border border-slate-200 px-2 py-1.5 text-xs font-semibold"
+                            value={dnHeaderEdits?.scheduleIndex ?? ''}
+                            onChange={(event) => handleDnDetailScheduleChange(event.target.value)}
+                            disabled={dnDetailScheduleRows.length === 0}
+                          >
+                            <option value="">{dnDetailScheduleRows.length === 0 ? 'No supplier schedule' : 'Select Rit/Time'}</option>
+                            {dnDetailScheduleRows.map((row, idx) => (
+                              <option key={`dn-detail-schedule-${idx}`} value={String(idx)}>
+                                Rit {row.rit || '-'} {row.time ? `(${row.time})` : ''}{row.cycle ? ` - ${row.cycle}` : ''}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <div className="font-semibold">{selectedDnDetail?.rit || '-'} / {selectedDnDetail?.delivery_time || '-'}</div>
+                        )}
+                        {dnDetailEditable && (
+                          <div className="mt-1 text-[10px] text-slate-400">
+                            Time: {dnHeaderEdits?.deliveryTime || '-'}
+                          </div>
+                        )}
                       </div>
                     </div>
+                    {dnDetailEditable
+                      && compareDnDateInput(dnHeaderEdits?.plannedDate, selectedDnDetail?.created_at || selectedDnDetail?.createdAt) === 0
+                      && normalizeDnDeliveryType(dnHeaderEdits?.deliveryType) === 'normal' && (
+                        <div className="mb-4 rounded border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-700">
+                          Same-day delivery must be marked as Additional or Urgent.
+                        </div>
+                    )}
 
                     {dnDetailLoading ? (
-                      <div className="text-xs text-slate-400">Memuat...</div>
+                      <div className="text-xs text-slate-400">Loading...</div>
                     ) : (
                       <div className="overflow-x-auto max-h-[360px] border rounded">
                         <table className="min-w-full text-xs">
@@ -6260,7 +7615,7 @@ const TabKanban = (props) => {
                               </tr>
                             ))}
                             {dnDetailRows.length === 0 && (
-                              <tr><td colSpan="4" className="p-3 text-center text-gray-400">Tidak ada item.</td></tr>
+                              <tr><td colSpan="4" className="p-3 text-center text-gray-400">No items.</td></tr>
                             )}
                           </tbody>
                         </table>
@@ -6277,9 +7632,9 @@ const TabKanban = (props) => {
                           Force Close
                         </button>
                       )}
-                      <button type="button" onClick={closeDnDetailModal} className="px-3 py-2 text-sm border rounded">Tutup</button>
+                      <button type="button" onClick={closeDnDetailModal} className="px-3 py-2 text-sm border rounded">Close</button>
                       {dnDetailEditable && (
-                        <button type="button" onClick={handleDnDetailSave} className="px-3 py-2 text-sm bg-indigo-600 text-white rounded">Simpan</button>
+                        <button type="button" onClick={handleDnDetailSave} className="px-3 py-2 text-sm bg-indigo-600 text-white rounded">Save</button>
                       )}
                     </div>
                   </div>
@@ -6418,7 +7773,7 @@ const TabKanban = (props) => {
 
                     {dnBatchWarnings.missingSupplier.length > 0 && (
                       <div className="mb-2 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">
-                        Default supplier belum diisi untuk item: {Array.from(new Set(dnBatchWarnings.missingSupplier)).slice(0, 5).join(', ')}
+                        Supplier Master Item belum diisi untuk item: {Array.from(new Set(dnBatchWarnings.missingSupplier)).slice(0, 5).join(', ')}
                         {dnBatchWarnings.missingSupplier.length > 5 ? ' ...' : ''}
                       </div>
                     )}
@@ -6426,6 +7781,12 @@ const TabKanban = (props) => {
                       <div className="mb-2 text-[11px] text-rose-700 bg-rose-50 border border-rose-200 rounded p-2">
                         Supplier bukan role Delivery Note untuk item: {Array.from(new Set(dnBatchWarnings.invalidRole)).slice(0, 5).join(', ')}
                         {dnBatchWarnings.invalidRole.length > 5 ? ' ...' : ''}
+                      </div>
+                    )}
+                    {(dnBatchWarnings.invalidFlow || []).length > 0 && (
+                      <div className="mb-2 text-[11px] text-indigo-700 bg-indigo-50 border border-indigo-200 rounded p-2">
+                        Skipped because flow is not Supplier DN: {Array.from(new Set(dnBatchWarnings.invalidFlow)).slice(0, 5).join(', ')}
+                        {dnBatchWarnings.invalidFlow.length > 5 ? ' ...' : ''}
                       </div>
                     )}
 
@@ -6489,12 +7850,19 @@ const TabKanban = (props) => {
                       <div className="flex items-center gap-2">
                         <button
                           onClick={() => {
-                            const filename = buildPrintFileName('DN', dnPrintPayload?.dnNumber);
-                            triggerPrintWithTitle(filename);
+                            const sourceDn = dnPrintPayload?.sourceDn;
+                            if (String(sourceDn?.status || '').toLowerCase() === 'draft' && sourceDn?.id) {
+                              void handleDnPrintPdf(sourceDn);
+                              return;
+                            }
+                            void handleDnPreviewPrint();
                           }}
                           className="px-3 py-1.5 text-xs border rounded"
+                          title={String(dnPrintPayload?.sourceDn?.status || '').toLowerCase() === 'draft'
+                            ? 'Open DN and continue to Print/PDF'
+                            : 'Print / PDF'}
                         >
-                          Print / PDF
+                          {String(dnPrintPayload?.sourceDn?.status || '').toLowerCase() === 'draft' ? 'Open & Print/PDF' : 'Print / PDF'}
                         </button>
                         <button onClick={closeDnPrintModal} className="text-slate-500"><X size={18} /></button>
                       </div>
@@ -6514,7 +7882,27 @@ const TabKanban = (props) => {
                       <button onClick={() => setShowScheduleModal(false)}><X size={16} /></button>
                     </div>
                     <form onSubmit={handleCreateSchedule} className="space-y-3">
-                      <input className="border p-2 rounded text-sm w-full" placeholder="PO Number" value={scheduleForm.poNumber} onChange={(e) => setScheduleForm({ ...scheduleForm, poNumber: e.target.value })} />
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
+                        <div><span className="font-semibold text-slate-800">Supplier:</span> {scheduleRequestSupplier.label}</div>
+                        <div><span className="font-semibold text-slate-800">Item:</span> {selectedKanban?.item_code || selectedKanban?.itemCode || selectedKanban?.item || '-'}</div>
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">PO Aktif</label>
+                        <SearchableSelectDropdown
+                          value={scheduleForm.poNumber}
+                          options={schedulePoOptions}
+                          onChange={(value) => setScheduleForm({ ...scheduleForm, poNumber: value })}
+                          placeholder={schedulePoLoading ? 'Memuat PO aktif...' : 'Pilih PO aktif dari Master PO'}
+                          searchPlaceholder="Ketik nomor PO / supplier"
+                          emptyText={schedulePoLoading ? 'Memuat PO aktif...' : 'Tidak ada PO aktif untuk supplier dan item ini.'}
+                          disabled={schedulePoLoading}
+                          getOptionValue={(option) => option.value}
+                          getOptionLabel={(option) => option.label}
+                        />
+                        {schedulePoError && (
+                          <div className="mt-1 text-[11px] text-rose-600">{schedulePoError}</div>
+                        )}
+                      </div>
                       <input type="date" className="border p-2 rounded text-sm w-full" value={scheduleForm.requestDate} onChange={(e) => setScheduleForm({ ...scheduleForm, requestDate: e.target.value })} />
                       <select
                         className="border p-2 rounded text-sm w-full"
@@ -6587,89 +7975,187 @@ const TabKanban = (props) => {
 
               {showManualRequestModal && (
                 <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
-                  <div className="bg-white rounded-xl w-full max-w-md p-5">
+                  <div className="bg-white rounded-xl w-full max-w-6xl p-5 shadow-xl max-h-[90vh] overflow-hidden">
                     <div className="flex items-center justify-between mb-3">
                       <div>
                         <div className="text-sm font-semibold">Create Manual Request</div>
                         <div className="text-xs text-slate-500">Create a manual kanban request</div>
                       </div>
-                      <button onClick={() => setShowManualRequestModal(false)}><X size={16} /></button>
+                      <button onClick={closeManualRequestModal}><X size={16} /></button>
                     </div>
-                    <form onSubmit={handleManualRequest} className="space-y-3 text-sm">
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                        <div>
-                          <label className="block text-xs font-semibold text-slate-600 mb-1">Kanban ID *</label>
-                          <select
-                            className="border p-2 rounded w-full text-sm"
-                            value={manualRequestForm.kanbanId}
-                            onChange={(e) => handleManualKanbanSelect(e.target.value)}
-                          >
-                            <option value="">Pilih Kanban ID dari Master Kanban</option>
-                            {kanbanSettings.map((row) => {
-                              const kanbanId = buildKanbanDisplayId(row.item_code, row.item_type, row);
-                              return (
-                                <option key={row.item_code} value={kanbanId}>
-                                  {kanbanId} - {row.item_code} - {row.item_name || '-'}
+                    <div className="grid gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(280px,0.8fr)]">
+                      <form
+                        onSubmit={handleManualRequest}
+                        onKeyDown={(e) => {
+                          if (e.key !== 'Enter' || e.target.tagName === 'TEXTAREA') return;
+                          e.preventDefault();
+                          queueManualRequestFromForm();
+                        }}
+                        className="space-y-3 text-sm overflow-y-auto pr-1"
+                      >
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-xs font-semibold text-slate-600 mb-1">Kanban ID *</label>
+                            <SearchableSelectDropdown
+                              value={manualRequestForm.kanbanId}
+                              options={manualKanbanOptions}
+                              onChange={(value) => handleManualKanbanSelect(value)}
+                              placeholder="Pilih Kanban ID dari Master Kanban"
+                              searchPlaceholder="Ketik Kanban ID / item"
+                              emptyText="Master Kanban belum tersedia."
+                              getOptionValue={(option) => String(option?.value || '').trim()}
+                              getOptionLabel={(option) => option?.label || option?.value || ''}
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-xs font-semibold text-slate-600 mb-1">Item Code *</label>
+                            <select
+                              className="border p-2 rounded w-full text-sm"
+                              value={manualRequestForm.itemCode}
+                              onChange={(e) => syncManualRequestFromItem(e.target.value)}
+                            >
+                              <option value="">Pilih item dari Master Item</option>
+                              {masterItemOptions.map((item) => (
+                                <option key={item.code} value={item.code}>
+                                  {item.code} - {item.name || '-'}
                                 </option>
-                              );
-                            })}
-                          </select>
+                              ))}
+                            </select>
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-xs font-semibold text-slate-600 mb-1">Trigger Type</label>
+                            <select
+                              className="border p-2 rounded w-full text-sm"
+                              value={manualRequestForm.triggerType}
+                              onChange={(e) => setManualRequestForm({ ...manualRequestForm, triggerType: e.target.value })}
+                            >
+                              <option value="manual">Manual</option>
+                              <option value="scan">Scan Card</option>
+                              <option value="auto">Stock &lt; Min</option>
+                            </select>
+                          </div>
+                          <div>
+                            <label className="block text-xs font-semibold text-slate-600 mb-1">On Hand Trigger *</label>
+                            <input
+                              type="number"
+                              className="border p-2 rounded w-full text-sm"
+                              placeholder="Qty on hand"
+                              value={manualRequestForm.onHand}
+                              onChange={(e) => setManualRequestForm({ ...manualRequestForm, onHand: e.target.value })}
+                            />
+                          </div>
                         </div>
                         <div>
-                          <label className="block text-xs font-semibold text-slate-600 mb-1">Item Code *</label>
-                          <select
-                            className="border p-2 rounded w-full text-sm"
-                            value={manualRequestForm.itemCode}
-                            onChange={(e) => syncManualRequestFromItem(e.target.value)}
-                          >
-                            <option value="">Pilih item dari Master Item</option>
-                            {masterItemOptions.map((item) => (
-                              <option key={item.code} value={item.code}>
-                                {item.code} - {item.name || '-'}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      </div>
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                        <div>
-                          <label className="block text-xs font-semibold text-slate-600 mb-1">Trigger Type</label>
-                          <select
-                            className="border p-2 rounded w-full text-sm"
-                            value={manualRequestForm.triggerType}
-                            onChange={(e) => setManualRequestForm({ ...manualRequestForm, triggerType: e.target.value })}
-                          >
-                            <option value="manual">Manual</option>
-                            <option value="scan">Scan Card</option>
-                            <option value="auto">Stock &lt; Min</option>
-                          </select>
-                        </div>
-                        <div>
-                          <label className="block text-xs font-semibold text-slate-600 mb-1">On Hand Trigger *</label>
+                          <label className="block text-xs font-semibold text-slate-600 mb-1">Suggested Qty *</label>
                           <input
                             type="number"
                             className="border p-2 rounded w-full text-sm"
-                            placeholder="Qty on hand"
-                            value={manualRequestForm.onHand}
-                            onChange={(e) => setManualRequestForm({ ...manualRequestForm, onHand: e.target.value })}
+                            placeholder="Qty request"
+                            value={manualRequestForm.requestQty}
+                            onChange={(e) => setManualRequestForm({ ...manualRequestForm, requestQty: e.target.value })}
                           />
                         </div>
+                        <div className="flex flex-wrap gap-2 pt-2">
+                          <button
+                            type="button"
+                            onClick={queueManualRequestFromForm}
+                            className="px-3 py-2 text-sm border rounded bg-white inline-flex items-center gap-2"
+                          >
+                            <Plus size={14} />
+                            <span>Item</span>
+                          </button>
+                          <button type="submit" className="flex-1 px-3 py-2 text-sm bg-slate-900 text-white rounded">
+                            {manualRequestQueue.length > 0 ? `Create ${manualRequestQueue.length} Requests` : 'Create Request'}
+                          </button>
+                          <button type="button" onClick={closeManualRequestModal} className="px-3 py-2 text-sm border rounded">
+                            Cancel
+                          </button>
+                        </div>
+                      </form>
+                      <div className="rounded-xl border bg-slate-50 p-3">
+                        <div className="mb-2 flex items-center justify-between">
+                          <div>
+                            <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Daftar Request</div>
+                            <div className="text-sm font-semibold text-slate-900">{manualRequestQueue.length} item</div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setManualRequestQueue([])}
+                            className="text-xs text-slate-500 hover:text-slate-700"
+                            disabled={manualRequestQueue.length === 0}
+                          >
+                            Clear
+                          </button>
+                        </div>
+                        <div className="max-h-[60vh] space-y-2 overflow-y-auto pr-1">
+                          {manualRequestQueue.length === 0 ? (
+                            <div className="rounded-lg border border-dashed border-slate-300 bg-white p-3 text-xs text-slate-500">
+                              Belum ada item di daftar. Isi form lalu klik Tambah ke Daftar untuk membuat banyak request sekaligus.
+                            </div>
+                          ) : manualRequestQueue.map((row, index) => (
+                            <div key={row.id} className="rounded-lg border border-slate-200 bg-white p-3 text-xs">
+                              <div className="flex items-start justify-between gap-2">
+                                <div>
+                                  <div className="font-semibold text-slate-900">
+                                    {index + 1}. {row.itemCode}
+                                  </div>
+                                  {row.itemName && (
+                                    <div className="mt-0.5 text-slate-600">
+                                      {row.itemName}
+                                    </div>
+                                  )}
+                                  {row.kanbanId && (
+                                    <div className="mt-1 inline-flex items-center gap-1 rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 font-mono text-[10px] text-indigo-700">
+                                      {row.kanbanId}
+                                    </div>
+                                  )}
+                                  <div className="mt-2 flex flex-wrap items-center gap-2 text-slate-500">
+                                    <span>Qty</span>
+                                    <input
+                                      type="number"
+                                      className="w-24 rounded border border-slate-200 px-2 py-1 text-xs text-slate-700"
+                                      value={row.requestQty}
+                                      onChange={(e) => updateManualRequestQueueRow(row.id, { requestQty: e.target.value })}
+                                    />
+                                    <span>On hand {row.onHand}</span>
+                                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] uppercase tracking-wide text-slate-500">
+                                      {row.triggerType}
+                                    </span>
+                                  </div>
+                                  <div className="mt-1 text-[11px] text-slate-400">
+                                    Akan tersimpan: {row.normalizedQty ?? row.requestQty}
+                                  </div>
+                                  {row.errorMessage && (
+                                    <div className="mt-1 text-rose-600">
+                                      Gagal: {row.errorMessage}
+                                    </div>
+                                  )}
+                                </div>
+                                <div className="flex items-center gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => openKanbanInScan(row.kanbanId || buildKanbanDisplayId(row.itemCode, masterItemsByCode.get(row.itemCode)?.type || '', row))}
+                                    className="rounded border border-indigo-200 bg-indigo-50 px-2 py-1 text-[10px] font-semibold text-indigo-700 hover:bg-indigo-100"
+                                    title="Kirim Kanban ID ke tab Scan"
+                                  >
+                                    Scan
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setManualRequestQueue((prev) => prev.filter((_, idx) => idx !== index))}
+                                    className="text-slate-400 hover:text-rose-600"
+                                  >
+                                    <X size={14} />
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
                       </div>
-                      <div>
-                        <label className="block text-xs font-semibold text-slate-600 mb-1">Suggested Qty *</label>
-                        <input
-                          type="number"
-                          className="border p-2 rounded w-full text-sm"
-                          placeholder="Qty request"
-                          value={manualRequestForm.requestQty}
-                          onChange={(e) => setManualRequestForm({ ...manualRequestForm, requestQty: e.target.value })}
-                        />
-                      </div>
-                      <div className="flex justify-end gap-2 pt-2">
-                        <button type="submit" className="flex-1 px-3 py-2 text-sm bg-slate-900 text-white rounded">Create Request</button>
-                        <button type="button" onClick={() => setShowManualRequestModal(false)} className="px-3 py-2 text-sm border rounded">Cancel</button>
-                      </div>
-                    </form>
+                    </div>
                   </div>
                 </div>
               )}

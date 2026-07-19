@@ -8,7 +8,7 @@ import {
   FileSpreadsheet, ChevronDown, FileUp, Calendar, Bot, Send, MessageCircle, 
   Minimize2, FileText, Mail, Truck, GitFork, LogOut, Lock, User, Rocket,
   QrCode, BarChart3, ArrowDownUp, MapPin, TrendingDown, TrendingUp, Scissors,
-  Play, Pause, Eye, EyeOff, Check, X as XIcon, Coins, ListChecks
+  Play, Pause, Eye, EyeOff, Check, X as XIcon, Coins, ListChecks, HelpCircle
 } from 'lucide-react';
 import logoMatra from './assets/logo-matra.png';
 import logoPrl from './assets/kop-mrp.png';
@@ -16,6 +16,7 @@ import {
   parseModelCodes,
   buildModelMap,
   formatModelCodes,
+  joinModelCodes,
 } from './utils/modelUtils';
 import { QRCodeCanvas, QRCodeSVG } from 'qrcode.react';
 import { useScheduleStore } from './stores/useScheduleStore';
@@ -24,7 +25,7 @@ const standardKanbanIdFormat = 'KB-{CATEGORY}-{UNIQ}';
 const standardKanbanCardIdFormat = 'KB-{CATEGORY}-{UNIQ}-{TOTAL:02}-{SEQ:02}';
 const standardKanbanQrRule = 'KANBAN_ID|ITEM|CATEGORY|QTY|AREA|CYCLE|RIT|TIME';
 
-// ⚠️ PENTING: Hapus tanda '//' di bawah ini di komputer Anda agar fitur Excel aktif
+// âš ï¸ PENTING: Hapus tanda '//' di bawah ini di komputer Anda agar fitur Excel aktif
 
 const TabDashboard = React.lazy(() => import('./tabs/TabDashboard'));
 const TabInbound = React.lazy(() => import('./tabs/TabInbound'));
@@ -51,23 +52,339 @@ const NOTIFICATION_MODULE_OPTIONS = [
   { value: 'Activity', label: 'Activity' },
 ];
 
+const HELP_REPORT_LABELS = {
+  rekap: 'Report Rekap Supplier/PO',
+  scorecard: 'Rapor Kinerja Supplier',
+  'stock-coverage': 'Stock Coverage',
+  'slow-moving': 'Slow & Dead Stock',
+  'inbound-performance': 'Inbound Performance',
+  'inbound-matrix': 'Delivery Matrix Inbound',
+  'fifo-violations': 'FIFO Violation Log',
+  'inventory-value': 'Inventory Value',
+  'supplier-shortage': 'Report Shortage Supplier',
+  'all-mutations': 'All Laporan Mutasi',
+  'sasaran-mutu': 'Sasaran Mutu',
+  'outstanding-prl': 'Outstanding PRL',
+  'capacity-planning': 'Capacity Planning',
+};
+
+const HELP_MASTER_REF_LABELS = {
+  org: 'Org',
+  vendor: 'Vendor',
+  customer: 'Customer',
+  bom: 'BOM',
+  model: 'Model',
+  process: 'Process',
+  category: 'Category',
+  item: 'Item',
+  packing: 'Packing',
+  config: 'Config',
+};
+
+const HELP_KANBAN_LABELS = {
+  master: 'Setup Master Kanban',
+  dashboard: 'Dashboard Kanban',
+  items: 'Kanban Item',
+  requests: 'Kanban Request',
+  dn: 'Delivery Note',
+  delivery: 'Delivery',
+  receiving: 'Receiving',
+  empty: 'Kanban Kosong',
+  production: 'Production',
+  scan: 'Scan QR',
+};
+
+const HELP_CONTENT = {
+  dashboard: {
+    title: 'Dashboard',
+    subtitle: 'Pantau ringkasan operasional dan buka tindak lanjut dari satu halaman.',
+    sop: [
+      'Cek kartu ringkasan untuk melihat kondisi PRL, kanban, inventory, inbound, dan master data.',
+      'Gunakan kartu atau notifikasi untuk membuka data yang perlu ditindaklanjuti.',
+      'Jika angka terlihat kosong, cek master referensi lalu cek laporan mutasi untuk sumber transaksinya.',
+    ],
+    links: [
+      { label: 'Kanban Board', description: 'Cek scan, request, delivery, dan receiving.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'dashboard' },
+      { label: 'Inventory', description: 'Cek on hand, reserved, available, dan kartu stok.', mainTab: 'inventory' },
+      { label: 'PRL', description: 'Cek kebutuhan part per model dan bulan.', mainTab: 'prl' },
+      { label: 'Laporan Mutasi', description: 'Cek aliran masuk dan keluar material.', mainTab: 'reports', reportTab: 'all-mutations' },
+    ],
+  },
+  monitoring: {
+    title: 'Inbound Schedule',
+    subtitle: 'Kelola jadwal kedatangan, PO, receiving, dan follow up supplier.',
+    sop: [
+      'Cari PO atau item yang akan diterima, lalu cek tanggal request dan status inbound.',
+      'Buat atau update jadwal sesuai data PO dan supplier.',
+      'Setelah barang diterima, pastikan transaksi masuk tercatat di inventory dan laporan inbound.',
+    ],
+    links: [
+      { label: 'Receiving Kanban', description: 'Lanjutkan penerimaan kanban.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'receiving' },
+      { label: 'Inventory', description: 'Validasi stok setelah receiving.', mainTab: 'inventory' },
+      { label: 'Inbound Performance', description: 'Cek kinerja kedatangan supplier.', mainTab: 'reports', reportTab: 'inbound-performance' },
+    ],
+  },
+  kanban: {
+    title: 'Kanban Board',
+    subtitle: 'Proses scan, request, delivery, receiving, dan kanban kosong.',
+    sop: [
+      'Mulai dari scan QR untuk mencatat konsumsi atau status kartu.',
+      'QR Kanban menunjukkan kartu dan kebutuhan item, bukan nomor lot fisik. Untuk bukti lot aktual, gunakan QR Label Lot/Part dari Inventory > Kartu Stok per Lot.',
+      'Jika stok habis, cek Kanban Kosong dan request kanban.',
+      'Untuk request manual, pilih Kanban ID dari Master Kanban agar item/on hand/qty terisi. Setelah request dibuat, klik tombol Scan pada baris request untuk membawa Kanban ID ke tab Scan.',
+      'Request manual yang dibuat dari Kanban menyimpan catatan kanban: <Kanban ID>, sehingga operator bisa mengambil kartu yang sama untuk proses scan.',
+      'Request yang masih aktif akan menjadi Reserved di Inventory sampai proses ditutup, diterima, atau dibatalkan.',
+      'Create Schedule hanya muncul untuk supplier/vendor dengan role Schedule. Vendor role Delivery Note diproses lewat DN Register/Delivery tanpa popup schedule.',
+      'Untuk incoming dari supplier, scan QR Label Incoming yang dicetak supplier dari Supplier Portal > Tracking DN.',
+      'Lanjutkan proses ke Delivery/Receiving sampai stok dan reservasi berubah sesuai transaksi.',
+      'Untuk pelanggaran FIFO atau konsumsi tanpa reorder, cek notifikasi dan laporan terkait.',
+    ],
+    links: [
+      { label: 'Scan QR', description: 'Input konsumsi atau perpindahan kanban.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'scan' },
+      { label: 'Manual Request', description: 'Buat request dari Kanban ID lalu kirim ke Scan.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'requests' },
+      { label: 'Kanban Kosong', description: 'Cek kartu kosong yang perlu diisi ulang.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'empty' },
+      { label: 'Inventory', description: 'Cek efek scan ke stok.', mainTab: 'inventory' },
+      { label: 'PRL', description: 'Cek kebutuhan reorder per bulan.', mainTab: 'prl' },
+    ],
+  },
+  fifo: {
+    title: 'Management FIFO',
+    subtitle: 'Kelola lot masuk, lot keluar, dan urutan oldest first.',
+    sop: [
+      'Terima material ke lot yang benar agar tanggal received/expiry tercatat.',
+      'Setelah receiving membuat lot, cetak Label Lot/Part dari Inventory > Kartu Stok per Lot lalu tempel ke barang fisik.',
+      'Saat issue material, pakai lot paling atas dalam urutan FIFO.',
+      'Scan kanban dipakai untuk konsumsi/request, sedangkan scan label lot dipakai untuk memastikan item dan lot fisik saat cek aktual atau stok opname.',
+      'Jika aktual lot berbeda dari sistem, catat koreksi lewat stok opname atau transaksi penyesuaian.',
+      'Pelanggaran FIFO dibaca di laporan FIFO Violation Log.',
+    ],
+    links: [
+      { label: 'Inventory', description: 'Cek saldo per item dan kartu stok.', mainTab: 'inventory' },
+      { label: 'FIFO Violation Log', description: 'Baca pelanggaran urutan lot.', mainTab: 'reports', reportTab: 'fifo-violations' },
+      { label: 'All Laporan Mutasi', description: 'Telusuri mutasi masuk/keluar.', mainTab: 'reports', reportTab: 'all-mutations' },
+    ],
+  },
+  inventory: {
+    title: 'Inventory',
+    subtitle: 'Pantau on hand, reserved, available, kartu stok, lot FIFO, dan stok opname.',
+    sop: [
+      'Gunakan pencarian item untuk cek saldo on hand, reserved, available, dan threshold min/max.',
+      'Reserved adalah kebutuhan kanban/request aktif, bukan stok fisik. Available dihitung dari On Hand dikurangi Reserved.',
+      'Jika On Hand 0 tetapi Reserved masih ada, Available menjadi minus. Artinya ada kebutuhan aktif yang belum terpenuhi, bukan stok fisik benar-benar negatif.',
+      'Klik detail atau analytics pada kartu kanban untuk membaca sumber angka.',
+      'Cek Kartu Stok dan Kartu Stok per Lot untuk melihat histori transaksi.',
+      'Untuk memastikan koneksi aktual, pilih batch di Kartu Stok per Lot, klik Label Lot/Part, print, lalu tempel ke barang yang diterima.',
+      'Saat stok opname, cocokkan barang fisik dengan QR Label Lot/Part. Jika lot fisik berbeda dari urutan FIFO sistem, catat sebagai koreksi/indikasi pelanggaran FIFO.',
+      'Jika saldo hilang setelah sync, cek kanban source, laporan mutasi, dan referensi master item.',
+    ],
+    links: [
+      { label: 'Kanban Board', description: 'Cek sumber sync dan status kartu.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'items' },
+      { label: 'Kartu Stok / Mutasi', description: 'Telusuri transaksi masuk dan keluar.', mainTab: 'reports', reportTab: 'all-mutations' },
+      { label: 'Master Item', description: 'Validasi kategori, lokasi, supplier, customer, model, packing.', mainTab: 'masterref', masterRefTab: 'item' },
+      { label: 'FIFO Lots', description: 'Cek lot dan remaining quantity.', mainTab: 'fifo' },
+    ],
+  },
+  subcon: {
+    title: 'Subcon',
+    subtitle: 'Kelola kebutuhan dan pergerakan material subcontractor.',
+    sop: [
+      'Cek item dan supplier/customer subcon dari master referensi.',
+      'Pastikan transaksi kirim/terima tercatat agar inventory tetap sesuai.',
+      'Gunakan laporan mutasi untuk membandingkan saldo sebelum dan sesudah proses subcon.',
+    ],
+    links: [
+      { label: 'Inventory', description: 'Cek stok yang terdampak proses subcon.', mainTab: 'inventory' },
+      { label: 'Master Customer', description: 'Validasi customer subcon.', mainTab: 'masterref', masterRefTab: 'customer' },
+      { label: 'All Laporan Mutasi', description: 'Cek histori transaksi.', mainTab: 'reports', reportTab: 'all-mutations' },
+    ],
+  },
+  prl: {
+    title: 'PRL',
+    subtitle: 'Daftar kebutuhan part per model dan bulan.',
+    sop: [
+      'Pilih bulan fokus, model, category, supplier, lalu tampilkan data.',
+      'Pastikan model item berasal dari Master Model dan master item hanya menampilkan kode model.',
+      'Rilis PRL setelah kebutuhan sudah benar.',
+      'Jika scan kanban tanpa PRL, cek notifikasi lalu buka PRL bulan terkait.',
+    ],
+    links: [
+      { label: 'Master Model', description: 'Validasi kode model sumber PRL.', mainTab: 'masterref', masterRefTab: 'model' },
+      { label: 'Master Item', description: 'Cek mapping item ke model/supplier/customer.', mainTab: 'masterref', masterRefTab: 'item' },
+      { label: 'Kanban Board', description: 'Cek konsumsi dan reorder.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'scan' },
+      { label: 'Outstanding PRL', description: 'Cek PRL yang belum selesai.', mainTab: 'reports', reportTab: 'outstanding-prl' },
+    ],
+  },
+  masterref: {
+    title: 'Master Referensi',
+    subtitle: 'Sumber utama Org, Vendor, Customer, Model, Process, Category, Packing, Config, dan Item.',
+    sop: [
+      'Tambah atau update referensi dari tab sesuai jenis datanya.',
+      'Pastikan kode referensi unik dan konsisten karena dipakai oleh kanban, inventory, PRL, dan laporan.',
+      'Jangan mengisi default manual di modul lain; semua modul harus mengambil dari master referensi.',
+      'Gunakan pencarian di setiap tab untuk validasi data sebelum proses transaksi.',
+    ],
+    links: [
+      { label: 'Master Item', description: 'Mapping referensi ke item.', mainTab: 'masterref', masterRefTab: 'item' },
+      { label: 'Master Model', description: 'Sumber kode model.', mainTab: 'masterref', masterRefTab: 'model' },
+      { label: 'Master Vendor', description: 'Sumber supplier/vendor.', mainTab: 'masterref', masterRefTab: 'vendor' },
+      { label: 'Setup Kanban', description: 'Generate dan cek master kanban dari referensi.', mainTab: 'kanban', kanbanView: 'master' },
+    ],
+  },
+  settings: {
+    title: 'Pengaturan',
+    subtitle: 'Atur parameter sistem, akses, dan konfigurasi pendukung.',
+    sop: [
+      'Ubah konfigurasi hanya jika dampaknya sudah dipahami oleh admin.',
+      'Cek kembali master referensi setelah perubahan konfigurasi yang memengaruhi transaksi.',
+      'Gunakan audit log untuk menelusuri perubahan penting.',
+    ],
+    links: [
+      { label: 'Master Config', description: 'Cek konfigurasi referensi operasional.', mainTab: 'masterref', masterRefTab: 'config' },
+      { label: 'Audit Log', description: 'Telusuri perubahan sistem.', mainTab: 'audit' },
+    ],
+  },
+  audit: {
+    title: 'Audit Log',
+    subtitle: 'Lacak aktivitas dan perubahan penting di sistem.',
+    sop: [
+      'Gunakan filter untuk mencari user, modul, atau rentang tanggal.',
+      'Cek detail aktivitas sebelum melakukan koreksi data.',
+      'Hubungkan temuan audit dengan laporan mutasi atau master referensi terkait.',
+    ],
+    links: [
+      { label: 'Pengaturan', description: 'Cek konfigurasi dan akses.', mainTab: 'settings' },
+      { label: 'Laporan Mutasi', description: 'Bandingkan aktivitas dengan transaksi.', mainTab: 'reports', reportTab: 'all-mutations' },
+    ],
+  },
+  reports: {
+    title: 'Laporan',
+    subtitle: 'Baca rekap operasional, mutasi, performa, FIFO, shortage, dan capacity planning.',
+    sop: [
+      'Pilih jenis laporan dari menu Laporan.',
+      'Isi periode dan filter yang diperlukan, lalu tampilkan data.',
+      'Gunakan Print/PDF atau export jika laporan perlu dibagikan.',
+      'Jika laporan kosong, cek periode, kategori, lokasi, dan apakah transaksi sumber sudah tercatat.',
+    ],
+    links: [
+      { label: 'All Laporan Mutasi', description: 'Sumber utama histori masuk/keluar.', mainTab: 'reports', reportTab: 'all-mutations' },
+      { label: 'FIFO Violation Log', description: 'Cek pelanggaran FIFO.', mainTab: 'reports', reportTab: 'fifo-violations' },
+      { label: 'Inventory', description: 'Bandingkan saldo laporan dengan overview.', mainTab: 'inventory' },
+      { label: 'Inbound Schedule', description: 'Cek transaksi sumber inbound.', mainTab: 'monitoring' },
+    ],
+  },
+  supplier: {
+    title: 'Supplier Portal',
+    subtitle: 'Area supplier untuk melihat jadwal, dokumen, dan tindak lanjut pengiriman.',
+    sop: [
+      'Cek jadwal dan kebutuhan pengiriman yang aktif.',
+      'Buka Tracking DN, expand detail DN, lalu cetak Label Incoming per package sebelum barang dikirim.',
+      'Isi Qty Kirim Aktual jika pengiriman partial, isi Lot Supplier, dan gunakan custom package jika packing aktual tidak sesuai SNP.',
+      'Update status sesuai proses yang tersedia untuk supplier.',
+      'Koordinasikan perubahan jadwal melalui menu inbound atau notifikasi terkait.',
+    ],
+    links: [
+      { label: 'Inbound Schedule', description: 'Cek jadwal pengiriman.', mainTab: 'monitoring' },
+      { label: 'Report Rekap', description: 'Cek rekap supplier/PO.', mainTab: 'reports', reportTab: 'rekap' },
+    ],
+  },
+};
+
+const normalizeNotificationPayload = (payload) => {
+  if (!payload) return {};
+  if (typeof payload === 'object' && !Array.isArray(payload)) return payload;
+  if (typeof payload === 'string') {
+    try {
+      const parsed = JSON.parse(payload);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+};
+
+const getNotificationItemCode = (item) => {
+  const payload = normalizeNotificationPayload(item?.payload);
+  return String(
+    payload.itemCode
+    || payload.item_code
+    || payload.productCode
+    || payload.product_code
+    || item?.entity_id
+    || '',
+  ).trim();
+};
+
+const resolveNotificationTarget = (item) => {
+  const payload = normalizeNotificationPayload(item?.payload);
+  const moduleKey = String(item?.module || '').trim().toLowerCase();
+  const entityType = String(item?.entity_type || item?.entityType || '').trim().toLowerCase();
+  const title = String(item?.title || '').trim().toLowerCase();
+  const detail = String(item?.detail || '').trim().toLowerCase();
+  const itemCode = getNotificationItemCode(item);
+  const prlPlan = normalizeNotificationPayload(payload.prlPlan || payload.prl_plan);
+
+  if (moduleKey.includes('kanban')) {
+    const isPrlGap = entityType.includes('scan')
+      && (
+        String(payload.actionType || payload.action_type || '').toLowerCase() === 'consumption_only'
+        || title.includes('tanpa reorder')
+        || detail.includes('prl')
+      );
+    if (isPrlGap) {
+      return {
+        mainTab: 'prl',
+        prl: {
+          search: itemCode,
+          month: String(prlPlan.monthKey || prlPlan.month || '').toLowerCase(),
+          year: prlPlan.year ? String(prlPlan.year) : '',
+        },
+      };
+    }
+    if (entityType.includes('request') || payload.requestGroup || payload.requestCode) {
+      return {
+        mainTab: 'kanban',
+        kanbanView: 'board',
+        kanbanSubTab: 'requests',
+        kanbanRequestFilters: {
+          requestId: String(payload.requestGroup || payload.requestCode || item?.entity_id || '').trim(),
+          item: itemCode,
+        },
+      };
+    }
+    if (entityType.includes('setting')) {
+      return { mainTab: 'kanban', kanbanView: 'master', kanbanSearch: itemCode };
+    }
+    return { mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'scan', kanbanSearch: itemCode };
+  }
+
+  if (moduleKey.includes('inbound')) return { mainTab: 'monitoring' };
+  if (moduleKey.includes('stock opname')) return { mainTab: 'inventory' };
+  if (moduleKey.includes('bom') || moduleKey.includes('master')) return { mainTab: 'masterref' };
+  if (moduleKey.includes('prl')) return { mainTab: 'prl', prl: { search: itemCode } };
+  return { mainTab: 'dashboard' };
+};
+
 const resolveApiBase = () => {
   const envValue = String(import.meta.env.VITE_API_BASE || '').trim();
-  const fallbackHost = typeof window !== 'undefined' && window.location.hostname
-    ? window.location.hostname
-    : 'localhost';
-  const fallbackBase = `http://${fallbackHost}:4000`;
-  if (!envValue) return fallbackBase;
-  if (/^https?:\/\/(:|$)/i.test(envValue)) return fallbackBase;
-  if (/HOST_IP/i.test(envValue)) return fallbackBase;
+  if (!envValue) return '';
+  if (/HOST_IP/i.test(envValue)) return '';
   return envValue;
 };
 
 const API_BASE = resolveApiBase();
+const API_BASE_LABEL = (() => {
+  const envValue = String(import.meta.env.VITE_API_BASE || '').trim();
+  if (envValue) return envValue;
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    return `${window.location.origin}/api`;
+  }
+  return '/api';
+})();
 if (typeof window !== 'undefined') {
   const envValue = String(import.meta.env.VITE_API_BASE || '').trim();
   if (envValue && envValue !== API_BASE) {
-    console.warn(`VITE_API_BASE invalid: "${envValue}". Fallback ke ${API_BASE}`);
+    console.warn(`VITE_API_BASE invalid: "${envValue}". Fallback ke ${API_BASE_LABEL}`);
   }
 }
 const API_TIMEOUT_MS = 20000;
@@ -94,6 +411,18 @@ const formatMonthKeyLocal = (value) => {
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) return '';
   return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}`;
+};
+
+const sanitizeApiErrorMessage = (value, fallback = '') => {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (!text) return fallback;
+  if (/^<!doctype html/i.test(text) || /^<html[\s>]/i.test(text) || /<\/?[a-z][\s\S]*>/i.test(text)) {
+    return fallback;
+  }
+  if (/^cannot (get|post|put|patch|delete)\s+/i.test(text)) {
+    return fallback || 'Rute API tidak ditemukan.';
+  }
+  return text.length > 240 ? `${text.slice(0, 237)}...` : text;
 };
 
 const getCurrentMonthRange = () => {
@@ -159,13 +488,18 @@ const apiRequest = async (path, options = {}, token) => {
     if (!response.ok) {
       let data = null;
       const contentType = response.headers.get('content-type') || '';
+      const fallbackMessage = response.status === 404
+        ? `Endpoint ${path} tidak ditemukan.`
+        : `HTTP ${response.status}`;
       if (contentType.includes('application/json')) {
         data = await response.json().catch(() => null);
       } else {
         const text = await response.text().catch(() => '');
         data = text ? { error: text } : null;
       }
-      const error = new Error(data?.error || `HTTP ${response.status}`);
+      const error = new Error(
+        sanitizeApiErrorMessage(data?.error || data?.message || data?.detail, fallbackMessage),
+      );
       error.status = response.status;
       error.response = data;
       throw error;
@@ -182,7 +516,7 @@ const apiRequest = async (path, options = {}, token) => {
     }
     const message = String(error?.message || '');
     if (/failed to fetch|networkerror|load failed|disconnected/i.test(message)) {
-      throw new Error(`API tidak tersedia. Pastikan server berjalan di ${API_BASE}.`);
+      throw new Error(`API tidak tersedia. Pastikan server berjalan di ${API_BASE_LABEL}.`);
     }
     throw error;
   } finally {
@@ -261,7 +595,7 @@ const ApiStatusBanner = ({ online, checking, lastCheckedAt, lastError, lastLaten
     <div className="fixed top-0 inset-x-0 z-[60] bg-red-600 text-white text-xs font-semibold px-4 py-2 text-center shadow-lg">
       <div>
         <span>API offline.</span>
-        <span className="ml-2">Pastikan server backend menyala di {API_BASE}.</span>
+        <span className="ml-2">Pastikan server backend menyala di {API_BASE_LABEL}.</span>
         {checking && <span className="ml-2 opacity-80">Mencoba ulang...</span>}
       </div>
       <div className="mt-1 flex flex-wrap items-center justify-center gap-3 text-[11px] font-normal opacity-90">
@@ -487,6 +821,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   const globalSearchInputRef = useRef(null);
   const globalSearchRequestRef = useRef(0);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   const [notificationRecords, setNotificationRecords] = useState([]);
   const [notificationLoading, setNotificationLoading] = useState(false);
   const [notificationError, setNotificationError] = useState('');
@@ -766,15 +1101,25 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [kanbanView, setKanbanView] = useState('master');
   const [kanbanRequestStatusFilter, setKanbanRequestStatusFilter] = useState('all');
   const [kanbanRequestQuickFilter, setKanbanRequestQuickFilter] = useState('all');
+  const [kanbanRequestCategoryFilter, setKanbanRequestCategoryFilter] = useState('all');
+  const [kanbanRequestFlowFilter, setKanbanRequestFlowFilter] = useState('all');
   const [kanbanRequestFilters, setKanbanRequestFilters] = useState({
     requestId: '',
     date: '',
     kanbanId: '',
     item: '',
+    supplier: '',
     trigger: '',
+    category: '',
+    flow: '',
     onHand: '',
     suggested: '',
     status: '',
+  });
+  const [kanbanDnFilters, setKanbanDnFilters] = useState({
+    search: '',
+    supplier: 'all',
+    status: 'all',
   });
   const [tablePagination, setTablePagination] = useState({
     kanbanRequests: { page: 1, perPage: 25 },
@@ -814,7 +1159,6 @@ const Dashboard = ({ onLogout, token, user }) => {
     cycleX: '1',
     cycleY: '4',
     cycleZ: '4',
-    defaultSupplier: '',
     dropZone: '',
     active: true,
   });
@@ -825,6 +1169,15 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [dnDetailLoading, setDnDetailLoading] = useState(false);
   const [dnDetailRows, setDnDetailRows] = useState([]);
   const [dnDetailEdits, setDnDetailEdits] = useState({});
+  const [dnHeaderEdits, setDnHeaderEdits] = useState({
+    plannedDate: '',
+    deliveryType: 'normal',
+    remarks: '',
+    scheduleIndex: '',
+    cycle: '',
+    rit: '',
+    deliveryTime: '',
+  });
   const [dnDetailEditable, setDnDetailEditable] = useState(false);
   const [selectedDnDetail, setSelectedDnDetail] = useState(null);
   const [showScheduleModal, setShowScheduleModal] = useState(false);
@@ -833,6 +1186,9 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [showManualRequestModal, setShowManualRequestModal] = useState(false);
   const [showQrModal, setShowQrModal] = useState(false);
   const [showKanbanCardModal, setShowKanbanCardModal] = useState(false);
+  const [kanbanCardPreviewReady, setKanbanCardPreviewReady] = useState(false);
+  const [kanbanCardPreviewPageIndex, setKanbanCardPreviewPageIndex] = useState(0);
+  const [kanbanCardPrintReady, setKanbanCardPrintReady] = useState(false);
   const [showInboundCardModal, setShowInboundCardModal] = useState(false);
   const [showDnPrintModal, setShowDnPrintModal] = useState(false);
   const [dnPrintPayload, setDnPrintPayload] = useState(null);
@@ -851,6 +1207,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     dnNumber: '',
     supplier: '',
     plannedDate: '',
+    deliveryType: 'normal',
     remarks: '',
     scheduleIndex: '',
     cycle: '',
@@ -866,6 +1223,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     onHand: '',
     requestQty: '',
   });
+  const [manualRequestQueue, setManualRequestQueue] = useState([]);
   const [qrPayload, setQrPayload] = useState('');
   const [qrTitle, setQrTitle] = useState('');
   const [emptyKanbanForm, setEmptyKanbanForm] = useState({ area: '', kanbanId: '' });
@@ -877,6 +1235,35 @@ const Dashboard = ({ onLogout, token, user }) => {
     return () => document.body.classList.remove('kanban-print-active');
   }, [showKanbanCardModal, showInboundCardModal, showDnPrintModal]);
 
+  useEffect(() => {
+    if (!showKanbanCardModal) {
+      setKanbanCardPreviewReady(false);
+      setKanbanCardPreviewPageIndex(0);
+      setKanbanCardPrintReady(false);
+      return undefined;
+    }
+    setKanbanCardPreviewReady(false);
+    setKanbanCardPreviewPageIndex(0);
+    setKanbanCardPrintReady(false);
+    const rafId = window.requestAnimationFrame(() => {
+      setKanbanCardPreviewReady(true);
+    });
+    return () => window.cancelAnimationFrame(rafId);
+  }, [showKanbanCardModal]);
+
+  useEffect(() => {
+    if (!showKanbanCardModal) return;
+    setKanbanCardPreviewPageIndex((prev) => Math.max(0, prev));
+  }, [showKanbanCardModal]);
+
+  useEffect(() => {
+    const handleAfterPrint = () => {
+      setKanbanCardPrintReady(false);
+    };
+    window.addEventListener('afterprint', handleAfterPrint);
+    return () => window.removeEventListener('afterprint', handleAfterPrint);
+  }, []);
+
   const [selectedRequestIds, setSelectedRequestIds] = useState([]);
   const [showBatchModal, setShowBatchModal] = useState(false);
   const [batchForm, setBatchForm] = useState({ area: '', kanbanIds: '' });
@@ -885,9 +1272,30 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [scanResults, setScanResults] = useState([]);
   const [scanActiveResult, setScanActiveResult] = useState(null);
   const [scanError, setScanError] = useState('');
+  const [scanCameraStatus, setScanCameraStatus] = useState('');
   const [scanCameraEnabled, setScanCameraEnabled] = useState(false);
   const scanVideoRef = useRef(null);
   const scanInstanceRef = useRef(null);
+  const scanStartPendingRef = useRef(false);
+  const scanStartTokenRef = useRef(0);
+  const fetchScanPreviewRef = useRef(null);
+  const getScanCameraErrorMessage = (error) => {
+    const rawMessage = String(error?.message || error || '').trim();
+    const lowered = rawMessage.toLowerCase();
+    if (typeof window !== 'undefined' && !window.isSecureContext) {
+      return 'Kamera hanya bisa dipakai di HTTPS atau localhost.';
+    }
+    if (lowered.includes('notallowederror') || lowered.includes('permission') || lowered.includes('denied')) {
+      return 'Akses kamera ditolak. Izinkan permission kamera di browser lalu coba lagi.';
+    }
+    if (lowered.includes('notfounderror') || lowered.includes('camera not found')) {
+      return 'Kamera tidak ditemukan di perangkat ini.';
+    }
+    if (lowered.includes('notreadableerror') || lowered.includes('could not start video source')) {
+      return 'Kamera sedang dipakai aplikasi lain atau gagal dibuka.';
+    }
+    return rawMessage ? `Gagal menyalakan kamera: ${rawMessage}` : 'Gagal menyalakan kamera.';
+  };
     const [showConsumeModal, setShowConsumeModal] = useState(false);
     const [consumeQty, setConsumeQty] = useState('');
 
@@ -934,6 +1342,10 @@ const Dashboard = ({ onLogout, token, user }) => {
   const currentYear = new Date().getFullYear();
   const [prlRows, setPrlRows] = useState([]);
   const [prlLoading, setPrlLoading] = useState(false);
+  const [prlImportSummary, setPrlImportSummary] = useState(null);
+  const [prlImportHistoryRows, setPrlImportHistoryRows] = useState([]);
+  const [prlImportHistoryLoading, setPrlImportHistoryLoading] = useState(false);
+  const [prlImportHistoryError, setPrlImportHistoryError] = useState('');
   const [prlFilters, setPrlFilters] = useState({
     search: '',
     model: [],
@@ -1009,6 +1421,7 @@ const Dashboard = ({ onLogout, token, user }) => {
         name && `${code} - ${name}`,
         name && `${code}-${name}`,
         name && `${code} ${name}`,
+        name && `${name} ${code}`,
       ]
         .filter(Boolean)
         .forEach((key) => lookup.set(String(key).trim().toLowerCase(), code));
@@ -1161,6 +1574,9 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [itemBulkCustomer, setItemBulkCustomer] = useState('');
   const [itemBulkShelfLife, setItemBulkShelfLife] = useState('');
   const [itemBulkSaving, setItemBulkSaving] = useState(false);
+  const [itemBulkRoutingTemplateCode, setItemBulkRoutingTemplateCode] = useState('');
+  const [itemBulkRoutingMode, setItemBulkRoutingMode] = useState('merge');
+  const [itemBulkRoutingSaving, setItemBulkRoutingSaving] = useState(false);
   const [itemTableFilters, setItemTableFilters] = useState({
     code: '',
     name: '',
@@ -1174,6 +1590,83 @@ const Dashboard = ({ onLogout, token, user }) => {
     customer: '',
     duplicatesOnly: false,
   });
+  const openNotificationTarget = useCallback((item) => {
+    const target = resolveNotificationTarget(item);
+    const itemCode = getNotificationItemCode(item);
+
+    setNotificationsOpen(false);
+    setMainTab(target.mainTab || 'dashboard');
+
+    if (target.mainTab === 'prl') {
+      setPrlFilters((prev) => ({
+        ...prev,
+        search: target.prl?.search || itemCode || prev.search,
+        month: target.prl?.month || prev.month,
+        year: target.prl?.year || prev.year || String(currentYear),
+      }));
+      setTablePagination((prev) => ({
+        ...prev,
+        prl: { ...(prev.prl || {}), page: 1 },
+      }));
+    }
+
+    if (target.mainTab === 'kanban') {
+      if (target.kanbanView) setKanbanView(target.kanbanView);
+      if (target.kanbanSubTab) setKanbanSubTab(target.kanbanSubTab);
+      if (target.kanbanSearch || itemCode) setKanbanSearch(target.kanbanSearch || itemCode);
+      if (target.kanbanRequestFilters) {
+        setKanbanRequestFilters((prev) => ({
+          ...prev,
+          ...Object.fromEntries(
+            Object.entries(target.kanbanRequestFilters)
+              .filter(([, value]) => String(value || '').trim()),
+          ),
+        }));
+        setTablePagination((prev) => ({
+          ...prev,
+          kanbanRequests: { ...(prev.kanbanRequests || {}), page: 1 },
+        }));
+      }
+    }
+
+    if (target.mainTab === 'masterref') {
+      setMasterRefTab('item');
+      if (itemCode) {
+        setItemTableFilters((prev) => ({
+          ...prev,
+          code: itemCode,
+        }));
+        setTablePagination((prev) => ({
+          ...prev,
+          masterItems: { ...(prev.masterItems || {}), page: 1 },
+        }));
+      }
+    }
+
+    if (item?.id && !item?.is_read) {
+      apiFetch(`/api/notifications/${item.id}/read`, { method: 'POST' })
+        .then(fetchNotifications)
+        .catch((error) => setNotificationError(error?.message || 'Gagal menandai notifikasi.'));
+    }
+  }, [
+    apiFetch,
+    currentYear,
+    fetchNotifications,
+    setItemTableFilters,
+    setKanbanRequestFilters,
+    setKanbanSearch,
+    setKanbanSubTab,
+    setKanbanView,
+    setMainTab,
+    setMasterRefTab,
+    setPrlFilters,
+    setTablePagination,
+  ]);
+  const handleNotificationCardKeyDown = useCallback((event, item) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    openNotificationTarget(item);
+  }, [openNotificationTarget]);
   const [inventoryFilterBucket, setInventoryFilterBucket] = useState('all');
   const [inventoryDetailOpen, setInventoryDetailOpen] = useState(false);
   const [inventoryDetailItem, setInventoryDetailItem] = useState(null);
@@ -1222,6 +1715,24 @@ const Dashboard = ({ onLogout, token, user }) => {
     const setting = kanbanSettingsByCode.get(itemCode);
     const lotQty = Number(setting?.lot_qty ?? 0);
     return Number.isFinite(lotQty) && lotQty > 0 ? lotQty : 0;
+  };
+  const isWeightItemUnit = (unitValue) => {
+    const normalized = String(unitValue || '').trim().toLowerCase();
+    if (!normalized) return false;
+    const tokens = normalized.replace(/[^a-z0-9]+/g, ' ').split(/\s+/).filter(Boolean);
+    return tokens.includes('kg')
+      || tokens.includes('kgs')
+      || tokens.includes('kilogram')
+      || tokens.includes('kilograms')
+      || normalized.includes('berat');
+  };
+  const isPackingWithinTolerance = (actualQty, standardQty, tolerance = 0.25) => {
+    const actual = Number(actualQty);
+    const standard = Number(standardQty);
+    const toleranceValue = Number(tolerance);
+    if (!Number.isFinite(actual) || !Number.isFinite(standard) || actual <= 0 || standard <= 0) return false;
+    const safeTolerance = Number.isFinite(toleranceValue) && toleranceValue > 0 ? toleranceValue : 0.25;
+    return actual >= (standard * (1 - safeTolerance)) && actual <= (standard * (1 + safeTolerance));
   };
   const normalizeQtyByNsp = (qty, itemCode) => {
     const qtyValue = Number(qty);
@@ -1385,8 +1896,8 @@ const Dashboard = ({ onLogout, token, user }) => {
         locationType,
         fifoLane,
         `${locationId} - ${locationType}`,
-        `${locationId} • ${locationType}`,
-        `${locationId} • ${locationType}${fifoLane ? ` • ${fifoLane}` : ''}`,
+        `${locationId} â€¢ ${locationType}`,
+        `${locationId} â€¢ ${locationType}${fifoLane ? ` â€¢ ${fifoLane}` : ''}`,
       ].filter(Boolean);
       return aliases.some((alias) => String(alias).trim().toLowerCase() === lowered);
     });
@@ -1523,6 +2034,22 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [reportTab, setReportTab] = useState('rekap');
   const [reportMenuOpen, setReportMenuOpen] = useState(false);
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
+  const activeHelpContent = useMemo(() => {
+    const base = HELP_CONTENT[mainTab] || HELP_CONTENT.dashboard;
+    let detailLabel = '';
+    if (mainTab === 'reports') detailLabel = HELP_REPORT_LABELS[reportTab] || '';
+    if (mainTab === 'masterref') detailLabel = HELP_MASTER_REF_LABELS[masterRefTab] || '';
+    if (mainTab === 'kanban') {
+      detailLabel = kanbanView === 'master'
+        ? HELP_KANBAN_LABELS.master
+        : HELP_KANBAN_LABELS[kanbanSubTab] || '';
+    }
+    return {
+      ...base,
+      detailLabel,
+      title: detailLabel ? `${base.title} - ${detailLabel}` : base.title,
+    };
+  }, [kanbanSubTab, kanbanView, mainTab, masterRefTab, reportTab]);
   const [fifoLots, setFifoLots] = useState([]);
   const [selectedFifoKanban, setSelectedFifoKanban] = useState('');
   const [inventoryItems, setInventoryItems] = useState([]);
@@ -1907,7 +2434,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   // Chatbot States
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState([
-    { role: 'ai', text: 'Halo! Saya Asisten Logistik Anda. 🤖nAda yang bisa saya bantu mengenai data jadwal pengiriman hari ini?' }
+    { role: 'ai', text: 'Halo! Saya Asisten Logistik Anda. ðŸ¤–nAda yang bisa saya bantu mengenai data jadwal pengiriman hari ini?' }
   ]);
   const [chatInput, setChatInput] = useState('');
   const [isChatLoading, setIsChatLoading] = useState(false);
@@ -1959,6 +2486,55 @@ const Dashboard = ({ onLogout, token, user }) => {
   const canResetAll = can('resetAll');
   const canSubcon = canEditSchedules || canViewReport;
   const canProduction = can('production') && !isProductionUser;
+  const canOpenReportMenu = canViewReport || canViewScorecard;
+  const getMainNavAccessMessage = (target) => {
+    const normalized = String(target || '').trim();
+    if (normalized === 'kanban') return 'Anda tidak memiliki akses Kanban Board.';
+    if (normalized === 'subcon') return 'Anda tidak memiliki akses Subcon.';
+    if (normalized === 'prl') return 'Anda tidak memiliki akses PRL.';
+    if (normalized === 'masterref') return 'Anda tidak memiliki akses Master Referensi.';
+    if (normalized === 'reports') return 'Anda tidak memiliki akses Laporan.';
+    return 'Anda tidak memiliki akses ke menu ini.';
+  };
+  const getMainNavButtonClassName = (baseClassName, disabled) => (
+    `${baseClassName}${disabled ? ' opacity-60 cursor-not-allowed shadow-none hover:bg-white/80' : ''}`
+  );
+  const handleHelpLinkClick = useCallback((link) => {
+    const targetTab = link?.mainTab || 'dashboard';
+    const blocked = (
+      (targetTab === 'kanban' && !canEditSchedules && !isProductionUser)
+      || (targetTab === 'subcon' && !canSubcon)
+      || (targetTab === 'prl' && !canViewPrl)
+      || (targetTab === 'masterref' && !canViewMaster)
+      || (targetTab === 'reports' && !canOpenReportMenu)
+      || (targetTab === 'audit' && !isAdmin)
+    );
+    if (blocked) {
+      showToastMessage(getMainNavAccessMessage(targetTab), '', null, 'error');
+      return;
+    }
+
+    setHelpOpen(false);
+    setActiveMenu(null);
+    setSettingsMenuOpen(false);
+    setReportMenuOpen(false);
+    setShowForm(false);
+    setMainTab(targetTab);
+    if (link?.reportTab) setReportTab(link.reportTab);
+    if (link?.masterRefTab) setMasterRefTab(link.masterRefTab);
+    if (link?.kanbanView) setKanbanView(link.kanbanView);
+    if (link?.kanbanSubTab) setKanbanSubTab(link.kanbanSubTab);
+  }, [
+    canEditSchedules,
+    canOpenReportMenu,
+    canSubcon,
+    canViewMaster,
+    canViewPrl,
+    getMainNavAccessMessage,
+    isAdmin,
+    isProductionUser,
+    showToastMessage,
+  ]);
 
   const refreshAiConfigStatus = useCallback(async ({ silent = false } = {}) => {
     if (!canUseAI) {
@@ -2281,7 +2857,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (isProductionUser) return [];
     if (!silent && !items.length) setItemsLoading(true);
     try {
-      const data = await apiFetch('/api/items');
+      const data = await fetchPagedCollection('/api/items', { pageSize: 250 });
       setItems(data);
       dataCacheRef.current.itemsLoaded = true;
     } catch (error) {
@@ -2291,11 +2867,32 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
   };
 
+  const fetchPagedCollection = async (path, { pageSize = 250, query = {}, timeoutMs = API_TIMEOUT_MS } = {}) => {
+    const normalizedPageSize = Math.max(1, Math.min(Number(pageSize) || 250, 1000));
+    const allRows = [];
+    let offset = 0;
+    while (true) {
+      const params = new URLSearchParams();
+      Object.entries(query || {}).forEach(([key, value]) => {
+        if (value === undefined || value === null || value === '') return;
+        params.set(key, String(value));
+      });
+      params.set('limit', String(normalizedPageSize));
+      params.set('offset', String(offset));
+      const page = await apiFetch(`${path}?${params.toString()}`, { timeoutMs });
+      if (!Array.isArray(page) || page.length === 0) break;
+      allRows.push(...page);
+      if (page.length < normalizedPageSize) break;
+      offset += normalizedPageSize;
+    }
+    return allRows;
+  };
+
   const fetchKanbanSettings = async ({ silent = false } = {}) => {
     if (!silent && !kanbanSettings.length) setKanbanLoading(true);
     setKanbanError('');
     try {
-      const data = await apiFetch('/api/kanban/settings');
+      const data = await fetchPagedCollection('/api/kanban/settings', { pageSize: 250 });
       setKanbanSettings(data);
       dataCacheRef.current.kanbanSettingsLoaded = true;
     } catch (error) {
@@ -2309,7 +2906,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (!silent && !kanbanRequests.length) setKanbanLoading(true);
     setKanbanError('');
     try {
-      const data = await apiFetch('/api/kanban/requests');
+      const data = await fetchPagedCollection('/api/kanban/requests', { pageSize: 250 });
       setKanbanRequests(data);
       dataCacheRef.current.kanbanRequestsLoaded = true;
     } catch (error) {
@@ -2383,6 +2980,22 @@ const Dashboard = ({ onLogout, token, user }) => {
     }).filter(Boolean);
   };
 
+  const resolveItemPrimarySupplier = (itemCode, masterItem = null) => {
+    const supplierRows = itemSupplierMap.get(itemCode) || [];
+    const primaryRelation = [...supplierRows].sort((left, right) => Number(right.sharePercent || 0) - Number(left.sharePercent || 0))[0] || null;
+    const supplierCodeRaw = primaryRelation?.vendorId || masterItem?.vendor_id || '';
+    const vendor = masterVendorsById.get(supplierCodeRaw)
+      || masterVendors.find((row) => String(row.name || '').trim().toLowerCase() === String(supplierCodeRaw || '').trim().toLowerCase())
+      || null;
+    const supplierCode = String(vendor?.id || primaryRelation?.vendorId || supplierCodeRaw || '').trim();
+    const supplierName = String(vendor?.name || primaryRelation?.vendorName || masterItem?.supplier_name || '').trim();
+    return {
+      supplierCode,
+      supplierName,
+      supplier: supplierCode || supplierName || '',
+    };
+  };
+
   const buildInventoryFromSources = (notes) => {
     const receivedTotals = new Map();
     (notes || []).forEach((note) => {
@@ -2410,11 +3023,9 @@ const Dashboard = ({ onLogout, token, user }) => {
       const setting = kanbanSettingsByCode.get(itemCode);
       const masterItem = masterItemsByCode.get(itemCode);
       const masterLocation = masterLocationsById.get(masterItem?.location_id);
-      const masterVendor = masterVendorsById.get(masterItem?.vendor_id);
+      const supplierMeta = resolveItemPrimarySupplier(itemCode, masterItem);
       const locationCode = String(masterLocation?.id || masterItem?.location_id || setting?.drop_zone || '').trim();
       const locationName = String(masterLocation?.name || masterItem?.location_name || '').trim();
-      const supplierCode = String(masterVendor?.id || setting?.default_supplier || masterItem?.vendor_id || '').trim();
-      const supplierName = String(masterVendor?.name || masterItem?.supplier_name || '').trim();
       const minQty = Number(setting?.min_qty || 0);
       const maxQty = Number(setting?.effective_max_qty ?? setting?.max_qty ?? 0);
       const kanbanQty = Number(setting?.lot_qty || 0);
@@ -2450,9 +3061,9 @@ const Dashboard = ({ onLogout, token, user }) => {
         maxQty,
         noOfCards,
         kanbanQty,
-        supplierCode,
-        supplierName,
-        supplier: supplierCode || supplierName || '',
+        supplierCode: supplierMeta.supplierCode,
+        supplierName: supplierMeta.supplierName,
+        supplier: supplierMeta.supplier,
         leadTime: Number(setting?.lead_time_days || 0),
         uom: masterItem?.unit || '',
         status,
@@ -2526,7 +3137,6 @@ const Dashboard = ({ onLogout, token, user }) => {
         cycleX: '1',
         cycleY: '4',
         cycleZ: '4',
-        defaultSupplier: '',
         dropZone: '',
         active: true,
       });
@@ -2547,7 +3157,6 @@ const Dashboard = ({ onLogout, token, user }) => {
       maxQty,
       lotQty,
       leadTimeDays: Number(item?.lead_time_days ?? item?.leadTimeDays ?? 0) || 0,
-      defaultSupplier: item?.vendor_id || item?.supplier_name || item?.supplierName || '',
       dropZone: item?.line_production || item?.location_name || item?.location_id || '',
       active: true,
     };
@@ -2794,6 +3403,31 @@ const Dashboard = ({ onLogout, token, user }) => {
     return num.toLocaleString('id-ID', { maximumFractionDigits: 0 });
   };
 
+  const buildLotSummaryText = (rows, { label = 'Lot', limit = 3 } = {}) => {
+    const list = Array.isArray(rows) ? rows : [];
+    const parts = list
+      .map((row) => {
+        const lotCode = String(
+          row?.batchNo
+          || row?.batch_no
+          || row?.lotNumber
+          || row?.lot_no
+          || row?.batchId
+          || row?.batch_id
+          || '',
+        ).trim();
+        if (!lotCode) return '';
+        const qtyValue = Number(row?.qty ?? row?.consumedQty ?? row?.remainingQty ?? row?.receivedQty ?? 0);
+        const qtyText = Number.isFinite(qtyValue) && qtyValue > 0 ? ` x ${formatNumber0(qtyValue)}` : '';
+        return `${lotCode}${qtyText}`;
+      })
+      .filter(Boolean);
+    if (!parts.length) return '';
+    const visible = parts.slice(0, limit).join(', ');
+    const extra = parts.length > limit ? ` +${parts.length - limit} lainnya` : '';
+    return `${label}: ${visible}${extra}`;
+  };
+
   const formatNumber2 = (value) => {
     const num = Number(value);
     if (!Number.isFinite(num)) return value ?? '';
@@ -2904,16 +3538,17 @@ const Dashboard = ({ onLogout, token, user }) => {
   }, [globalSearchOpen]);
 
   useEffect(() => {
-    if (!globalSearchOpen && !notificationsOpen) return;
+    if (!globalSearchOpen && !notificationsOpen && !helpOpen) return;
     const onKeyDown = (event) => {
       if (event.key === 'Escape') {
         setGlobalSearchOpen(false);
         setNotificationsOpen(false);
+        setHelpOpen(false);
       }
     };
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
-  }, [globalSearchOpen, notificationsOpen]);
+  }, [globalSearchOpen, helpOpen, notificationsOpen]);
 
   const kanbanIdCounterMap = useMemo(() => {
     const codes = new Set([
@@ -3153,7 +3788,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     const suppliers = Array.isArray(row?.suppliers) ? row.suppliers : [];
     const primarySupplier = suppliers[0] || null;
     const item = masterItemsByCode.get(row.uniq);
-    const vendorId = primarySupplier?.vendorId || row.defaultSupplier || item?.vendor_id || '';
+    const vendorId = primarySupplier?.vendorId || item?.vendor_id || '';
     const vendor = (vendorId && masterVendorsById.get(vendorId)) || masterVendors.find((v) => (
       String(v.id).toLowerCase() === String(vendorId).toLowerCase()
       || String(v.name || '').toLowerCase() === String(primarySupplier?.vendorName || row.supplierName || item?.supplier_name || '').toLowerCase()
@@ -3329,9 +3964,10 @@ const Dashboard = ({ onLogout, token, user }) => {
           supplierFilter === String(supplier.vendorId || '').toLowerCase()
           || supplierFilter === String(supplier.vendorName || '').toLowerCase()
         ));
+        const item = masterItemsByCode.get(row.uniq);
         const fallbackMatch = suppliers.length === 0 && (
-          supplierFilter === String(row.defaultSupplier || '').toLowerCase()
-          || supplierFilter === String(row.supplierName || '').toLowerCase()
+          supplierFilter === String(item?.vendor_id || '').toLowerCase()
+          || supplierFilter === String(item?.supplier_name || row.supplierName || '').toLowerCase()
         );
         if (!relationMatch && !fallbackMatch) return false;
       }
@@ -3420,7 +4056,11 @@ const Dashboard = ({ onLogout, token, user }) => {
         if (!partValue.includes(partNoFilter)) return false;
       }
       if (nameFilter && !String(item.name || '').toLowerCase().includes(nameFilter)) return false;
-      if (modelFilter && !String(item.model || '').toLowerCase().includes(modelFilter)) return false;
+      if (modelFilter) {
+        const normalizedModel = formatModelCodes(masterModelsMap, item.modelCodes || resolveModelCodesFromMaster(item.model));
+        const modelHay = [item.model, normalizedModel].filter(Boolean).join(' ').toLowerCase();
+        if (!modelHay.includes(modelFilter)) return false;
+      }
       if (unitFilter && !String(item.unit || '').toLowerCase().includes(unitFilter)) return false;
       if (typePackFilter && !String(item.type_pack || '').toLowerCase().includes(typePackFilter)) return false;
       if (itemTableFilters.category && resolveItemCategoryCode(item.type) !== itemTableFilters.category) return false;
@@ -3441,18 +4081,45 @@ const Dashboard = ({ onLogout, token, user }) => {
       }
       return true;
     });
-  }, [masterItemsWithModelCodes, itemTableFilters, itemSupplierMap, itemCustomerMap, itemDuplicateKeySets]);
+  }, [masterItemsWithModelCodes, itemTableFilters, itemSupplierMap, itemCustomerMap, itemDuplicateKeySets, masterModelsMap, resolveModelCodesFromMaster]);
 
   const fetchPrlRows = async (yearValue, { silent = false } = {}) => {
     if (!silent && !prlRows.length) setPrlLoading(true);
     try {
       const yearParam = yearValue || prlFilters.year || currentYear;
-      const params = new URLSearchParams();
-      params.set('year', yearParam);
-      if (prlFilters.supplier) params.set('supplier', prlFilters.supplier);
-      const data = await apiFetch(`/api/prl?${params.toString()}`);
+      const data = await fetchPagedCollection('/api/prl', {
+        pageSize: 100,
+        timeoutMs: 60000,
+        query: {
+          year: yearParam,
+          supplier: prlFilters.supplier,
+        },
+      });
       const selectedSupplier = String(prlFilters.supplier || '').trim();
       const supplierKey = selectedSupplier.toLowerCase();
+      const normalizeSharePercent = (value) => {
+        const numeric = Number(value || 0);
+        return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+      };
+      const computeSupplierShare = (suppliers = []) => {
+        const list = Array.isArray(suppliers) ? suppliers : [];
+        if (supplierKey) {
+          const matched = list.filter((supplier) => (
+            supplierKey === String(supplier.vendorId || '').trim().toLowerCase()
+            || supplierKey === String(supplier.vendorName || '').trim().toLowerCase()
+          ));
+          if (matched.length === 0) {
+            return { sharePercent: 0, shareRatio: 0 };
+          }
+          const totalShare = list.reduce((sum, supplier) => sum + normalizeSharePercent(supplier.sharePercent), 0);
+          const matchedShare = matched.reduce((sum, supplier) => sum + normalizeSharePercent(supplier.sharePercent), 0);
+          if (totalShare > 0) {
+            return { sharePercent: matchedShare, shareRatio: matchedShare / totalShare };
+          }
+          return { sharePercent: matched.length ? 100 / Math.max(list.length, 1) : 0, shareRatio: matched.length / Math.max(list.length, 1) };
+        }
+        return { sharePercent: 100, shareRatio: 1 };
+      };
       const filterSupplierRelations = (relations = []) => {
         const supplierRows = Array.isArray(relations) ? relations : [];
         if (!supplierKey) return supplierRows;
@@ -3465,6 +4132,14 @@ const Dashboard = ({ onLogout, token, user }) => {
         let normalized = (data || []).map((row) => {
           const rowModelSource = row.item_model || row.model || '';
           const rowModelCodes = resolveModelCodesFromMaster(rowModelSource);
+          const supplierRows = Array.isArray(row.suppliers) ? row.suppliers : [];
+          const supplierAllocation = computeSupplierShare(supplierRows);
+          const monthValues = Object.fromEntries(
+            Object.entries(row.months || {}).map(([monthKey, monthValue]) => [
+              monthKey,
+              Number((Number(monthValue || 0) * supplierAllocation.shareRatio).toFixed(2)),
+            ]),
+          );
           return {
             id: row.id,
             uniq: row.item_code,
@@ -3477,11 +4152,13 @@ const Dashboard = ({ onLogout, token, user }) => {
             typePack: row.type_pack || row.item_type_pack || '',
             typePackName: row.type_pack_name || '',
             volume: row.volume || '',
-            months: row.months || {},
+            months: monthValues,
             status: row.status || {},
             category: row.category || '',
             categoryName: row.category_name || '',
-            suppliers: filterSupplierRelations(row.suppliers),
+            suppliers: filterSupplierRelations(supplierRows),
+            supplierSharePercent: supplierAllocation.sharePercent,
+            supplierShareRatio: supplierAllocation.shareRatio,
             customers: Array.isArray(row.customers) ? row.customers : [],
             locationId: row.location_id || '',
             locationName: row.location_name || '',
@@ -3489,12 +4166,13 @@ const Dashboard = ({ onLogout, token, user }) => {
             fifoLane: row.fifo_lane || '',
             itemPackQty: row.item_pack_qty ?? '',
             kanbanLotQty: row.kanban_lot_qty ?? '',
-            defaultSupplier: row.default_supplier || '',
+            masterSupplier: row.master_supplier || '',
             supplierName: row.supplier_name || '',
             year: row.year,
             sourceType: row.id ? row.source_type || '' : 'master_item',
             sourceRef: row.source_ref || '',
             suggestedQty: Number(row.suggested_qty || 0),
+            supplierSuggestedQty: Number((Number(row.suggested_qty || 0) * supplierAllocation.shareRatio).toFixed(2)),
             dueDate: row.due_date || '',
             priorityScore: Number(row.priority_score || 0),
             approvedQty: Number(row.approved_qty || 0),
@@ -3549,7 +4227,7 @@ const Dashboard = ({ onLogout, token, user }) => {
               fifoLane: '',
               itemPackQty: item.pack_qty ?? '',
               kanbanLotQty: '',
-              defaultSupplier: item.vendor_id || '',
+              masterSupplier: item.vendor_id || '',
               supplierName: item.supplier_name || '',
               year: Number(yearParam),
               sourceType: 'master_item',
@@ -3947,17 +4625,17 @@ const Dashboard = ({ onLogout, token, user }) => {
         const nMinus = getMonthValue(row, monthSlots[0]);
         const nValue = getMonthValue(row, monthSlots[1]);
         let diffPct = 0;
-        let trend = '→';
+        let trend = 'â†’';
         if (nMinus > 0) {
           diffPct = ((nValue - nMinus) / nMinus) * 100;
-          if (diffPct > 5) trend = '▲';
-          else if (diffPct < -5) trend = '▼';
+          if (diffPct > 5) trend = 'â–²';
+          else if (diffPct < -5) trend = 'â–¼';
         }
         const diffValue = nMinus > 0 ? Math.round(diffPct) : null;
         const diffLabel = nMinus > 0 ? `${trend} ${formatNumber0(diffValue)}%` : '-';
-        const color = trend === '▲'
+        const color = trend === 'â–²'
           ? [185, 28, 28]
-          : trend === '▼'
+          : trend === 'â–¼'
             ? [21, 128, 61]
             : [31, 41, 55];
 
@@ -4049,6 +4727,248 @@ const Dashboard = ({ onLogout, token, user }) => {
     doc.save(`${buildPrlDownloadBaseName(baseYear, monthKeyByIndex[baseMonthIndex])}.pdf`);
   };
 
+  const handlePrlForecastPreview = async () => {
+    const selectedMonth = prlFilters.month || prlActiveMonthKey || monthKeyByIndex[new Date().getMonth()];
+    if (!selectedMonth) {
+      showToastMessage('Pilih bulan fokus terlebih dahulu.');
+      return;
+    }
+    try {
+      const params = new URLSearchParams();
+      params.set('year', String(prlFilters.year || currentYear));
+      params.set('month', selectedMonth);
+      if (prlFilters.supplier) params.set('supplier', prlFilters.supplier);
+      const report = await apiFetch(`/api/prl/forecast-preview?${params.toString()}`, {
+        timeoutMs: 60000,
+      });
+      const rows = Array.isArray(report?.rows) ? report.rows : [];
+      if (rows.length === 0) {
+        showToastMessage('Data forecast belum tersedia untuk supplier/bulan ini.');
+        return;
+      }
+      const monthSlots = Array.isArray(report?.monthSlots) ? report.monthSlots : [];
+      const supplierName = String(report?.supplier?.name || prlFilters.supplier || 'All Supplier').trim();
+      const supplierCode = String(report?.supplier?.code || prlFilters.supplier || 'ALL').trim();
+      const documentNumber = String(report?.documentNumber || '').trim() || `PRL/${supplierCode}/VII/${String(prlFilters.year || currentYear).slice(-2)}/0001`;
+      const monthLabel = String(report?.monthLabel || prlMonthLabel(selectedMonth) || '').trim();
+      const printDateLabel = String(report?.printDate || new Date().toLocaleDateString('id-ID')).trim();
+      const selectedMonthSlot = monthSlots[1] || {
+        monthLabel,
+        workingDays: Number(report?.workingDays || getWorkingDays(selectedMonth, prlFilters.year || currentYear)),
+      };
+      const escapeHtml = (value) => String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+      const formatCellNumber = (value, digits = 0) => {
+        const num = Number(value || 0);
+        if (!Number.isFinite(num)) return '0';
+        const fixed = num.toFixed(digits);
+        return digits > 0
+          ? fixed.replace(/\.?0+$/, '')
+          : String(Math.round(num));
+      };
+      const rowsHtml = rows.map((row, index) => `
+        <tr>
+          <td class="center">${index + 1}</td>
+          <td class="left">
+            <div class="part-code">${escapeHtml(row.partNo || row.itemCode || '-')}</div>
+            <div class="part-desc">${escapeHtml(row.description || '-')}</div>
+          </td>
+          <td class="center">${escapeHtml(formatModelCodes(masterModelsMap, resolveModelCodesFromMaster(row.model)) || row.model || '-')}</td>
+          <td class="center">${formatCellNumber(row.snp, 0)}</td>
+          <td class="center">${formatCellNumber(row.qtyDayMinusOne, 2)}</td>
+          <td class="center">${formatCellNumber(row.qtyDayCurrent, 2)}</td>
+          <td class="center">${escapeHtml(row.uom || '-')}</td>
+          <td class="center">${escapeHtml(row.typePack || '-')}</td>
+          <td class="center">${formatCellNumber(row.weekI, 2)}</td>
+          <td class="center">${formatCellNumber(row.weekII, 2)}</td>
+          <td class="center">${formatCellNumber(row.weekIII, 2)}</td>
+          <td class="center">${formatCellNumber(row.weekIV, 2)}</td>
+          <td class="center">${formatCellNumber(row.months?.nMinus1, 2)}</td>
+          <td class="center">${formatCellNumber(row.months?.n, 2)}</td>
+          <td class="center">${formatCellNumber(row.months?.nPlus1, 2)}</td>
+          <td class="center">${formatCellNumber(row.months?.nPlus2, 2)}</td>
+          <td class="center">${formatCellNumber(row.months?.nPlus3, 2)}</td>
+          <td class="center">${row.fluctuation === null || row.fluctuation === undefined ? '-' : `${formatCellNumber(row.fluctuation, 0)}%`}</td>
+        </tr>
+      `).join('');
+      const signatureBoxes = [
+        { title: 'CONFIRMATION', role: 'Supplier' },
+        { title: 'ACKNOWLEDGED', role: 'Div. Head PPIC' },
+        { title: 'APPROVED', role: 'Sec. Head MKT' },
+        { title: 'CHECKED', role: 'Sec. Head PPIC' },
+        { title: 'PREPARED', role: 'Staff PPIC' },
+      ].map((item) => `
+        <div class="sig-card">
+          <div class="sig-title">${item.title}</div>
+          <div class="sig-space">Nama &amp; Tanda Tangan</div>
+          <div class="sig-role">${item.role}</div>
+        </div>
+      `).join('');
+      const monthHeader = (slot) => `(${slot?.monthLabel || '-'})<br>(${formatCellNumber(slot?.workingDays || 0, 0)} HK)`;
+      const html = `
+        <!doctype html>
+        <html>
+        <head>
+          <meta charset="utf-8" />
+          <title>${escapeHtml(documentNumber)}</title>
+          <style>
+            @page { size: A4 landscape; margin: 5mm; }
+            html, body { margin: 0; padding: 0; font-family: Arial, Helvetica, sans-serif; color: #1f2937; }
+            body { background: #fff; }
+            .toolbar { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 12px 0; }
+            .btn { border: 1px solid #94a3b8; background: #fff; color: #0f172a; padding: 8px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+            .btn.primary { background: #0f172a; color: #fff; border-color: #0f172a; }
+            .page { padding: 4px 6px 8px; }
+            .header { display: grid; grid-template-columns: 1.55fr 0.68fr 1.77fr; gap: 6px; align-items: start; }
+            .brand { display: flex; gap: 8px; align-items: flex-start; }
+            .brand img { width: 48px; height: 48px; object-fit: contain; }
+            .brand-text { font-size: 11px; line-height: 1.05; }
+            .brand-title { font-size: 15px; font-weight: 700; margin-bottom: 1px; letter-spacing: 0.2px; }
+            .brand-sub { font-size: 9px; color: #334155; line-height: 1.05; }
+            .doc-box { border: 1px solid #7c8796; width: 156px; margin: 0 auto; text-align: center; }
+            .doc-box .label { background: #6b7280; color: #fff; font-size: 9px; padding: 4px 6px; font-weight: 700; }
+            .doc-box .value { padding: 10px 6px; font-size: 13px; font-weight: 700; line-height: 1.15; }
+            .signatures { display: grid; grid-template-columns: repeat(5, 1fr); gap: 3px; align-items: stretch; }
+            .sig-card { border: 1px solid #8b929b; min-height: 46px; }
+            .sig-title { background: #eef2f7; font-size: 8px; font-weight: 700; text-align: center; padding: 3px 2px; border-bottom: 1px solid #8b929b; }
+            .sig-space { min-height: 22px; display: flex; align-items: center; justify-content: center; font-size: 6px; color: #6b7280; padding: 1px 2px; text-align: center; }
+            .sig-role { font-size: 7px; text-align: center; padding: 1px 2px 3px; color: #374151; }
+            .meta { display: flex; justify-content: space-between; margin: 6px 0 5px; font-size: 9px; line-height: 1.2; }
+            .meta-left div { margin-bottom: 1px; }
+            .meta-right { text-align: right; }
+            .separator { border-top: 1px solid #cbd5e1; margin: 5px 0 6px; }
+            table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+            th, td { border: 1px solid #c8d0da; padding: 2px 3px; font-size: 7px; vertical-align: middle; }
+            th { background: #eef2f7; font-size: 7px; font-weight: 700; text-align: center; line-height: 1.05; }
+            td.center { text-align: center; }
+            td.left { text-align: left; }
+            .part-code { font-weight: 700; font-size: 7px; line-height: 1.05; }
+            .part-desc { font-size: 6px; color: #374151; margin-top: 1px; line-height: 1.05; }
+            .foot { margin-top: 5px; font-size: 7px; color: #6b7280; display: flex; justify-content: space-between; }
+            .hidden-print { }
+            @media print {
+              .toolbar, .hidden-print { display: none !important; }
+              body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+              .page { padding: 0; }
+            }
+          </style>
+        </head>
+        <body>
+          <div class="toolbar hidden-print">
+            <button class="btn primary" id="printBtn">Cetak Dokumen</button>
+            <button class="btn" id="closeBtn">Tutup</button>
+          </div>
+          <div class="page">
+            <div class="header">
+              <div class="brand">
+                <img src="${logoPrl || logoMatra}" alt="Logo PT Matra Roda Piranti" />
+                <div class="brand-text">
+                  <div class="brand-title">PT. MATRA RODA PIRANTI</div>
+                  <div class="brand-sub">PRODUCTION CONTROL DEPARTMENT</div>
+                  <div class="brand-sub">PART PROCUREMENT &amp; LOGISTIC DEPARTMENT</div>
+                  <div style="margin-top:6px;font-size:10px;line-height:1.25;">
+                    <div><strong>FORECAST ORDER</strong></div>
+                    <div>MONTH : ${escapeHtml(monthLabel)}</div>
+                    <div>SUPPLIER : ${escapeHtml(supplierName)}</div>
+                    <div>CODE : ${escapeHtml(supplierCode)}</div>
+                  </div>
+                </div>
+              </div>
+              <div class="doc-box">
+                <div class="label">#PRL NUMBER</div>
+                <div class="value">${escapeHtml(documentNumber)}</div>
+              </div>
+              <div class="signatures">${signatureBoxes}</div>
+            </div>
+            <div class="meta">
+              <div class="meta-left">
+                <div><strong>Working Days:</strong> ${formatCellNumber(selectedMonthSlot.workingDays || report?.workingDays || 0, 0)} HK</div>
+                <div><strong>Month Focus:</strong> ${escapeHtml(monthLabel)}</div>
+                <div><strong>Document No:</strong> ${escapeHtml(documentNumber)}</div>
+              </div>
+              <div class="meta-right">
+                <div>PRINT DATE : ${escapeHtml(printDateLabel)}</div>
+                <div>Total Item : ${rows.length}</div>
+              </div>
+            </div>
+            <div class="separator"></div>
+            <table>
+              <thead>
+                <tr>
+                  <th rowspan="2" style="width:20px;">No</th>
+                  <th rowspan="2" style="width:168px;">Part No / Deskripsi</th>
+                  <th rowspan="2" style="width:48px;">Model</th>
+                  <th rowspan="2" style="width:26px;">SNP</th>
+                  <th colspan="2" style="width:70px;">QTY/DAY</th>
+                  <th rowspan="2" style="width:26px;">UOM</th>
+                  <th rowspan="2" style="width:50px;">Type Pack</th>
+                  <th colspan="4" style="width:120px;">QTY/WEEK</th>
+                  <th rowspan="2" style="width:36px;">N-1<br>${escapeHtml(monthSlots[0]?.monthLabel || '-')}<br>(${formatCellNumber(monthSlots[0]?.workingDays || 0, 0)} HK)</th>
+                  <th rowspan="2" style="width:36px;">N<br>${escapeHtml(monthSlots[1]?.monthLabel || '-')}<br>(${formatCellNumber(monthSlots[1]?.workingDays || 0, 0)} HK)</th>
+                  <th rowspan="2" style="width:36px;">N+1<br>${escapeHtml(monthSlots[2]?.monthLabel || '-')}<br>(${formatCellNumber(monthSlots[2]?.workingDays || 0, 0)} HK)</th>
+                  <th rowspan="2" style="width:36px;">N+2<br>${escapeHtml(monthSlots[3]?.monthLabel || '-')}<br>(${formatCellNumber(monthSlots[3]?.workingDays || 0, 0)} HK)</th>
+                  <th rowspan="2" style="width:36px;">N+3<br>${escapeHtml(monthSlots[4]?.monthLabel || '-')}<br>(${formatCellNumber(monthSlots[4]?.workingDays || 0, 0)} HK)</th>
+                  <th rowspan="2" style="width:34px;">Fluctuation<br>(N-1 &gt; N)</th>
+                </tr>
+                <tr>
+                  <th style="width:26px;">N-1</th>
+                  <th style="width:26px;">N</th>
+                  <th style="width:28px;">I</th>
+                  <th style="width:28px;">II</th>
+                  <th style="width:28px;">III</th>
+                  <th style="width:28px;">IV</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${rowsHtml}
+              </tbody>
+            </table>
+            <div class="foot">
+              <div>Dokumen ini dapat dicetak langsung melalui tombol Cetak Dokumen.</div>
+              <div>Preview forecast supplier ${escapeHtml(supplierCode)}</div>
+            </div>
+          </div>
+          <script>
+            const printBtn = document.getElementById('printBtn');
+            const closeBtn = document.getElementById('closeBtn');
+            printBtn?.addEventListener('click', () => window.print());
+            closeBtn?.addEventListener('click', () => window.close());
+          </script>
+        </body>
+        </html>
+      `;
+      const previewWindow = window.open('', '_blank', 'noopener,noreferrer,width=1600,height=1000');
+      if (!previewWindow) {
+        showToastMessage('Popup preview diblokir browser.');
+        return;
+      }
+      previewWindow.document.open();
+      previewWindow.document.write(html);
+      previewWindow.document.close();
+      previewWindow.focus();
+    } catch (error) {
+      showToastMessage(`Gagal menyiapkan preview forecast: ${error.message || 'Unknown error'}`);
+    }
+  };
+
+  const fetchPrlImportHistory = useCallback(async () => {
+    setPrlImportHistoryLoading(true);
+    setPrlImportHistoryError('');
+    try {
+      const data = await apiFetch('/api/prl/imports?limit=25');
+      setPrlImportHistoryRows(Array.isArray(data) ? data : []);
+    } catch (error) {
+      setPrlImportHistoryRows([]);
+      setPrlImportHistoryError(error?.message || 'Gagal memuat riwayat import PRL.');
+    } finally {
+      setPrlImportHistoryLoading(false);
+    }
+  }, [apiFetch]);
+
   const parsePrlSheet = (sheet, XLSX) => {
     const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true });
     if (!rows.length) return [];
@@ -4124,15 +5044,33 @@ const Dashboard = ({ onLogout, token, user }) => {
       const payload = {
         year: Number(prlFilters.year) || currentYear,
         rows,
+        fileName: file.name,
       };
       const result = await apiFetch('/api/prl/import', {
         method: 'POST',
         body: JSON.stringify(payload),
       });
       await fetchPrlRows(prlFilters.year);
-      showToastMessage(
-        `Import PRL selesai: ${result.saved || 0} tersimpan, ${result.skipped || 0} dilewati.`,
-      );
+      await fetchPrlImportHistory();
+      const summary = {
+        open: true,
+        fileName: result.fileName || file.name,
+        totalRows: result.totalRows || rows.length,
+        inserted: result.inserted ?? result.saved ?? 0,
+        updated: result.updated ?? 0,
+        duplicate: result.duplicate ?? 0,
+        skipped: result.skipped ?? 0,
+        status: (Number(result.inserted || 0) + Number(result.updated || 0)) > 0 ? 'success' : 'failed',
+        message: result.message || `Inserted: ${result.inserted ?? result.saved ?? 0}, Updated: ${result.updated ?? 0}, Duplicate: ${result.duplicate ?? 0}, Skipped: ${result.skipped ?? 0}.`,
+      };
+      setPrlImportSummary({
+        ...summary,
+        detailRows: [
+          ...(Array.isArray(result.duplicateRows) ? result.duplicateRows.map((row) => ({ ...row, type: 'duplicate' })) : []),
+          ...(Array.isArray(result.skippedRows) ? result.skippedRows.map((row) => ({ ...row, type: 'skipped' })) : []),
+        ],
+      });
+      showToastMessage(summary.message);
     } catch (error) {
       showToastMessage(`Import PRL gagal: ${error.message || 'Unknown error'}`);
     }
@@ -4625,7 +5563,6 @@ const Dashboard = ({ onLogout, token, user }) => {
         vendors,
         customers,
         categories,
-        itemsMaster,
         locations,
         packings,
         models,
@@ -4640,7 +5577,6 @@ const Dashboard = ({ onLogout, token, user }) => {
         apiFetch('/api/master/vendors'),
         apiFetch('/api/master/customers'),
         apiFetch('/api/master/categories'),
-        apiFetch('/api/master/items'),
         apiFetch('/api/master/locations'),
         apiFetch('/api/master/packings'),
         safeApiFetch('/api/master/models', []),
@@ -4648,6 +5584,7 @@ const Dashboard = ({ onLogout, token, user }) => {
         safeApiFetch('/api/master/item-relations', { suppliers: [], customers: [] }),
         apiFetch('/api/master/config'),
       ]);
+      const itemsMaster = await fetchPagedCollection('/api/master/items', { pageSize: 250 });
       setMasterPlants(plants || []);
       setMasterAreas(areas || []);
       setMasterDeliveries(deliveries || []);
@@ -4716,6 +5653,17 @@ const Dashboard = ({ onLogout, token, user }) => {
       if (!silent) setMasterLoading(false);
     }
   };
+
+  const fetchProductionAreas = useCallback(async () => {
+    try {
+      const areas = await apiFetch('/api/master/areas');
+      setMasterAreas(Array.isArray(areas) ? areas : []);
+      return true;
+    } catch (error) {
+      setMasterError(error.message || 'Gagal memuat area produksi.');
+      return false;
+    }
+  }, [apiFetch]);
 
   const finalizeMasterSave = async (successMessage) => {
     const refreshed = await fetchMasterReferences();
@@ -4839,13 +5787,38 @@ const Dashboard = ({ onLogout, token, user }) => {
     await finalizeMasterSave('Vendor berhasil disimpan.');
   };
 
+  const isProductionOutputItemCategory = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return false;
+    const matched = (masterCategories || []).find((category) => (
+      String(category.code || '').trim().toLowerCase() === raw.toLowerCase()
+      || String(category.name || '').trim().toLowerCase() === raw.toLowerCase()
+    ));
+    const text = [raw, matched?.code || '', matched?.name || ''].join(' ').toLowerCase();
+    const compact = text.replace(/[^a-z0-9]+/g, '');
+    return (
+      compact === 'fg'
+      || compact === 'sa'
+      || compact.includes('finishedgood')
+      || compact.includes('finishgood')
+      || compact.includes('finishgoods')
+      || compact.includes('assembly')
+      || compact.includes('assy')
+      || compact.includes('subassy')
+      || compact.includes('subassembly')
+    );
+  };
+
   const handleSaveItemMaster = async () => {
     if (!itemMasterForm.code || !itemMasterForm.name || !itemMasterForm.type || !itemMasterForm.unit) {
       alert('UNIQ, Nama, Category, Unit wajib diisi.');
       return;
     }
-    const supplierShareTotal = (itemMasterForm.suppliers || []).reduce((acc, row) => acc + Number(row.sharePercent || 0), 0);
-    const customerShareTotal = (itemMasterForm.customers || []).reduce((acc, row) => acc + Number(row.sharePercent || 0), 0);
+    const isProductionOutputItem = isProductionOutputItemCategory(itemMasterForm.type);
+    const normalizedSuppliers = isProductionOutputItem ? [] : (itemMasterForm.suppliers || []);
+    const normalizedCustomers = isProductionOutputItem ? (itemMasterForm.customers || []) : [];
+    const supplierShareTotal = normalizedSuppliers.reduce((acc, row) => acc + Number(row.sharePercent || 0), 0);
+    const customerShareTotal = normalizedCustomers.reduce((acc, row) => acc + Number(row.sharePercent || 0), 0);
     if (supplierShareTotal > 100) {
       alert('Total share supplier melebihi 100%.');
       return;
@@ -4903,6 +5876,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     const { vendorId, ...itemMasterPayload } = itemMasterForm;
     const payload = {
       ...itemMasterPayload,
+      model: joinModelCodes(itemMasterForm.modelCodes || []),
       locationName: locationNameValue,
       lineProduction: lineProductionValue || null,
       shelfLifeDays: Number.isFinite(shelfLifeValue) ? Math.max(0, Math.round(shelfLifeValue)) : 0,
@@ -4914,8 +5888,8 @@ const Dashboard = ({ onLogout, token, user }) => {
       cycleTimeSeconds: Number.isFinite(cycleTimeSecondsValue) ? Math.max(0, cycleTimeSecondsValue) : 0,
       processFlow: processFlowValue,
       processRouting: normalizedProcessRouting,
-      suppliers: itemMasterForm.suppliers || [],
-      customers: itemMasterForm.customers || [],
+      suppliers: normalizedSuppliers,
+      customers: normalizedCustomers,
     };
     if (masterEditingItemCode) {
       await apiFetch(`/api/master/items/${masterEditingItemCode}`, { method: 'PUT', body: JSON.stringify(payload) });
@@ -5272,11 +6246,53 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
   };
 
+  const handleBatchApproveKanban = async () => {
+    if (selectedRequestIds.length === 0) {
+      alert('Pilih minimal 1 request.');
+      return false;
+    }
+    const selectedRows = selectedRequestIds
+      .map((id) => kanbanRequests.find((reqRow) => reqRow.id === id))
+      .filter(Boolean);
+    const eligibleIds = selectedRequestIds.filter((id) => {
+      const row = kanbanRequests.find((reqRow) => reqRow.id === id);
+      if (!row) return false;
+      const statusKey = String(row?.status || '').trim().toLowerCase();
+      return ['triggered', 'requested'].includes(statusKey) && !row?.dn_id;
+    });
+    if (eligibleIds.length === 0) {
+      alert(`Tidak ada request yang valid untuk di-approve.
+Kemungkinan status masih ${getKanbanRequestStatusLabel(selectedRows[0]) || 'Pending'}, sudah punya DN, atau belum masuk antrian approve.
+${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
+      return false;
+    }
+    if (eligibleIds.length !== selectedRequestIds.length) {
+      showToastMessage(`Sebagian request di-skip karena status tidak valid atau sudah punya DN.
+${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
+    }
+    try {
+      const result = await apiFetch('/api/kanban/requests/batch-approve', {
+        method: 'POST',
+        body: JSON.stringify({ requestIds: eligibleIds }),
+      });
+      setSelectedRequestIds([]);
+      const approvedCount = Array.isArray(result?.approved) ? result.approved.length : eligibleIds.length;
+      const skippedCount = Array.isArray(result?.skipped) ? result.skipped.length : 0;
+      showToastMessage(`Batch approve selesai untuk ${approvedCount} request.${skippedCount ? ` (${skippedCount} di-skip)` : ''}`);
+      await fetchKanbanRequests();
+      return true;
+    } catch (error) {
+      alert(`Gagal batch approve: ${error.message || 'Unknown error'}`);
+      return false;
+    }
+  };
+
   const handleApproveAndCreateDn = async (row) => {
-    const setting = kanbanSettingsByCode.get(row.item_code);
-    const supplier = setting?.default_supplier || row.supplier || '';
+    const masterItem = masterItemsByCode.get(row.item_code);
+    const supplierMeta = resolveItemPrimarySupplier(row.item_code, masterItem);
+    const supplier = supplierMeta.supplierCode || supplierMeta.supplierName || '';
     if (!supplier) {
-      alert('Supplier belum ada. Silakan isi supplier dulu.');
+      alert('Supplier belum ada di Master Item. Silakan isi supplier di Master Referensi.');
       openDnModal(row);
       return;
     }
@@ -5327,32 +6343,163 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
   };
 
-  const handleManualRequest = async (e) => {
-    e.preventDefault();
-    const itemCode = manualRequestForm.itemCode || resolveKanbanItemCode(manualRequestForm.kanbanId);
-    if (!itemCode || !manualRequestForm.requestQty || !manualRequestForm.onHand) {
-      alert('Item, on hand, dan quantity wajib diisi.');
+  const buildManualRequestRow = (source = manualRequestForm) => {
+    const triggerType = String(source?.triggerType || 'manual').trim() || 'manual';
+    const kanbanId = String(source?.kanbanId || '').trim();
+    const itemCode = String(source?.itemCode || resolveKanbanItemCode(kanbanId) || '').trim();
+    const onHandValue = Number(String(source?.onHand ?? '').replace(',', '.'));
+    const rawQty = Number(String(source?.requestQty ?? '').replace(',', '.'));
+    if (!itemCode || !Number.isFinite(onHandValue) || onHandValue < 0 || !Number.isFinite(rawQty) || rawQty <= 0) {
+      return null;
+    }
+    const normalizedQty = normalizeQtyByNsp(rawQty, itemCode);
+    return {
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      kanbanId,
+      itemCode,
+      itemName: masterItemsByCode.get(itemCode)?.name || '',
+      triggerType,
+      onHand: String(Math.max(0, onHandValue)),
+      requestQty: String(source?.requestQty ?? rawQty),
+      normalizedQty,
+    };
+  };
+
+  const getManualRequestDraft = (source = manualRequestForm) => buildManualRequestRow(source);
+
+  const clearManualRequestDraft = () => {
+    setManualRequestForm({
+      kanbanId: '',
+      itemCode: '',
+      triggerType: 'manual',
+      onHand: '',
+      requestQty: '',
+    });
+  };
+
+  const closeManualRequestModal = () => {
+    setShowManualRequestModal(false);
+    setManualRequestQueue([]);
+    clearManualRequestDraft();
+  };
+
+  const queueManualRequestFromForm = () => {
+    const draft = getManualRequestDraft();
+    if (!draft) {
+      alert('Item, on hand, dan quantity wajib diisi dan quantity harus lebih dari 0.');
       return;
     }
-    const rawQty = Number(manualRequestForm.requestQty) || 0;
-    const nsp = resolveNspForItem(itemCode);
-    const normalizedQty = normalizeQtyByNsp(rawQty, itemCode);
-    if (nsp > 0 && normalizedQty !== rawQty) {
-      showToastMessage(`Qty dibulatkan ke kelipatan NSP ${nsp}: ${rawQty} → ${normalizedQty}.`);
+    setManualRequestQueue((prev) => {
+      if (prev.some((row) => row.itemCode === draft.itemCode && row.kanbanId === draft.kanbanId && row.triggerType === draft.triggerType)) {
+        alert(`Item ${draft.itemCode} sudah ada di daftar.`);
+        return prev;
+      }
+      return [...prev, draft];
+    });
+    clearManualRequestDraft();
+  };
+
+  const updateManualRequestQueueRow = (rowId, patch = {}) => {
+    setManualRequestQueue((prev) => prev.map((row) => {
+      if (row.id !== rowId) return row;
+      const next = { ...row, ...patch };
+      const rebuilt = buildManualRequestRow(next);
+      if (!rebuilt) {
+        return next;
+      }
+      return {
+        ...next,
+        itemCode: rebuilt.itemCode,
+        itemName: rebuilt.itemName,
+        normalizedQty: rebuilt.normalizedQty,
+      };
+    }));
+  };
+
+  const handleManualRequest = async (e) => {
+    e.preventDefault();
+    const queuedRows = [];
+    const invalidQueueRows = [];
+    manualRequestQueue.forEach((row) => {
+      const normalized = buildManualRequestRow(row);
+      if (normalized) {
+        queuedRows.push(normalized);
+      } else {
+        invalidQueueRows.push(row);
+      }
+    });
+    if (invalidQueueRows.length > 0) {
+      alert('Ada item di daftar dengan qty kosong atau tidak valid. Perbaiki dulu sebelum simpan.');
+      return;
     }
+    const draft = getManualRequestDraft();
+    const requestRows = draft ? [...queuedRows, draft] : queuedRows;
+    if (requestRows.length === 0) {
+      alert('Tambahkan minimal 1 item request.');
+      return;
+    }
+
+    const failures = [];
+    let successCount = 0;
+    const totalRows = requestRows.length;
+
     try {
-      await apiFetch('/api/kanban/requests', {
-        method: 'POST',
-        body: JSON.stringify({
-          itemCode,
-          requestQty: normalizedQty,
-          triggerType: manualRequestForm.triggerType || 'manual',
-          notes: manualRequestForm.onHand ? `onHand:${manualRequestForm.onHand}` : null,
-        }),
-      });
+      for (const row of requestRows) {
+        try {
+          await apiFetch('/api/kanban/requests', {
+            method: 'POST',
+            body: JSON.stringify({
+              itemCode: row.itemCode,
+              requestQty: row.normalizedQty,
+              triggerType: row.triggerType || 'manual',
+              kanbanId: row.kanbanId || null,
+              notes: [row.kanbanId ? `kanban: ${row.kanbanId}` : '', `onHand:${row.onHand}`].filter(Boolean).join(' | '),
+            }),
+          });
+          successCount += 1;
+        } catch (error) {
+          failures.push({
+            ...row,
+            errorMessage: error.message || 'Unknown error',
+          });
+        }
+      }
+
+      if (failures.length > 0) {
+        setManualRequestQueue(failures);
+        setManualRequestForm({
+          kanbanId: '',
+          itemCode: '',
+          triggerType: 'manual',
+          onHand: '',
+          requestQty: '',
+        });
+        showToastMessage(
+          `${successCount} dari ${totalRows} request berhasil disimpan.`,
+          '',
+          null,
+          successCount > 0 ? 'warning' : 'error',
+        );
+        alert(
+          [
+            'Sebagian request gagal disimpan:',
+            ...failures.map((row) => `- ${row.itemCode}: ${row.errorMessage}`),
+          ].join('\n'),
+        );
+        return;
+      }
+
+      setManualRequestQueue([]);
+      clearManualRequestDraft();
       setShowManualRequestModal(false);
-      setManualRequestForm({ kanbanId: '', itemCode: '', triggerType: 'manual', onHand: '', requestQty: '' });
-      showToastMessage(`Request manual dibuat untuk ${itemCode} (qty ${normalizedQty}).`);
+      showToastMessage(
+        totalRows > 1
+          ? `${successCount} request manual berhasil dibuat.`
+          : `Request manual dibuat untuk ${requestRows[0].itemCode} (qty ${requestRows[0].normalizedQty}).`,
+        '',
+        null,
+        'success',
+      );
       await fetchKanbanRequests();
     } catch (error) {
       alert(`Gagal membuat request: ${error.message || 'Unknown error'}`);
@@ -5372,6 +6519,21 @@ const Dashboard = ({ onLogout, token, user }) => {
       alert('Pilih Rit/Jam terlebih dahulu.');
       return;
     }
+    const today = getTodayDateInput();
+    const deliveryType = resolveDnDeliveryType({
+      plannedDate: dnForm.plannedDate,
+      createdAt: today,
+      deliveryType: dnForm.deliveryType,
+      remarks: dnForm.remarks,
+    });
+    if (!validateDnDateRules({
+      plannedDate: dnForm.plannedDate,
+      createdAt: today,
+      deliveryType,
+      remarks: dnForm.remarks,
+    })) {
+      return;
+    }
     const vendorMatch = masterVendors.find(
       (vendor) => String(vendor.id).toLowerCase() === String(dnForm.supplier).toLowerCase()
         || String(vendor.name).toLowerCase() === String(dnForm.supplier).toLowerCase()
@@ -5386,13 +6548,14 @@ const Dashboard = ({ onLogout, token, user }) => {
         body: JSON.stringify({
           ...dnForm,
           dnNumber: dnForm.dnNumber?.trim() || null,
+          deliveryType,
           remarks: dnForm.remarks?.trim() || null,
           deliveryScheduleIndex: dnForm.scheduleIndex,
         }),
       });
       setShowDnModal(false);
       setSelectedKanban(null);
-      setDnForm({ dnNumber: '', supplier: '', plannedDate: '', remarks: '', scheduleIndex: '', cycle: '', rit: '', deliveryTime: '' });
+      setDnForm({ dnNumber: '', supplier: '', plannedDate: '', deliveryType: 'normal', remarks: '', scheduleIndex: '', cycle: '', rit: '', deliveryTime: '' });
       await fetchKanbanRequests();
       await fetchDeliveryNotes();
     } catch (error) {
@@ -5404,6 +6567,11 @@ const Dashboard = ({ onLogout, token, user }) => {
     e.preventDefault();
     const dnId = selectedKanban?.dn_id ?? selectedKanban?.id;
     if (!dnId) return;
+    const scheduleVendor = resolveRequestVendor(selectedKanban);
+    if (!isScheduleVendorRole(scheduleVendor?.role)) {
+      alert('Create Schedule hanya untuk supplier dengan role Schedule.');
+      return;
+    }
     try {
       await apiFetch(`/api/dn/${dnId}/create-schedule`, {
         method: 'POST',
@@ -5522,9 +6690,10 @@ const Dashboard = ({ onLogout, token, user }) => {
   };
 
   const openDnModal = (row) => {
-    const setting = kanbanSettings.find((item) => item.item_code === row.item_code);
-    const today = new Date().toISOString().slice(0, 10);
-    const supplierValue = setting?.default_supplier || '';
+    const today = getTodayDateInput();
+    const masterItem = masterItemsByCode.get(row.item_code);
+    const supplierMeta = resolveItemPrimarySupplier(row.item_code, masterItem);
+    const supplierValue = supplierMeta.supplierCode || supplierMeta.supplierName || '';
     const vendor = resolveVendorFromSupplier(supplierValue);
     const scheduleRows = getVendorScheduleRows(vendor);
     const firstSchedule = scheduleRows[0] || {};
@@ -5533,6 +6702,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       dnNumber: '',
       supplier: supplierValue,
       plannedDate: today,
+      deliveryType: 'additional',
       remarks: '',
       scheduleIndex: scheduleRows.length > 0 ? '0' : '',
       cycle: firstSchedule.cycle || '',
@@ -5543,6 +6713,11 @@ const Dashboard = ({ onLogout, token, user }) => {
   };
 
   const openScheduleModal = (row) => {
+    const scheduleVendor = resolveRequestVendor(row);
+    if (!isScheduleVendorRole(scheduleVendor?.role)) {
+      alert('Create Schedule hanya untuk supplier dengan role Schedule.');
+      return;
+    }
     const today = new Date().toISOString().slice(0, 10);
     const planned = row?.planned_date || row?.plannedDate || today;
     setSelectedKanban(row);
@@ -5576,6 +6751,25 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (direct) return direct;
     return masterVendorsLookup.get(String(supplierValue).trim().toLowerCase()) || null;
   };
+
+  function isScheduleVendorRole(role) {
+    return String(role || '').trim().toLowerCase() === 'schedule';
+  }
+
+  function resolveRequestVendor(row = {}) {
+    const directSupplier = row?.supplier_id
+      || row?.supplier
+      || row?.supplier_name
+      || row?.supplierName
+      || row?.default_supplier
+      || '';
+    const directVendor = resolveVendorFromSupplier(directSupplier);
+    if (directVendor) return directVendor;
+    const itemCode = row?.item_code || row?.itemCode || row?.item || '';
+    const masterItem = masterItemsByCode.get(itemCode);
+    const supplierMeta = resolveItemPrimarySupplier(itemCode, masterItem);
+    return resolveVendorFromSupplier(supplierMeta.supplierCode || supplierMeta.supplierName || supplierMeta.supplier);
+  }
 
   function normalizeDeliveryScheduleRows(input) {
     let rows = input;
@@ -5644,6 +6838,35 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (!dn?.id) return;
     setSelectedDnDetail(dn);
     setDnDetailEditable(Boolean(editable));
+    const vendor = resolveVendorFromSupplier(dn.supplier);
+    const scheduleRows = getVendorScheduleRows(vendor);
+    const matchedScheduleIndex = scheduleRows.findIndex((row) => (
+      String(row?.rit || '').trim() === String(dn?.rit || '').trim()
+      && String(row?.time || '').trim() === String(dn?.delivery_time || dn?.deliveryTime || '').trim()
+      && String(row?.cycle || '').trim() === String(dn?.cycle || '').trim()
+    ));
+    const fallbackScheduleIndex = scheduleRows.findIndex((row) => (
+      String(row?.rit || '').trim() === String(dn?.rit || '').trim()
+      || String(row?.time || '').trim() === String(dn?.delivery_time || dn?.deliveryTime || '').trim()
+    ));
+    setDnHeaderEdits({
+      plannedDate: String(dn.planned_date || dn.plannedDate || '').slice(0, 10),
+      deliveryType: resolveDnDeliveryType({
+        plannedDate: dn.planned_date || dn.plannedDate,
+        createdAt: dn.created_at || dn.createdAt,
+        deliveryType: dn.delivery_type || dn.deliveryType,
+        remarks: dn.remarks,
+      }),
+      remarks: dn.remarks || '',
+      scheduleIndex: matchedScheduleIndex >= 0
+        ? String(matchedScheduleIndex)
+        : fallbackScheduleIndex >= 0
+          ? String(fallbackScheduleIndex)
+          : '',
+      cycle: dn.cycle || '',
+      rit: dn.rit || '',
+      deliveryTime: dn.delivery_time || dn.deliveryTime || '',
+    });
     setShowDnDetailModal(true);
     setDnDetailLoading(true);
     try {
@@ -5667,11 +6890,48 @@ const Dashboard = ({ onLogout, token, user }) => {
       const nextValue = Number(dnDetailEdits[row.id]);
       return Number.isFinite(nextValue) && Number(nextValue) !== Number(row.request_qty);
     });
-    if (updates.length === 0) {
+    const headerChanged = (
+      String(dnHeaderEdits.plannedDate || '') !== String(selectedDnDetail.planned_date || selectedDnDetail.plannedDate || '').slice(0, 10)
+      || normalizeDnDeliveryType(dnHeaderEdits.deliveryType) !== normalizeDnDeliveryType(selectedDnDetail.delivery_type || selectedDnDetail.deliveryType)
+      || String(dnHeaderEdits.remarks || '') !== String(selectedDnDetail.remarks || '')
+      || String(dnHeaderEdits.cycle || '') !== String(selectedDnDetail.cycle || '')
+      || String(dnHeaderEdits.rit || '') !== String(selectedDnDetail.rit || '')
+      || String(dnHeaderEdits.deliveryTime || '') !== String(selectedDnDetail.delivery_time || selectedDnDetail.deliveryTime || '')
+    );
+    if (updates.length === 0 && !headerChanged) {
       closeDnDetailModal();
       return;
     }
+    const deliveryType = resolveDnDeliveryType({
+      plannedDate: dnHeaderEdits.plannedDate,
+      createdAt: selectedDnDetail.created_at || selectedDnDetail.createdAt,
+      deliveryType: dnHeaderEdits.deliveryType,
+      remarks: dnHeaderEdits.remarks,
+    });
+    if (!validateDnDateRules({
+      plannedDate: dnHeaderEdits.plannedDate,
+      createdAt: selectedDnDetail.created_at || selectedDnDetail.createdAt,
+      deliveryType,
+      remarks: dnHeaderEdits.remarks,
+    })) {
+      return;
+    }
     try {
+      if (headerChanged) {
+        const updatedDn = await apiFetch(`/api/dn/${selectedDnDetail.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            plannedDate: dnHeaderEdits.plannedDate,
+            deliveryType,
+            remarks: dnHeaderEdits.remarks?.trim() || null,
+            deliveryScheduleIndex: dnHeaderEdits.scheduleIndex,
+            cycle: dnHeaderEdits.cycle,
+            rit: dnHeaderEdits.rit,
+            deliveryTime: dnHeaderEdits.deliveryTime,
+          }),
+        });
+        setSelectedDnDetail((prev) => (prev && prev.id === selectedDnDetail.id ? { ...prev, ...updatedDn } : prev));
+      }
       for (const row of updates) {
         await apiFetch(`/api/kanban/requests/${row.id}/qty`, {
           method: 'PUT',
@@ -5682,7 +6942,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       await fetchKanbanRequests();
       await fetchDeliveryNotes();
     } catch (error) {
-      alert(error.message || 'Gagal menyimpan perubahan DN.');
+      alert(error.message || 'Failed to save DN changes.');
     }
   };
 
@@ -5708,6 +6968,15 @@ const Dashboard = ({ onLogout, token, user }) => {
     setSelectedDnDetail(null);
     setDnDetailRows([]);
     setDnDetailEdits({});
+    setDnHeaderEdits({
+      plannedDate: '',
+      deliveryType: 'normal',
+      remarks: '',
+      scheduleIndex: '',
+      cycle: '',
+      rit: '',
+      deliveryTime: '',
+    });
   };
 
   const handleDeleteDn = async (dn) => {
@@ -5834,6 +7103,12 @@ const Dashboard = ({ onLogout, token, user }) => {
       supplierEmail,
       dateLabel: formatDateLabel(dn?.created_at || dn?.planned_date),
       deliveryDateLabel: formatDateLabel(dn?.planned_date),
+      deliveryType: resolveDnDeliveryType({
+        plannedDate: dn?.planned_date || dn?.plannedDate,
+        createdAt: dn?.created_at || dn?.createdAt,
+        deliveryType: dn?.delivery_type || dn?.deliveryType,
+        remarks: dn?.remarks,
+      }),
       deliveryAddress,
       recipientLabel,
       areaLabel,
@@ -5940,6 +7215,14 @@ const Dashboard = ({ onLogout, token, user }) => {
         body += `\n\nRemarks: ${payload.remarksText}`;
       }
       const email = payload.supplierEmail || '';
+      const currentStatus = String(resolvedDn?.status || dn.status || '').toLowerCase();
+      if (!['sent', 'in_transit', 'partial', 'closed', 'received', 'cancelled'].includes(currentStatus)) {
+        await apiFetch(`/api/dn/${dn.id}/status`, {
+          method: 'PUT',
+          body: JSON.stringify({ status: 'sent' }),
+        });
+        await fetchDeliveryNotes();
+      }
       window.location.href = `mailto:${email}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
     } catch (error) {
       alert(error.message || 'Gagal menyiapkan email DN.');
@@ -6251,17 +7534,18 @@ const Dashboard = ({ onLogout, token, user }) => {
       const consumedQty = Number(result?.consumedQty ?? qty);
       const consumedBatches = Number(result?.consumedBatches ?? result?.updatedLots ?? 0);
       const stockNote = `Stok terpotong ${formatNumber0(consumedQty)}${consumedBatches ? ` (${consumedBatches} lot)` : ''}.`;
+      const lotSummary = buildLotSummaryText(result?.consumed, { label: 'Lot terpakai' });
       const prlNotice = result?.prlPlan?.notice || result?.notice || '';
       const scanWarning = Array.isArray(result?.warnings) && result.warnings.length ? ` ${result.warnings.join(' ')}` : '';
       if (result?.notice) {
-        showToastMessage(`${stockNote} ${result.notice}${scanWarning}`);
+        showToastMessage(`${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} ${result.notice}${scanWarning}`);
       } else if (result?.requestCreated) {
         const prlLabel = result?.prlPlan?.monthLabel ? ` PRL ${result.prlPlan.monthLabel} tersisa ${formatNumber0(result.prlPlan.remainingQty || 0)}.` : '';
-        showToastMessage(`Kanban kosong diproses. ${stockNote} Request dibuat.${prlLabel}${scanWarning}`);
+        showToastMessage(`Kanban kosong diproses. ${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} Request dibuat.${prlLabel}${scanWarning}`);
       } else if (prlNotice) {
-        showToastMessage(`Kanban kosong diproses. ${stockNote} ${prlNotice}${scanWarning}`);
+        showToastMessage(`Kanban kosong diproses. ${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} ${prlNotice}${scanWarning}`);
       } else {
-        showToastMessage(`Kanban kosong diproses. ${stockNote} Request sudah ada.${scanWarning}`);
+        showToastMessage(`Kanban kosong diproses. ${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} Request sudah ada.${scanWarning}`);
       }
       await fetchKanbanRequests();
       await fetchItems();
@@ -6312,8 +7596,9 @@ const Dashboard = ({ onLogout, token, user }) => {
           const consumedQty = Number(result?.consumedQty ?? qty);
           const consumedBatches = Number(result?.consumedBatches ?? result?.updatedLots ?? 0);
           const stockNote = `Stok terpotong ${formatNumber0(consumedQty)}${consumedBatches ? ` (${consumedBatches} lot)` : ''}.`;
+          const lotSummary = buildLotSummaryText(result?.consumed, { label: 'Lot terpakai' });
           const scanWarning = Array.isArray(result?.warnings) && result.warnings.length ? ` ${result.warnings.join(' ')}` : '';
-          notices.push(`${id}: ${stockNote} ${result.notice}${scanWarning}`);
+          notices.push(`${id}: ${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} ${result.notice}${scanWarning}`);
         } else if (Array.isArray(result?.warnings) && result.warnings.length) {
           notices.push(`${id}: ${result.warnings.join(' ')}`);
         }
@@ -6609,15 +7894,26 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
   };
 
-  const handleImportItemsXls = (e) => {
-    const file = e.target.files[0];
+  const handleImportItemsXls = async (e) => {
+    const input = e.target;
+    const file = input.files[0];
     if (!file) return;
-    readItemImportRows(file).then(async (rows) => {
+    const importModeInput = window.prompt(
+      'Mode import items:\n- MERGE = isi data yang kosong tanpa menghapus data lama\n- REPLACE = timpa data lama dengan data file\n\nKetik MERGE atau REPLACE:',
+      'MERGE',
+    );
+    if (importModeInput === null) {
+      if (itemsImportRef.current) itemsImportRef.current.value = '';
+      return;
+    }
+    const importMode = String(importModeInput || 'MERGE').trim().toUpperCase() === 'REPLACE' ? 'REPLACE' : 'MERGE';
+    const isReplaceMode = importMode === 'REPLACE';
+    try {
+      const rows = await readItemImportRows(file);
       if (!rows.length) { showToastMessage('File kosong.'); return; }
-      try {
-        setItemImportDuplicateKeys({ code: [], partNo: [] });
-        const existingCodes = new Set(masterItems.map((item) => String(item.code || '').trim()).filter(Boolean));
-        const existingPartNos = new Set(masterItems.map((item) => String(item.part_no || item.partNo || '').trim()).filter(Boolean));
+      setItemImportDuplicateKeys({ code: [], partNo: [] });
+      const existingCodes = new Set(masterItems.map((item) => String(item.code || '').trim()).filter(Boolean));
+      const existingPartNos = new Set(masterItems.map((item) => String(item.part_no || item.partNo || '').trim()).filter(Boolean));
         let inserted = 0;
         let updated = 0;
         let skipped = 0;
@@ -6630,21 +7926,23 @@ const Dashboard = ({ onLogout, token, user }) => {
         const seenCodesInFile = new Set();
         const seenPartNosInFile = new Set();
         const hasImportValue = (value) => String(value ?? '').trim() !== '';
-        const pickTextValue = (importedValue, existingValue = '') => (
-          hasImportValue(importedValue) ? String(importedValue).trim() : String(existingValue || '').trim()
-        );
+        const pickTextValue = (importedValue, existingValue = '') => {
+          if (isReplaceMode) return hasImportValue(importedValue) ? String(importedValue).trim() : '';
+          return hasImportValue(importedValue) ? String(importedValue).trim() : String(existingValue || '').trim();
+        };
         const pickNumberValue = (importedValue, existingValue = 0) => {
           if (hasImportValue(importedValue)) {
             const parsed = Number(importedValue);
             return Number.isFinite(parsed) ? parsed : Number(existingValue || 0);
           }
+          if (isReplaceMode) return 0;
           const parsedExisting = Number(existingValue || 0);
           return Number.isFinite(parsedExisting) ? parsedExisting : 0;
         };
         const pickBooleanValue = (importedValue, existingValue = false) => (
           hasImportValue(importedValue)
             ? /^(1|true|yes|y|seasonal)$/i.test(String(importedValue).trim())
-            : Boolean(existingValue)
+            : (isReplaceMode ? false : Boolean(existingValue))
         );
         rows.forEach((row, index) => {
           const rowNumber = index + 2;
@@ -6737,20 +8035,26 @@ const Dashboard = ({ onLogout, token, user }) => {
           const existingItem = masterItems.find((item) => String(item.code || '').trim() === normalizedCode) || null;
           const existingSupplierRows = itemSupplierMap.get(normalizedCode) || [];
           const existingCustomerRows = itemCustomerMap.get(normalizedCode) || [];
-          const mergedSuppliers = existingSupplierRows.length > 0
-            ? existingSupplierRows.map((supplier) => ({
-                vendorId: String(supplier.vendorId || '').trim(),
-                vendorName: String(supplier.vendorName || supplier.vendorId || '').trim(),
-                sharePercent: Number(supplier.sharePercent || 0),
-              }))
-            : (resolvedSupplier?.id ? [{ vendorId: String(resolvedSupplier.id).trim(), vendorName: String(resolvedSupplier.name || resolvedSupplier.id || '').trim(), sharePercent: 100 }] : []);
-          const mergedCustomers = existingCustomerRows.length > 0
-            ? existingCustomerRows.map((customer) => ({
-                customerId: String(customer.customerId || '').trim(),
-                customerName: String(customer.customerName || customer.customerId || '').trim(),
-                sharePercent: Number(customer.sharePercent || 0),
-              }))
-            : [];
+          const mergedSuppliers = isReplaceMode
+            ? (resolvedSupplier?.id
+              ? [{ vendorId: String(resolvedSupplier.id).trim(), vendorName: String(resolvedSupplier.name || resolvedSupplier.id || '').trim(), sharePercent: 100 }]
+              : [])
+            : (existingSupplierRows.length > 0
+              ? existingSupplierRows.map((supplier) => ({
+                  vendorId: String(supplier.vendorId || '').trim(),
+                  vendorName: String(supplier.vendorName || supplier.vendorId || '').trim(),
+                  sharePercent: Number(supplier.sharePercent || 0),
+                }))
+              : (resolvedSupplier?.id ? [{ vendorId: String(resolvedSupplier.id).trim(), vendorName: String(resolvedSupplier.name || resolvedSupplier.id || '').trim(), sharePercent: 100 }] : []));
+          const mergedCustomers = isReplaceMode
+            ? []
+            : (existingCustomerRows.length > 0
+              ? existingCustomerRows.map((customer) => ({
+                  customerId: String(customer.customerId || '').trim(),
+                  customerName: String(customer.customerName || customer.customerId || '').trim(),
+                  sharePercent: Number(customer.sharePercent || 0),
+                }))
+              : []);
           payloads.push({
             code: normalizedCode,
             name: String(name).trim(),
@@ -6758,8 +8062,8 @@ const Dashboard = ({ onLogout, token, user }) => {
             type,
             unit: pickTextValue(unit, existingItem?.unit || ''),
             model: pickTextValue(model, existingItem?.model || ''),
-            weight: hasImportValue(weight) ? Number(weight) : (existingItem?.weight ?? null),
-            price: hasImportValue(price) ? Number(price) : (existingItem?.price ?? null),
+            weight: pickNumberValue(weight, existingItem?.weight ?? null),
+            price: pickNumberValue(price, existingItem?.price ?? null),
             locationId: pickTextValue(locationIdResolved, existingItem?.location_id || existingItem?.locationId || ''),
             locationName: pickTextValue(
               getMasterWarehouseLabel(selectedWarehouse) || String(locationInput || '').trim(),
@@ -6782,7 +8086,9 @@ const Dashboard = ({ onLogout, token, user }) => {
             processFlow: processFlowValue,
             processRouting: normalizedProcessRouting,
             shelfLifeDays: pickNumberValue(shelfLifeDaysValue, existingItem?.shelf_life_days || existingItem?.shelfLifeDays || 0),
-            shelfLifeMonths: existingItem?.shelf_life_months ?? existingItem?.shelfLifeMonths ?? null,
+            shelfLifeMonths: isReplaceMode
+              ? (hasImportValue(shelfLifeMonths) ? Number(shelfLifeMonths) : null)
+              : (existingItem?.shelf_life_months ?? existingItem?.shelfLifeMonths ?? null),
             movingStatus: pickTextValue(movingStatus, existingItem?.moving_status || existingItem?.movingStatus || ''),
             isSeasonal: pickBooleanValue(seasonalValue, existingItem?.is_seasonal || existingItem?.isSeasonal || false),
             typePack: pickTextValue(typePack, existingItem?.type_pack || existingItem?.typePack || ''),
@@ -6828,7 +8134,7 @@ const Dashboard = ({ onLogout, token, user }) => {
           partNo: Array.from(duplicatePartNoKeys),
         });
         await fetchItems();
-        const summaryMessage = `Import items selesai. Inserted: ${inserted}, Updated: ${updated}, Duplicate: ${duplicates}, Skipped: ${skipped}.`;
+        const summaryMessage = `Import items selesai (${importMode}). Inserted: ${inserted}, Updated: ${updated}, Duplicate: ${duplicates}, Skipped: ${skipped}.`;
         showToastMessage(summaryMessage);
         const detailSections = [];
         if (duplicateReasons.length > 0) {
@@ -6840,13 +8146,12 @@ const Dashboard = ({ onLogout, token, user }) => {
         if (detailSections.length > 0) {
           alert(`${summaryMessage}\n\n${detailSections.join('\n\n')}`);
         }
-      } catch (error) {
-        showToastMessage(`Import items gagal: ${error.message || 'Unknown error'}`);
-      }
-    }).catch((error) => {
+    } catch (error) {
       showToastMessage(`Import items gagal: ${error.message || 'Unknown error'}`);
-    });
-    if (itemsImportRef.current) itemsImportRef.current.value = '';
+    } finally {
+      if (itemsImportRef.current) itemsImportRef.current.value = '';
+      if (input) input.value = '';
+    }
   };
 
   const handleImportProductionXls = (e) => {
@@ -7058,7 +8363,7 @@ const Dashboard = ({ onLogout, token, user }) => {
         "Type Pack": item.type_pack || '',
         "Order Lot Size": item.order_lot_size ?? '',
         "Max Delivery / Rit": item.max_delivery_per_rit ?? '',
-        "Model": item.model || '',
+        "Model": formatModelCodes(masterModelsMap, resolveModelCodesFromMaster(item.model)) || item.model || '',
         "Berat Part (kg)": item.weight ?? '',
         "Master Ord Warehouse": locationLabel,
         "Nama Master Ord Warehouse": item.location_name || locationLabel || '',
@@ -7081,6 +8386,111 @@ const Dashboard = ({ onLogout, token, user }) => {
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Master Items");
     XLSX.writeFile(wb, `Master_Items_${new Date().toISOString().split('T')[0]}.xlsx`);
+  };
+
+  const handleExportBomProjectXls = async () => {
+    const XLSX = await ensureXlsx();
+    if (!XLSX) return;
+    const triggerStaticDownload = () => {
+      const anchor = document.createElement('a');
+      anchor.href = '/BOM_Import_By_Project.xlsx';
+      anchor.download = 'BOM_Import_By_Project.xlsx';
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+    };
+    try {
+      const report = await apiFetch('/api/master/bom/project-report');
+      const projects = Array.isArray(report?.projects) ? report.projects : [];
+      if (projects.length === 0) {
+        triggerStaticDownload();
+        showToastMessage('Data report kosong, memakai file laporan terakhir yang tersedia.', '', null, 'success');
+        return;
+      }
+      const columns = [
+        'Level',
+        'Row Type',
+        'Parent Code',
+        'Kode Item',
+        'Nama Item',
+        'Model',
+        'Tipe',
+        'Qty (Use)',
+        'UOM',
+        'Berat (Kg)',
+        'Scrap %',
+        'Lead Time',
+        'Line',
+        'Process List',
+        'Process Code',
+        'Consumption Basis',
+        'Cycle Time (s)',
+        'Packing',
+        'Revision No',
+        'Effective Start',
+        'Effective End',
+        'Yield Factor',
+        'Position Code',
+        'Substitute Codes',
+        'BOM Version',
+        'Reference',
+      ];
+      const sanitizeSheetName = (value, fallback = 'Project') => {
+        const raw = String(value || '').trim() || fallback;
+        const cleaned = raw.replace(/[\\/?*\[\]:]/g, ' ').replace(/\s+/g, ' ').trim();
+        return (cleaned || fallback).slice(0, 31);
+      };
+      const uniqueSheetName = (name, usedNames) => {
+        let base = sanitizeSheetName(name);
+        if (!base) base = 'Project';
+        let candidate = base;
+        let counter = 2;
+        while (usedNames.has(candidate)) {
+          const suffix = `_${counter}`;
+          candidate = `${base.slice(0, Math.max(1, 31 - suffix.length))}${suffix}`;
+          counter += 1;
+        }
+        usedNames.add(candidate);
+        return candidate;
+      };
+      const workbook = XLSX.utils.book_new();
+      const usedSheetNames = new Set();
+      const summaryRows = projects.map((project) => ({
+        'Project / BOM Version': project.bomVersion || '-',
+        'Sheet Name': project.sheetName || project.bomVersion || '-',
+        'Parent Headers': Number(project.parentCount || 0),
+        'Total Rows': Number(project.rowCount || 0),
+        'Child Rows': Number(project.childCount || 0),
+        'Root Rows': Number(project.rootCount || 0),
+        'Empty Routing Header': Number(project.emptyRoutingHeaders || 0),
+        'Empty Routing Child': Number(project.emptyRoutingChildren || 0),
+      }));
+      const summarySheet = XLSX.utils.json_to_sheet(summaryRows, {
+        header: [
+          'Project / BOM Version',
+          'Sheet Name',
+          'Parent Headers',
+          'Total Rows',
+          'Child Rows',
+          'Root Rows',
+          'Empty Routing Header',
+          'Empty Routing Child',
+        ],
+      });
+      XLSX.utils.book_append_sheet(workbook, summarySheet, 'Summary');
+      projects.forEach((project, index) => {
+        const rows = Array.isArray(project.rows) ? project.rows : [];
+        const sheetName = uniqueSheetName(project.sheetName || project.bomVersion || `Project ${index + 1}`, usedSheetNames);
+        const ws = XLSX.utils.json_to_sheet(rows, { header: columns });
+        XLSX.utils.book_append_sheet(workbook, ws, sheetName);
+      });
+      const dateLabel = new Date().toISOString().split('T')[0];
+      XLSX.writeFile(workbook, `BOM_Import_By_Project_${dateLabel}.xlsx`);
+      showToastMessage('Export BOM per project berhasil dibuat.', '', null, 'success');
+    } catch (error) {
+      triggerStaticDownload();
+      showToastMessage(`Export BOM per project gagal dari server, memakai file laporan terakhir.`, '', null, 'success');
+    }
   };
 
   const handleDownloadProductionTemplate = async () => {
@@ -7259,6 +8669,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     }
     let remaining = issueQty;
     const updated = filteredFifoLots.map((lot) => ({ ...lot }));
+    const consumedLots = [];
     for (let i = 0; i < updated.length && remaining > 0; i += 1) {
       const lot = updated[i];
       if (lot.status === 'Active' && lot.remainingQty > 0) {
@@ -7267,6 +8678,10 @@ const Dashboard = ({ onLogout, token, user }) => {
         if (lot.remainingQty === 0) {
           lot.status = 'Depleted';
         }
+        consumedLots.push({
+          batchNo: lot.batchNumber || lot.lotNumber || lot.batch_no || lot.batchNo || lot.id,
+          qty,
+        });
         remaining -= qty;
       }
     }
@@ -7279,6 +8694,13 @@ const Dashboard = ({ onLogout, token, user }) => {
       )
     );
     setShowFifoIssue(false);
+    const lotSummary = buildLotSummaryText(consumedLots, { label: 'Lot terpakai' });
+    showToastMessage(
+      `Issue FIFO selesai. Stok terpotong ${formatNumber0(issueQty)}${lotSummary ? ` | ${lotSummary}` : ''}.`,
+      '',
+      null,
+      'success',
+    );
   };
 
   const handleFifoDelete = (lotId) => {
@@ -7288,7 +8710,13 @@ const Dashboard = ({ onLogout, token, user }) => {
 
   const handleInventoryDelete = (itemId) => {
     if (!window.confirm('Hapus item inventory ini?')) return;
-    setInventoryItems((prev) => prev.filter((item) => item.id !== itemId));
+    const target = String(itemId || '').trim();
+    setInventoryItems((prev) => prev.filter((item) => {
+      const keys = [item.id, item.kanbanId, item.kanban_id, item.itemCode, item.item_code]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean);
+      return !keys.includes(target);
+    }));
     if (selectedFifoKanban === itemId) {
       setSelectedFifoKanban('');
     }
@@ -7300,11 +8728,14 @@ const Dashboard = ({ onLogout, token, user }) => {
     ));
   };
 
-  const handleRequestDnBatch = async ({ remarksBySupplier = null, remarks = '' } = {}) => {
+  const handleRequestDnBatch = async ({ remarksBySupplier = null, remarks = '', approveBeforeDn = false } = {}) => {
     if (selectedRequestIds.length === 0) {
       alert('Pilih minimal 1 request.');
       return false;
     }
+    const selectedRows = selectedRequestIds
+      .map((id) => kanbanRequests.find((reqRow) => reqRow.id === id))
+      .filter(Boolean);
     const eligibleIds = selectedRequestIds.filter((id) => {
       const row = kanbanRequests.find((reqRow) => reqRow.id === id);
       if (!row) return false;
@@ -7312,16 +8743,25 @@ const Dashboard = ({ onLogout, token, user }) => {
       return ['triggered', 'requested', 'approved'].includes(statusKey) && !row?.dn_id;
     });
     if (eligibleIds.length === 0) {
-      alert('Tidak ada request yang valid untuk dibuat DN. Pastikan status masih Pending/Approved dan belum punya DN.');
+      alert(`Tidak ada request yang valid untuk dibuat DN.
+Kemungkinan status masih ${getKanbanRequestStatusLabel(selectedRows[0]) || 'Pending'}, sudah punya DN, atau belum lolos eligibility DN.
+${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       return false;
     }
     const invalidSupplierItems = [];
     const invalidRoleItems = [];
+    const invalidFlowItems = [];
     const validIds = eligibleIds.filter((id) => {
       const row = kanbanRequests.find((reqRow) => reqRow.id === id);
       if (!row) return false;
-      const setting = kanbanSettingsByCode.get(row.item_code);
-      const supplier = String(setting?.default_supplier || '').trim();
+      const flowMeta = getKanbanRequestFlowMeta(row);
+      if (flowMeta.key !== 'supplier-dn') {
+        invalidFlowItems.push(`${row.item_code} (${flowMeta.label})`);
+        return false;
+      }
+      const masterItem = masterItemsByCode.get(row.item_code);
+      const supplierMeta = resolveItemPrimarySupplier(row.item_code, masterItem);
+      const supplier = String(supplierMeta.supplierCode || supplierMeta.supplierName || '').trim();
       if (!supplier) {
         invalidSupplierItems.push(row.item_code);
         return false;
@@ -7338,19 +8778,26 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (invalidSupplierItems.length > 0) {
       const preview = Array.from(new Set(invalidSupplierItems)).slice(0, 3).join(', ');
       const suffix = invalidSupplierItems.length > 3 ? ` dan ${invalidSupplierItems.length - 3} lainnya` : '';
-      showToastMessage(`Default supplier belum diisi untuk item: ${preview}${suffix}.`);
+      showToastMessage(`Supplier Master Item belum diisi untuk item: ${preview}${suffix}.`);
     }
     if (invalidRoleItems.length > 0) {
       const preview = Array.from(new Set(invalidRoleItems)).slice(0, 3).join(', ');
       const suffix = invalidRoleItems.length > 3 ? ` dan ${invalidRoleItems.length - 3} lainnya` : '';
       showToastMessage(`Supplier bukan role Delivery Note untuk item: ${preview}${suffix}.`);
     }
+    if (invalidFlowItems.length > 0) {
+      const preview = Array.from(new Set(invalidFlowItems)).slice(0, 3).join(', ');
+      const suffix = invalidFlowItems.length > 3 ? ` dan ${invalidFlowItems.length - 3} lainnya` : '';
+      showToastMessage(`Request bukan flow Supplier DN: ${preview}${suffix}.`);
+    }
     if (validIds.length === 0) {
-      alert('Tidak ada request yang valid untuk dibuat DN.');
+      alert(`Tidak ada request yang valid untuk dibuat DN.
+${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       return false;
     }
     if (eligibleIds.length !== selectedRequestIds.length) {
-      showToastMessage('Sebagian request di-skip karena status tidak valid atau sudah punya DN.');
+      showToastMessage(`Sebagian request di-skip karena status tidak valid atau sudah punya DN.
+${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     }
     try {
       const result = await apiFetch('/api/kanban/requests/batch-dn', {
@@ -7359,15 +8806,19 @@ const Dashboard = ({ onLogout, token, user }) => {
           requestIds: validIds,
           remarksBySupplier,
           remarks,
+          approveBeforeDn,
         }),
       });
       setSelectedRequestIds([]);
       const dns = Array.isArray(result?.dns) ? result.dns : result?.dn ? [result.dn] : [];
       const skippedCount = Array.isArray(result?.skipped) ? result.skipped.length : 0;
+      const approvedCount = Array.isArray(result?.approvedIds) ? result.approvedIds.length : 0;
       const dnLabels = dns.map((dn) => dn?.dn_number).filter(Boolean);
       const dnText = dnLabels.length ? dnLabels.join(', ') : '';
       const dnPrefix = dnText ? `DN ${dnText}` : 'DN';
-      showToastMessage(`${dnPrefix} dibuat untuk ${validIds.length} request.${skippedCount ? ` (${skippedCount} di-skip)` : ''}`);
+      const approvePrefix = approveBeforeDn ? `Approve + ${dnPrefix}` : dnPrefix;
+      const approvedNote = approveBeforeDn && approvedCount > 0 ? ` (${approvedCount} di-approve dulu)` : '';
+      showToastMessage(`${approvePrefix} dibuat untuk ${validIds.length} request${approvedNote}.${skippedCount ? ` (${skippedCount} di-skip)` : ''}`);
       if (skippedCount) {
         console.warn('Batch DN skipped rows:', result.skipped);
       }
@@ -7379,6 +8830,101 @@ const Dashboard = ({ onLogout, token, user }) => {
       return false;
     }
   };
+
+  useEffect(() => {
+    fetchScanPreviewRef.current = fetchScanPreview;
+  }, [fetchScanPreview]);
+
+  const stopScanner = useCallback(async () => {
+    scanStartTokenRef.current += 1;
+    scanStartPendingRef.current = false;
+    if (scanInstanceRef.current) {
+      try {
+        await scanInstanceRef.current.stop();
+      } catch (error) {
+        console.warn('Failed to stop scanner:', error);
+      }
+      try {
+        scanInstanceRef.current.destroy();
+      } catch (error) {
+        console.warn('Failed to destroy scanner:', error);
+      }
+      scanInstanceRef.current = null;
+    }
+    setScanCameraStatus('');
+  }, []);
+
+  const startScanner = useCallback(async () => {
+    if (kanbanSubTab !== 'scan' || scanMode !== 'camera') return;
+    if (!scanVideoRef.current) return;
+    if (scanInstanceRef.current || scanStartPendingRef.current) return;
+
+    const token = scanStartTokenRef.current + 1;
+    scanStartTokenRef.current = token;
+    scanStartPendingRef.current = true;
+    setScanCameraStatus('Meminta akses kamera...');
+    try {
+      const qrModule = await import('qr-scanner');
+      if (scanStartTokenRef.current !== token) return;
+      const QrScanner = qrModule.default || qrModule;
+      const scanner = new QrScanner(
+        scanVideoRef.current,
+        async (result) => {
+          const value = result?.data || '';
+          const now = Date.now();
+          if (!value) return;
+          if (lastScanRef.current.value === value && now - lastScanRef.current.time < 2000) {
+            return;
+          }
+          lastScanRef.current = { value, time: now };
+          const payload = parseScanLine(value);
+          const built = await (fetchScanPreviewRef.current || fetchScanPreview)(payload, 0);
+          setScanResults([built]);
+          setScanActiveResult(built);
+          setScanError(built.scanPreviewError ? built.scanPreviewError : '');
+        },
+        {
+          returnDetailedScanResult: true,
+          preferredCamera: 'environment',
+        },
+      );
+      if (scanStartTokenRef.current !== token) {
+        try {
+          scanner.destroy();
+        } catch (destroyError) {
+          console.warn('Failed to destroy stale scanner:', destroyError);
+        }
+        return;
+      }
+      scanInstanceRef.current = scanner;
+      await scanner.start();
+      if (scanStartTokenRef.current !== token) {
+        try {
+          await scanner.stop();
+        } catch (stopError) {
+          console.warn('Failed to stop stale scanner:', stopError);
+        }
+        try {
+          scanner.destroy();
+        } catch (destroyError) {
+          console.warn('Failed to destroy stale scanner:', destroyError);
+        }
+        return;
+      }
+      setScanError('');
+      setScanCameraStatus('Kamera aktif');
+    } catch (error) {
+      await stopScanner();
+      setScanCameraEnabled(false);
+      setScanError(getScanCameraErrorMessage(error));
+    } finally {
+      if (scanStartTokenRef.current === token) {
+        scanStartPendingRef.current = false;
+      }
+    }
+  }, [kanbanSubTab, scanMode, stopScanner]);
+
+  const handleBatchApproveAndDn = async () => handleRequestDnBatch({ approveBeforeDn: true });
 
   const openInventoryDetail = (item) => {
     setInventoryDetailItem(item);
@@ -7399,24 +8945,37 @@ const Dashboard = ({ onLogout, token, user }) => {
       alert('Data master kanban belum tersedia.');
       return;
     }
+    const reservedStatuses = new Set(['triggered', 'requested', 'approved', 'dn_created', 'scheduled', 'in_transit']);
+    const reservedTotals = new Map();
+    (kanbanRequests || []).forEach((request) => {
+      const itemCode = request.item_code || '';
+      const status = String(request.status || '').toLowerCase();
+      if (!itemCode || !reservedStatuses.has(status)) return;
+      reservedTotals.set(itemCode, Number(reservedTotals.get(itemCode) || 0) + Number(request.request_qty || 0));
+    });
     const synced = kanbanSettings.map((row) => {
       const masterItem = masterItemsByCode.get(row.item_code);
       const masterLocation = masterLocationsById.get(masterItem?.location_id);
-      const masterVendor =
-        masterVendorsById.get(row.default_supplier) ||
-        masterVendors.find((vendor) => vendor.name === row.default_supplier);
+      const supplierMeta = resolveItemPrimarySupplier(row.item_code, masterItem);
       const locationCode = String(masterLocation?.id || masterItem?.location_id || row.drop_zone || '').trim();
       const locationName = String(masterLocation?.name || masterItem?.location_name || '').trim();
-      const supplierCode = String(masterVendor?.id || row.default_supplier || masterItem?.vendor_id || '').trim();
-      const supplierName = String(masterVendor?.name || row.default_supplier || '').trim();
       const category = masterItem?.type || row.item_type || '';
       const kanbanId = buildKanbanId(row.item_code || '', category);
       const kanbanQty = Number(row.lot_qty || 0);
-      const maxQty = Number(row.max_qty || 0);
+      const maxQty = Number(row.effective_max_qty ?? row.max_qty ?? 0);
       const minQty = Number(row.min_qty || 0);
       const noOfCards = kanbanQty ? Math.ceil(maxQty / kanbanQty) : 0;
-      const onHand = 0;
-      const status = onHand <= minQty ? 'Critical' : 'Normal';
+      const onHand = Number(masterItem?.stock_qty || 0);
+      const reserved = Number(reservedTotals.get(row.item_code) || 0);
+      const available = onHand - reserved;
+      let status = 'Active';
+      if (available < 0) {
+        status = 'Minus';
+      } else if (minQty > 0 && available <= minQty) {
+        status = 'Critical';
+      } else if (reserved > 0) {
+        status = 'Reserved';
+      }
       return {
         id: kanbanId,
         kanbanId,
@@ -7429,14 +8988,16 @@ const Dashboard = ({ onLogout, token, user }) => {
         locationName,
         location: locationCode || locationName || '',
         onHand,
+        reserved,
+        available,
         minQty,
         maxQty,
         noOfCards,
         kanbanQty,
-        supplierCode,
-        supplierName,
-        supplier: supplierCode || supplierName || '',
-        leadTime: Number(row.lead_time_days || 0),
+        supplierCode: supplierMeta.supplierCode,
+        supplierName: supplierMeta.supplierName,
+        supplier: supplierMeta.supplier,
+        leadTime: Number(masterItem?.lead_time_days ?? row.lead_time_days ?? 0),
         uom: masterItem?.unit || '',
         status,
       };
@@ -7828,7 +9389,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     const rows = outstandingPrlRows.map((row) => ({
       'Item Code': row.itemCode,
       'Item Name': row.itemName,
-      Model: row.model,
+      Model: formatModelCodes(masterModelsMap, resolveModelCodesFromMaster(row.model)) || row.model,
       UOM: row.uom,
       'Type Pack': row.typePack,
       'Plan Qty': row.planQty,
@@ -8225,15 +9786,30 @@ const Dashboard = ({ onLogout, token, user }) => {
 
   useEffect(() => {
     if (mainTab === 'kanban') {
-      fetchKanbanSettings({ silent: dataCacheRef.current.kanbanSettingsLoaded });
-      fetchKanbanRequests({ silent: dataCacheRef.current.kanbanRequestsLoaded });
-      if (!isProductionUser) {
-        fetchDeliveryNotes({ silent: dataCacheRef.current.deliveryNotesLoaded });
-        fetchReceiveNotes({ silent: dataCacheRef.current.receiveNotesLoaded });
-        fetchItems({ silent: dataCacheRef.current.itemsLoaded });
-      }
+      let cancelled = false;
+      const loadKanbanData = async () => {
+        if (isProductionUser) {
+          await fetchProductionAreas();
+          if (cancelled) return;
+        }
+        await fetchKanbanSettings({ silent: dataCacheRef.current.kanbanSettingsLoaded });
+        if (cancelled) return;
+        await fetchKanbanRequests({ silent: dataCacheRef.current.kanbanRequestsLoaded });
+        if (cancelled) return;
+        if (!isProductionUser) {
+          await fetchDeliveryNotes({ silent: dataCacheRef.current.deliveryNotesLoaded });
+          if (cancelled) return;
+          await fetchReceiveNotes({ silent: dataCacheRef.current.receiveNotesLoaded });
+          if (cancelled) return;
+          await fetchItems({ silent: dataCacheRef.current.itemsLoaded });
+        }
+      };
+      void loadKanbanData();
+      return () => {
+        cancelled = true;
+      };
     }
-  }, [mainTab, isProductionUser]);
+  }, [mainTab, isProductionUser, fetchProductionAreas]);
 
   useEffect(() => {
     if (!user || isProductionUser) return;
@@ -8242,6 +9818,11 @@ const Dashboard = ({ onLogout, token, user }) => {
     fetchKanbanRequests({ silent: dataCacheRef.current.kanbanRequestsLoaded });
     fetchPrlRows(prlFilters.year, { silent: dataCacheRef.current.prlLoadedYear === `${prlFilters.year || currentYear}:${prlFilters.supplier || 'all'}` });
   }, [mainTab]);
+
+  useEffect(() => {
+    if (mainTab !== 'prl') return;
+    fetchPrlImportHistory();
+  }, [mainTab, fetchPrlImportHistory]);
 
   useEffect(() => {
     if (!['dashboard', 'dash-prl', 'dash-kanban', 'dash-inventory', 'dash-schedule'].includes(mainTab)) return;
@@ -8280,9 +9861,13 @@ const Dashboard = ({ onLogout, token, user }) => {
       if (mainTab !== 'kanban') {
         setMainTab('kanban');
       }
-      if (!['scan', 'empty'].includes(kanbanSubTab)) {
+      if (!['dashboard', 'scan', 'empty'].includes(kanbanSubTab)) {
         setKanbanSubTab('scan');
       }
+      return;
+    }
+    if (!canViewPrl && mainTab === 'prl') {
+      setMainTab('dashboard');
       return;
     }
     if (user.role === 'supplier' && mainTab !== 'supplier') {
@@ -8294,7 +9879,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (user.role !== 'admin' && mainTab === 'audit') {
       setMainTab('dashboard');
     }
-  }, [user, mainTab, kanbanSubTab, isProductionUser, setKanbanSubTab, setMainTab]);
+  }, [user, mainTab, kanbanSubTab, isProductionUser, canViewPrl, setKanbanSubTab, setMainTab]);
 
   useEffect(() => {
     if (!receiveNotes.length && !kanbanSettings.length) {
@@ -8307,52 +9892,16 @@ const Dashboard = ({ onLogout, token, user }) => {
   }, [receiveNotes, kanbanSettings, kanbanRequests, masterItems, masterLocations, masterVendors]);
 
   useEffect(() => {
-    const startScanner = async () => {
-      if (kanbanSubTab !== 'scan' || scanMode !== 'camera' || !scanCameraEnabled) return;
-      if (!scanVideoRef.current) return;
-      if (scanInstanceRef.current) return;
-      const qrModule = await import('qr-scanner');
-      const QrScanner = qrModule.default || qrModule;
-      const scanner = new QrScanner(
-        scanVideoRef.current,
-        async (result) => {
-          const value = result?.data || '';
-          const now = Date.now();
-          if (!value) return;
-          if (lastScanRef.current.value === value && now - lastScanRef.current.time < 2000) {
-            return;
-          }
-          lastScanRef.current = { value, time: now };
-          const payload = parseScanLine(value);
-          const built = await fetchScanPreview(payload, 0);
-          setScanResults([built]);
-          setScanActiveResult(built);
-          setScanError(built.scanPreviewError ? built.scanPreviewError : '');
-        },
-        { returnDetailedScanResult: true },
-      );
-      scanInstanceRef.current = scanner;
-      await scanner.start();
-    };
-
-    const stopScanner = async () => {
-      if (scanInstanceRef.current) {
-        await scanInstanceRef.current.stop();
-        scanInstanceRef.current.destroy();
-        scanInstanceRef.current = null;
-      }
-    };
-
     if (scanMode === 'camera' && kanbanSubTab === 'scan' && scanCameraEnabled) {
-      startScanner();
+      void startScanner();
     } else {
-      stopScanner();
+      void stopScanner();
     }
 
     return () => {
-      stopScanner();
+      void stopScanner();
     };
-  }, [kanbanSubTab, scanMode, scanCameraEnabled, itemsByCode, kanbanSettingsByCode]);
+  }, [kanbanSubTab, scanMode, scanCameraEnabled, startScanner, stopScanner]);
 
   useEffect(() => {
     const itemCodes = productionRequirements.map((row) => row.itemCode).filter(Boolean);
@@ -8399,9 +9948,62 @@ const Dashboard = ({ onLogout, token, user }) => {
 
   function parseDateOnly(value) {
     if (!value) return null;
-    const parts = String(value).split('-').map(Number);
+    const parts = String(value).slice(0, 10).split('-').map(Number);
     if (parts.length !== 3) return null;
     return new Date(parts[0], parts[1] - 1, parts[2]);
+  }
+
+  function formatDateOnlyInput(value) {
+    if (!value) return '';
+    return String(value).slice(0, 10);
+  }
+
+  function getTodayDateInput() {
+    const date = new Date();
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  function compareDateOnlyValue(left, right) {
+    const a = formatDateOnlyInput(left);
+    const b = formatDateOnlyInput(right);
+    if (!a || !b) return null;
+    return a.localeCompare(b);
+  }
+
+  function normalizeDnDeliveryType(value) {
+    const raw = String(value || '').trim().toLowerCase();
+    if (raw === 'urgent') return 'urgent';
+    if (raw === 'additional') return 'additional';
+    return 'normal';
+  }
+
+  function resolveDnDeliveryType({ plannedDate, createdAt, deliveryType, remarks } = {}) {
+    const normalized = normalizeDnDeliveryType(deliveryType);
+    if (normalized !== 'normal') return normalized;
+    const text = String(remarks || '').toLowerCase();
+    if (text.includes('urgent')) return 'urgent';
+    if (text.includes('additional')) return 'additional';
+    return compareDateOnlyValue(plannedDate, createdAt) === 0 ? 'additional' : 'normal';
+  }
+
+  function validateDnDateRules({ plannedDate, createdAt, deliveryType, remarks } = {}) {
+    const comparison = compareDateOnlyValue(plannedDate, createdAt);
+    if (comparison === null) return true;
+    if (comparison < 0) {
+      alert('Delivery date cannot be earlier than the DN created date.');
+      return false;
+    }
+    const type = normalizeDnDeliveryType(deliveryType);
+    const text = String(remarks || '').toLowerCase();
+    const sameDayFlag = ['additional', 'urgent'].includes(type) || text.includes('additional') || text.includes('urgent');
+    if (comparison === 0 && !sameDayFlag) {
+      alert('Same-day delivery must be marked as Additional or Urgent.');
+      return false;
+    }
+    return true;
   }
 
   const ROW_OPTIONS = [25, 50, 75, 100];
@@ -8488,7 +10090,7 @@ const Dashboard = ({ onLogout, token, user }) => {
           {sequence.map((item, index) => (
             item.type === 'ellipsis' ? (
               <span key={`ell-${index}`} className="px-2 text-[12px]">
-                …
+                â€¦
               </span>
             ) : (
               <button
@@ -8647,7 +10249,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   }, [kanbanSettings, kanbanSearch, kanbanCategoryFilter]);
 
   const kanbanCardPayloads = useMemo(() => {
-    if (!showKanbanCardModal) return [];
+    if (!showKanbanCardModal || !kanbanCardPreviewReady) return [];
     const payloads = [];
     filteredKanbanItems.forEach((row) => {
       const lotQty = Number(row.lot_qty ?? row.min_qty ?? 0);
@@ -8676,7 +10278,8 @@ const Dashboard = ({ onLogout, token, user }) => {
         plant.id === masterArea?.plant_id
         || plant.id === masterWarehouse?.plant_id
       ));
-      const supplier = row.default_supplier || masterItem?.vendor_id || '';
+      const supplierMeta = resolveItemPrimarySupplier(row.item_code, masterItem);
+      const supplier = supplierMeta.supplierCode || supplierMeta.supplierName || '';
       const itemName = row.item_name || masterItem?.name || row.item_code || '';
       const sidNumber = row.item_code || '';
       const qtyBox = lotQty || row.min_qty || '';
@@ -8686,14 +10289,25 @@ const Dashboard = ({ onLogout, token, user }) => {
       const plantName = masterPlant?.name || masterPlant?.id || '';
       Array.from({ length: totalCards }).forEach((_, idx) => {
         const arrivalTime = new Date().toISOString().slice(0, 16).replace('T', ' ');
-        const orderNo = `${String(idx + 1).padStart(2, '0')} / ${totalCards}`;
-        const kanbanId = buildKanbanCardId(row.item_code || '', row.item_type, idx + 1, totalCards);
-        const conveyanceNo = `CV-${String(idx + 1).padStart(2, '0')}`;
-        const pressBarcodeValue = kanbanId;
-        payloads.push({
-          key: `${row.item_code}-${idx}-${row.item_name}`,
-          supplier,
-          itemName,
+      const orderNo = `${String(idx + 1).padStart(2, '0')} / ${totalCards}`;
+      const kanbanId = buildKanbanCardId(row.item_code || '', row.item_type, idx + 1, totalCards);
+      const conveyanceNo = `CV-${String(idx + 1).padStart(2, '0')}`;
+      const pressBarcodeValue = kanbanId;
+      const lotBatch = String(
+        row.lot_batch
+        || row.lotBatch
+        || row.batch_no
+        || row.batchNo
+        || row.lot_no
+        || row.lotNo
+        || row.batch_id
+        || row.batchId
+        || '',
+      ).trim();
+      payloads.push({
+        key: `${row.item_code}-${idx}-${row.item_name}`,
+        supplier,
+        itemName,
           sidNumber,
           qtyBox,
           areaId,
@@ -8703,15 +10317,27 @@ const Dashboard = ({ onLogout, token, user }) => {
           orderNo,
           uniqueNo: kanbanId,
           kanbanId,
-          pressLocation: areaId,
-          conveyanceNo,
-          pressBarcodeValue,
-          plantName,
-        });
+        pressLocation: areaId,
+        conveyanceNo,
+        pressBarcodeValue,
+        plantName,
+        lotBatch,
       });
     });
+  });
     return payloads;
-  }, [showKanbanCardModal, filteredKanbanItems, masterAreas, masterDeliveries, masterWarehouses, masterPlants, masterItemsByCode, masterLocationsById]);
+  }, [showKanbanCardModal, kanbanCardPreviewReady, filteredKanbanItems, masterAreas, masterDeliveries, masterWarehouses, masterPlants, masterItemsByCode, masterLocationsById]);
+
+  const kanbanCardPageSize = 4;
+  const kanbanCardPageCount = useMemo(
+    () => Math.max(1, Math.ceil(kanbanCardPayloads.length / kanbanCardPageSize)),
+    [kanbanCardPayloads.length],
+  );
+
+  useEffect(() => {
+    if (!showKanbanCardModal) return;
+    setKanbanCardPreviewPageIndex((prev) => Math.min(prev, Math.max(kanbanCardPageCount - 1, 0)));
+  }, [showKanbanCardModal, kanbanCardPageCount]);
 
   const renderKanbanCard = (payload) => (
     <div
@@ -8745,7 +10371,7 @@ const Dashboard = ({ onLogout, token, user }) => {
             <div className="col-span-2 border-r border-slate-400 p-1">
               <div className="text-[9px] uppercase text-slate-500">Barcode Nomor Part</div>
               <div className="mt-2 flex items-center gap-2">
-                <QRCodeSVG value={payload.sidNumber} size={42} />
+                <QRCodeCanvas value={payload.sidNumber} size={42} includeMargin={false} />
                 <div className="text-[10px] font-semibold">{payload.sidNumber}</div>
               </div>
             </div>
@@ -8754,6 +10380,8 @@ const Dashboard = ({ onLogout, token, user }) => {
               <div className="text-[14px] font-bold">{payload.qtyBox}</div>
               <div className="text-[9px] uppercase text-slate-500 mt-2">Nomor Urut Order</div>
               <div className="text-[12px] font-bold">{payload.orderNo}</div>
+              <div className="text-[9px] uppercase text-slate-500 mt-2">Batch / Lot</div>
+              <div className="text-[11px] font-bold break-all">{payload.lotBatch || '-'}</div>
             </div>
           </div>
           <div className="grid grid-cols-2 border-b border-slate-400">
@@ -8793,7 +10421,7 @@ const Dashboard = ({ onLogout, token, user }) => {
             <div className="flex-1 p-1">
             <div className="text-[9px] uppercase text-slate-500">QR Kanban ID</div>
             <div className="mt-2 flex items-center gap-2">
-              <QRCodeSVG value={payload.kanbanId} size={60} />
+              <QRCodeCanvas value={payload.kanbanId} size={60} includeMargin={false} />
               <div className="text-[10px] font-semibold">{payload.kanbanId}</div>
             </div>
           </div>
@@ -8802,31 +10430,48 @@ const Dashboard = ({ onLogout, token, user }) => {
     </div>
   );
 
+  const renderKanbanCardPage = (payloadSlice, pageKey) => (
+    <div key={pageKey} className="kanban-page">
+      {payloadSlice.map((payload, idx) => (
+        <React.Fragment key={`${pageKey}-${payload.key || idx}`}>
+          {renderKanbanCard(payload)}
+          {idx < payloadSlice.length - 1 && (
+            <div className="kanban-cutline-row">
+              <span className="kanban-cutline-icon">
+                <Scissors size={12} />
+              </span>
+            </div>
+          )}
+        </React.Fragment>
+      ))}
+    </div>
+  );
+
   const kanbanPrintPages = useMemo(() => {
-    if (!showKanbanCardModal) return [];
-    const cards = kanbanCardPayloads.map(renderKanbanCard);
+    if (!showKanbanCardModal || !kanbanCardPrintReady) return [];
     const pages = [];
-    for (let i = 0; i < cards.length; i += 4) {
-      const slice = cards.slice(i, i + 4);
-      pages.push(
-        <div key={`page-${i}`} className="kanban-page">
-          {slice.map((card, idx) => (
-            <React.Fragment key={`print-${i}-${idx}`}>
-              {card}
-              {idx < slice.length - 1 && (
-                <div className="kanban-cutline-row">
-                  <span className="kanban-cutline-icon">
-                    <Scissors size={12} />
-                  </span>
-                </div>
-              )}
-            </React.Fragment>
-          ))}
-        </div>
-      );
+    for (let i = 0; i < kanbanCardPayloads.length; i += kanbanCardPageSize) {
+      const slice = kanbanCardPayloads.slice(i, i + kanbanCardPageSize);
+      pages.push(renderKanbanCardPage(slice, `page-${i}`));
     }
     return pages;
-  }, [showKanbanCardModal, kanbanCardPayloads]);
+  }, [showKanbanCardModal, kanbanCardPrintReady, kanbanCardPayloads]);
+
+  const kanbanPreviewPageCards = useMemo(() => {
+    if (!showKanbanCardModal || !kanbanCardPreviewReady || kanbanCardPayloads.length === 0) return [];
+    const startIndex = kanbanCardPreviewPageIndex * kanbanCardPageSize;
+    return kanbanCardPayloads.slice(startIndex, startIndex + kanbanCardPageSize);
+  }, [showKanbanCardModal, kanbanCardPreviewReady, kanbanCardPreviewPageIndex, kanbanCardPayloads]);
+
+  const handleKanbanCardPrint = () => {
+    if (!showKanbanCardModal || !kanbanCardPreviewReady || kanbanCardPayloads.length === 0) return;
+    setKanbanCardPrintReady(true);
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        window.print();
+      });
+    });
+  };
 
   const renderInboundCard = (card) => (
     <div
@@ -8838,7 +10483,7 @@ const Dashboard = ({ onLogout, token, user }) => {
         <div className="border border-slate-400 flex flex-col h-full">
           <div className="border-b border-slate-400 p-1">
             <div className="text-[9px] uppercase text-slate-500">PO / Supplier</div>
-            <div className="text-[12px] font-bold">{card.po_number || '-'} • {resolveSupplierLabel(card)}</div>
+            <div className="text-[12px] font-bold">{card.po_number || '-'} â€¢ {resolveSupplierLabel(card)}</div>
           </div>
           <div className="border-b border-slate-400 p-1">
             <div className="text-[9px] uppercase text-slate-500">Item</div>
@@ -8967,6 +10612,207 @@ const Dashboard = ({ onLogout, token, user }) => {
     };
   };
 
+  const getKanbanRequestSourceLabel = (row) => {
+    const triggerType = String(row?.trigger_type || '').trim().toLowerCase();
+    if (triggerType === 'manual') return 'Manual';
+    if (triggerType === 'scan') return 'Scan QR';
+    if (['auto', 'forecast', 'prl', 'system'].includes(triggerType)) return 'Forecast / Auto';
+    if (triggerType) {
+      return triggerType
+        .replace(/_/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .replace(/\b\w/g, (match) => match.toUpperCase());
+    }
+    if (/forecast|prl/i.test(`${row?.source || ''} ${row?.notes || ''}`)) return 'Forecast / PRL';
+    return 'Auto';
+  };
+
+  const getKanbanRequestStatusLabel = (row) => {
+    const statusKey = String(row?.status || 'requested').trim().toLowerCase();
+    if (statusKey === 'triggered' || statusKey === 'requested') return 'Pending';
+    if (statusKey === 'approved') return 'Approved';
+    if (statusKey === 'dn_created') return 'DN Issued';
+    if (statusKey === 'scheduled') return 'Scheduled';
+    if (statusKey === 'in_transit') return 'In Transit';
+    if (statusKey === 'receiving') return 'Receiving';
+    if (statusKey === 'fifo') return 'FIFO';
+    if (statusKey === 'closed') return 'Closed';
+    if (statusKey === 'rejected') return 'Rejected';
+    return String(row?.status || '-');
+  };
+
+  const getKanbanRequestCategoryMeta = (row = {}) => {
+    const masterItem = masterItemsByCode.get(row?.item_code);
+    const raw = String(row?.item_type || masterItem?.type || masterItem?.category || '').trim();
+    const text = raw.toLowerCase();
+    const hasToken = (token) => new RegExp(`(^|[^a-z0-9])${token}([^a-z0-9]|$)`, 'i').test(raw);
+    if (hasToken('fg') || text.includes('finish')) return { key: 'fg', label: 'FG' };
+    if (hasToken('sa') || text.includes('subassy') || text.includes('sub assy') || text.includes('sub-assy') || text.includes('assy')) {
+      return { key: 'subassy', label: 'Subassy' };
+    }
+    if (hasToken('cp') || text.includes('child')) return { key: 'child', label: 'Child Part' };
+    if (hasToken('rm') || text.includes('raw')) return { key: 'rm', label: 'RM' };
+    if (hasToken('im') || text.includes('indirect')) return { key: 'indirect', label: 'Indirect' };
+    if (hasToken('cb') || text.includes('consumable')) return { key: 'consumable', label: 'Consumable' };
+    return { key: 'other', label: raw || 'Unmapped' };
+  };
+
+  const getKanbanRequestFlowMeta = (row = {}) => {
+    const category = getKanbanRequestCategoryMeta(row);
+    const masterItem = masterItemsByCode.get(row?.item_code);
+    const supplierMeta = resolveItemPrimarySupplier(row?.item_code, masterItem);
+    const supplier = String(supplierMeta.supplierCode || supplierMeta.supplierName || '').trim();
+    const vendor = supplier
+      ? masterVendors.find((v) => String(v.id || '').trim().toLowerCase() === supplier.toLowerCase()
+        || String(v.name || '').trim().toLowerCase() === supplier.toLowerCase())
+      : null;
+    const vendorRole = String(vendor?.role || '').trim().toLowerCase();
+    const vendorType = String(vendor?.type || '').trim().toLowerCase();
+    const isExternalSupplier = vendorRole === 'delivery note'
+      || vendorRole === 'schedule'
+      || vendorType.includes('supplier')
+      || vendorType.includes('vendor');
+    const isSubcon = vendorRole.includes('subcon') || vendorType.includes('subcon');
+    const productionCategories = new Set(['fg', 'subassy']);
+    const childOrProduction = new Set(['fg', 'subassy', 'child']);
+
+    if (isSubcon) {
+      return {
+        key: 'subcon',
+        label: 'Subcon',
+        actionLabel: 'Subcon Request',
+        category,
+        supplier,
+        vendor,
+        canCreateDn: false,
+        reason: 'Supplier is configured as subcon.',
+      };
+    }
+    if (vendorRole === 'schedule') {
+      return {
+        key: 'schedule',
+        label: 'Supplier Schedule',
+        actionLabel: 'Create Schedule',
+        category,
+        supplier,
+        vendor,
+        canCreateDn: false,
+        reason: 'Supplier uses schedule flow, not DN batch.',
+      };
+    }
+    if (supplier && vendorRole === 'delivery note' && (isExternalSupplier || !productionCategories.has(category.key))) {
+      return {
+        key: 'supplier-dn',
+        label: 'Supplier DN',
+        actionLabel: 'Approve + DN',
+        category,
+        supplier,
+        vendor,
+        canCreateDn: true,
+        reason: 'Supplier is configured for Delivery Note.',
+      };
+    }
+    if (childOrProduction.has(category.key)) {
+      return {
+        key: 'production',
+        label: 'Production',
+        actionLabel: 'Production Request',
+        category,
+        supplier,
+        vendor,
+        canCreateDn: false,
+        reason: 'FG/Subassy/Child Part should be routed to production unless the master vendor is a Delivery Note supplier.',
+      };
+    }
+    if (!supplier) {
+      return {
+        key: 'blocked',
+        label: 'Blocked',
+        actionLabel: 'Complete Master',
+        category,
+        supplier,
+        vendor,
+        canCreateDn: false,
+        reason: 'Primary supplier is not configured in Master Item.',
+      };
+    }
+    return {
+      key: 'blocked',
+      label: 'Blocked',
+      actionLabel: 'Review Master',
+      category,
+      supplier,
+      vendor,
+      canCreateDn: false,
+      reason: vendorRole ? `Vendor role ${vendorRole} is not eligible for DN.` : 'Vendor role is not configured for DN.',
+    };
+  };
+
+  const describeKanbanRequestReason = (row) => {
+    if (!row) return 'Data request tidak ditemukan.';
+    const health = getKanbanRequestHealth(row);
+    const parts = [];
+    parts.push(`Sumber ${getKanbanRequestSourceLabel(row)}`);
+    if (health.hasStockGap) {
+      parts.push(`Stock Gap: on hand ${formatNumber0(health.onHand)} < request ${formatNumber0(health.requestQty)}`);
+    }
+    if (health.isOverPrl) {
+      parts.push('Over PRL');
+    }
+    if (health.isOverdue) {
+      parts.push(`Overdue ${formatNumber0(health.ageHours)} jam`);
+    }
+    if (health.hasException) {
+      parts.push(health.exceptionNote ? `${health.exceptionCode || 'EXCEPTION'} - ${health.exceptionNote}` : health.exceptionCode);
+    }
+    if (row?.dn_id) {
+      parts.push(`Sudah punya DN ${row.dn_number || row.dn_id}`);
+    }
+    return parts.filter(Boolean).join(' â€¢ ');
+  };
+
+  const describeKanbanSelectionIssues = (rows, { mode = 'dn' } = {}) => {
+    const validRows = Array.isArray(rows) ? rows.filter(Boolean) : [];
+    if (validRows.length === 0) return 'Tidak ada request yang dipilih.';
+    const lines = [];
+    validRows.slice(0, 4).forEach((row) => {
+      const statusKey = String(row?.status || 'requested').trim().toLowerCase();
+      const blockers = [];
+      if (mode === 'approve') {
+        if (!['triggered', 'requested'].includes(statusKey)) blockers.push(`status ${getKanbanRequestStatusLabel(row)}`);
+      } else if (!['triggered', 'requested', 'approved'].includes(statusKey)) {
+        blockers.push(`status ${getKanbanRequestStatusLabel(row)}`);
+      }
+      if (row?.dn_id) blockers.push(`sudah punya DN ${row.dn_number || row.dn_id}`);
+      const masterItem = masterItemsByCode.get(row?.item_code);
+      const supplierMeta = resolveItemPrimarySupplier(row?.item_code, masterItem);
+      const supplier = String(supplierMeta.supplierCode || supplierMeta.supplierName || '').trim();
+      const flowMeta = getKanbanRequestFlowMeta(row);
+      if (mode === 'dn' && flowMeta.key !== 'supplier-dn') blockers.push(`flow ${flowMeta.label}`);
+      if (!supplier && mode === 'dn') blockers.push('supplier Master Item belum diisi');
+      if (supplier && mode === 'dn') {
+        const vendor = masterVendors.find((v) => String(v.id).toLowerCase() === supplier.toLowerCase()
+          || String(v.name || '').toLowerCase() === supplier.toLowerCase());
+        const vendorRole = String(vendor?.role || '').trim().toLowerCase();
+        if (vendorRole && vendorRole !== 'delivery note') blockers.push(`role vendor ${vendorRole}`);
+      }
+      const health = getKanbanRequestHealth(row);
+      if (health.hasStockGap) {
+        blockers.push(`stock gap ${formatNumber0(health.onHand)}/${formatNumber0(health.requestQty)}`);
+      }
+      if (health.isOverPrl) blockers.push('over PRL');
+      if (health.isOverdue) blockers.push(`overdue ${formatNumber0(health.ageHours)} jam`);
+      if (health.hasException && health.exceptionNote) blockers.push(health.exceptionNote);
+      if (blockers.length > 0) {
+        lines.push(`${getRequestIdLabel(row)}: ${blockers.join(', ')}`);
+      }
+    });
+    const remaining = validRows.length - Math.min(validRows.length, 4);
+    if (remaining > 0) lines.push(`... dan ${remaining} request lainnya`);
+    return lines.length ? lines.join('\n') : 'Tidak ada alasan spesifik yang terdeteksi.';
+  };
+
   const filteredKanbanRequests = useMemo(() => {
     const statusFiltered = kanbanRequestStatusFilter === 'all'
       ? kanbanRequests
@@ -8988,8 +10834,15 @@ const Dashboard = ({ onLogout, token, user }) => {
         return true;
       });
 
+    const categoryFlowFiltered = quickFiltered.filter((row) => {
+      const flowMeta = getKanbanRequestFlowMeta(row);
+      if (kanbanRequestCategoryFilter !== 'all' && flowMeta.category?.key !== kanbanRequestCategoryFilter) return false;
+      if (kanbanRequestFlowFilter !== 'all' && flowMeta.key !== kanbanRequestFlowFilter) return false;
+      return true;
+    });
+
     const filterValues = Object.values(kanbanRequestFilters || {}).some((val) => String(val || '').trim() !== '');
-    if (!filterValues) return quickFiltered;
+    if (!filterValues) return categoryFlowFiltered;
 
     const norm = (value) => String(value || '').trim().toLowerCase();
     const filters = {
@@ -8997,13 +10850,16 @@ const Dashboard = ({ onLogout, token, user }) => {
       date: norm(kanbanRequestFilters.date),
       kanbanId: norm(kanbanRequestFilters.kanbanId),
       item: norm(kanbanRequestFilters.item),
+      supplier: norm(kanbanRequestFilters.supplier),
       trigger: norm(kanbanRequestFilters.trigger),
+      category: norm(kanbanRequestFilters.category),
+      flow: norm(kanbanRequestFilters.flow),
       onHand: norm(kanbanRequestFilters.onHand),
       suggested: norm(kanbanRequestFilters.suggested),
       status: norm(kanbanRequestFilters.status),
     };
 
-    return quickFiltered.filter((row) => {
+    return categoryFlowFiltered.filter((row) => {
       const health = getKanbanRequestHealth(row);
       const onHand = health.onHand;
       const orderQty = health.requestQty;
@@ -9011,7 +10867,15 @@ const Dashboard = ({ onLogout, token, user }) => {
       const createdLabel = row.created_at ? new Date(row.created_at).toLocaleString('id-ID') : '';
       const kanbanIdLabel = buildKanbanDisplayId(row.item_code, row.item_type, row);
       const itemLabel = `${row.item_code} - ${row.item_name || ''}`.trim();
+      const masterItem = masterItemsByCode.get(row.item_code);
+      const supplierMeta = resolveItemPrimarySupplier(row.item_code, masterItem);
+      const supplierLabel = [
+        supplierMeta.supplierCode,
+        supplierMeta.supplierName,
+        supplierMeta.supplier,
+      ].filter(Boolean).join(' ');
       const triggerLabel = row.trigger_type === 'manual' ? 'Manual' : 'Auto';
+      const flowMeta = getKanbanRequestFlowMeta(row);
       const statusLabel = row.status === 'triggered' || row.status === 'requested'
         ? 'Pending'
         : row.status === 'approved'
@@ -9024,7 +10888,10 @@ const Dashboard = ({ onLogout, token, user }) => {
       if (filters.date && !norm(createdLabel).includes(filters.date)) return false;
       if (filters.kanbanId && !norm(kanbanIdLabel).includes(filters.kanbanId)) return false;
       if (filters.item && !norm(itemLabel).includes(filters.item)) return false;
+      if (filters.supplier && !norm(supplierLabel).includes(filters.supplier)) return false;
       if (filters.trigger && !norm(triggerLabel).includes(filters.trigger)) return false;
+      if (filters.category && !norm(flowMeta.category?.label).includes(filters.category)) return false;
+      if (filters.flow && !norm(`${flowMeta.label} ${flowMeta.actionLabel} ${flowMeta.reason}`).includes(filters.flow)) return false;
       if (filters.status && !norm(statusLabel).includes(filters.status)) return false;
       if (filters.onHand) {
         const onHandText = norm(onHand);
@@ -9042,11 +10909,17 @@ const Dashboard = ({ onLogout, token, user }) => {
     kanbanRequests,
     kanbanRequestStatusFilter,
     kanbanRequestQuickFilter,
+    kanbanRequestCategoryFilter,
+    kanbanRequestFlowFilter,
     kanbanRequestFilters,
     fifoTotalsByItemCode,
+    itemSupplierMap,
     buildKanbanId,
+    buildKanbanDisplayId,
     formatNumber0,
     getRequestIdLabel,
+    masterItemsByCode,
+    masterVendors,
   ]);
 
   const kanbanPaginationMeta = useMemo(
@@ -9070,9 +10943,68 @@ const Dashboard = ({ onLogout, token, user }) => {
       return Number(b?.id || 0) - Number(a?.id || 0);
     });
   }, [deliveryNotes]);
+  const kanbanDnSupplierOptions = useMemo(() => {
+    const map = new Map();
+    deliveryNotesSorted.forEach((dn) => {
+      const vendor = resolveVendorFromSupplier(dn?.supplier);
+      const code = String(vendor?.id || dn?.supplier || '').trim();
+      const name = String(vendor?.name || '').trim();
+      if (!code && !name) return;
+      const value = code || name;
+      if (!map.has(value)) {
+        map.set(value, {
+          value,
+          label: name && code && name !== code ? `${code} - ${name}` : code || name,
+          searchText: `${code} ${name}`.trim().toLowerCase(),
+        });
+      }
+    });
+    return Array.from(map.values()).sort((a, b) => a.label.localeCompare(b.label));
+  }, [deliveryNotesSorted, masterVendors]);
+  const kanbanDnStatusOptions = useMemo(() => {
+    const statuses = new Set();
+    deliveryNotesSorted.forEach((dn) => {
+      const status = String(dn?.status || '').trim().toLowerCase();
+      if (status) statuses.add(status);
+    });
+    return Array.from(statuses).sort().map((status) => ({
+      value: status,
+      label: status.toUpperCase(),
+    }));
+  }, [deliveryNotesSorted]);
+  const filteredDeliveryNotes = useMemo(() => {
+    const norm = (value) => String(value || '').trim().toLowerCase();
+    const query = norm(kanbanDnFilters.search);
+    const supplierFilter = norm(kanbanDnFilters.supplier);
+    const statusFilter = norm(kanbanDnFilters.status);
+
+    return deliveryNotesSorted.filter((dn) => {
+      const vendor = resolveVendorFromSupplier(dn?.supplier);
+      const supplierCode = String(vendor?.id || dn?.supplier || '').trim();
+      const supplierName = String(vendor?.name || '').trim();
+      const plannedDate = dn?.planned_date ? new Date(dn.planned_date).toLocaleDateString('id-ID') : '';
+      const createdDate = dn?.created_at ? new Date(dn.created_at).toLocaleDateString('id-ID') : '';
+      const status = norm(dn?.status);
+      const haystack = [
+        dn?.dn_number,
+        dn?.id ? `DN-${dn.id}` : '',
+        supplierCode,
+        supplierName,
+        plannedDate,
+        createdDate,
+        dn?.total_qty,
+        dn?.status,
+      ].filter((value) => value !== null && value !== undefined).join(' ').toLowerCase();
+
+      if (query && !haystack.includes(query)) return false;
+      if (supplierFilter !== 'all' && norm(supplierCode || supplierName) !== supplierFilter) return false;
+      if (statusFilter !== 'all' && status !== statusFilter) return false;
+      return true;
+    });
+  }, [deliveryNotesSorted, kanbanDnFilters, masterVendors]);
   const kanbanDnPaginationMeta = useMemo(
-    () => paginateRows('kanbanDn', deliveryNotesSorted),
-    [deliveryNotesSorted, tablePagination.kanbanDn?.page, tablePagination.kanbanDn?.perPage],
+    () => paginateRows('kanbanDn', filteredDeliveryNotes),
+    [filteredDeliveryNotes, tablePagination.kanbanDn?.page, tablePagination.kanbanDn?.perPage],
   );
   const receiveNoteHeaders = useMemo(() => {
     const groups = new Map();
@@ -9541,11 +11473,15 @@ const Dashboard = ({ onLogout, token, user }) => {
       }
       performance[bucketKey].name = supplierMeta.name || performance[bucketKey].name || supplierKey;
       const itemCode = note.item_code || schedule?.item || '';
-      const packQty = Number(masterItemsByCode.get(itemCode)?.pack_qty ?? 0);
+      const masterItem = masterItemsByCode.get(itemCode);
+      const packQty = Number(masterItem?.pack_qty ?? 0);
       const receivedQty = Number(note.received_qty || 0);
       if (!Number.isFinite(packQty) || packQty <= 0 || receivedQty <= 0) return;
       const isLooseFlag = Boolean(note.is_loose);
-      const computedLoose = packQty > 0 && receivedQty % packQty !== 0;
+      const isWeightItem = isWeightItemUnit(masterItem?.unit);
+      const computedLoose = isWeightItem
+        ? !isPackingWithinTolerance(receivedQty, packQty, 0.25)
+        : packQty > 0 && receivedQty % packQty !== 0;
       const isLoose = isLooseFlag || computedLoose;
       performance[bucketKey].packingTotal += 1;
       if (isLoose) performance[bucketKey].packingLoose += 1;
@@ -9624,7 +11560,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       if (!Array.isArray(rows) || rows.length === 0) { alert("Data kosong!"); return; }
       const summary = rows.map(s => `- ${s.supplier}: PO ${s.poNumber}, Item ${s.item}, Status ${s.status}, Qty ${s.requestQty}, Tiba ${s.receivedQty}`).join('\n');
       const prompt = `Analisis data logistik ini dan berikan respons dalam format JSON murni. Data:n${summary}nFormat JSON: {"summary": "Ringkasan singkat...", "stats": {"onTime": 0, "late": 0, "pending": 0, "totalQtyReceived": 0}, "criticalIssues": ["Isu 1"], "recommendations": ["Saran 1"]}`;
-      callGeminiAI(prompt, "✨ Laporan Statistik Cerdas (AI)", true); 
+      callGeminiAI(prompt, "âœ¨ Laporan Statistik Cerdas (AI)", true);
   };
 
   const handleAnalyzeData = async () => {
@@ -9884,6 +11820,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     deliveryNotesLoading,
     dnDetailEditable,
     dnDetailEdits,
+    dnHeaderEdits,
     dnDetailLoading,
     dnDetailRows,
     dnForm,
@@ -9970,6 +11907,8 @@ const Dashboard = ({ onLogout, token, user }) => {
     handleAnalyzeData,
     handleAddPlan,
     handleApproveKanban,
+    handleBatchApproveKanban,
+    handleBatchApproveAndDn,
     handleApproveAndCreateDn,
     handleBatchSubmit,
     handleCancelEdit,
@@ -10008,6 +11947,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     handleEditProcess,
     handleEmptyKanbanSubmit,
     handleExportItemsXls,
+    handleExportBomProjectXls,
     handleExportReportExcel,
     handleExportQualityObjectivesExcel,
     handleExportStockCoverageExcel,
@@ -10023,9 +11963,15 @@ const Dashboard = ({ onLogout, token, user }) => {
     handleFifoReceive,
     handleInventoryDelete,
     handleManualRequest,
+    manualRequestQueue,
+    setManualRequestQueue,
+    queueManualRequestFromForm,
+    closeManualRequestModal,
+    updateManualRequestQueueRow,
     handlePrintPDF,
     handlePrintQualityObjectives,
     handlePrlPrintPdf,
+    handlePrlForecastPreview,
     handlePrlExport,
     handlePrlImport,
     handlePrlModelSelection,
@@ -10076,6 +12022,9 @@ const Dashboard = ({ onLogout, token, user }) => {
     itemBulkShelfLife,
     itemBulkSupplier,
     itemBulkTypePack,
+    itemBulkRoutingTemplateCode,
+    itemBulkRoutingMode,
+    itemBulkRoutingSaving,
     itemCustomerMap,
     itemMasterForm,
     itemMenuOpen,
@@ -10088,7 +12037,10 @@ const Dashboard = ({ onLogout, token, user }) => {
     kanbanCategory,
     kanbanCategoryFilter,
     kanbanDashboardCategoryFilter,
+    kanbanDnFilters,
     kanbanDnPaginationMeta,
+    kanbanDnStatusOptions,
+    kanbanDnSupplierOptions,
     kanbanEditMode,
     kanbanEmptyPaginationMeta,
     kanbanError,
@@ -10096,12 +12048,16 @@ const Dashboard = ({ onLogout, token, user }) => {
     kanbanPaginationMeta,
     kanbanPipelineSummary,
     kanbanRequestStatusFilter,
+    kanbanRequestCategoryFilter,
+    kanbanRequestFlowFilter,
     kanbanRequestQuickFilter,
     kanbanRequestFilters,
     kanbanReceivingPaginationMeta,
     kanbanRequests,
     filteredKanbanRequests,
     getKanbanRequestHealth,
+    getKanbanRequestCategoryMeta,
+    getKanbanRequestFlowMeta,
     kanbanSearch,
     kanbanSettings,
     kanbanSettingsByCode,
@@ -10170,6 +12126,11 @@ const Dashboard = ({ onLogout, token, user }) => {
     prlFilters,
     prlFlowOpen,
     prlImportRef,
+    prlImportHistoryError,
+    prlImportHistoryLoading,
+    prlImportHistoryRows,
+    prlImportSummary,
+    setPrlImportSummary,
     prlLoading,
     prlMenuOpen,
     prlMonthLabel,
@@ -10192,6 +12153,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     reportSummary,
     reportSupplier,
     reportTab,
+    refreshPrlImportHistory: fetchPrlImportHistory,
     getWorkingDays,
     capacityPlanningMonth,
     setCapacityPlanningMonth,
@@ -10251,11 +12213,15 @@ const Dashboard = ({ onLogout, token, user }) => {
     handleKanbanProcessFinish,
     scanActiveResult,
     scanError,
+    scanCameraStatus,
     scanInput,
     scanMode,
     scanResults,
     scanVideoRef,
+    startScanner,
+    stopScanner,
     scheduleForm,
+    selectedKanban,
     scheduleReadinessData,
     scheduleReadinessMeta,
     scheduleReadinessLoading,
@@ -10286,6 +12252,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     setDeliveryForm,
     setDnDetailEdits,
     setDnForm,
+    setDnHeaderEdits,
     setEditingAreaId,
     setEditingCategoryCode,
     setEditingCustomerId,
@@ -10314,6 +12281,9 @@ const Dashboard = ({ onLogout, token, user }) => {
     setItemBulkSaving,
     setItemBulkShelfLife,
     setItemBulkSupplier,
+    setItemBulkRoutingTemplateCode,
+    setItemBulkRoutingMode,
+    setItemBulkRoutingSaving,
     setRawMaterialLedgerPeriodType,
     setRawMaterialLedgerMonth,
     setRawMaterialLedgerYear,
@@ -10325,8 +12295,11 @@ const Dashboard = ({ onLogout, token, user }) => {
     setKanbanCategory,
     setKanbanCategoryFilter,
     setKanbanDashboardCategoryFilter,
+    setKanbanDnFilters,
     setKanbanEditMode,
     setKanbanRequestStatusFilter,
+    setKanbanRequestCategoryFilter,
+    setKanbanRequestFlowFilter,
     setKanbanRequestQuickFilter,
     setKanbanRequestFilters,
     setKanbanSearch,
@@ -10364,6 +12337,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     setScanInput,
     setScanMode,
     setScheduleForm,
+    setTablePagination,
     setScorecardFilterSupplier,
     setRnDateEnd,
     setRnDateStart,
@@ -10432,6 +12406,15 @@ const Dashboard = ({ onLogout, token, user }) => {
               </div>
               <div className="flex flex-wrap gap-2 print:hidden">
                   {/* ICON ONLY BUTTONS WITH TOOLTIPS */}
+                  <button
+                    type="button"
+                    onClick={() => setHelpOpen(true)}
+                    className="bg-white border border-slate-200 text-slate-500 p-2 rounded-lg shadow-sm hover:bg-slate-50 hover:text-indigo-600 transition"
+                    title={`Bantuan SOP - ${activeHelpContent.title}`}
+                    aria-label={`Bantuan SOP - ${activeHelpContent.title}`}
+                  >
+                    <HelpCircle size={20} />
+                  </button>
                   {canEditSchedules && (
                     <div className="flex items-center gap-2">
                       <button
@@ -10493,6 +12476,24 @@ const Dashboard = ({ onLogout, token, user }) => {
                   )}
 
 
+                  {isProductionUser && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setActiveMenu(null);
+                        setReportMenuOpen(false);
+                        setShowForm(false);
+                        setMainTab('kanban');
+                        setKanbanView('board');
+                        setKanbanSubTab('scan');
+                      }}
+                      className="bg-indigo-600 hover:bg-indigo-700 text-white p-2 rounded-lg shadow transition"
+                      title="QR Cepat"
+                    >
+                      <QrCode size={20} />
+                    </button>
+                  )}
                   <div className="w-px h-8 bg-gray-300 mx-1"></div>
                   <button onClick={onLogout} className="bg-red-600 hover:bg-red-700 text-white p-2 rounded-lg shadow transition" title="Keluar"><LogOut size={20} /></button>
               </div>
@@ -10529,7 +12530,11 @@ const Dashboard = ({ onLogout, token, user }) => {
               <div className="mb-6 flex flex-wrap gap-3 print:hidden">
                 <div className="flex flex-wrap items-center gap-1.5 rounded-full border border-slate-200 bg-white/80 p-1 shadow-sm backdrop-blur">
                   <button
-                    onClick={() => setMainTab('kanban')}
+                    onClick={() => {
+                      setMainTab('kanban');
+                      setKanbanView('board');
+                      setKanbanSubTab('dashboard');
+                    }}
                     className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'kanban' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                   >
                     Kanban Board
@@ -10551,14 +12556,20 @@ const Dashboard = ({ onLogout, token, user }) => {
                   >
                     Inbound Schedule
                   </button>
-                  {canEditSchedules && (
-                    <button
-                      onClick={() => setMainTab('kanban')}
-                      className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'kanban' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
-                    >
-                      Kanban Board
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!canEditSchedules) return;
+                      setMainTab('kanban');
+                      setKanbanView('board');
+                      setKanbanSubTab('dashboard');
+                    }}
+                    disabled={!canEditSchedules}
+                    title={canEditSchedules ? 'Buka Kanban Board' : getMainNavAccessMessage('kanban')}
+                    className={getMainNavButtonClassName(`px-4 py-2 rounded-full text-sm transition ${mainTab === 'kanban' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canEditSchedules)}
+                  >
+                    Kanban Board
+                  </button>
                   <button
                     onClick={() => setMainTab('fifo')}
                     className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'fifo' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
@@ -10571,30 +12582,42 @@ const Dashboard = ({ onLogout, token, user }) => {
                   >
                     Inventory
                   </button>
-                  {canSubcon && (
-                    <button
-                      onClick={() => setMainTab('subcon')}
-                      className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'subcon' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
-                    >
-                      Subcon
-                    </button>
-                  )}
-                  {canViewPrl && (
-                    <button
-                      onClick={() => setMainTab('prl')}
-                      className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'prl' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
-                    >
-                      PRL
-                    </button>
-                  )}
-                  {canViewMaster && (
-                    <button
-                      onClick={() => setMainTab('masterref')}
-                      className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'masterref' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
-                    >
-                      Master Referensi
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!canSubcon) return;
+                      setMainTab('subcon');
+                    }}
+                    disabled={!canSubcon}
+                    title={canSubcon ? 'Buka Subcon' : getMainNavAccessMessage('subcon')}
+                    className={getMainNavButtonClassName(`px-4 py-2 rounded-full text-sm transition ${mainTab === 'subcon' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canSubcon)}
+                  >
+                    Subcon
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!canViewPrl) return;
+                      setMainTab('prl');
+                    }}
+                    disabled={!canViewPrl}
+                    title={canViewPrl ? 'Buka PRL' : getMainNavAccessMessage('prl')}
+                    className={getMainNavButtonClassName(`px-4 py-2 rounded-full text-sm transition ${mainTab === 'prl' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canViewPrl)}
+                  >
+                    PRL
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!canViewMaster) return;
+                      setMainTab('masterref');
+                    }}
+                    disabled={!canViewMaster}
+                    title={canViewMaster ? 'Buka Master Referensi' : getMainNavAccessMessage('masterref')}
+                    className={getMainNavButtonClassName(`px-4 py-2 rounded-full text-sm transition ${mainTab === 'masterref' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canViewMaster)}
+                  >
+                    Master Referensi
+                  </button>
                   {isAdmin ? (
                     <div className={`relative ${settingsMenuOpen ? 'z-[120]' : 'z-10'}`}>
                       <button
@@ -10641,7 +12664,7 @@ const Dashboard = ({ onLogout, token, user }) => {
                   )}
                 </div>
 
-                {(canViewReport || canViewScorecard) && (
+                {canOpenReportMenu ? (
                   <div className={`relative ${reportMenuOpen ? 'z-[120]' : 'z-10'}`}>
                     <button
                       onClick={(e) => {
@@ -10763,6 +12786,16 @@ const Dashboard = ({ onLogout, token, user }) => {
                       </div>
                     )}
                   </div>
+                ) : (
+                  <button
+                    type="button"
+                    disabled
+                    title={getMainNavAccessMessage('reports')}
+                    className={getMainNavButtonClassName('px-4 py-2 rounded-full text-sm border transition flex items-center gap-2 bg-white/80 text-slate-400 border-slate-200', true)}
+                  >
+                    Laporan
+                    <ChevronDown size={14} />
+                  </button>
                 )}
               </div>
             )}
@@ -10835,21 +12868,58 @@ const Dashboard = ({ onLogout, token, user }) => {
                           <div className="p-4 border-b flex justify-between items-center print:hidden">
                             <div className="text-sm font-semibold">Kanban Cards</div>
                             <div className="flex items-center gap-2">
-                              <button onClick={() => window.print()} className="px-3 py-1.5 text-xs border rounded">Print</button>
+                              <button
+                                onClick={handleKanbanCardPrint}
+                                disabled={!kanbanCardPreviewReady || kanbanCardPayloads.length === 0}
+                                className="px-3 py-1.5 text-xs border rounded disabled:opacity-50"
+                              >
+                                Print
+                              </button>
                               <button onClick={() => setShowKanbanCardModal(false)} className="text-slate-500"><X size={18} /></button>
+                            </div>
+                          </div>
+                          <div className="flex items-center justify-between border-b bg-slate-50 px-4 py-2 text-xs text-slate-500 print:hidden">
+                            <div>
+                              Preview halaman {Math.min(kanbanCardPreviewPageIndex + 1, kanbanCardPageCount)} / {kanbanCardPageCount}
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setKanbanCardPreviewPageIndex((prev) => Math.max(0, prev - 1))}
+                                disabled={kanbanCardPreviewPageIndex <= 0 || !kanbanCardPreviewReady}
+                                className="rounded border px-2 py-1 disabled:opacity-50"
+                              >
+                                Prev
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setKanbanCardPreviewPageIndex((prev) => Math.min(kanbanCardPageCount - 1, prev + 1))}
+                                disabled={kanbanCardPreviewPageIndex >= kanbanCardPageCount - 1 || !kanbanCardPreviewReady}
+                                className="rounded border px-2 py-1 disabled:opacity-50"
+                              >
+                                Next
+                              </button>
                             </div>
                           </div>
                         <div className="p-4 overflow-y-auto bg-slate-50 print:bg-white print:p-0 kanban-print-scroll">
                           <div className="kanban-print-screen print:hidden">
                             <div className="kanban-preview-page">
-                              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 kanban-print-grid kanban-preview-grid">
-                                {kanbanPrintPages}
-                              </div>
+                              {!kanbanCardPreviewReady ? (
+                                <div className="rounded-lg border border-dashed border-slate-300 bg-white p-6 text-sm text-slate-500">
+                                  Menyiapkan preview kartu kanban...
+                                </div>
+                              ) : kanbanPreviewPageCards.length === 0 ? (
+                                <div className="rounded-lg border border-dashed border-slate-300 bg-white p-6 text-sm text-slate-500">
+                                  Tidak ada kartu untuk dipreview.
+                                </div>
+                              ) : (
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 kanban-print-grid kanban-preview-grid">
+                                  {renderKanbanCardPage(kanbanPreviewPageCards, `preview-${kanbanCardPreviewPageIndex}`)}
+                                </div>
+                              )}
                             </div>
                           </div>
-                          <div className="kanban-print-only hidden print:block">
-                            {kanbanPrintPages}
-                          </div>
+                          <div className="kanban-print-only hidden print:block">{kanbanPrintPages}</div>
                         </div>
                       </div>
                     </div>
@@ -11238,6 +13308,67 @@ const Dashboard = ({ onLogout, token, user }) => {
                 )}
               </div>
             )}
+        {helpOpen && (
+          <div className="fixed inset-0 z-[60] print:hidden">
+            <div className="absolute inset-0 bg-slate-900/30" onClick={() => setHelpOpen(false)} />
+            <div className="absolute right-0 top-0 h-full w-full max-w-md overflow-hidden border-l border-slate-200 bg-white shadow-2xl">
+              <div className="flex items-start justify-between gap-3 border-b border-slate-100 px-5 py-4">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-indigo-600">
+                    <HelpCircle size={14} />
+                    Bantuan SOP
+                  </div>
+                  <div className="mt-1 text-base font-semibold text-slate-900">{activeHelpContent.title}</div>
+                  <div className="mt-1 text-xs leading-5 text-slate-500">{activeHelpContent.subtitle}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setHelpOpen(false)}
+                  className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                  title="Tutup bantuan"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="h-[calc(100%-89px)] overflow-y-auto px-5 py-4">
+                <section>
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">SOP ringkas</div>
+                  <ol className="mt-3 space-y-3">
+                    {(activeHelpContent.sop || []).map((step, index) => (
+                      <li key={`${activeHelpContent.title}-sop-${index}`} className="flex gap-3 text-sm leading-6 text-slate-700">
+                        <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-slate-100 text-xs font-semibold text-slate-600">
+                          {index + 1}
+                        </span>
+                        <span>{step}</span>
+                      </li>
+                    ))}
+                  </ol>
+                </section>
+
+                <section className="mt-6">
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Menu terhubung</div>
+                  <div className="mt-3 space-y-2">
+                    {(activeHelpContent.links || []).map((link) => (
+                      <button
+                        key={`${activeHelpContent.title}-${link.label}`}
+                        type="button"
+                        onClick={() => handleHelpLinkClick(link)}
+                        className="group flex w-full items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white px-3 py-3 text-left shadow-sm transition hover:border-indigo-200 hover:bg-indigo-50"
+                      >
+                        <span className="min-w-0">
+                          <span className="block text-sm font-semibold text-slate-900">{link.label}</span>
+                          <span className="mt-0.5 block text-xs leading-5 text-slate-500">{link.description}</span>
+                        </span>
+                        <ArrowRightCircle className="shrink-0 text-slate-300 group-hover:text-indigo-600" size={18} />
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              </div>
+            </div>
+          </div>
+        )}
+
         {globalSearchOpen && (
           <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/40 backdrop-blur-sm print:hidden">
             <div className="w-full max-w-3xl rounded-2xl border border-slate-200 bg-white shadow-2xl">
@@ -11421,7 +13552,15 @@ const Dashboard = ({ onLogout, token, user }) => {
                   <div className="space-y-2">
                     <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Belum dibaca</div>
                     {unreadNotificationItems.map((item) => (
-                      <div key={item.id} className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
+                      <div
+                        key={item.id}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => openNotificationTarget(item)}
+                        onKeyDown={(event) => handleNotificationCardKeyDown(event, item)}
+                        title="Buka lokasi notifikasi"
+                        className="cursor-pointer rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-left transition hover:border-amber-300 hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-300"
+                      >
                         <div className="flex items-start justify-between gap-3">
                           <div>
                             <div className="text-[10px] uppercase tracking-wide text-slate-400">{item.module}</div>
@@ -11439,7 +13578,10 @@ const Dashboard = ({ onLogout, token, user }) => {
                             </span>
                             <button
                               type="button"
-                              onClick={() => markNotificationAsRead(item.id)}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                markNotificationAsRead(item.id);
+                              }}
                               className="rounded-md border border-amber-300 bg-white px-2 py-1 text-[10px] font-semibold text-amber-700 hover:bg-amber-100"
                             >
                               Dibaca
@@ -11447,9 +13589,17 @@ const Dashboard = ({ onLogout, token, user }) => {
                           </div>
                         </div>
                         <div className="mt-1 text-xs text-slate-600">{item.detail}</div>
+                        {String(item?.payload?.reason || item?.payload?.cause || item?.payload?.note || '').trim() && (
+                          <div className="mt-1 text-[11px] text-slate-500">
+                            Alasan: {String(item?.payload?.reason || item?.payload?.cause || item?.payload?.note || '').trim()}
+                          </div>
+                        )}
                         <div className="mt-2 text-[10px] text-slate-400">
                           {item.created_at ? new Date(item.created_at).toLocaleString('id-ID') : '-'}
-                          {item.status ? ` • ${String(item.status).toUpperCase()}` : ''}
+                          {item.status ? ` â€¢ ${String(item.status).toUpperCase()}` : ''}
+                          <span className="ml-2 inline-flex items-center gap-1 rounded-full bg-white/70 px-2 py-0.5 font-semibold text-amber-700">
+                            <MapPin size={10} /> Buka
+                          </span>
                         </div>
                       </div>
                     ))}
@@ -11459,7 +13609,15 @@ const Dashboard = ({ onLogout, token, user }) => {
                   <div className="space-y-2">
                     <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Riwayat</div>
                     {readNotificationItems.map((item) => (
-                      <div key={item.id} className="rounded-xl border border-slate-200 bg-white px-4 py-3">
+                      <div
+                        key={item.id}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => openNotificationTarget(item)}
+                        onKeyDown={(event) => handleNotificationCardKeyDown(event, item)}
+                        title="Buka lokasi notifikasi"
+                        className="cursor-pointer rounded-xl border border-slate-200 bg-white px-4 py-3 text-left transition hover:border-indigo-200 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-indigo-200"
+                      >
                         <div className="flex items-start justify-between gap-3">
                           <div>
                             <div className="text-[10px] uppercase tracking-wide text-slate-400">{item.module}</div>
@@ -11478,9 +13636,17 @@ const Dashboard = ({ onLogout, token, user }) => {
                           </span>
                         </div>
                         <div className="mt-1 text-xs text-slate-500">{item.detail}</div>
+                        {String(item?.payload?.reason || item?.payload?.cause || item?.payload?.note || '').trim() && (
+                          <div className="mt-1 text-[11px] text-slate-500">
+                            Alasan: {String(item?.payload?.reason || item?.payload?.cause || item?.payload?.note || '').trim()}
+                          </div>
+                        )}
                         <div className="mt-2 text-[10px] text-slate-400">
                           {item.read_at ? `Dibaca: ${new Date(item.read_at).toLocaleString('id-ID')}` : ''}
-                          {item.created_at ? ` • Dibuat: ${new Date(item.created_at).toLocaleString('id-ID')}` : ''}
+                          {item.created_at ? ` â€¢ Dibuat: ${new Date(item.created_at).toLocaleString('id-ID')}` : ''}
+                          <span className="ml-2 inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 font-semibold text-slate-600">
+                            <MapPin size={10} /> Buka
+                          </span>
                         </div>
                       </div>
                     ))}
@@ -11582,7 +13748,7 @@ const Dashboard = ({ onLogout, token, user }) => {
         </div>
         )}
         
-        <div className="mt-4 text-xs text-gray-400 text-center print:mt-8"><span>*Laporan ini dicetak otomatis dari sistem monitoring.</span></div>
+        <div className="mt-4 text-xs text-gray-400 text-center print:mt-8"><span> @2026 PT. MRP | Sistem Informasi Master Schedule & Kanban System [MSKS] . (ERP) </span></div>
       </div>
     </div>
             {inboundPrintPortal}
@@ -11709,12 +13875,5 @@ const MainApp = () => {
 };
 
 export default MainApp;
-
-
-
-
-
-
-
 
 

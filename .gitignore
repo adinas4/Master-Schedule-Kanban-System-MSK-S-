@@ -26,6 +26,8 @@ tmp-downloads/*
 *.dump
 dev.log
 consoleCapture.cjs
+server/uploads/
+.certs/
 
 # Editor directories and files
 .vscode/*

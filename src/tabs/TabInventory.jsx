@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState, Suspense } from 'react';
+import { QRCodeCanvas } from 'qrcode.react';
 import {
   BarChart3,
   Eye,
@@ -6,6 +7,7 @@ import {
   FileText,
   Pause,
   Play,
+  Printer,
   QrCode,
   RefreshCw,
   Search,
@@ -36,8 +38,6 @@ const TabInventory = (props) => {
     handleInventoryDelete,
     canDeleteRecords,
     openInventoryDetail,
-    renderPaginationControls,
-    kanbanPaginationMeta,
     inventoryDetailOpen,
     inventoryDetailItem,
     closeInventoryDetail,
@@ -49,6 +49,15 @@ const TabInventory = (props) => {
     formatNumber0,
     items,
     soOpenSession,
+    masterItemsByCode = new Map(),
+    masterProcesses = [],
+    itemSupplierMap = new Map(),
+    masterVendors = [],
+    openQrModal,
+    qrPayload,
+    qrTitle,
+    showQrModal,
+    setShowQrModal,
   } = props;
 
   const getCurrentMonthRange = () => {
@@ -67,6 +76,7 @@ const TabInventory = (props) => {
   const [inventoryHealthFilter, setInventoryHealthFilter] = useState('all');
   const inventoryRowOptions = useMemo(() => [25, 50, 75], []);
   const [inventoryTab, setInventoryTab] = useState('overview');
+  const [inventoryAnalyticsItem, setInventoryAnalyticsItem] = useState(null);
 
   const stockCardRange = getCurrentMonthRange();
   const [stockCardItem, setStockCardItem] = useState('');
@@ -85,8 +95,118 @@ const TabInventory = (props) => {
   const [lotHeader, setLotHeader] = useState(null);
   const [lotLoading, setLotLoading] = useState(false);
   const [lotError, setLotError] = useState('');
+  const [lotLabelOpen, setLotLabelOpen] = useState(false);
+  const [detailBomRows, setDetailBomRows] = useState([]);
+  const [detailBomLoading, setDetailBomLoading] = useState(false);
+  const [detailBomError, setDetailBomError] = useState('');
 
   const normalizeStockCardCode = (value) => String(value || '').split(' - ')[0].trim();
+  const getInventoryItemKey = (item = {}) => String(
+    item.id
+    || item.kanbanId
+    || item.kanban_id
+    || item.itemCode
+    || item.item_code
+    || '',
+  ).trim();
+  const getDetailItemCode = (item = inventoryDetailItem) => String(item?.itemCode || item?.item_code || '').trim();
+  const selectedLotBatch = useMemo(() => (
+    (lotBatches || []).find((batch) => String(batch.id || '') === String(lotBatchId || '')) || null
+  ), [lotBatches, lotBatchId]);
+  const lotLabelPayload = useMemo(() => {
+    if (!lotHeader) return '';
+    return JSON.stringify({
+      type: 'LOT_LABEL',
+      batchId: lotHeader.id || lotBatchId || '',
+      lotNo: lotHeader.batch_no || '',
+      itemCode: lotHeader.item_code || '',
+      itemName: lotHeader.item_name || '',
+      uom: lotHeader.unit || '',
+      balance: Number(lotHeader.balance || 0),
+      doNumber: lotHeader.do_number || '',
+      arrivalDate: lotHeader.arrival_date || '',
+    });
+  }, [lotHeader, lotBatchId]);
+  const getVendorLabel = (vendorId, fallback = '') => {
+    const key = String(vendorId || '').trim();
+    const vendor = (masterVendors || []).find((row) => (
+      String(row.id || '').trim() === key
+      || String(row.code || '').trim() === key
+      || String(row.name || '').trim() === key
+    ));
+    const code = String(vendor?.id || vendor?.code || key || '').trim();
+    const name = String(vendor?.name || fallback || '').trim();
+    return [code, name].filter(Boolean).join(' - ') || fallback || '-';
+  };
+  const getProcessLabel = (processCode, fallback = '') => {
+    const key = String(processCode || '').trim();
+    const process = (masterProcesses || []).find((row) => (
+      String(row.code || '').trim() === key
+      || String(row.name || '').trim() === key
+    ));
+    const code = String(process?.code || key || '').trim();
+    const name = String(process?.name || fallback || '').trim();
+    return [code, name].filter(Boolean).join(' - ') || fallback || '-';
+  };
+  const detailMasterItem = useMemo(() => {
+    const code = getDetailItemCode();
+    if (!code) return null;
+    return masterItemsByCode?.get?.(code) || items.find((item) => String(item.code || '').trim() === code) || null;
+  }, [inventoryDetailItem, masterItemsByCode, items]);
+  const detailSupplierRows = useMemo(() => {
+    const code = getDetailItemCode();
+    const rows = code ? (itemSupplierMap?.get?.(code) || []) : [];
+    if (rows.length > 0) {
+      return rows.map((row) => {
+        const vendorId = row.vendorId || row.vendor_id || row.id || row.code || '';
+        const vendorName = row.vendorName || row.vendor_name || row.name || '';
+        return {
+          label: getVendorLabel(vendorId, vendorName),
+          share: row.share ?? row.percentage ?? row.ratio ?? '',
+          role: row.role || row.vendorRole || row.vendor_role || '',
+        };
+      });
+    }
+    const fallbackSupplier = inventoryDetailItem?.supplierCode || inventoryDetailItem?.supplier || detailMasterItem?.vendor_id || '';
+    return fallbackSupplier ? [{ label: getVendorLabel(fallbackSupplier, inventoryDetailItem?.supplierName || ''), share: '', role: '' }] : [];
+  }, [detailMasterItem, inventoryDetailItem, itemSupplierMap, masterVendors]);
+  const detailRoutingRows = useMemo(() => {
+    const routing = Array.isArray(detailMasterItem?.process_routing) && detailMasterItem.process_routing.length > 0
+      ? detailMasterItem.process_routing
+      : Array.isArray(detailMasterItem?.processRouting) && detailMasterItem.processRouting.length > 0
+        ? detailMasterItem.processRouting
+        : Array.isArray(detailMasterItem?.process_flow) && detailMasterItem.process_flow.length > 0
+          ? detailMasterItem.process_flow.map((code, index) => ({ processCode: code, sequence: index + 1 }))
+          : [];
+    if (routing.length > 0) {
+      return routing.map((step, index) => {
+        const processCode = step?.processCode || step?.process_code || step?.code || step?.process || step;
+        return {
+          sequence: Number(step?.sequence || step?.seq || index + 1),
+          label: getProcessLabel(processCode, step?.processName || step?.name || ''),
+          workCenter: step?.workCenter || step?.work_center || step?.line || '',
+          cycleTime: step?.cycleTimeSeconds || step?.cycle_time_seconds || '',
+          processType: step?.processType || step?.process_type || '',
+        };
+      }).sort((a, b) => Number(a.sequence || 0) - Number(b.sequence || 0));
+    }
+    const lineProduction = detailMasterItem?.line_production || detailMasterItem?.lineProduction || '';
+    if (lineProduction) {
+      return [{
+        sequence: 1,
+        label: getProcessLabel(lineProduction, lineProduction),
+        workCenter: lineProduction,
+        cycleTime: detailMasterItem?.cycle_time_seconds || detailMasterItem?.cycleTimeSeconds || '',
+        processType: '',
+      }];
+    }
+    return [];
+  }, [detailMasterItem, masterProcesses]);
+  const detailRouteSummary = useMemo(() => {
+    const location = inventoryDetailItem?.locationCode || inventoryDetailItem?.location || detailMasterItem?.location_id || '-';
+    const route = detailRoutingRows.map((row) => row.workCenter || row.label).filter(Boolean).join(' > ');
+    return route ? `${location} > ${route}` : location;
+  }, [detailMasterItem, detailRoutingRows, inventoryDetailItem]);
 
   const fetchStockCard = async () => {
     const code = normalizeStockCardCode(stockCardItem);
@@ -123,9 +243,12 @@ const TabInventory = (props) => {
     }
     try {
       const data = await apiFetch(`/api/stock/batches/list?itemCode=${encodeURIComponent(code)}`);
-      setLotBatches(Array.isArray(data) ? data : []);
+      const rows = Array.isArray(data) ? data : [];
+      setLotBatches(rows);
+      setLotBatchId(rows[0]?.id ? String(rows[0].id) : '');
     } catch (error) {
       setLotBatches([]);
+      setLotBatchId('');
     }
   };
 
@@ -178,10 +301,44 @@ const TabInventory = (props) => {
   }, [inventoryTab, lotBatchId, lotStart, lotEnd]);
 
   useEffect(() => {
+    if (!lotLabelOpen) return undefined;
+    document.body.classList.add('lot-label-print-active');
+    return () => document.body.classList.remove('lot-label-print-active');
+  }, [lotLabelOpen]);
+
+  useEffect(() => {
     if (mainTab === 'inventory') {
       setInventoryTab('overview');
     }
   }, [mainTab]);
+
+  useEffect(() => {
+    const code = getDetailItemCode();
+    if (!inventoryDetailOpen || !code) {
+      setDetailBomRows([]);
+      setDetailBomError('');
+      return;
+    }
+    let cancelled = false;
+    setDetailBomLoading(true);
+    setDetailBomError('');
+    apiFetch(`/api/bom/${encodeURIComponent(code)}`)
+      .then((data) => {
+        if (cancelled) return;
+        setDetailBomRows(Array.isArray(data) ? data : []);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setDetailBomRows([]);
+        setDetailBomError(error.message || 'Gagal memuat BOM.');
+      })
+      .finally(() => {
+        if (!cancelled) setDetailBomLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiFetch, inventoryDetailOpen, inventoryDetailItem]);
 
   const filteredInventoryItems = useMemo(() => {
     const query = inventorySearch.trim().toLowerCase();
@@ -290,6 +447,105 @@ const TabInventory = (props) => {
     }
     return items;
   };
+
+  const clampPercent = (value) => Math.min(100, Math.max(0, Number(value) || 0));
+  const buildAnalytics = (item) => {
+    if (!item) return null;
+    const onHand = Number(item.onHand || 0);
+    const reserved = Number(item.reserved || 0);
+    const available = Number(item.available || 0);
+    const minQty = Number(item.minQty || 0);
+    const maxQty = Number(item.maxQty || 0);
+    const kanbanQty = Number(item.kanbanQty || 0);
+    const noOfCards = Number(item.noOfCards || 0);
+    const capacityQty = kanbanQty * noOfCards;
+    const shortToMin = Math.max(minQty - available, 0);
+    const shortToMax = Math.max(maxQty - available, 0);
+    const excessQty = maxQty > 0 ? Math.max(available - maxQty, 0) : 0;
+    const suggestedCards = kanbanQty > 0 && available <= minQty ? Math.ceil(shortToMax / kanbanQty) : 0;
+    const suggestedQty = suggestedCards * kanbanQty;
+    const reserveRatio = onHand > 0 ? (reserved / onHand) * 100 : (reserved > 0 ? 100 : 0);
+    const stockRatio = maxQty > 0 ? (available / maxQty) * 100 : 0;
+    const minRatio = minQty > 0 ? (available / minQty) * 100 : 0;
+    const capacityRatio = maxQty > 0 ? (capacityQty / maxQty) * 100 : 0;
+    let action = 'Stock aman';
+    let actionTone = 'emerald';
+    if (available < 0) {
+      action = 'Available negatif';
+      actionTone = 'rose';
+    } else if (minQty > 0 && available <= minQty) {
+      action = 'Reorder sampai max';
+      actionTone = 'amber';
+    } else if (excessQty > 0) {
+      action = 'Over max';
+      actionTone = 'sky';
+    } else if (reserved > 0) {
+      action = 'Ada reservasi';
+      actionTone = 'amber';
+    }
+    const insights = [];
+    if (available < 0) {
+      insights.push(`Available negatif ${Math.abs(available).toLocaleString('id-ID')} ${item.uom || ''}; cek request/reserved yang belum close.`);
+    }
+    if (minQty > 0 && available <= minQty) {
+      insights.push(`Available sudah menyentuh min. Saran order ${suggestedCards.toLocaleString('id-ID')} kartu atau ${suggestedQty.toLocaleString('id-ID')} ${item.uom || ''}.`);
+    }
+    if (excessQty > 0) {
+      insights.push(`Available melebihi max sebesar ${excessQty.toLocaleString('id-ID')} ${item.uom || ''}; review max kanban atau stock master.`);
+    }
+    if (reserved > 0) {
+      insights.push(`${reserved.toLocaleString('id-ID')} ${item.uom || ''} sedang reserved, pastikan request kanban lanjut sampai close.`);
+    }
+    if (kanbanQty <= 0) {
+      insights.push('Qty per kanban belum diatur, analytics kartu dan reorder belum bisa dihitung akurat.');
+    }
+    if (maxQty <= 0) {
+      insights.push('Max stock belum diatur, bar posisi stock belum punya pembanding.');
+    }
+    if (insights.length === 0) {
+      insights.push('Stock berada di range min/max dan tidak ada reservasi aktif.');
+    }
+    return {
+      onHand,
+      reserved,
+      available,
+      minQty,
+      maxQty,
+      kanbanQty,
+      noOfCards,
+      capacityQty,
+      shortToMin,
+      shortToMax,
+      excessQty,
+      suggestedCards,
+      suggestedQty,
+      reserveRatio,
+      stockRatio,
+      minRatio,
+      capacityRatio,
+      action,
+      actionTone,
+      insights,
+    };
+  };
+  const selectedAnalytics = useMemo(
+    () => buildAnalytics(inventoryAnalyticsItem),
+    [inventoryAnalyticsItem],
+  );
+  const renderAnalyticsBar = (label, value, helper, colorClass = 'bg-indigo-500') => (
+    <div>
+      <div className="mb-1 flex items-center justify-between text-[11px]">
+        <span className="font-medium text-slate-600">{label}</span>
+        <span className="text-slate-500">{helper}</span>
+      </div>
+      <div className="h-2 rounded-full bg-slate-100 overflow-hidden">
+        <div
+          className={`h-full rounded-full ${colorClass}`}
+          style={{ width: `${clampPercent(value)}%` }}
+        />
+      </div>
+    </div>
+  );
 
   const renderInventoryPaginationControls = (meta) => {
     const sequence = buildPageSequence(meta.page, meta.totalPages);
@@ -489,6 +745,7 @@ const TabInventory = (props) => {
                     <thead className="bg-slate-100 text-slate-600">
                       <tr>
                         <th className="text-left p-2 border">Date</th>
+                        <th className="text-left p-2 border">Lot / Batch</th>
                         <th className="text-left p-2 border">Doc Ref</th>
                         <th className="text-left p-2 border">Type</th>
                         <th className="text-right p-2 border">In</th>
@@ -499,12 +756,16 @@ const TabInventory = (props) => {
                     </thead>
                     <tbody>
                       {stockCardLoading && (
-                        <tr><td colSpan="7" className="p-3 text-center text-slate-400">Memuat...</td></tr>
+                        <tr><td colSpan="8" className="p-3 text-center text-slate-400">Memuat...</td></tr>
                       )}
                       {!stockCardLoading && stockCardRows.map((row) => (
                         <tr key={row.id} className="border-t">
                           <td className="p-2 border">
                             {row.date ? new Date(row.date).toLocaleString('id-ID') : '-'}
+                          </td>
+                          <td className="p-2 border">
+                            <div className="font-semibold">{row.batch_no || (row.batch_id ? `Batch #${row.batch_id}` : '-')}</div>
+                            {row.batch_no && <div className="text-[10px] text-slate-500">ID {row.batch_id || '-'}</div>}
                           </td>
                           <td className="p-2 border">{row.reference_doc || '-'}</td>
                           <td className="p-2 border">{row.transaction_type || '-'}</td>
@@ -515,7 +776,7 @@ const TabInventory = (props) => {
                         </tr>
                       ))}
                       {!stockCardLoading && stockCardRows.length === 0 && (
-                        <tr><td colSpan="7" className="p-3 text-center text-slate-400">Belum ada transaksi.</td></tr>
+                        <tr><td colSpan="8" className="p-3 text-center text-slate-400">Belum ada transaksi.</td></tr>
                       )}
                     </tbody>
                 </table>
@@ -559,7 +820,7 @@ const TabInventory = (props) => {
                       <option value="">Pilih batch...</option>
                       {lotBatches.map((batch) => (
                         <option key={batch.id} value={batch.id}>
-                          {batch.batch_no || batch.do_number || `Batch ${batch.id}`} | {batch.arrival_date || '-'} | Avl {formatNumber0(batch.available_qty || 0)}
+                          {batch.batch_no || batch.do_number || `Batch ${batch.id}`} | Avl {formatNumber0(batch.available_qty || 0)} | Out {formatNumber0(batch.qty_out || 0)} | Last {batch.last_movement_at ? String(batch.last_movement_at).slice(0, 10) : '-'}
                         </option>
                       ))}
                     </select>
@@ -597,26 +858,41 @@ const TabInventory = (props) => {
                 )}
 
                 {lotHeader && (
-                  <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mt-4 text-xs">
-                    <div className="border rounded p-3">
-                      <div className="text-[10px] uppercase text-slate-400">Batch No</div>
-                      <div className="font-semibold">{lotHeader.batch_no || '-'}</div>
-                      <div className="text-[10px] text-slate-500">{lotHeader.item_code}</div>
+                  <div className="mt-4 rounded-lg border border-slate-200 p-3">
+                    <div className="mb-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                      <div>
+                        <div className="text-xs font-semibold text-slate-900">Lot Aktif dari Receiving</div>
+                        <div className="text-[10px] text-slate-500">Gunakan label ini untuk ditempel ke barang fisik agar lot aktual sama dengan sistem.</div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setLotLabelOpen(true)}
+                        className="inline-flex items-center justify-center gap-2 rounded border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                      >
+                        <Printer size={14} /> Label Lot/Part
+                      </button>
                     </div>
-                    <div className="border rounded p-3">
-                      <div className="text-[10px] uppercase text-slate-400">Item</div>
-                      <div className="font-semibold">{lotHeader.item_name || '-'}</div>
-                      <div className="text-[10px] text-slate-500">{lotHeader.unit || '-'}</div>
-                    </div>
-                    <div className="border rounded p-3">
-                      <div className="text-[10px] uppercase text-slate-400">Arrival / DO</div>
-                      <div className="font-semibold">{lotHeader.arrival_date || '-'}</div>
-                      <div className="text-[10px] text-slate-500">{lotHeader.do_number || '-'}</div>
-                    </div>
-                    <div className="border rounded p-3">
-                      <div className="text-[10px] uppercase text-slate-400">Balance</div>
-                      <div className="font-semibold">{formatNumber0(lotHeader.balance || 0)}</div>
-                      <div className="text-[10px] text-slate-500">In {formatNumber0(lotHeader.qty_in || 0)} | Out {formatNumber0(lotHeader.qty_out || 0)}</div>
+                    <div className="grid grid-cols-1 gap-3 text-xs md:grid-cols-4">
+                      <div className="border rounded p-3">
+                        <div className="text-[10px] uppercase text-slate-400">Batch No</div>
+                        <div className="font-semibold">{lotHeader.batch_no || '-'}</div>
+                        <div className="text-[10px] text-slate-500">{lotHeader.item_code}</div>
+                      </div>
+                      <div className="border rounded p-3">
+                        <div className="text-[10px] uppercase text-slate-400">Item</div>
+                        <div className="font-semibold">{lotHeader.item_name || '-'}</div>
+                        <div className="text-[10px] text-slate-500">{lotHeader.unit || '-'}</div>
+                      </div>
+                      <div className="border rounded p-3">
+                        <div className="text-[10px] uppercase text-slate-400">Arrival / DO</div>
+                        <div className="font-semibold">{lotHeader.arrival_date || '-'}</div>
+                        <div className="text-[10px] text-slate-500">{lotHeader.do_number || '-'}</div>
+                      </div>
+                      <div className="border rounded p-3">
+                        <div className="text-[10px] uppercase text-slate-400">Balance</div>
+                        <div className="font-semibold">{formatNumber0(lotHeader.balance || 0)}</div>
+                        <div className="text-[10px] text-slate-500">In {formatNumber0(lotHeader.qty_in || 0)} | Out {formatNumber0(lotHeader.qty_out || 0)}</div>
+                      </div>
                     </div>
                   </div>
                 )}
@@ -744,9 +1020,9 @@ const TabInventory = (props) => {
               {inventoryShowKanban && (
               <>
                 <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
-                  {filteredInventoryItems.map((item) => (
+                  {inventoryPaginationMeta.rows.map((item) => (
                     <div
-                      key={item.id}
+                      key={getInventoryItemKey(item)}
                       className={`bg-white rounded-xl border p-4 shadow-sm ${
                         item.status === 'Minus' ? 'border-rose-200 bg-rose-50' : item.status === 'Critical' ? 'border-red-200 bg-red-50' : ''
                       }`}
@@ -759,7 +1035,7 @@ const TabInventory = (props) => {
                       <div className="flex items-center gap-2">
                         <span className={`px-2 py-0.5 rounded-full text-xs border ${getInventoryStatusBadge(item.status)}`}>{item.status}</span>
                         {canDeleteRecords && (
-                          <button onClick={() => handleInventoryDelete(item.id)} className="text-red-600 hover:text-red-700" title="Delete">
+                          <button onClick={() => handleInventoryDelete(getInventoryItemKey(item))} className="text-red-600 hover:text-red-700" title="Delete">
                             <Trash2 size={14} />
                           </button>
                         )}
@@ -814,19 +1090,31 @@ const TabInventory = (props) => {
                           >
                             <FileText size={12} className="inline-block mr-1" /> Detail
                           </button>
-                          <button className="p-2 border rounded text-slate-600" title="QR">
+                          <button
+                            type="button"
+                            onClick={() => openQrModal?.(item)}
+                            className="p-2 border rounded text-slate-600 hover:border-indigo-200 hover:bg-indigo-50 hover:text-indigo-700"
+                            title="Tampilkan QR Kanban"
+                          >
                             <QrCode size={14} />
                           </button>
-                          <button className="p-2 border rounded text-slate-600" title="Analytics">
+                          <button
+                            type="button"
+                            onClick={() => setInventoryAnalyticsItem(item)}
+                            className="p-2 border rounded text-slate-600 hover:border-indigo-200 hover:bg-indigo-50 hover:text-indigo-700"
+                            title="Analytics"
+                          >
                             <BarChart3 size={14} />
                           </button>
                         </div>
                       </div>
                     </div>
                   ))}
-                </div>
-                <div className="mt-3">
-                  {renderPaginationControls('kanbanRequests', kanbanPaginationMeta)}
+                  {inventoryPaginationMeta.total === 0 && (
+                    <div className="rounded-xl border border-dashed border-slate-200 bg-white p-6 text-center text-xs text-slate-400 lg:col-span-2 xl:col-span-3">
+                      Data tidak ditemukan.
+                    </div>
+                  )}
                 </div>
               </>
               )}
@@ -852,7 +1140,7 @@ const TabInventory = (props) => {
                   </thead>
                   <tbody>
                     {inventoryPaginationMeta.rows.map((item) => (
-                      <tr key={item.id} className="border-t">
+                      <tr key={getInventoryItemKey(item)} className="border-t">
                         <td className="p-2 font-medium">{item.kanbanId}</td>
                         <td className="p-2">
                           <div className="font-medium">{item.itemCode}</div>
@@ -887,8 +1175,24 @@ const TabInventory = (props) => {
                             >
                               <FileText size={14} />
                             </button>
+                            <button
+                              type="button"
+                              onClick={() => openQrModal?.(item)}
+                              className="text-slate-600 hover:text-indigo-700"
+                              title="Tampilkan QR Kanban"
+                            >
+                              <QrCode size={14} />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setInventoryAnalyticsItem(item)}
+                              className="text-slate-600 hover:text-indigo-700"
+                              title="Analytics"
+                            >
+                              <BarChart3 size={14} />
+                            </button>
                             {canDeleteRecords && (
-                              <button onClick={() => handleInventoryDelete(item.id)} className="text-red-600 hover:text-red-700" title="Delete">
+                              <button onClick={() => handleInventoryDelete(getInventoryItemKey(item))} className="text-red-600 hover:text-red-700" title="Delete">
                                 <Trash2 size={14} />
                               </button>
                             )}
@@ -913,7 +1217,7 @@ const TabInventory = (props) => {
               {inventoryDetailOpen && inventoryDetailItem && (
                 <div className="fixed inset-0 z-40 bg-black/40 flex justify-end" onClick={closeInventoryDetail}>
                   <div
-                    className="bg-white w-full max-w-md h-full p-6 overflow-y-auto"
+                    className="bg-white w-full max-w-xl h-full p-6 overflow-y-auto"
                     onClick={(e) => e.stopPropagation()}
                   >
                     <div className="flex items-center justify-between mb-4">
@@ -954,6 +1258,126 @@ const TabInventory = (props) => {
                         <div className="text-xs text-slate-500">Supplier</div>
                         <div className="font-semibold">{inventoryDetailItem.supplierCode || inventoryDetailItem.supplier || '-'}</div>
                       </div>
+                    </div>
+
+                    <div className="mt-5 rounded-lg border p-4">
+                      <div className="text-sm font-semibold text-slate-900">Rute Material</div>
+                      <div className="mt-1 text-xs text-slate-500">{detailRouteSummary || '-'}</div>
+                      <div className="mt-3 grid grid-cols-1 gap-2 text-xs">
+                        <div className="rounded-lg bg-slate-50 px-3 py-2">
+                          <div className="text-[10px] uppercase text-slate-400">Item</div>
+                          <div className="font-semibold text-slate-800">{getDetailItemCode()} - {detailMasterItem?.name || inventoryDetailItem.itemName || '-'}</div>
+                        </div>
+                        <div className="rounded-lg bg-slate-50 px-3 py-2">
+                          <div className="text-[10px] uppercase text-slate-400">Line / Location Master</div>
+                          <div className="font-semibold text-slate-800">
+                            {[detailMasterItem?.line_production || detailMasterItem?.lineProduction, detailMasterItem?.location_id || inventoryDetailItem.locationCode || inventoryDetailItem.location]
+                              .filter(Boolean)
+                              .join(' / ') || '-'}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-5 rounded-lg border p-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-semibold text-slate-900">Supplier / Proses</div>
+                          <div className="text-xs text-slate-500">Sumber master referensi item.</div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => openQrModal?.(inventoryDetailItem)}
+                          className="rounded border px-3 py-2 text-xs font-semibold text-indigo-700 hover:border-indigo-200 hover:bg-indigo-50"
+                          title="Tampilkan QR Kanban"
+                        >
+                          <QrCode size={12} className="mr-1 inline-block" /> QR
+                        </button>
+                      </div>
+
+                      <div className="mt-3">
+                        <div className="text-[10px] font-semibold uppercase text-slate-400">Supplier</div>
+                        {detailSupplierRows.length === 0 ? (
+                          <div className="mt-2 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-400">Supplier belum terhubung di master item.</div>
+                        ) : (
+                          <div className="mt-2 space-y-2">
+                            {detailSupplierRows.map((supplier, index) => (
+                              <div key={`detail-supplier-${index}`} className="rounded-lg bg-slate-50 px-3 py-2 text-xs">
+                                <div className="font-semibold text-slate-800">{supplier.label}</div>
+                                {(supplier.share || supplier.role) && (
+                                  <div className="mt-0.5 text-[10px] text-slate-500">
+                                    {[supplier.share ? `Share ${supplier.share}%` : '', supplier.role].filter(Boolean).join(' | ')}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="mt-4">
+                        <div className="text-[10px] font-semibold uppercase text-slate-400">Routing Proses</div>
+                        {detailRoutingRows.length === 0 ? (
+                          <div className="mt-2 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-400">Routing proses belum diisi di master item.</div>
+                        ) : (
+                          <div className="mt-2 space-y-2">
+                            {detailRoutingRows.map((route) => (
+                              <div key={`detail-route-${route.sequence}-${route.label}`} className="flex gap-3 rounded-lg bg-slate-50 px-3 py-2 text-xs">
+                                <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-white font-semibold text-slate-600">{route.sequence}</div>
+                                <div className="min-w-0">
+                                  <div className="font-semibold text-slate-800">{route.label}</div>
+                                  <div className="mt-0.5 text-[10px] text-slate-500">
+                                    {[route.workCenter, route.processType, route.cycleTime ? `${route.cycleTime}s` : ''].filter(Boolean).join(' | ') || '-'}
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="mt-5 rounded-lg border p-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-semibold text-slate-900">BOM</div>
+                          <div className="text-xs text-slate-500">Komponen untuk item ini sebagai parent BOM.</div>
+                        </div>
+                        <div className="rounded-full bg-slate-100 px-2 py-1 text-xs font-semibold text-slate-600">
+                          {detailBomRows.length} line
+                        </div>
+                      </div>
+                      {detailBomLoading && (
+                        <div className="mt-3 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">Memuat BOM...</div>
+                      )}
+                      {!detailBomLoading && detailBomError && (
+                        <div className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-700">{detailBomError}</div>
+                      )}
+                      {!detailBomLoading && !detailBomError && detailBomRows.length === 0 && (
+                        <div className="mt-3 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-400">Belum ada struktur BOM untuk item ini.</div>
+                      )}
+                      {!detailBomLoading && !detailBomError && detailBomRows.length > 0 && (
+                        <div className="mt-3 space-y-2">
+                          {detailBomRows.slice(0, 6).map((row) => (
+                            <div key={`detail-bom-${row.id}`} className="rounded-lg bg-slate-50 px-3 py-2 text-xs">
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="min-w-0">
+                                  <div className="font-semibold text-slate-800">{row.child_code} - {row.child_name || row.component_description || '-'}</div>
+                                  <div className="mt-0.5 text-[10px] text-slate-500">
+                                    {[row.component_type || row.child_type, row.process_code ? `Process ${row.process_code}` : '', row.position_code ? `Pos ${row.position_code}` : ''].filter(Boolean).join(' | ') || '-'}
+                                  </div>
+                                </div>
+                                <div className="shrink-0 text-right font-semibold text-slate-700">
+                                  {Number(row.quantity || 0).toLocaleString('id-ID')} {row.child_unit || ''}
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                          {detailBomRows.length > 6 && (
+                            <div className="text-[10px] text-slate-400">+{detailBomRows.length - 6} line BOM lainnya.</div>
+                          )}
+                        </div>
+                      )}
                     </div>
 
                     <div className="mt-5">
@@ -999,6 +1423,283 @@ const TabInventory = (props) => {
                           ))}
                         </div>
                       )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {lotLabelOpen && lotHeader && (
+                <div
+                  className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 lot-label-print-scope"
+                  onClick={() => setLotLabelOpen(false)}
+                >
+                  <div
+                    className="w-full max-w-xl rounded-xl bg-white shadow-2xl lot-label-print-shell"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <div className="flex items-center justify-between border-b p-4 lot-label-print-hidden">
+                      <div>
+                        <div className="text-sm font-semibold text-slate-900">Label Lot / Part</div>
+                        <div className="text-xs text-slate-500">Cetak dan tempel pada barang aktual setelah receiving.</div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => window.print()}
+                          className="inline-flex items-center gap-2 rounded bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800"
+                        >
+                          <Printer size={14} /> Print
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setLotLabelOpen(false)}
+                          className="text-slate-400 hover:text-slate-600"
+                          title="Tutup"
+                        >
+                          <X size={18} />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="bg-slate-50 p-5 lot-label-print-wrap">
+                      <div className="mx-auto rounded-lg border-2 border-slate-900 bg-white p-4 text-slate-900 lot-label-card">
+                        <div className="mb-3 flex items-start justify-between gap-3 border-b-2 border-slate-900 pb-2">
+                          <div>
+                            <div className="text-[10px] font-bold uppercase tracking-wide text-slate-500">MRP - Lot / Part Label</div>
+                            <div className="mt-1 text-lg font-black leading-tight">{lotHeader.item_code || '-'}</div>
+                            <div className="text-xs font-semibold leading-tight">{lotHeader.item_name || '-'}</div>
+                          </div>
+                          <div className="shrink-0 rounded border border-slate-300 bg-white p-1">
+                            <QRCodeCanvas value={lotLabelPayload || '-'} size={92} includeMargin={false} />
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2 text-xs">
+                          <div className="rounded border border-slate-300 p-2">
+                            <div className="text-[9px] font-semibold uppercase text-slate-500">Lot / Batch No</div>
+                            <div className="break-all text-sm font-bold">{lotHeader.batch_no || `BATCH-${lotHeader.id || lotBatchId}`}</div>
+                          </div>
+                          <div className="rounded border border-slate-300 p-2">
+                            <div className="text-[9px] font-semibold uppercase text-slate-500">Qty Sisa Label</div>
+                            <div className="text-sm font-bold">{formatNumber0(lotHeader.balance || 0)} {lotHeader.unit || ''}</div>
+                          </div>
+                          <div className="rounded border border-slate-300 p-2">
+                            <div className="text-[9px] font-semibold uppercase text-slate-500">Qty Terima</div>
+                            <div className="font-bold">{formatNumber0(lotHeader.qty_in || 0)} {lotHeader.unit || ''}</div>
+                          </div>
+                          <div className="rounded border border-slate-300 p-2">
+                            <div className="text-[9px] font-semibold uppercase text-slate-500">Qty Keluar Sistem</div>
+                            <div className="font-bold">{formatNumber0(lotHeader.qty_out || 0)} {lotHeader.unit || ''}</div>
+                          </div>
+                          <div className="rounded border border-slate-300 p-2">
+                            <div className="text-[9px] font-semibold uppercase text-slate-500">Tanggal Terima</div>
+                            <div className="font-bold">{lotHeader.arrival_date || '-'}</div>
+                          </div>
+                          <div className="rounded border border-slate-300 p-2">
+                            <div className="text-[9px] font-semibold uppercase text-slate-500">DO / Referensi</div>
+                            <div className="break-all font-bold">{lotHeader.do_number || '-'}</div>
+                          </div>
+                          <div className="rounded border border-slate-300 p-2">
+                            <div className="text-[9px] font-semibold uppercase text-slate-500">Produksi / Expired</div>
+                            <div className="font-bold">{lotHeader.production_date || '-'} / {lotHeader.expired_date || '-'}</div>
+                          </div>
+                          <div className="rounded border border-slate-300 p-2">
+                            <div className="text-[9px] font-semibold uppercase text-slate-500">Movement</div>
+                            <div className="font-bold">{formatNumber0(selectedLotBatch?.movement_count || lotRows.length || 0)} transaksi</div>
+                          </div>
+                        </div>
+
+                        <div className="mt-3 grid grid-cols-2 gap-3 border-t border-slate-300 pt-3 text-[10px]">
+                          <div>
+                            <div className="font-semibold uppercase text-slate-500">Ditempel Oleh</div>
+                            <div className="mt-7 border-t border-slate-400 pt-1">Nama / Tanggal</div>
+                          </div>
+                          <div>
+                            <div className="font-semibold uppercase text-slate-500">Dicek Oleh</div>
+                            <div className="mt-7 border-t border-slate-400 pt-1">Nama / Tanggal</div>
+                          </div>
+                        </div>
+
+                        <div className="mt-2 text-[9px] text-slate-500">
+                          Scan QR label ini saat cek fisik/opname untuk memastikan item dan lot aktual sama dengan data sistem.
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {showQrModal && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setShowQrModal?.(false)}>
+                  <div
+                    className="w-full max-w-sm rounded-xl bg-white p-5 shadow-2xl"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <div className="mb-4 flex items-center justify-between">
+                      <div>
+                        <div className="text-sm font-semibold text-slate-900">QR Kanban ID</div>
+                        <div className="text-xs text-slate-500">{qrTitle || 'Kanban Item'}</div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowQrModal?.(false)}
+                        className="text-slate-400 hover:text-slate-600"
+                        title="Tutup"
+                      >
+                        <X size={18} />
+                      </button>
+                    </div>
+                    <div className="flex flex-col items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 p-5">
+                      <QRCodeCanvas value={qrPayload || '-'} size={180} />
+                      <div className="break-all text-center text-xs font-semibold text-slate-700">{qrPayload || '-'}</div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {inventoryAnalyticsItem && selectedAnalytics && (
+                <div className="fixed inset-0 z-50 bg-black/40 flex justify-end" onClick={() => setInventoryAnalyticsItem(null)}>
+                  <div
+                    className="bg-white w-full max-w-xl h-full p-6 overflow-y-auto"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="flex items-start justify-between gap-4 mb-5">
+                      <div>
+                        <div className="text-sm text-slate-500">Kanban Analytics</div>
+                        <div className="text-xl font-bold text-slate-900">{inventoryAnalyticsItem.kanbanId}</div>
+                        <div className="text-xs text-slate-500">{inventoryAnalyticsItem.itemCode} - {inventoryAnalyticsItem.itemName || '-'}</div>
+                      </div>
+                      <button onClick={() => setInventoryAnalyticsItem(null)} className="text-slate-400 hover:text-slate-600">
+                        <X size={18} />
+                      </button>
+                    </div>
+
+                    <div className="mb-4 flex flex-wrap items-center gap-2">
+                      <span className={`rounded-full border px-2 py-1 text-xs font-semibold ${getInventoryStatusBadge(inventoryAnalyticsItem.status)}`}>
+                        {inventoryAnalyticsItem.status}
+                      </span>
+                      <span className={`rounded-full px-2 py-1 text-xs font-semibold ${
+                        selectedAnalytics.actionTone === 'rose'
+                          ? 'bg-rose-100 text-rose-700'
+                          : selectedAnalytics.actionTone === 'amber'
+                            ? 'bg-amber-100 text-amber-700'
+                            : selectedAnalytics.actionTone === 'sky'
+                              ? 'bg-sky-100 text-sky-700'
+                              : 'bg-emerald-100 text-emerald-700'
+                      }`}>
+                        {selectedAnalytics.action}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3 text-sm">
+                      <div className="rounded-lg border p-3">
+                        <div className="text-[10px] uppercase text-slate-400">On Hand</div>
+                        <div className="mt-1 text-lg font-bold text-slate-900">
+                          {selectedAnalytics.onHand.toLocaleString('id-ID')} {inventoryAnalyticsItem.uom}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-amber-200 bg-amber-50 p-3">
+                        <div className="text-[10px] uppercase text-amber-700">Reserved</div>
+                        <div className="mt-1 text-lg font-bold text-amber-700">
+                          {selectedAnalytics.reserved.toLocaleString('id-ID')} {inventoryAnalyticsItem.uom}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3">
+                        <div className="text-[10px] uppercase text-emerald-700">Available</div>
+                        <div className="mt-1 text-lg font-bold text-emerald-700">
+                          {selectedAnalytics.available.toLocaleString('id-ID')} {inventoryAnalyticsItem.uom}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border p-3">
+                        <div className="text-[10px] uppercase text-slate-400">Min / Max</div>
+                        <div className="mt-1 text-lg font-bold text-slate-900">
+                          {selectedAnalytics.minQty.toLocaleString('id-ID')} / {selectedAnalytics.maxQty.toLocaleString('id-ID')}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-5 rounded-lg border p-4">
+                      <div className="mb-3 flex items-center justify-between">
+                        <div>
+                          <div className="text-sm font-semibold text-slate-900">Stock Posture</div>
+                          <div className="text-xs text-slate-500">Perbandingan available, reserve, dan kapasitas kanban.</div>
+                        </div>
+                        <BarChart3 size={18} className="text-indigo-500" />
+                      </div>
+                      <div className="space-y-4">
+                        {renderAnalyticsBar(
+                          'Available vs Max',
+                          selectedAnalytics.stockRatio,
+                          `${Math.round(selectedAnalytics.stockRatio).toLocaleString('id-ID')}%`,
+                          selectedAnalytics.excessQty > 0 ? 'bg-sky-500' : selectedAnalytics.available <= selectedAnalytics.minQty ? 'bg-amber-500' : 'bg-emerald-500',
+                        )}
+                        {renderAnalyticsBar(
+                          'Available vs Min',
+                          selectedAnalytics.minRatio,
+                          `${Math.round(selectedAnalytics.minRatio).toLocaleString('id-ID')}%`,
+                          selectedAnalytics.available <= selectedAnalytics.minQty ? 'bg-amber-500' : 'bg-emerald-500',
+                        )}
+                        {renderAnalyticsBar(
+                          'Reserved Ratio',
+                          selectedAnalytics.reserveRatio,
+                          `${Math.round(selectedAnalytics.reserveRatio).toLocaleString('id-ID')}%`,
+                          'bg-amber-500',
+                        )}
+                        {renderAnalyticsBar(
+                          'Kanban Capacity vs Max',
+                          selectedAnalytics.capacityRatio,
+                          `${selectedAnalytics.noOfCards.toLocaleString('id-ID')} x ${selectedAnalytics.kanbanQty.toLocaleString('id-ID')}`,
+                          'bg-indigo-500',
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="mt-5 grid grid-cols-2 gap-3 text-sm">
+                      <div className="rounded-lg border p-3">
+                        <div className="text-xs text-slate-500">Short to Min</div>
+                        <div className="font-semibold text-slate-900">{selectedAnalytics.shortToMin.toLocaleString('id-ID')} {inventoryAnalyticsItem.uom}</div>
+                      </div>
+                      <div className="rounded-lg border p-3">
+                        <div className="text-xs text-slate-500">Short to Max</div>
+                        <div className="font-semibold text-slate-900">{selectedAnalytics.shortToMax.toLocaleString('id-ID')} {inventoryAnalyticsItem.uom}</div>
+                      </div>
+                      <div className="rounded-lg border p-3">
+                        <div className="text-xs text-slate-500">Suggested Cards</div>
+                        <div className="font-semibold text-slate-900">{selectedAnalytics.suggestedCards.toLocaleString('id-ID')} kartu</div>
+                      </div>
+                      <div className="rounded-lg border p-3">
+                        <div className="text-xs text-slate-500">Suggested Qty</div>
+                        <div className="font-semibold text-slate-900">{selectedAnalytics.suggestedQty.toLocaleString('id-ID')} {inventoryAnalyticsItem.uom}</div>
+                      </div>
+                      <div className="rounded-lg border p-3">
+                        <div className="text-xs text-slate-500">Kanban Capacity</div>
+                        <div className="font-semibold text-slate-900">{selectedAnalytics.capacityQty.toLocaleString('id-ID')} {inventoryAnalyticsItem.uom}</div>
+                      </div>
+                      <div className="rounded-lg border p-3">
+                        <div className="text-xs text-slate-500">Lead Time</div>
+                        <div className="font-semibold text-slate-900">{Number(inventoryAnalyticsItem.leadTime || 0).toLocaleString('id-ID')} hari</div>
+                      </div>
+                    </div>
+
+                    <div className="mt-5 rounded-lg border p-4">
+                      <div className="text-sm font-semibold text-slate-900">Insight</div>
+                      <div className="mt-3 space-y-2">
+                        {selectedAnalytics.insights.map((insight, index) => (
+                          <div key={`inventory-insight-${index}`} className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-700">
+                            {insight}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="mt-5 rounded-lg border p-4 text-xs text-slate-600">
+                      <div className="font-semibold text-slate-900">Referensi</div>
+                      <div className="mt-2 grid grid-cols-2 gap-2">
+                        <div>Supplier: <span className="font-semibold">{inventoryAnalyticsItem.supplierCode || inventoryAnalyticsItem.supplier || '-'}</span></div>
+                        <div>Location: <span className="font-semibold">{inventoryAnalyticsItem.locationCode || inventoryAnalyticsItem.location || '-'}</span></div>
+                        <div>Category: <span className="font-semibold">{inventoryAnalyticsItem.categoryCode || inventoryAnalyticsItem.category || '-'}</span></div>
+                        <div>Cards: <span className="font-semibold">{selectedAnalytics.noOfCards.toLocaleString('id-ID')} kartu</span></div>
+                      </div>
                     </div>
                   </div>
                 </div>

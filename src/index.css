@@ -92,6 +92,87 @@
   color: #0f172a;
 }
 
+.supplier-kanban-card {
+  width: 128mm;
+  height: 84mm;
+  box-sizing: border-box;
+  border: 2px solid #000;
+  background: #fff;
+  color: #000;
+  font-family: inherit;
+  break-inside: avoid;
+  page-break-inside: avoid;
+  overflow: hidden;
+}
+
+.supplier-kanban-card__body {
+  display: grid;
+  grid-template-rows: 12.5mm 71.5mm;
+  height: 100%;
+}
+
+.supplier-kanban-card__top {
+  display: grid;
+  grid-template-columns: 1fr 1fr 22mm;
+  border-bottom: 2px solid #000;
+}
+
+.supplier-kanban-card__middle {
+  display: grid;
+  grid-template-columns: 1fr 32mm;
+  min-height: 0;
+}
+
+.supplier-kanban-card__main {
+  display: grid;
+  grid-template-rows: 1fr 28mm;
+  min-width: 0;
+}
+
+.supplier-kanban-card__meta {
+  display: grid;
+  grid-template-rows: 12mm 12mm 10mm 1fr;
+  border-left: 2px solid #000;
+}
+
+.supplier-meta-line {
+  border-bottom: 2px solid #000;
+  padding: 3px 4px;
+  font-size: 6pt;
+  line-height: 1.15;
+}
+
+.supplier-meta-line span {
+  display: block;
+  color: #475569;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.supplier-meta-line strong {
+  display: block;
+  margin-top: 2px;
+  font-size: 7pt;
+  color: #000;
+}
+
+.supplier-meta-chip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-bottom: 2px solid #000;
+  padding: 2px;
+  text-align: center;
+  font-size: 6pt;
+  font-weight: 800;
+}
+
+.supplier-meta-qr {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .rn-header {
   display: flex;
   align-items: center;
@@ -563,11 +644,25 @@
   background: #fff;
 }
 
+.lot-label-card {
+  width: min(100%, 100mm);
+  min-height: 65mm;
+}
+
+.supplier-package-label {
+  min-height: 65mm;
+}
+
 @media print {
   @page {
     size: A4;
     margin: 15mm;
     margin-bottom: 25mm;
+  }
+
+  @page supplier-label-page {
+    size: A4 landscape;
+    margin: 8mm;
   }
 
   html,
@@ -632,6 +727,29 @@
 
   body.report-print-active .report-print-host {
     display: block !important;
+  }
+
+  body.report-print-active.report-print-landscape .report-print-scope {
+    width: 100%;
+    min-width: 270mm;
+  }
+
+  body.report-print-active.report-print-landscape .report-print-scope > div {
+    width: 100% !important;
+    max-width: none !important;
+  }
+
+  html.report-print-landscape-root,
+  body.report-print-active.report-print-landscape {
+    width: 297mm;
+    min-width: 297mm;
+  }
+
+  body.report-print-active.report-print-landscape #root,
+  body.report-print-active.report-print-landscape .content-wrapper,
+  body.report-print-active.report-print-landscape .report-print-host {
+    width: 297mm;
+    max-width: 297mm;
   }
 
   .print-only {
@@ -714,6 +832,132 @@
     margin: 0 !important;
     padding-top: 4mm;
     background: #fff;
+  }
+
+  body.lot-label-print-active #root {
+    position: relative;
+    overflow: visible;
+  }
+
+  body.lot-label-print-active #root > * {
+    visibility: hidden !important;
+  }
+
+  body.lot-label-print-active .lot-label-print-scope,
+  body.lot-label-print-active .lot-label-print-scope * {
+    visibility: visible !important;
+  }
+
+  body.lot-label-print-active .lot-label-print-scope {
+    position: absolute !important;
+    inset: 0 !important;
+    display: block !important;
+    background: #fff !important;
+    padding: 0 !important;
+  }
+
+  body.lot-label-print-active .lot-label-print-shell {
+    width: auto !important;
+    max-width: none !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+  }
+
+  body.lot-label-print-active .lot-label-print-wrap {
+    background: #fff !important;
+    padding: 0 !important;
+  }
+
+  body.lot-label-print-active .lot-label-card {
+    margin: 0 !important;
+    width: 100mm !important;
+    min-height: 65mm !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  body.lot-label-print-active .lot-label-print-hidden {
+    display: none !important;
+  }
+
+  body.supplier-label-print-active #root {
+    position: relative;
+    overflow: visible;
+  }
+
+  body.supplier-label-print-active #root > * {
+    visibility: hidden !important;
+  }
+
+  body.supplier-label-print-active .supplier-label-print-scope,
+  body.supplier-label-print-active .supplier-label-print-scope * {
+    visibility: visible !important;
+  }
+
+  body.supplier-label-print-active .supplier-label-print-scope {
+    position: absolute !important;
+    inset: 0 !important;
+    display: block !important;
+    background: #fff !important;
+    padding: 0 !important;
+    page: supplier-label-page;
+  }
+
+  body.supplier-label-print-active .supplier-label-print-shell {
+    width: auto !important;
+    max-width: none !important;
+    max-height: none !important;
+    overflow: visible !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+  }
+
+  body.supplier-label-print-active .supplier-label-print-wrap {
+    background: #fff !important;
+    padding: 0 !important;
+    overflow: visible !important;
+  }
+
+  body.supplier-label-print-active .supplier-label-grid {
+    display: grid !important;
+    grid-template-columns: repeat(2, minmax(0, 128mm)) !important;
+    gap: 4mm !important;
+    align-items: start !important;
+    break-before: page;
+    page-break-before: always;
+  }
+
+  body.supplier-label-print-active .supplier-dn-cover {
+    width: 281mm !important;
+    min-height: 140mm !important;
+    margin: 0 0 8mm 0 !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    padding: 4mm !important;
+    break-after: page;
+    page-break-after: always;
+  }
+
+  body.supplier-label-print-active .supplier-dn-table {
+    border-collapse: collapse !important;
+    table-layout: fixed !important;
+    font-size: 9.5pt !important;
+  }
+
+  body.supplier-label-print-active .supplier-dn-table th,
+  body.supplier-label-print-active .supplier-dn-table td {
+    border-color: #111827 !important;
+  }
+
+  body.supplier-label-print-active .supplier-package-label {
+    width: 128mm !important;
+    height: 84mm !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  body.supplier-label-print-active .supplier-label-print-hidden {
+    display: none !important;
   }
 
   .report-print-scope table {
@@ -956,6 +1200,10 @@
     padding-bottom: 24mm;
   }
 
+  .dn-print-page.print-body {
+    padding-bottom: 14mm;
+  }
+
   .rn-print-page {
     min-height: calc(297mm - 25mm);
     display: flex;
@@ -1052,6 +1300,151 @@
   .dn-part-cell {
     font-size: 10px;
     white-space: normal;
+  }
+
+  .dn-card-section {
+    break-inside: auto;
+    page-break-inside: auto;
+    margin-top: 0;
+  }
+
+  .dn-card-sheet {
+    width: 297mm;
+    min-height: 210mm;
+    box-sizing: border-box;
+    padding: 0 6mm 6mm;
+    break-before: page;
+    page-break-before: always;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .dn-card-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 3mm 3mm;
+    align-items: start;
+  }
+
+  .dn-kanban-card {
+    width: 128mm;
+    height: 84mm;
+    box-sizing: border-box;
+    border: 2px solid #000;
+    background: #fff;
+    color: #000;
+    font-family: inherit;
+    break-inside: avoid;
+    page-break-inside: avoid;
+    overflow: hidden;
+  }
+
+  .dn-kanban-card__body {
+    display: grid;
+    grid-template-rows: 12.5mm 71.5mm;
+    height: 100%;
+  }
+
+  .dn-kanban-card__top {
+    display: grid;
+    grid-template-columns: 1fr 1fr 22mm;
+    border-bottom: 2px solid #000;
+  }
+
+  .dn-kanban-card__middle {
+    display: grid;
+    grid-template-columns: 1fr 32mm;
+    min-height: 0;
+  }
+
+  .dn-kanban-card__main {
+    display: grid;
+    grid-template-rows: 27mm 44.5mm;
+    min-height: 0;
+    border-right: 2px solid #000;
+  }
+
+  .dn-part-group {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 0.6mm;
+    padding: 1.15mm 2.1mm 0.7mm;
+    min-height: 0;
+    border-bottom: 1px solid #000;
+  }
+
+  .dn-grid-info {
+    display: grid;
+    grid-template-columns: 22mm 1fr;
+    min-height: 0;
+  }
+
+  .dn-qty-panel {
+    border-right: 1px solid #000;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    padding: 1.1mm 1.15mm 1.1mm 2.05mm;
+    min-height: 0;
+  }
+
+  .dn-order-panel {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 0.4mm;
+    padding: 1.1mm 1.6mm 1.1mm 1.6mm;
+    min-height: 0;
+  }
+
+  .dn-kanban-card__meta {
+    display: grid;
+    grid-template-rows: 10mm 10mm 8mm 1fr;
+    min-height: 0;
+    padding: 1.1mm 1.35mm;
+  }
+
+  .dn-meta-line {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 0.4mm;
+    border-bottom: 1px solid #000;
+    padding: 0.3mm 0;
+  }
+
+  .dn-meta-line span {
+    font-size: 6pt;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    color: #475569;
+  }
+
+  .dn-meta-line strong {
+    font-size: 8pt;
+    line-height: 1.1;
+    word-break: break-word;
+  }
+
+  .dn-meta-chip {
+    align-self: start;
+    margin-top: 0.3mm;
+    padding: 0.45mm 1.15mm;
+    font-size: 6pt;
+    font-weight: 700;
+    text-transform: uppercase;
+    border: 1px solid #000;
+    border-radius: 9999px;
+    line-height: 1.1;
+  }
+
+  .dn-meta-qr {
+    display: flex;
+    align-items: end;
+    justify-content: center;
+    padding-top: 0.1mm;
   }
 
   .dn-header-container {

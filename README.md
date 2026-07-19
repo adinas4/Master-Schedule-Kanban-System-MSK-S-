@@ -93,6 +93,227 @@ npm run build
 npm run preview
 ```
 
+## Railway Deployment
+
+Arsitektur yang dipakai untuk Railway adalah satu application service plus satu PostgreSQL service. Frontend React dibuild menjadi `dist/`, lalu backend Express menyajikan file statis tersebut dan tetap melayani API di service yang sama. Pola ini paling sederhana untuk repo ini karena hanya perlu satu domain production, CORS lebih mudah dikunci, dan refresh halaman React tidak 404.
+
+### A. Persiapan Akun Railway
+
+1. Buat akun di Railway.
+2. Hubungkan akun Railway ke GitHub.
+3. Pastikan repository ini sudah berada di GitHub dan branch deployment siap dipilih.
+
+### B. Hubungkan Repository GitHub
+
+1. Di Railway, pilih `New Project`.
+2. Pilih `Deploy from GitHub repo`.
+3. Pilih repository `Master-Schedule-Kanban-System-MSK-S-`.
+4. Pilih branch deployment, misalnya `deployment/railway-production`.
+
+### C. Buat PostgreSQL Railway
+
+1. Di project Railway yang sama, klik `New`.
+2. Pilih `Database` lalu `PostgreSQL`.
+3. Setelah database dibuat, hubungkan service aplikasi ke PostgreSQL agar Railway menyediakan `DATABASE_URL`.
+
+### D. Service Backend + Frontend
+
+Gunakan satu service aplikasi dari root repository.
+
+Railway akan membaca `railway.json`:
+
+```text
+Build command: npm run build:railway
+Pre-deploy command: npm run migrate:railway
+Start command: npm run start:railway
+Health check path: /health
+```
+
+Jika mengisi manual di Railway, gunakan nilai yang sama.
+
+### E. Root Directory
+
+Gunakan root directory repository:
+
+```text
+/
+```
+
+Jangan gunakan `server/` sebagai root service karena frontend perlu dibuild dari root.
+
+### F. Environment Variables
+
+Isi variable berikut di Railway application service:
+
+```text
+NODE_ENV=production
+PORT=<disediakan Railway, boleh tidak diisi manual>
+DATABASE_URL=<otomatis dari Railway PostgreSQL>
+JWT_SECRET=<isi secret panjang dan acak>
+FRONTEND_URL=https://<domain-app-railway-anda>
+VITE_API_BASE=
+SESSION_INACTIVITY_TIMEOUT_MINUTES=15
+DEFAULT_RESET_PASSWORD=<password reset default internal>
+SERVE_FRONTEND=true
+UPLOAD_DIR=/data/uploads
+```
+
+Optional jika memakai email:
+
+```text
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASS=
+SMTP_SECURE=false
+SMTP_FROM=
+```
+
+Untuk local development, gunakan fallback PostgreSQL:
+
+```text
+PGHOST=localhost
+PGPORT=5432
+PGUSER=postgres
+PGPASSWORD=
+PGDATABASE=monitoring_supplier
+```
+
+### G. DATABASE_URL
+
+Jika PostgreSQL Railway sudah linked, `DATABASE_URL` biasanya tersedia otomatis. Aplikasi akan memakai `DATABASE_URL` lebih dulu. Jika kosong, aplikasi fallback ke `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, dan `PGDATABASE`.
+
+SSL PostgreSQL aktif otomatis saat `NODE_ENV=production` atau Railway environment terdeteksi. Gunakan `PGSSLMODE=disable` hanya untuk database lokal yang tidak mendukung SSL. Gunakan `PGSSLMODE=no-verify` hanya jika provider mewajibkan SSL tetapi sertifikatnya tidak dapat diverifikasi.
+
+### H. FRONTEND_URL dan VITE_API_BASE
+
+Karena frontend disajikan oleh backend yang sama, isi:
+
+```text
+FRONTEND_URL=https://<domain-app-railway-anda>
+VITE_API_BASE=
+```
+
+`VITE_API_BASE` dikosongkan agar browser memakai relative path `/api`. Jika frontend dipisah ke service/domain lain, isi `VITE_API_BASE=https://<domain-backend>` dan isi `FRONTEND_URL=https://<domain-frontend>`.
+
+### I. Migration
+
+Migration dijalankan oleh Railway sebelum deploy melalui:
+
+```bash
+npm run migrate:railway
+```
+
+Migration memakai mekanisme `ensureSchema()` yang idempotent: `CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD COLUMN IF NOT EXISTS`, dan index `IF NOT EXISTS`. Migration dapat dijalankan ulang. Jangan jalankan script cleanup manual di production.
+
+### J. Admin Pertama
+
+Jika database baru belum punya user admin, isi sementara:
+
+```text
+ADMIN_USER=admin
+ADMIN_PASSWORD=<password awal yang kuat>
+```
+
+Deploy sekali sampai user dibuat, lalu hapus `ADMIN_PASSWORD` dari Railway variables atau ganti password dari aplikasi. Jangan commit password admin ke repository.
+
+### K. Health Check
+
+Railway health check memakai:
+
+```text
+/health
+```
+
+Endpoint ini tidak butuh autentikasi dan tidak bergantung pada database. Untuk cek database dari browser/admin, gunakan:
+
+```text
+/api/health
+```
+
+### L. Upload dan Railway Volume
+
+Railway filesystem biasa bersifat ephemeral. File di `server/uploads` bisa hilang saat redeploy/restart jika tidak memakai volume.
+
+Solusi yang disiapkan:
+
+1. Buat Railway Volume.
+2. Mount volume ke path `/data`.
+3. Isi environment variable:
+
+```text
+UPLOAD_DIR=/data/uploads
+```
+
+Aplikasi membuat folder upload otomatis saat startup. Jika belum memakai volume, upload tetap berjalan, tetapi tidak persisten.
+
+### M. Auto Deploy
+
+Aktifkan auto-deploy Railway dari branch deployment. Setiap push ke branch tersebut akan menjalankan install, build, migration, lalu start.
+
+### N. Log Deployment
+
+Di Railway:
+
+1. Buka service aplikasi.
+2. Buka tab `Deployments`.
+3. Klik deployment terbaru.
+4. Baca log build, pre-deploy, dan runtime.
+
+Cari pesan:
+
+```text
+Database migration completed.
+API listening on http://0.0.0.0:<PORT>
+```
+
+### O. Rollback
+
+Di tab `Deployments`, pilih deployment yang sebelumnya berhasil lalu gunakan fitur rollback/redeploy dari Railway. Jika rollback terkait database, restore backup PostgreSQL yang sesuai sebelum membuka aplikasi untuk user.
+
+### P. Backup dan Restore PostgreSQL
+
+Backup manual:
+
+```bash
+pg_dump "$DATABASE_URL" > backup.sql
+```
+
+Restore manual:
+
+```bash
+psql "$DATABASE_URL" < backup.sql
+```
+
+Untuk script lokal repo:
+
+```bash
+cd server
+npm run backup
+npm run restore
+```
+
+Pastikan file backup tidak berisi data sensitif sebelum dibagikan dan jangan commit dump database.
+
+### Q. Custom Domain dan HTTPS
+
+1. Di Railway service, buka `Settings` atau `Networking`.
+2. Tambahkan custom domain.
+3. Ikuti instruksi DNS Railway.
+4. Setelah aktif, Railway menyediakan HTTPS otomatis.
+5. Update `FRONTEND_URL` menjadi custom domain HTTPS.
+
+### R. Troubleshooting
+
+- Build gagal di dependency server: pastikan `npm run build:railway` menjalankan `npm --prefix server install`.
+- Health check gagal: pastikan service start command `npm run start:railway` dan path `/health`.
+- Login gagal setelah deploy: cek `JWT_SECRET`, user admin, dan koneksi database.
+- Database gagal konek: cek `DATABASE_URL` sudah linked dari PostgreSQL Railway.
+- CORS error: cek `FRONTEND_URL` sama persis dengan domain browser, tanpa slash belakang.
+- Refresh halaman 404: pastikan `SERVE_FRONTEND=true` dan folder `dist/` terbentuk saat build.
+- Upload hilang setelah redeploy: pasang Railway Volume dan set `UPLOAD_DIR=/data/uploads`.
+- Kamera QR tidak aktif: browser membutuhkan HTTPS atau localhost; gunakan domain Railway HTTPS.
+
 ## System Modules (Per Tab)
 
 ### Dashboard

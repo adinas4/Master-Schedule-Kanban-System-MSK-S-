@@ -11,6 +11,7 @@ import {
   Trash2,
   TrendingDown,
 } from 'lucide-react';
+import SearchableSelectDropdown from '../components/SearchableSelectDropdown';
 
 const TabFifo = (props) => {
   const {
@@ -82,18 +83,17 @@ const TabFifo = (props) => {
                 <div className="flex flex-col md:flex-row gap-4">
                   <div className="flex-1">
                     <label className="text-xs font-semibold text-slate-600">Select Kanban Item</label>
-                    <select
-                      className="mt-1 w-full border rounded px-3 py-2 text-sm bg-white"
+                    <SearchableSelectDropdown
+                      className="mt-1"
                       value={selectedFifoKanban}
-                      onChange={(e) => setSelectedFifoKanban(e.target.value)}
-                    >
-                      <option value="">Choose a kanban item...</option>
-                      {fifoKanbanItems.map((item) => (
-                        <option key={item.id} value={item.kanbanId}>
-                          {item.kanbanId} - {item.itemCode} - {item.itemName}
-                        </option>
-                      ))}
-                    </select>
+                      options={fifoKanbanItems}
+                      onChange={(value) => setSelectedFifoKanban(value)}
+                      placeholder="Choose a kanban item..."
+                      searchPlaceholder="Ketik kode Kanban / nama barang"
+                      emptyText="Item Kanban tidak ditemukan."
+                      getOptionValue={(item) => String(item?.kanbanId || '').trim()}
+                      getOptionLabel={(item) => `${item?.kanbanId || ''} - ${item?.itemCode || ''} - ${item?.itemName || ''}`.trim().replace(/^-+\s*|\s*-\s*$/g, '')}
+                    />
                   </div>
                   <div className="flex gap-2 items-end">
                     <button

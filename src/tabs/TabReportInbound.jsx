@@ -10,6 +10,7 @@ import {
   YAxis,
 } from 'recharts';
 import { Download, Filter, Loader2, Printer, Table2, TrendingUp } from 'lucide-react';
+import SearchableSelectDropdown from '../components/SearchableSelectDropdown';
 
 const MONTH_NAMES_ID = [
   'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
@@ -73,12 +74,13 @@ const applyCellStyle = (sheet, address, style) => {
 
 const MATRIX_COL_WIDTHS = {
   index: 36,
-  po: 120,
-  supplier: 180,
-  partCode: 110,
-  partName: 190,
-  unit: 70,
-  type: 72,
+  po: 98,
+  supplier: 144,
+  doNumber: 116,
+  partCode: 86,
+  partName: 150,
+  unit: 60,
+  type: 62,
   day: 46,
   total: 74,
 };
@@ -86,11 +88,12 @@ const MATRIX_COL_WIDTHS = {
 const MATRIX_LEFT_OFFSETS = {
   index: 0,
   po: 36,
-  supplier: 156,
-  partCode: 336,
-  partName: 446,
-  unit: 636,
-  type: 706,
+  supplier: 134,
+  doNumber: 278,
+  partCode: 394,
+  partName: 544,
+  unit: 604,
+  type: 666,
 };
 
 const stickyCellStyle = (left, width, zIndex = 20) => ({
@@ -109,6 +112,7 @@ const normalizeScheduleRow = (row, index = 0) => {
   const supplierName = formatTitleCase(row?.supplierName ?? row?.supplier_name ?? row?.supplier ?? '');
   const itemCode = formatTitleCase(row?.itemCode ?? row?.item_code ?? row?.item ?? row?.partCode ?? row?.part_code ?? '');
   const itemName = formatTitleCase(row?.itemName ?? row?.item_name ?? row?.name ?? row?.description ?? '');
+  const doNumber = formatTitleCase(row?.doNumber ?? row?.do_number ?? row?.doNo ?? row?.do_no ?? row?.sjNumber ?? row?.sj_number ?? '');
   const requestDate = toDateKey(row?.requestDate ?? row?.request_date ?? row?.plannedDate ?? row?.planned_date ?? row?.planDate ?? row?.plan_date ?? '');
   const arrivalDate = toDateKey(
     row?.arrivalDate
@@ -152,6 +156,7 @@ const normalizeScheduleRow = (row, index = 0) => {
     supplierName,
     itemCode,
     itemName,
+    doNumber,
     requestDate,
     arrivalDate,
     requestQty,
@@ -227,6 +232,7 @@ const TabReportInbound = ({
   schedules = [],
   ensureSchedulesLoaded,
   scheduleLoading,
+  masterVendors = [],
 }) => {
   const [localLoading, setLocalLoading] = useState(false);
   const [monthKey, setMonthKey] = useState('');
@@ -281,15 +287,36 @@ const TabReportInbound = ({
   );
 
   const supplierOptions = useMemo(() => {
-    const seen = new Map();
-    rowsInMonth.forEach((row) => {
-      const key = String(row.supplierName || '').trim() || 'UNKNOWN';
-      if (!seen.has(key)) {
-        seen.set(key, { value: key, label: row.supplierName || key });
-      }
+    const seen = new Set();
+    return (Array.isArray(masterVendors) ? masterVendors : [])
+      .map((vendor) => {
+        const id = String(vendor?.id || '').trim();
+        const name = String(vendor?.name || '').trim();
+        const value = id || name;
+        if (!value) return null;
+        const key = value.toLowerCase();
+        if (seen.has(key)) return null;
+        seen.add(key);
+        return {
+          value,
+          label: id && name && id !== name ? `${id} - ${name}` : (name || id),
+          id: id.toLowerCase(),
+          name: name.toLowerCase(),
+        };
+      })
+      .filter(Boolean)
+      .sort((left, right) => String(left.label).localeCompare(String(right.label), 'id'));
+  }, [masterVendors]);
+
+  const supplierLookup = useMemo(() => {
+    const map = new Map();
+    supplierOptions.forEach((option) => {
+      map.set(String(option.value || '').toLowerCase(), option);
+      if (option.id) map.set(option.id, option);
+      if (option.name) map.set(option.name, option);
     });
-    return Array.from(seen.values()).sort((left, right) => String(left.label).localeCompare(String(right.label), 'id'));
-  }, [rowsInMonth]);
+    return map;
+  }, [supplierOptions]);
 
   useEffect(() => {
     if (supplierFilter === 'ALL') return;
@@ -299,8 +326,16 @@ const TabReportInbound = ({
   }, [supplierFilter, supplierOptions]);
 
   const rowsBySupplier = useMemo(
-    () => rowsInMonth.filter((row) => supplierFilter === 'ALL' || row.supplierName === supplierFilter),
-    [rowsInMonth, supplierFilter],
+    () => {
+      if (supplierFilter === 'ALL') return rowsInMonth;
+      const selected = supplierLookup.get(String(supplierFilter || '').trim().toLowerCase());
+      if (!selected) return [];
+      return rowsInMonth.filter((row) => {
+        const rowKey = String(row.supplierName || '').trim().toLowerCase();
+        return rowKey === selected.id || rowKey === selected.name || rowKey === String(selected.value || '').trim().toLowerCase();
+      });
+    },
+    [rowsInMonth, supplierFilter, supplierLookup],
   );
 
   const poOptions = useMemo(() => {
@@ -403,12 +438,19 @@ const TabReportInbound = ({
       .map((group, index) => {
         const planMap = new Map();
         const actualMap = new Map();
+        const doNumbers = [];
         group.rows.forEach((row) => {
           if (row.requestDate) {
             planMap.set(row.requestDate, (planMap.get(row.requestDate) || 0) + Number(row.requestQty || 0));
           }
           if (row.arrivalDate) {
             actualMap.set(row.arrivalDate, (actualMap.get(row.arrivalDate) || 0) + Number(row.receivedQty || 0));
+          }
+          if (row.doNumber) {
+            const exists = doNumbers.some((value) => String(value || '').trim().toLowerCase() === String(row.doNumber || '').trim().toLowerCase());
+            if (!exists) {
+              doNumbers.push(row.doNumber);
+            }
           }
         });
 
@@ -432,6 +474,7 @@ const TabReportInbound = ({
         return {
           ...group,
           rowNo: index + 1,
+          doNumberLabel: doNumbers.length > 0 ? doNumbers.join(', ') : '-',
           dayValues,
           totals: {
             do: totalDo,
@@ -528,7 +571,7 @@ const TabReportInbound = ({
       [`DELIVERY SCHEDULE CONTROL MATRIX & KPI SUPPLIER - ${formatMonthLabel(monthKey)}`],
       [`Supplier`, supplierFilter === 'ALL' ? 'Semua Supplier' : supplierFilter, `No PO`, poFilter === 'ALL' ? 'Semua PO' : poFilter],
       [],
-      ['Tanggal', 'PLAN', 'ACTUAL', 'BALANCE'],
+      ['Tanggal', 'Jadwal', 'Aktual', 'Selisih'],
       ...trendData.map((row) => [row.label, row.plan, row.actual, row.balance]),
     ];
     const trendWorksheet = XLSX.utils.aoa_to_sheet(trendSheet);
@@ -556,6 +599,7 @@ const TabReportInbound = ({
       'No',
       'No PO',
       'Supplier',
+      'No SJ / DO',
       'Part Code',
       'Part Name',
       'Unit',
@@ -577,6 +621,7 @@ const TabReportInbound = ({
           typeIndex === 0 ? group.rowNo : '',
           typeIndex === 0 ? group.poNumber : '',
           typeIndex === 0 ? group.supplierName : '',
+          typeIndex === 0 ? group.doNumberLabel : '',
           typeIndex === 0 ? group.itemCode : '',
           typeIndex === 0 ? group.itemName : '',
           typeIndex === 0 ? group.unit : '',
@@ -593,6 +638,7 @@ const TabReportInbound = ({
       { wch: 6 },
       { wch: 18 },
       { wch: 24 },
+      { wch: 22 },
       { wch: 14 },
       { wch: 28 },
       { wch: 10 },
@@ -608,9 +654,9 @@ const TabReportInbound = ({
       }),
     };
     matrixWorksheet['!freeze'] = {
-      xSplit: 7,
+      xSplit: 8,
       ySplit: 4,
-      topLeftCell: 'H5',
+      topLeftCell: 'I5',
       activePane: 'bottomRight',
       state: 'frozen',
     };
@@ -641,13 +687,13 @@ const TabReportInbound = ({
         const rowAddress = baseRow + typeIndex + 1;
         for (let colIndex = 0; colIndex < matrixHeader.length; colIndex += 1) {
           const cellAddress = XLSX.utils.encode_cell({ r: rowAddress - 1, c: colIndex });
-          if (colIndex === 6) {
+          if (colIndex === 7) {
             applyCellStyle(matrixWorksheet, cellAddress, style);
-          } else if (colIndex >= 7 && colIndex < 7 + dayColumns.length && typeIndex === 2) {
-            const dayValue = group.dayValues[colIndex - 7];
+          } else if (colIndex >= 8 && colIndex < 8 + dayColumns.length && typeIndex === 2) {
+            const dayValue = group.dayValues[colIndex - 8];
             const balanceStyle = Number(dayValue?.balanceQty || 0) < 0 ? negativeStyle : Number(dayValue?.balanceQty || 0) > 0 ? positiveStyle : neutralStyle;
             applyCellStyle(matrixWorksheet, cellAddress, balanceStyle);
-          } else if (colIndex >= 7 && colIndex < 7 + dayColumns.length && typeIndex !== 2) {
+          } else if (colIndex >= 8 && colIndex < 8 + dayColumns.length && typeIndex !== 2) {
             applyCellStyle(matrixWorksheet, cellAddress, neutralStyle);
           } else if (colIndex === matrixHeader.length - 1) {
             const totalBalanceStyle = typeIndex === 2
@@ -735,13 +781,13 @@ const TabReportInbound = ({
             <div>
               <div className="inline-flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.25em] text-sky-700">
                 <TrendingUp size={14} />
-                Report Inbound
+                Laporan Penerimaan Aktual
               </div>
               <h2 className="mt-1 text-2xl font-bold text-slate-900">
-                Delivery Schedule Control Matrix
+                Matriks Jadwal vs Aktual SJ
               </h2>
               <p className="mt-1 text-sm text-slate-500">
-                PLAN, ACTUAL, dan BALANCE harian per part number dengan struktur horizontal siap rapat manajemen.
+                Jadwal, Aktual SJ, dan selisih harian per part number dengan struktur horizontal siap rapat manajemen.
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2 print-hidden">
@@ -781,7 +827,7 @@ const TabReportInbound = ({
           <label className="block">
             <span className="mb-1 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
               <Filter size={12} />
-              Bulan
+              Bulan laporan
             </span>
             <select
               value={monthKey}
@@ -799,63 +845,57 @@ const TabReportInbound = ({
           <label className="block">
             <span className="mb-1 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
               <Filter size={12} />
-              Supplier
+              Cari supplier
             </span>
-            <select
-              value={supplierFilter}
-              onChange={(event) => setSupplierFilter(event.target.value)}
-              className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none transition focus:border-sky-400"
-            >
-              <option value="ALL">Semua Supplier</option>
-              {supplierOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
+              <SearchableSelectDropdown
+                value={supplierFilter === 'ALL' ? '' : supplierFilter}
+                options={supplierOptions}
+                placeholder="Cari supplier..."
+                searchPlaceholder="Ketik kode / nama supplier"
+                emptyText="Supplier tidak ditemukan."
+                className="w-full"
+                onChange={(nextValue) => setSupplierFilter(nextValue || 'ALL')}
+              />
+            </label>
 
           <label className="block">
             <span className="mb-1 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
               <Filter size={12} />
-              Nomor PO
+              Cari No PO
             </span>
-            <select
-              value={poFilter}
-              onChange={(event) => setPoFilter(event.target.value)}
-              className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none transition focus:border-sky-400"
-            >
-              <option value="ALL">Semua PO</option>
-              {poOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
+              <SearchableSelectDropdown
+                value={poFilter === 'ALL' ? '' : poFilter}
+                options={poOptions}
+                placeholder="Cari no PO..."
+                searchPlaceholder="Ketik no PO"
+                emptyText="No PO tidak ditemukan."
+                className="w-full"
+                onChange={(nextValue) => setPoFilter(nextValue || 'ALL')}
+              />
+            </label>
         </div>
 
         <div className={`grid gap-3 px-5 py-4 sm:grid-cols-2 xl:grid-cols-5 ${meetingMode ? 'bg-slate-50' : ''}`}>
           <div className="rounded-xl border border-sky-100 bg-sky-50 px-4 py-3">
-            <div className="text-xs font-semibold uppercase tracking-wide text-sky-600">Part Number</div>
+            <div className="text-xs font-semibold uppercase tracking-wide text-sky-600">Jumlah Part</div>
             <div className="mt-1 text-2xl font-bold text-slate-900">{summaryStats.partCount}</div>
           </div>
           <div className="rounded-xl border border-emerald-100 bg-emerald-50 px-4 py-3">
-            <div className="text-xs font-semibold uppercase tracking-wide text-emerald-600">Total PLAN</div>
+            <div className="text-xs font-semibold uppercase tracking-wide text-emerald-600">Total Jadwal</div>
             <div className="mt-1 text-2xl font-bold text-slate-900">{formatQty(summaryStats.planTotal)}</div>
           </div>
           <div className="rounded-xl border border-indigo-100 bg-indigo-50 px-4 py-3">
-            <div className="text-xs font-semibold uppercase tracking-wide text-indigo-600">Total ACTUAL</div>
+            <div className="text-xs font-semibold uppercase tracking-wide text-indigo-600">Total Aktual</div>
             <div className="mt-1 text-2xl font-bold text-slate-900">{formatQty(summaryStats.actualTotal)}</div>
           </div>
           <div className="rounded-xl border border-rose-100 bg-rose-50 px-4 py-3">
-            <div className="text-xs font-semibold uppercase tracking-wide text-rose-600">BALANCE Akhir</div>
+            <div className="text-xs font-semibold uppercase tracking-wide text-rose-600">Selisih Akhir</div>
             <div className={`mt-1 text-2xl font-bold ${summaryStats.balanceEnd < 0 ? 'text-red-600' : summaryStats.balanceEnd > 0 ? 'text-blue-600' : 'text-slate-900'}`}>
               {formatQty(summaryStats.balanceEnd)}
             </div>
           </div>
           <div className="rounded-xl border border-amber-100 bg-amber-50 px-4 py-3">
-            <div className="text-xs font-semibold uppercase tracking-wide text-amber-700">PO / Supplier</div>
+            <div className="text-xs font-semibold uppercase tracking-wide text-amber-700">No PO / Supplier</div>
             <div className="mt-1 text-2xl font-bold text-slate-900">
               {summaryStats.poCount} / {summaryStats.supplierCount}
             </div>
@@ -866,15 +906,15 @@ const TabReportInbound = ({
       <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
           <div>
-            <div className="text-sm font-semibold text-slate-900">Trend Harian</div>
-            <div className="text-xs text-slate-500">PLAN, ACTUAL, BALANCE per tanggal kalender</div>
+            <div className="text-sm font-semibold text-slate-900">Tren Harian</div>
+            <div className="text-xs text-slate-500">Jadwal, Aktual SJ, dan selisih per tanggal kalender</div>
           </div>
         </div>
         <div className={`${meetingMode ? 'h-[300px]' : 'h-[360px]'} px-2 py-4`}>
           {isLoading ? (
             <div className="flex h-full items-center justify-center text-sm text-slate-500">
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              Memuat data schedule...
+              Memuat data jadwal...
             </div>
           ) : (
             <SafeResponsiveContainer>
@@ -894,9 +934,9 @@ const TabReportInbound = ({
                 />
                 <Legend />
                 <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="4 4" />
-                <Line type="monotone" dataKey="plan" name="PLAN (DO)" stroke="#16a34a" strokeWidth={2.5} dot={{ r: 2 }} />
-                <Line type="monotone" dataKey="actual" name="ACTUAL" stroke="#2563eb" strokeWidth={2.5} dot={{ r: 2 }} />
-                <Line type="monotone" dataKey="balance" name="BALANCE" stroke="#dc2626" strokeWidth={2.5} dot={{ r: 2 }} />
+                <Line type="monotone" dataKey="plan" name="Jadwal" stroke="#16a34a" strokeWidth={2.5} dot={{ r: 2 }} />
+                <Line type="monotone" dataKey="actual" name="Aktual SJ" stroke="#2563eb" strokeWidth={2.5} dot={{ r: 2 }} />
+                <Line type="monotone" dataKey="balance" name="Selisih" stroke="#dc2626" strokeWidth={2.5} dot={{ r: 2 }} />
               </LineChart>
             </SafeResponsiveContainer>
           )}
@@ -908,23 +948,24 @@ const TabReportInbound = ({
           <div>
             <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
               <Table2 size={16} />
-              Matriks Horizontal
+              Matriks Jadwal Horizontal
             </div>
             <div className="text-xs text-slate-500">
-              Setiap part number dipecah menjadi 3 baris: DO, ACT, dan BLC.
+              Setiap part number dipecah menjadi 3 baris: Jadwal, Aktual, dan Selisih.
             </div>
           </div>
           <div className="text-xs text-slate-500">
-            Rumus BLC: Balance Hari Ini = Balance Kemarin + Actual Hari Ini - DO Hari Ini
+            Rumus Selisih: Selisih Hari Ini = Selisih Kemarin + Aktual Hari Ini - Jadwal Hari Ini
           </div>
         </div>
 
         <div className="overflow-x-auto">
-          <table className={`min-w-[1600px] border-separate border-spacing-0 text-xs table-fixed ${meetingMode ? 'bg-white' : ''}`}>
+          <table className={`min-w-[1500px] border-separate border-spacing-0 text-xs table-fixed ${meetingMode ? 'bg-white' : ''}`}>
             <colgroup>
               <col style={{ width: `${MATRIX_COL_WIDTHS.index}px` }} />
               <col style={{ width: `${MATRIX_COL_WIDTHS.po}px` }} />
               <col style={{ width: `${MATRIX_COL_WIDTHS.supplier}px` }} />
+              <col style={{ width: `${MATRIX_COL_WIDTHS.doNumber}px` }} />
               <col style={{ width: `${MATRIX_COL_WIDTHS.partCode}px` }} />
               <col style={{ width: `${MATRIX_COL_WIDTHS.partName}px` }} />
               <col style={{ width: `${MATRIX_COL_WIDTHS.unit}px` }} />
@@ -936,13 +977,14 @@ const TabReportInbound = ({
             </colgroup>
             <thead>
               <tr className="bg-slate-900 text-white">
-                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-2 py-3 text-left font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.index, MATRIX_COL_WIDTHS.index, 30)}>#</th>
-                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-2 py-3 text-left font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.po, MATRIX_COL_WIDTHS.po, 30)}>No PO</th>
-                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-2 py-3 text-left font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.supplier, MATRIX_COL_WIDTHS.supplier, 30)}>Supplier</th>
-                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-2 py-3 text-left font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.partCode, MATRIX_COL_WIDTHS.partCode, 30)}>Part Code</th>
-                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-2 py-3 text-left font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.partName, MATRIX_COL_WIDTHS.partName, 30)}>Part Name</th>
-                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-2 py-3 text-left font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.unit, MATRIX_COL_WIDTHS.unit, 30)}>Unit</th>
-                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-2 py-3 text-left font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.type, MATRIX_COL_WIDTHS.type, 30)}>Type</th>
+                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-1.5 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.index, MATRIX_COL_WIDTHS.index, 30)}>#</th>
+                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-1.5 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.po, MATRIX_COL_WIDTHS.po, 30)}>No PO</th>
+                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-1.5 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.supplier, MATRIX_COL_WIDTHS.supplier, 30)}>Supplier</th>
+                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-1.5 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.doNumber, MATRIX_COL_WIDTHS.doNumber, 30)}>No SJ / DO</th>
+                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-1.5 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.partCode, MATRIX_COL_WIDTHS.partCode, 30)}>Part Code</th>
+                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-1.5 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.partName, MATRIX_COL_WIDTHS.partName, 30)}>Part Name</th>
+                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-1.5 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.unit, MATRIX_COL_WIDTHS.unit, 30)}>Unit</th>
+                <th className="sticky z-30 border-b border-r border-slate-700 bg-slate-900 px-1.5 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.type, MATRIX_COL_WIDTHS.type, 30)}>Jenis</th>
                 {dayColumns.map((day) => (
                   <th key={day.dateKey} className="border-b border-r border-slate-700 px-1 py-2 text-center whitespace-nowrap bg-slate-800">
                     <div className="text-[11px] font-bold leading-3">{day.label}</div>
@@ -955,7 +997,7 @@ const TabReportInbound = ({
             <tbody>
               {matrixGroups.length === 0 && (
                 <tr>
-                  <td colSpan={8 + dayColumns.length} className="px-4 py-10 text-center text-sm text-slate-500">
+                  <td colSpan={9 + dayColumns.length} className="px-4 py-10 text-center text-sm text-slate-500">
                     Tidak ada data untuk filter yang dipilih.
                   </td>
                 </tr>
@@ -986,28 +1028,31 @@ const TabReportInbound = ({
                       >
                         {rowIndex === 0 && (
                           <>
-                            <td rowSpan={3} className="sticky z-20 border-b border-r border-slate-300 bg-inherit px-2 py-3 align-top font-semibold" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.index, MATRIX_COL_WIDTHS.index)}>
+                            <td rowSpan={3} className="sticky z-20 border-b border-r border-slate-300 bg-inherit px-1.5 py-2.5 align-top font-semibold" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.index, MATRIX_COL_WIDTHS.index)}>
                               {group.rowNo}
                             </td>
-                            <td rowSpan={3} className="sticky z-20 border-b border-r border-slate-300 bg-inherit px-2 py-3 align-top font-semibold break-words" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.po, MATRIX_COL_WIDTHS.po)}>
+                            <td rowSpan={3} className="sticky z-20 border-b border-r border-slate-300 bg-inherit px-1.5 py-2.5 align-top font-semibold break-words text-[11px] leading-snug" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.po, MATRIX_COL_WIDTHS.po)}>
                               {group.poNumber || '-'}
                             </td>
-                            <td rowSpan={3} className="sticky z-20 border-b border-r border-slate-300 bg-inherit px-2 py-3 align-top break-words" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.supplier, MATRIX_COL_WIDTHS.supplier)}>
+                            <td rowSpan={3} className="sticky z-20 border-b border-r border-slate-300 bg-inherit px-1.5 py-2.5 align-top break-words text-[11px] leading-snug" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.supplier, MATRIX_COL_WIDTHS.supplier)}>
                               {group.supplierName || '-'}
                             </td>
-                            <td rowSpan={3} className="sticky z-20 border-b border-r border-slate-300 bg-inherit px-2 py-3 align-top font-semibold text-slate-900 break-words" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.partCode, MATRIX_COL_WIDTHS.partCode)}>
+                            <td rowSpan={3} className="sticky z-20 border-b border-r border-slate-300 bg-inherit px-1.5 py-2.5 align-top break-words text-[11px] leading-snug text-slate-700" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.doNumber, MATRIX_COL_WIDTHS.doNumber)}>
+                              {group.doNumberLabel || '-'}
+                            </td>
+                            <td rowSpan={3} className="sticky z-20 border-b border-r border-slate-300 bg-inherit px-1.5 py-2.5 align-top font-semibold text-slate-900 break-words text-[11px] leading-snug" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.partCode, MATRIX_COL_WIDTHS.partCode)}>
                               {group.itemCode || '-'}
                             </td>
-                            <td rowSpan={3} className="sticky z-20 border-b border-r border-slate-300 bg-inherit px-2 py-3 align-top text-slate-700 break-words" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.partName, MATRIX_COL_WIDTHS.partName)}>
+                            <td rowSpan={3} className="sticky z-20 border-b border-r border-slate-300 bg-inherit px-1.5 py-2.5 align-top text-slate-700 break-words text-[11px] leading-snug" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.partName, MATRIX_COL_WIDTHS.partName)}>
                               {group.itemName || '-'}
                             </td>
-                            <td rowSpan={3} className="sticky z-20 border-b border-r border-slate-300 bg-inherit px-2 py-3 align-top" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.unit, MATRIX_COL_WIDTHS.unit)}>
+                            <td rowSpan={3} className="sticky z-20 border-b border-r border-slate-300 bg-inherit px-1.5 py-2.5 align-top text-[11px]" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.unit, MATRIX_COL_WIDTHS.unit)}>
                               {group.unit || '-'}
                             </td>
                           </>
                         )}
-                        <td className="sticky z-20 border-b border-r border-slate-300 px-2 py-3 font-semibold bg-inherit" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.type, MATRIX_COL_WIDTHS.type)}>
-                          <span className={`inline-flex min-w-[48px] justify-center rounded-md px-2 py-1 text-[11px] font-bold tracking-wide border ${
+                        <td className="sticky z-20 border-b border-r border-slate-300 px-1.5 py-2.5 font-semibold bg-inherit" style={stickyCellStyle(MATRIX_LEFT_OFFSETS.type, MATRIX_COL_WIDTHS.type)}>
+                          <span className={`inline-flex min-w-[42px] justify-center rounded-md px-1.5 py-1 text-[10px] font-bold tracking-wide border ${
                             typeLabel === 'DO'
                               ? 'bg-emerald-100 text-emerald-700 border-emerald-300'
                               : typeLabel === 'ACT'
@@ -1039,7 +1084,7 @@ const TabReportInbound = ({
                           );
                         })}
                         <td
-                          className={`border-b border-slate-200 px-2 py-3 text-center tabular-nums font-semibold ${
+                          className={`border-b border-slate-200 px-1.5 py-3 text-center tabular-nums font-semibold ${
                             typeLabel === 'BLC'
                               ? (Number(totalValue) < 0 ? 'text-red-600' : Number(totalValue) > 0 ? 'text-blue-600' : 'text-slate-700')
                               : 'text-slate-700'

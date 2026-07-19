@@ -8,11 +8,13 @@ import {
   FileSpreadsheet,
   FileUp,
   Plus,
+  Route,
   Save,
   Trash2,
   X as XIcon,
 } from 'lucide-react';
 import BomManager from '../components/BomManager';
+import SearchableSelectDropdown from '../components/SearchableSelectDropdown';
 
 const TabMasterRef = (props) => {
   const {
@@ -48,6 +50,7 @@ const TabMasterRef = (props) => {
     handleEditModel,
     handleEditProcess,
     handleExportItemsXls,
+    handleExportBomProjectXls,
     handleSaveArea,
     handleSaveCategory,
     handleSaveConfig,
@@ -65,6 +68,9 @@ const TabMasterRef = (props) => {
     itemBulkCustomer,
     itemBulkOpen,
     itemBulkSaving,
+    itemBulkRoutingTemplateCode,
+    itemBulkRoutingMode,
+    itemBulkRoutingSaving,
     itemBulkShelfLife,
     itemBulkSupplier,
     itemBulkTypePack,
@@ -135,6 +141,9 @@ const TabMasterRef = (props) => {
     setItemBulkCustomer,
     setItemBulkOpen,
     setItemBulkSaving,
+    setItemBulkRoutingTemplateCode,
+    setItemBulkRoutingMode,
+    setItemBulkRoutingSaving,
     setItemBulkShelfLife,
     setItemBulkSupplier,
     setItemBulkTypePack,
@@ -232,6 +241,21 @@ const TabMasterRef = (props) => {
     'PAIR',
     'DOZ',
   ];
+  const routingTemplateItems = useMemo(() => (
+    Array.isArray(masterItems) ? masterItems : []
+  ).filter((item) => {
+    const flow = Array.isArray(item?.process_routing) && item.process_routing.length > 0
+      ? item.process_routing
+      : Array.isArray(item?.process_flow) && item.process_flow.length > 0
+        ? item.process_flow
+        : [];
+    const hasRoutingText = flow.length > 0;
+    const hasLine = String(item?.line_production || '').trim();
+    const hasLocation = String(item?.location_name || '').trim();
+    const hasCycle = Number(item?.cycle_time_seconds || 0) > 0;
+    const hasLead = Number(item?.lead_time_days || 0) > 0;
+    return hasRoutingText || hasLine || hasLocation || hasCycle || hasLead;
+  }), [masterItems]);
   const itemWarehouseOptions = useMemo(() => {
     const seen = new Set();
     return (masterWarehouses || [])
@@ -249,6 +273,24 @@ const TabMasterRef = (props) => {
         return true;
       });
   }, [masterWarehouses]);
+  const itemPackingOptions = useMemo(() => {
+    const seen = new Set();
+    return (masterPackings || [])
+      .map((packing) => {
+        const value = String(packing.code || '').trim();
+        const name = String(packing.name || '').trim();
+        return {
+          value,
+          label: [value, name].filter(Boolean).join(' - '),
+          packing,
+        };
+      })
+      .filter((option) => {
+        if (!option.value || seen.has(option.value)) return false;
+        seen.add(option.value);
+        return true;
+      });
+  }, [masterPackings]);
   const itemProcessOptions = useMemo(() => {
     const seen = new Set();
     return (masterProcesses || [])
@@ -291,6 +333,48 @@ const TabMasterRef = (props) => {
     });
     return matchedByKeyword ? String(matchedByKeyword.code || '').trim() : raw;
   };
+  const isProductionOutputItemCategory = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return false;
+    const matched = (masterCategories || []).find((category) => (
+      String(category.code || '').trim().toLowerCase() === raw.toLowerCase()
+      || String(category.name || '').trim().toLowerCase() === raw.toLowerCase()
+    ));
+    const text = [
+      raw,
+      matched?.code || '',
+      matched?.name || '',
+    ].join(' ').toLowerCase();
+    const compact = text.replace(/[^a-z0-9]+/g, '');
+    return (
+      compact === 'fg'
+      || compact === 'sa'
+      || compact.includes('finishedgood')
+      || compact.includes('finishgood')
+      || compact.includes('finishgoods')
+      || compact.includes('assembly')
+      || compact.includes('assy')
+      || compact.includes('subassy')
+      || compact.includes('subassembly')
+    );
+  };
+  const isCustomerAllowedItemCategory = isProductionOutputItemCategory;
+  const isSupplierAllowedItemCategory = (value) => !isProductionOutputItemCategory(value);
+  const isItemCustomerEnabled = isCustomerAllowedItemCategory(itemMasterForm?.type);
+  const isItemSupplierEnabled = isSupplierAllowedItemCategory(itemMasterForm?.type);
+
+  useEffect(() => {
+    if (isItemCustomerEnabled) return;
+    if (!Array.isArray(itemMasterForm?.customers) || itemMasterForm.customers.length === 0) return;
+    setItemMasterForm((prev) => ({ ...prev, customers: [] }));
+  }, [isItemCustomerEnabled, itemMasterForm?.customers?.length, setItemMasterForm]);
+
+  useEffect(() => {
+    if (isItemSupplierEnabled) return;
+    if (!Array.isArray(itemMasterForm?.suppliers) || itemMasterForm.suppliers.length === 0) return;
+    setItemMasterForm((prev) => ({ ...prev, suppliers: [] }));
+  }, [isItemSupplierEnabled, itemMasterForm?.suppliers?.length, setItemMasterForm]);
+
   const getItemPackingCode = (value) => {
     const raw = String(value || '').trim();
     if (!raw) return '-';
@@ -298,7 +382,15 @@ const TabMasterRef = (props) => {
       String(packing.code || '').trim().toLowerCase() === raw.toLowerCase()
       || String(packing.name || '').trim().toLowerCase() === raw.toLowerCase()
     ));
-    return matched ? String(matched.code || '').trim() : raw;
+    return matched
+      ? [String(matched.code || '').trim(), String(matched.name || '').trim()].filter(Boolean).join(' - ')
+      : raw;
+  };
+  const getItemModelCodesOnly = (item) => {
+    const sourceCodes = Array.isArray(item?.modelCodes) && item.modelCodes.length > 0
+      ? item.modelCodes
+      : parseModelCodes(item?.model || '');
+    return formatModelCodes(masterModelsMap, sourceCodes) || '-';
   };
   const itemProcessRoutingRows = useMemo(() => {
     const rows = Array.isArray(itemMasterForm?.processRouting) && itemMasterForm.processRouting.length > 0
@@ -368,6 +460,21 @@ const TabMasterRef = (props) => {
       cycleTimeSeconds: String(currentRow?.cycleTimeSeconds || '').trim() || String(matchedProcess?.standard_time ?? ''),
     });
   };
+  const handleItemWarehouseChange = (value, option = null) => {
+    const nextLocationId = String(value || '').trim();
+    const selectedWarehouse = option?.warehouse || (masterWarehouses || []).find(
+      (warehouse) => String(warehouse.id || '').trim() === nextLocationId,
+    );
+    const nextLocationName = selectedWarehouse ? buildWarehouseLabel(selectedWarehouse) : '';
+    setItemMasterForm((prev) => ({
+      ...prev,
+      locationId: nextLocationId,
+      locationName: nextLocationName,
+    }));
+  };
+  const handleItemLineProductionChange = (value) => {
+    setItemMasterForm((prev) => ({ ...prev, lineProduction: String(value || '').trim() }));
+  };
 
   const processTypeOptions = useMemo(() => {
     const defaults = ['Subcon', 'Assembly', 'Machining', 'Welding', 'Painting', 'Inspection', 'Packing', 'Other'];
@@ -405,6 +512,29 @@ const TabMasterRef = (props) => {
     );
     return matched?.label || raw;
   };
+  const warehouseById = useMemo(
+    () => new Map((masterWarehouses || []).map((wh) => [wh.id, wh])),
+    [masterWarehouses],
+  );
+  const areaById = useMemo(
+    () => new Map((masterAreas || []).map((area) => [area.id, area])),
+    [masterAreas],
+  );
+  const itemProductionSourceMeta = useMemo(() => {
+    const warehouseId = String(itemMasterForm?.locationId || '').trim();
+    const lineId = String(itemMasterForm?.lineProduction || '').trim();
+    const warehouse = warehouseById.get(warehouseId) || null;
+    const line = (masterLocations || []).find((location) => String(location.id || '').trim() === lineId) || null;
+    const areaId = String(line?.area_id || line?.areaId || '').trim();
+    const area = areaById.get(areaId) || null;
+    const plant = (masterPlants || []).find((row) => String(row.id || '').trim() === String(area?.plant_id || area?.plantId || '').trim()) || null;
+    return {
+      warehouse: buildWarehouseLabel(warehouse) || itemMasterForm?.locationName || warehouseId || '-',
+      line: buildLocationLabel(line) || getProcessWorkCenterLabel(lineId),
+      area: area ? `${area.id} - ${area.name}` : '-',
+      plant: plant ? `${plant.id} - ${plant.name}` : String(warehouse?.site || plant?.site || '').trim() || '-',
+    };
+  }, [areaById, itemMasterForm?.lineProduction, itemMasterForm?.locationId, itemMasterForm?.locationName, masterLocations, masterPlants, warehouseById]);
   const masterFormHelperText = {
     warehouse: 'Gedung fisik atau fungsi utama secara keseluruhan. Contoh: Gudang Material (RM), Gudang Barang Jadi (FG).',
     area: 'Pembagian zona atau blok di dalam Gudang. Contoh: Area Karantina, Area Rak Besi.',
@@ -412,6 +542,23 @@ const TabMasterRef = (props) => {
     productionLine: 'Jalur produksi atau area perakitan secara keseluruhan. Contoh: Line Perakitan Rangka, Line Pengecatan.',
     workCenter: 'Titik mesin atau stasiun kerja spesifik di dalam Line. Contoh: Mesin Las 01, Meja Inspeksi 02.',
   };
+  const itemFieldToneClasses = {
+    identity: 'border-sky-200 bg-sky-50/70 focus:border-sky-400 focus:ring-2 focus:ring-sky-100',
+    reference: 'border-indigo-200 bg-indigo-50/60 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100',
+    packing: 'border-amber-200 bg-amber-50/70 focus:border-amber-400 focus:ring-2 focus:ring-amber-100',
+    process: 'border-violet-200 bg-violet-50/70 focus:border-violet-400 focus:ring-2 focus:ring-violet-100',
+    timing: 'border-emerald-200 bg-emerald-50/70 focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100',
+    relation: 'border-teal-200 bg-teal-50/60 focus:border-teal-400 focus:ring-2 focus:ring-teal-100',
+  };
+  const getItemFieldClass = (tone = 'identity', extra = '') => (
+    `border rounded px-3 py-2 outline-none transition ${itemFieldToneClasses[tone] || itemFieldToneClasses.identity} ${extra}`.trim()
+  );
+  const getItemCompactFieldClass = (tone = 'identity', extra = '') => (
+    `border rounded px-2 py-1 outline-none transition ${itemFieldToneClasses[tone] || itemFieldToneClasses.identity} ${extra}`.trim()
+  );
+  const getSearchableControlClass = (tone = 'reference') => (
+    `rounded border ${itemFieldToneClasses[tone] || itemFieldToneClasses.reference}`
+  );
 
   useEffect(() => {
     setLocalItemFilters(itemTableFilters || {});
@@ -498,7 +645,19 @@ const TabMasterRef = (props) => {
 
   const allowMasterEdit = !!canManageMaster;
   const allowVendorEdit = !!(canManageVendors || canManageMaster);
+  const [orgSearch, setOrgSearch] = useState('');
   const [vendorSearch, setVendorSearch] = useState('');
+  const [customerSearch, setCustomerSearch] = useState('');
+  const [modelSearch, setModelSearch] = useState('');
+  const [processSearch, setProcessSearch] = useState('');
+  const [categorySearch, setCategorySearch] = useState('');
+  const [packingSearch, setPackingSearch] = useState('');
+
+  const matchesSearch = (row, query, selectors) => {
+    const normalizedQuery = String(query || '').trim().toLowerCase();
+    if (!normalizedQuery) return true;
+    return selectors.some((selector) => String(selector(row) || '').toLowerCase().includes(normalizedQuery));
+  };
 
   useEffect(() => {
     if (typeof masterVendorSearch !== 'string') return;
@@ -517,14 +676,43 @@ const TabMasterRef = (props) => {
       return id.includes(query) || name.includes(query) || type.includes(query) || email.includes(query);
     });
   }, [masterVendors, vendorSearch]);
-  const warehouseById = useMemo(
-    () => new Map((masterWarehouses || []).map((wh) => [wh.id, wh])),
-    [masterWarehouses],
-  );
-  const areaById = useMemo(
-    () => new Map((masterAreas || []).map((area) => [area.id, area])),
-    [masterAreas],
-  );
+  const filteredCustomers = useMemo(() => (
+    (masterCustomers || []).filter((customer) => matchesSearch(customer, customerSearch, [
+      (row) => row.id,
+      (row) => row.name,
+      (row) => row.email,
+      (row) => row.lead_time_days,
+    ]))
+  ), [customerSearch, masterCustomers]);
+  const filteredModels = useMemo(() => (
+    (masterModels || []).filter((model) => matchesSearch(model, modelSearch, [
+      (row) => row.code,
+      (row) => row.name,
+    ]))
+  ), [masterModels, modelSearch]);
+  const filteredProcesses = useMemo(() => (
+    (masterProcesses || []).filter((process) => matchesSearch(process, processSearch, [
+      (row) => row.code,
+      (row) => row.name,
+      (row) => row.process_type || row.processType,
+      (row) => row.applies_to_level || row.appliesToLevel,
+      (row) => row.work_center || row.workCenter,
+      (row) => row.sequence,
+      (row) => row.standard_time,
+    ]))
+  ), [masterProcesses, processSearch]);
+  const filteredCategories = useMemo(() => (
+    (masterCategories || []).filter((category) => matchesSearch(category, categorySearch, [
+      (row) => row.code,
+      (row) => row.name,
+    ]))
+  ), [categorySearch, masterCategories]);
+  const filteredPackings = useMemo(() => (
+    (masterPackings || []).filter((packing) => matchesSearch(packing, packingSearch, [
+      (row) => row.code,
+      (row) => row.name,
+    ]))
+  ), [masterPackings, packingSearch]);
   const getAreaWarehouseId = (area) => area?.warehouse_id || area?.plant_id || '';
   const getWarehouseLabel = (warehouseId) => {
     if (!warehouseId) return '-';
@@ -536,6 +724,42 @@ const TabMasterRef = (props) => {
     const area = areaById.get(areaId);
     return area ? `${area.id} - ${area.name}` : areaId;
   };
+  const filteredWarehouses = useMemo(() => (
+    (masterWarehouses || []).filter((warehouse) => matchesSearch(warehouse, orgSearch, [
+      (row) => row.id,
+      (row) => row.name,
+      (row) => row.site,
+      (row) => row.type,
+    ]))
+  ), [masterWarehouses, orgSearch]);
+  const filteredAreas = useMemo(() => (
+    (masterAreas || []).filter((area) => matchesSearch(area, orgSearch, [
+      (row) => row.id,
+      (row) => row.name,
+      (row) => getAreaWarehouseId(row),
+      (row) => getWarehouseLabel(getAreaWarehouseId(row)),
+    ]))
+  ), [masterAreas, orgSearch, warehouseById]);
+  const filteredLocations = useMemo(() => (
+    (masterLocations || []).filter((location) => matchesSearch(location, orgSearch, [
+      (row) => row.id,
+      (row) => row.line_description || row.lineDescription,
+      (row) => row.area_id || row.areaId,
+      (row) => getAreaLabel(row.area_id || row.areaId),
+      (row) => row.warehouse_id || row.warehouseId,
+      (row) => getWarehouseLabel(row.warehouse_id || row.warehouseId),
+      (row) => row.fifo_lane || row.fifoLane,
+      (row) => row.machine_note || row.machineNote,
+    ]))
+  ), [areaById, masterLocations, orgSearch, warehouseById]);
+  const filteredDeliveries = useMemo(() => (
+    (masterDeliveries || []).filter((delivery) => matchesSearch(delivery, orgSearch, [
+      (row) => row.id,
+      (row) => row.area_id || row.areaId,
+      (row) => getAreaLabel(row.area_id || row.areaId),
+      (row) => row.address,
+    ]))
+  ), [areaById, masterDeliveries, orgSearch]);
   const isLocationProcessEnabled = isProcessLocationType(locationForm?.lineDescription);
   const getProcessScopeLabel = (value) => {
     const normalized = String(value || '').trim().toLowerCase();
@@ -653,6 +877,8 @@ const TabMasterRef = (props) => {
   };
   const allowItemEdit = !!canManageItems;
   const normalizeDuplicateKey = (value) => String(value ?? '').trim().toLowerCase();
+  const getMasterActionTitle = (allowed, label) => (allowed ? label : `${label} - tidak tersedia untuk role ini`);
+  const getMasterActionClassName = (baseClassName, disabled) => `${baseClassName}${disabled ? ' opacity-50 cursor-not-allowed' : ''}`;
 
   return (
     <>
@@ -740,19 +966,32 @@ const TabMasterRef = (props) => {
                 <div className="bg-white rounded-xl border p-4">
                   <div className="flex items-center justify-between mb-3">
                     <div className="text-sm font-semibold">Warehouse</div>
-                    {allowMasterEdit && (
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      <input
+                        className="w-56 rounded border px-3 py-1.5 text-xs"
+                        placeholder="Cari warehouse..."
+                        value={orgSearch}
+                        onChange={(e) => setOrgSearch(e.target.value)}
+                      />
+                      <div className="text-[11px] text-slate-500">
+                        {filteredWarehouses.length} / {masterWarehouses.length} warehouse
+                      </div>
                       <button
+                        type="button"
+                        disabled={!allowMasterEdit}
+                        title={getMasterActionTitle(allowMasterEdit, 'Tambah Baru')}
                         onClick={() => {
+                          if (!allowMasterEdit) return;
                           setWarehouseForm({ id: '', name: '', site: '', type: 'MAIN' });
                           setEditingWarehouseId(null);
                           setMasterFormVisible((prev) => ({ ...prev, warehouse: true }));
                         }}
-                        className="px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1"
+                        className={getMasterActionClassName('px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1', !allowMasterEdit)}
                       >
                         <Plus size={14} />
                         <span>Tambah Baru</span>
                       </button>
-                    )}
+                    </div>
                   </div>
                   {masterFormVisible.warehouse && allowMasterEdit && (
                     <>
@@ -796,7 +1035,7 @@ const TabMasterRef = (props) => {
                       </tr>
                     </thead>
                     <tbody>
-                      {masterWarehouses.map((wh) => (
+                      {filteredWarehouses.map((wh) => (
                         <tr key={wh.id} className="border-t">
                           <td className="p-2">{wh.id}</td>
                           <td className="p-2">{wh.name}</td>
@@ -838,19 +1077,32 @@ const TabMasterRef = (props) => {
               <div className="bg-white rounded-xl border p-4">
                   <div className="flex items-center justify-between mb-3">
                     <div className="text-sm font-semibold">Area</div>
-                  {allowMasterEdit && (
-                    <button
-                      onClick={() => {
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      <input
+                        className="w-56 rounded border px-3 py-1.5 text-xs"
+                        placeholder="Cari area..."
+                        value={orgSearch}
+                        onChange={(e) => setOrgSearch(e.target.value)}
+                      />
+                      <div className="text-[11px] text-slate-500">
+                        {filteredAreas.length} / {masterAreas.length} area
+                      </div>
+                      <button
+                        type="button"
+                        disabled={!allowMasterEdit}
+                        title={getMasterActionTitle(allowMasterEdit, 'Tambah Baru')}
+                        onClick={() => {
+                          if (!allowMasterEdit) return;
                           setAreaForm({ id: '', name: '', warehouseId: '' });
                           setEditingAreaId(null);
                           setMasterFormVisible((prev) => ({ ...prev, area: true }));
                         }}
-                        className="px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1"
+                        className={getMasterActionClassName('px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1', !allowMasterEdit)}
                       >
                         <Plus size={14} />
                         <span>Tambah Baru</span>
                       </button>
-                    )}
+                    </div>
                   </div>
                   {masterFormVisible.area && allowMasterEdit && (
                     <>
@@ -889,7 +1141,7 @@ const TabMasterRef = (props) => {
                       </tr>
                     </thead>
                     <tbody>
-                      {masterAreas.map((area) => (
+                      {filteredAreas.map((area) => (
                         <tr key={area.id} className="border-t">
                           <td className="p-2">{area.id}</td>
                           <td className="p-2">{area.name}</td>
@@ -930,19 +1182,32 @@ const TabMasterRef = (props) => {
               <div className="bg-white rounded-xl border p-4">
                   <div className="flex items-center justify-between mb-3">
                     <div className="text-sm font-semibold">Location</div>
-                    {allowMasterEdit && (
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      <input
+                        className="w-56 rounded border px-3 py-1.5 text-xs"
+                        placeholder="Cari location..."
+                        value={orgSearch}
+                        onChange={(e) => setOrgSearch(e.target.value)}
+                      />
+                      <div className="text-[11px] text-slate-500">
+                        {filteredLocations.length} / {masterLocations.length} location
+                      </div>
                       <button
+                        type="button"
+                        disabled={!allowMasterEdit}
+                        title={getMasterActionTitle(allowMasterEdit, 'Tambah Baru')}
                         onClick={() => {
-                        setLocationForm({ id: '', lineDescription: '', areaId: '', warehouseId: '', category: 'Raw Material', fifoLane: '', machineNote: '' });
+                          if (!allowMasterEdit) return;
+                          setLocationForm({ id: '', lineDescription: '', areaId: '', warehouseId: '', category: 'Raw Material', fifoLane: '', machineNote: '' });
                           setEditingLocationId(null);
                           setMasterFormVisible((prev) => ({ ...prev, location: true }));
                         }}
-                        className="px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1"
+                        className={getMasterActionClassName('px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1', !allowMasterEdit)}
                       >
                         <Plus size={14} />
                         <span>Tambah Baru</span>
                       </button>
-                    )}
+                    </div>
                   </div>
                   {masterFormVisible.location && allowMasterEdit && (
                     <>
@@ -1064,7 +1329,7 @@ const TabMasterRef = (props) => {
                       </tr>
                     </thead>
                     <tbody>
-                      {masterLocations.map((loc) => {
+                      {filteredLocations.map((loc) => {
                         const resolvedAreaId = loc.area_id
                           || loc.areaId
                           || masterAreas.find((area) => getAreaWarehouseId(area) === loc.warehouse_id)?.id
@@ -1120,19 +1385,32 @@ const TabMasterRef = (props) => {
             <div className="bg-white rounded-xl border p-4">
                   <div className="flex items-center justify-between mb-3">
                     <div className="text-sm font-semibold">Delivery Address</div>
-                    {allowMasterEdit && (
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      <input
+                        className="w-56 rounded border px-3 py-1.5 text-xs"
+                        placeholder="Cari delivery..."
+                        value={orgSearch}
+                        onChange={(e) => setOrgSearch(e.target.value)}
+                      />
+                      <div className="text-[11px] text-slate-500">
+                        {filteredDeliveries.length} / {masterDeliveries.length} delivery
+                      </div>
                       <button
+                        type="button"
+                        disabled={!allowMasterEdit}
+                        title={getMasterActionTitle(allowMasterEdit, 'Tambah Baru')}
                         onClick={() => {
+                          if (!allowMasterEdit) return;
                           setDeliveryForm({ id: '', areaId: '', address: '' });
                           setEditingDeliveryId(null);
                           setMasterFormVisible((prev) => ({ ...prev, delivery: true }));
                         }}
-                        className="px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1"
+                        className={getMasterActionClassName('px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1', !allowMasterEdit)}
                       >
                         <Plus size={14} />
                         <span>Tambah Baru</span>
                       </button>
-                    )}
+                    </div>
                   </div>
                   {masterFormVisible.delivery && allowMasterEdit && (
                     <>
@@ -1168,7 +1446,7 @@ const TabMasterRef = (props) => {
                       </tr>
                     </thead>
                     <tbody>
-                      {masterDeliveries.map((delivery) => (
+                      {filteredDeliveries.map((delivery) => (
                         <tr key={delivery.id} className="border-t">
                           <td className="p-2">{delivery.id}</td>
                           <td className="p-2">{delivery.area_id}</td>
@@ -1224,28 +1502,30 @@ const TabMasterRef = (props) => {
                         if (typeof setMasterVendorSearch === 'function') setMasterVendorSearch(next);
                       }}
                     />
-                    {allowVendorEdit && (
-                      <button
-                        onClick={() => {
-                          setVendorForm({
-                            id: '',
-                            name: '',
-                            type: 'Supplier',
-                            role: 'Delivery Note',
-                            email: '',
-                            leadTimeDays: '',
-                            dailyCapacityQty: '',
-                            deliverySchedule: [],
-                          });
-                          setEditingVendorId(null);
-                          setMasterFormVisible((prev) => ({ ...prev, vendor: true }));
-                        }}
-                        className="px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1"
-                      >
-                        <Plus size={14} />
-                        <span>Tambah Baru</span>
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      disabled={!allowVendorEdit}
+                      title={getMasterActionTitle(allowVendorEdit, 'Tambah Baru')}
+                      onClick={() => {
+                        if (!allowVendorEdit) return;
+                        setVendorForm({
+                          id: '',
+                          name: '',
+                          type: 'Supplier',
+                          role: 'Delivery Note',
+                          email: '',
+                          leadTimeDays: '',
+                          dailyCapacityQty: '',
+                          deliverySchedule: [],
+                        });
+                        setEditingVendorId(null);
+                        setMasterFormVisible((prev) => ({ ...prev, vendor: true }));
+                      }}
+                      className={getMasterActionClassName('px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1', !allowVendorEdit)}
+                    >
+                      <Plus size={14} />
+                      <span>Tambah Baru</span>
+                    </button>
                   </div>
                 </div>
                 {masterFormVisible.vendor && allowVendorEdit && (
@@ -1415,19 +1695,29 @@ const TabMasterRef = (props) => {
               <div className="bg-white rounded-xl border p-4">
                 <div className="flex items-center justify-between mb-3">
                   <div className="text-sm font-semibold">Customer</div>
-                  {allowMasterEdit && (
+                  <div className="flex items-center gap-2">
+                    <input
+                      className="border rounded px-3 py-1.5 text-xs"
+                      placeholder="Cari customer..."
+                      value={customerSearch}
+                      onChange={(e) => setCustomerSearch(e.target.value)}
+                    />
                     <button
+                      type="button"
+                      disabled={!allowMasterEdit}
+                      title={getMasterActionTitle(allowMasterEdit, 'Tambah Baru')}
                       onClick={() => {
+                        if (!allowMasterEdit) return;
                         setCustomerForm({ id: '', name: '', email: '', leadTimeDays: '' });
                         setEditingCustomerId(null);
                         setMasterFormVisible((prev) => ({ ...prev, customer: true }));
                       }}
-                      className="px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1"
+                      className={getMasterActionClassName('px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1', !allowMasterEdit)}
                     >
                       <Plus size={14} />
                       <span>Tambah Baru</span>
                     </button>
-                  )}
+                  </div>
                 </div>
                 {masterFormVisible.customer && allowMasterEdit && (
                   <>
@@ -1468,7 +1758,7 @@ const TabMasterRef = (props) => {
                     </tr>
                   </thead>
                   <tbody>
-                    {masterCustomers.map((customer) => (
+                    {filteredCustomers.map((customer) => (
                       <tr key={customer.id} className="border-t">
                         <td className="p-2">{customer.id}</td>
                         <td className="p-2">{customer.name}</td>
@@ -1536,19 +1826,29 @@ const TabMasterRef = (props) => {
               <div className="bg-white rounded-xl border p-4">
                 <div className="flex items-center justify-between mb-3">
                   <div className="text-sm font-semibold">Model Catalog</div>
-                  {allowMasterEdit && (
+                  <div className="flex items-center gap-2">
+                    <input
+                      className="border rounded px-3 py-1.5 text-xs"
+                      placeholder="Cari model..."
+                      value={modelSearch}
+                      onChange={(e) => setModelSearch(e.target.value)}
+                    />
                     <button
+                      type="button"
+                      disabled={!allowMasterEdit}
+                      title={getMasterActionTitle(allowMasterEdit, 'Tambah Model Baru')}
                       onClick={() => {
+                        if (!allowMasterEdit) return;
                         setModelCatalogForm({ code: '', name: '' });
                         setEditingModelCode(null);
                         setModelFormVisible(true);
                       }}
-                      className="px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1"
+                      className={getMasterActionClassName('px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1', !allowMasterEdit)}
                     >
                       <Plus size={14} />
                       <span>Tambah Model Baru</span>
                     </button>
-                  )}
+                  </div>
                 </div>
                 {modelFormVisible && allowMasterEdit && (
                   <div className="space-y-3 border-b pb-3 mb-4">
@@ -1588,7 +1888,7 @@ const TabMasterRef = (props) => {
                       </tr>
                     </thead>
                     <tbody>
-                      {masterModels.map((model) => (
+                      {filteredModels.map((model) => (
                         <tr key={model.code} className="border-t">
                           <td className="p-2">{model.code}</td>
                           <td className="p-2">{model.name}</td>
@@ -1620,7 +1920,7 @@ const TabMasterRef = (props) => {
                           </td>
                         </tr>
                       ))}
-                      {masterModels.length === 0 && (
+                      {filteredModels.length === 0 && (
                         <tr>
                           <td colSpan={3} className="p-4 text-center text-gray-500">Belum ada model.</td>
                         </tr>
@@ -1635,9 +1935,19 @@ const TabMasterRef = (props) => {
               <div className="bg-white rounded-xl border p-4">
                 <div className="flex items-center justify-between mb-3">
                   <div className="text-sm font-semibold">Process Catalog</div>
-                  {allowMasterEdit && (
+                  <div className="flex items-center gap-2">
+                    <input
+                      className="border rounded px-3 py-1.5 text-xs"
+                      placeholder="Cari process..."
+                      value={processSearch}
+                      onChange={(e) => setProcessSearch(e.target.value)}
+                    />
                     <button
+                      type="button"
+                      disabled={!allowMasterEdit}
+                      title={getMasterActionTitle(allowMasterEdit, 'Tambah Process Baru')}
                       onClick={() => {
+                        if (!allowMasterEdit) return;
                         setProcessCatalogForm({
                           code: '',
                           name: '',
@@ -1650,12 +1960,12 @@ const TabMasterRef = (props) => {
                         setEditingProcessCode(null);
                         setProcessFormVisible(true);
                       }}
-                      className="px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1"
+                      className={getMasterActionClassName('px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1', !allowMasterEdit)}
                     >
                       <Plus size={14} />
                       <span>Tambah Process Baru</span>
                     </button>
-                  )}
+                  </div>
                 </div>
                 {processFormVisible && allowMasterEdit && (
                   <div className="space-y-3 border-b pb-3 mb-4">
@@ -1744,7 +2054,7 @@ const TabMasterRef = (props) => {
                       </tr>
                     </thead>
                     <tbody>
-                      {masterProcesses.map((process) => (
+                      {filteredProcesses.map((process) => (
                         <tr key={process.code} className="border-t">
                           <td className="p-2">{process.code}</td>
                           <td className="p-2">{process.name}</td>
@@ -1781,7 +2091,7 @@ const TabMasterRef = (props) => {
                           </td>
                         </tr>
                       ))}
-                      {masterProcesses.length === 0 && (
+                      {filteredProcesses.length === 0 && (
                         <tr>
                           <td colSpan={8} className="p-4 text-center text-gray-500">Belum ada process.</td>
                         </tr>
@@ -1796,19 +2106,29 @@ const TabMasterRef = (props) => {
               <div className="bg-white rounded-xl border p-4">
                 <div className="flex items-center justify-between mb-3">
                   <div className="text-sm font-semibold">Category</div>
-                  {allowMasterEdit && (
+                  <div className="flex items-center gap-2">
+                    <input
+                      className="border rounded px-3 py-1.5 text-xs"
+                      placeholder="Cari category..."
+                      value={categorySearch}
+                      onChange={(e) => setCategorySearch(e.target.value)}
+                    />
                     <button
+                      type="button"
+                      disabled={!allowMasterEdit}
+                      title={getMasterActionTitle(allowMasterEdit, 'Tambah Baru')}
                       onClick={() => {
+                        if (!allowMasterEdit) return;
                         setCategoryForm({ code: '', name: '' });
                         setEditingCategoryCode(null);
                         setMasterFormVisible((prev) => ({ ...prev, category: true }));
                       }}
-                      className="px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1"
+                      className={getMasterActionClassName('px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1', !allowMasterEdit)}
                     >
                       <Plus size={14} />
                       <span>Tambah Baru</span>
                     </button>
-                  )}
+                  </div>
                 </div>
                 {masterFormVisible.category && allowMasterEdit && (
                   <>
@@ -1837,7 +2157,7 @@ const TabMasterRef = (props) => {
                     </tr>
                   </thead>
                   <tbody>
-                    {masterCategories.map((category) => (
+                    {filteredCategories.map((category) => (
                       <tr key={category.code} className="border-t">
                         <td className="p-2">{category.code}</td>
                         <td className="p-2">{category.name}</td>
@@ -1876,106 +2196,138 @@ const TabMasterRef = (props) => {
 
               {masterRefTab === 'item' && (
               <div className="bg-white rounded-xl border p-4">
-                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center justify-between mb-3">
                   <div className="text-sm font-semibold">Item</div>
                   <div className="flex items-center gap-2">
-                    {allowItemEdit && (
+                    <button
+                      type="button"
+                      disabled={!allowItemEdit}
+                      title={getMasterActionTitle(allowItemEdit, 'Tambah Baru')}
+                      onClick={() => {
+                        if (!allowItemEdit) return;
+                        setItemMasterForm({ code: '', name: '', partNo: '', type: 'Raw Material', unit: 'PCS', typePack: '', packQty: '', orderLotSize: '', maxDeliveryPerRit: '', isSeasonal: false, suppliers: [], customers: [], modelCodes: [], weight: '', locationId: '', locationName: '', lineProduction: '', processRouting: [], leadTimeDays: '', cycleTimeSeconds: '', imageUrl: '', imageThumbUrl: '', shelfLifeDays: '' });
+                        setItemModelEntry('');
+                        setItemImageError('');
+                        setItemImageUploading(false);
+                        setMasterEditingItemCode(null);
+                        setMasterFormVisible((prev) => ({ ...prev, item: true }));
+                      }}
+                      className={getMasterActionClassName('px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1', !allowItemEdit)}
+                    >
+                      <Plus size={14} />
+                      <span>Tambah Baru</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!allowItemEdit || selectedItemCodes.length === 0}
+                      title={getMasterActionTitle(allowItemEdit, 'Bulk Action')}
+                      onClick={() => {
+                        if (!allowItemEdit || selectedItemCodes.length === 0) return;
+                        setItemBulkOpen(true);
+                      }}
+                      className={getMasterActionClassName('px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1', !allowItemEdit || selectedItemCodes.length === 0)}
+                    >
+                      <Flag size={14} />
+                      <span>Bulk Action</span>
+                    </button>
+                    <div className="relative">
                       <button
-                        onClick={() => {
-                          setItemMasterForm({ code: '', name: '', partNo: '', type: 'Raw Material', unit: 'PCS', typePack: '', packQty: '', orderLotSize: '', maxDeliveryPerRit: '', isSeasonal: false, suppliers: [], customers: [], modelCodes: [], weight: '', locationId: '', locationName: '', lineProduction: '', processRouting: [], leadTimeDays: '', cycleTimeSeconds: '', imageUrl: '', imageThumbUrl: '', shelfLifeDays: '' });
-                          setItemModelEntry('');
-                          setItemImageError('');
-                          setItemImageUploading(false);
-                          setMasterEditingItemCode(null);
-                          setMasterFormVisible((prev) => ({ ...prev, item: true }));
+                        type="button"
+                        disabled={!allowItemEdit || !canImportExport}
+                        onClick={(e) => {
+                          if (!allowItemEdit || !canImportExport) return;
+                          e.stopPropagation();
+                          setItemMenuOpen((prev) => !prev);
+                          setActiveMenu(null);
                         }}
-                        className="px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1"
+                        className={getMasterActionClassName('px-3 py-1.5 rounded border text-xs flex items-center gap-1 bg-slate-50 hover:bg-slate-100 text-slate-700', !allowItemEdit || !canImportExport)}
+                        title={getMasterActionTitle(allowItemEdit && canImportExport, 'Template & Import/Export Item')}
                       >
-                        <Plus size={14} />
-                        <span>Tambah Baru</span>
+                        <FileSpreadsheet size={14} />
+                        <span>Data XLS</span>
+                        <ChevronDown size={12} />
                       </button>
-                    )}
-                    {allowItemEdit && (
-                      <button
-                        onClick={() => setItemBulkOpen(true)}
-                        className="px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1"
-                        disabled={selectedItemCodes.length === 0}
-                      >
-                        <Flag size={14} />
-                        <span>Bulk Action</span>
-                      </button>
-                    )}
-                    {allowItemEdit && canImportExport && (
-                      <div className="relative">
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setItemMenuOpen((prev) => !prev);
-                            setActiveMenu(null);
-                          }}
-                          className="px-3 py-1.5 rounded border text-xs flex items-center gap-1 bg-slate-50 hover:bg-slate-100 text-slate-700"
-                          title="Template & Import/Export Item"
+                      {itemMenuOpen && (
+                        <div
+                          className="absolute right-0 top-full mt-2 w-52 bg-white rounded-xl shadow-xl border border-gray-100 overflow-hidden z-20"
+                          onClick={(e) => e.stopPropagation()}
                         >
-                          <FileSpreadsheet size={14} />
-                          <span>Data XLS</span>
-                          <ChevronDown size={12} />
-                        </button>
-                        {itemMenuOpen && (
-                          <div className="absolute right-0 top-full mt-2 w-52 bg-white rounded-xl shadow-xl border border-gray-100 overflow-hidden z-20">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                if (itemsImportRef.current) itemsImportRef.current.click();
-                                setItemMenuOpen(false);
-                              }}
-                              className="w-full text-left px-4 py-3 hover:bg-slate-50 text-sm text-slate-700 flex items-center gap-2 border-b border-gray-50"
-                            >
-                              <FileUp size={16} className="text-green-600" />
-                              Import Items (.xls/.xlsx)
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                handleExportItemsXls();
-                                setItemMenuOpen(false);
-                              }}
-                              className="w-full text-left px-4 py-3 hover:bg-slate-50 text-sm text-slate-700 flex items-center gap-2 border-b border-gray-50"
-                            >
-                              <Download size={16} className="text-blue-600" />
-                              Export Items (.xlsx)
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                handleDownloadItemsTemplate();
-                                setItemMenuOpen(false);
-                              }}
-                              className="w-full text-left px-4 py-3 hover:bg-slate-50 text-sm text-slate-700 flex items-center gap-2"
-                            >
-                              <FileSpreadsheet size={16} className="text-indigo-600" />
-                              Template XLS Item
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    )}
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (itemsImportRef.current) itemsImportRef.current.click();
+                              setItemMenuOpen(false);
+                            }}
+                            className="w-full text-left px-4 py-3 hover:bg-slate-50 text-sm text-slate-700 flex items-center gap-2 border-b border-gray-50"
+                          >
+                            <FileUp size={16} className="text-green-600" />
+                            Import Items (.xls/.xlsx)
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              handleExportItemsXls();
+                              setItemMenuOpen(false);
+                            }}
+                            className="w-full text-left px-4 py-3 hover:bg-slate-50 text-sm text-slate-700 flex items-center gap-2 border-b border-gray-50"
+                          >
+                            <Download size={16} className="text-blue-600" />
+                            Export Items (.xlsx)
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              handleExportBomProjectXls();
+                              setItemMenuOpen(false);
+                            }}
+                            className="w-full text-left px-4 py-3 hover:bg-slate-50 text-sm text-slate-700 flex items-center gap-2 border-b border-gray-50"
+                          >
+                            <FileSpreadsheet size={16} className="text-amber-600" />
+                            Export BOM Per Project
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              handleDownloadItemsTemplate();
+                              setItemMenuOpen(false);
+                            }}
+                            className="w-full text-left px-4 py-3 hover:bg-slate-50 text-sm text-slate-700 flex items-center gap-2"
+                          >
+                            <FileSpreadsheet size={16} className="text-indigo-600" />
+                            Template XLS Item
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
                 {masterFormVisible.item && allowItemEdit && (
                   <>
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs mb-3 items-stretch">
-                      <input className="border rounded px-3 py-2" placeholder="UNIQ" value={itemMasterForm.code} onChange={(e) => setItemMasterForm({ ...itemMasterForm, code: e.target.value })} />
-                      <input className="border rounded px-3 py-2" placeholder="Part Name" value={itemMasterForm.name} onChange={(e) => setItemMasterForm({ ...itemMasterForm, name: e.target.value })} />
-                      <input className="border rounded px-3 py-2" placeholder="Part No" value={itemMasterForm.partNo} onChange={(e) => setItemMasterForm({ ...itemMasterForm, partNo: e.target.value })} />
-                      <select className="border rounded px-3 py-2" value={itemMasterForm.type} onChange={(e) => setItemMasterForm({ ...itemMasterForm, type: e.target.value })}>
+                      <input className={getItemFieldClass('identity')} placeholder="UNIQ" value={itemMasterForm.code} onChange={(e) => setItemMasterForm({ ...itemMasterForm, code: e.target.value })} />
+                      <input className={getItemFieldClass('identity')} placeholder="Part Name" value={itemMasterForm.name} onChange={(e) => setItemMasterForm({ ...itemMasterForm, name: e.target.value })} />
+                      <input className={getItemFieldClass('identity')} placeholder="Part No" value={itemMasterForm.partNo} onChange={(e) => setItemMasterForm({ ...itemMasterForm, partNo: e.target.value })} />
+                      <select
+                        className={getItemFieldClass('reference')}
+                        value={itemMasterForm.type}
+                        onChange={(e) => {
+                          const nextType = e.target.value;
+                          setItemMasterForm((prev) => ({
+                            ...prev,
+                            type: nextType,
+                            customers: isCustomerAllowedItemCategory(nextType) ? prev.customers : [],
+                            suppliers: isSupplierAllowedItemCategory(nextType) ? prev.suppliers : [],
+                          }));
+                        }}
+                      >
                         {masterCategories.length > 0 ? masterCategories.map((category) => (
                           <option key={category.code} value={category.code}>{category.code} - {category.name}</option>
                         )) : masterCategoryOptions.map((category) => (
                           <option key={category} value={category}>{category}</option>
                         ))}
                       </select>
-                      <select className="border rounded px-3 py-2" value={itemMasterForm.unit || ''} onChange={(e) => setItemMasterForm({ ...itemMasterForm, unit: e.target.value })}>
+                      <select className={getItemFieldClass('reference')} value={itemMasterForm.unit || ''} onChange={(e) => setItemMasterForm({ ...itemMasterForm, unit: e.target.value })}>
                         <option value="">Pilih Unit</option>
                         {String(itemMasterForm.unit || '').trim() && !standardUnitOptions.includes(String(itemMasterForm.unit || '').trim()) && (
                           <option value={String(itemMasterForm.unit || '').trim()}>{String(itemMasterForm.unit || '').trim()}</option>
@@ -1984,74 +2336,68 @@ const TabMasterRef = (props) => {
                           <option key={unit} value={unit}>{unit}</option>
                         ))}
                       </select>
-                      <select className="border rounded px-3 py-2" value={itemMasterForm.typePack} onChange={(e) => setItemMasterForm({ ...itemMasterForm, typePack: e.target.value })}>
-                        <option value="">Pilih Type Pack</option>
-                        {masterPackings.map((packing) => (
-                          <option key={packing.code} value={packing.code}>{packing.code}</option>
-                        ))}
-                      </select>
+                      <SearchableSelectDropdown
+                        value={itemMasterForm.typePack || ''}
+                        options={itemPackingOptions}
+                        onChange={(value) => setItemMasterForm((prev) => ({ ...prev, typePack: String(value || '').trim() }))}
+                        placeholder="Pilih Type Pack"
+                        searchPlaceholder="Ketik kode / nama packing"
+                        emptyText="Master packing belum tersedia."
+                        getOptionValue={(option) => String(option?.value || '').trim()}
+                        getOptionLabel={(option) => option?.label || option?.value || ''}
+                        controlClassName={getSearchableControlClass('packing')}
+                      />
                       <input
                         type="number"
-                        className="border rounded px-3 py-2"
+                        className={getItemFieldClass('packing')}
                         placeholder="SNP / Pack Qty"
                         value={itemMasterForm.packQty || ''}
                         onChange={(e) => setItemMasterForm({ ...itemMasterForm, packQty: e.target.value })}
                       />
                       <input
                         type="number"
-                        className="border rounded px-3 py-2"
+                        className={getItemFieldClass('packing')}
                         placeholder="Order Lot Size"
                         value={itemMasterForm.orderLotSize || ''}
                         onChange={(e) => setItemMasterForm({ ...itemMasterForm, orderLotSize: e.target.value })}
                       />
                       <input
                         type="number"
-                        className="border rounded px-3 py-2"
+                        className={getItemFieldClass('packing')}
                         placeholder="Max Delivery / Rit"
                         value={itemMasterForm.maxDeliveryPerRit || ''}
                         onChange={(e) => setItemMasterForm({ ...itemMasterForm, maxDeliveryPerRit: e.target.value })}
                       />
                       <input
                         type="number"
-                        className="border rounded px-3 py-2"
+                        className={getItemFieldClass('identity')}
                         placeholder="Berat Part (Kg)"
                         value={itemMasterForm.weight || ''}
                         onChange={(e) => setItemMasterForm({ ...itemMasterForm, weight: e.target.value })}
                       />
-                      <select
-                        className="border rounded px-3 py-2"
+                      <SearchableSelectDropdown
                         value={itemMasterForm.locationId || ''}
-                        onChange={(e) => {
-                          const nextLocationId = e.target.value;
-                          const selectedWarehouse = (masterWarehouses || []).find((warehouse) => String(warehouse.id || '').trim() === nextLocationId);
-                          const nextLocationName = selectedWarehouse ? buildWarehouseLabel(selectedWarehouse) : '';
-                          setItemMasterForm((prev) => ({
-                            ...prev,
-                            locationId: nextLocationId,
-                            locationName: nextLocationName,
-                          }));
-                        }}
-                      >
-                        <option value="">Pilih Master Ord Warehouse</option>
-                        {itemWarehouseOptions.map((option) => (
-                          <option key={`item-location-${option.value}`} value={option.value}>
-                            {option.label || option.value}
-                          </option>
-                        ))}
-                      </select>
-                      <select
-                        className="border rounded px-3 py-2"
+                        options={itemWarehouseOptions}
+                        onChange={handleItemWarehouseChange}
+                        placeholder="Pilih Master Ord Warehouse"
+                        searchPlaceholder="Ketik kode / nama warehouse"
+                        emptyText="Master warehouse belum tersedia."
+                        getOptionValue={(option) => String(option?.value || '').trim()}
+                        getOptionLabel={(option) => option?.label || option?.value || ''}
+                        controlClassName={getSearchableControlClass('reference')}
+                      />
+                      <SearchableSelectDropdown
                         value={itemMasterForm.lineProduction || ''}
-                        onChange={(e) => setItemMasterForm({ ...itemMasterForm, lineProduction: e.target.value })}
-                      >
-                        <option value="">Pilih Line Produksi / Work Center</option>
-                        {processWorkCenterOptions.map((option) => (
-                          <option key={`item-process-${option.value}`} value={option.value}>
-                            {option.label || option.value}
-                          </option>
-                        ))}
-                      </select>
-                      <div className="md:col-span-3 rounded border border-slate-200 bg-slate-50 p-3 space-y-3">
+                        options={processWorkCenterOptions}
+                        onChange={handleItemLineProductionChange}
+                        placeholder="Pilih Line Produksi / Work Center"
+                        searchPlaceholder="Ketik line / work center / proses"
+                        emptyText="Master location line/work center belum tersedia."
+                        getOptionValue={(option) => String(option?.value || '').trim()}
+                        getOptionLabel={(option) => option?.label || option?.value || ''}
+                        controlClassName={getSearchableControlClass('process')}
+                      />
+                      <div className="md:col-span-3 rounded border border-violet-200 bg-violet-50/40 p-3 space-y-3">
                         <div className="flex items-center justify-between gap-3">
                           <div>
                             <div className="text-[11px] font-semibold text-slate-700">Routing Proses</div>
@@ -2069,24 +2415,23 @@ const TabMasterRef = (props) => {
                           {itemProcessRoutingRows.map((row, index) => (
                             <div key={`item-routing-${index}`} className="grid grid-cols-1 md:grid-cols-12 gap-2 items-center">
                               <div className="md:col-span-7">
-                                <select
-                                  className="border rounded px-3 py-2 w-full"
+                                <SearchableSelectDropdown
                                   value={row.processCode || ''}
-                                  onChange={(e) => handleItemProcessRoutingChange(index, e.target.value)}
-                                >
-                                  <option value="">Pilih Process</option>
-                                  {itemProcessOptions.map((option) => (
-                                    <option key={`item-routing-opt-${index}-${option.value}`} value={option.value}>
-                                      {option.label || option.value}
-                                    </option>
-                                  ))}
-                                </select>
+                                  options={itemProcessOptions}
+                                  onChange={(value) => handleItemProcessRoutingChange(index, value)}
+                                  placeholder="Pilih Process"
+                                  searchPlaceholder="Ketik kode / nama process"
+                                  emptyText="Master process belum tersedia."
+                                  getOptionValue={(option) => String(option?.value || '').trim()}
+                                  getOptionLabel={(option) => option?.label || option?.value || ''}
+                                  controlClassName={getSearchableControlClass('process')}
+                                />
                               </div>
                               <div className="md:col-span-4">
                                 <input
                                   type="number"
                                   step="0.01"
-                                  className="border rounded px-3 py-2 w-full"
+                                  className={getItemFieldClass('process', 'w-full')}
                                   placeholder="Cycle Time (s)"
                                   value={row.cycleTimeSeconds || ''}
                                   onChange={(e) => updateItemProcessRoutingRow(index, { cycleTimeSeconds: e.target.value })}
@@ -2108,19 +2453,19 @@ const TabMasterRef = (props) => {
                       </div>
                       <input
                         type="number"
-                        className="border rounded px-3 py-2"
+                        className={getItemFieldClass('timing')}
                         placeholder="Lead Time (hari)"
                         value={itemMasterForm.leadTimeDays || ''}
                         onChange={(e) => setItemMasterForm({ ...itemMasterForm, leadTimeDays: e.target.value })}
                       />
                       <input
                         type="number"
-                        className="border rounded px-3 py-2"
+                        className={getItemFieldClass('timing')}
                         placeholder="Shelf Life (hari)"
                         value={itemMasterForm.shelfLifeDays || ''}
                         onChange={(e) => setItemMasterForm({ ...itemMasterForm, shelfLifeDays: e.target.value })}
                       />
-                      <label className="border rounded px-3 py-2 flex items-center gap-2 text-[11px] font-semibold text-slate-600">
+                      <label className="border border-emerald-200 rounded px-3 py-2 flex items-center gap-2 text-[11px] font-semibold text-emerald-700 bg-emerald-50/70">
                         <input
                           type="checkbox"
                           checked={!!itemMasterForm.isSeasonal}
@@ -2134,7 +2479,7 @@ const TabMasterRef = (props) => {
                             {itemMasterForm.modelCodes?.length ? (
                               itemMasterForm.modelCodes.map((code) => (
                               <span key={`model-chip-${code}`} className="text-[10px] flex items-center gap-1 bg-slate-100 px-2 py-0.5 rounded-full border border-slate-200">
-                                <span>{code}{masterModelsMap.get(code)?.name ? ` - ${masterModelsMap.get(code).name}` : ''}</span>
+                                <span title={masterModelsMap.get(code)?.name || code}>{code}</span>
                                   <button
                                     type="button"
                                     onClick={() => removeModelCodeFromItemForm(code)}
@@ -2151,7 +2496,7 @@ const TabMasterRef = (props) => {
                           </div>
                           <div className="flex gap-2 mt-2">
                             <select
-                              className="border rounded px-3 py-2 flex-1 text-xs bg-white"
+                              className={getItemFieldClass('reference', 'flex-1 text-xs')}
                               value={itemModelEntry}
                               onChange={(e) => setItemModelEntry(e.target.value)}
                             >
@@ -2186,17 +2531,17 @@ const TabMasterRef = (props) => {
                             </button>
                           </div>
                           {modelFormVisible && allowMasterEdit && (
-                            <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-3">
+                            <div className="mt-3 rounded-lg border border-indigo-200 bg-indigo-50/50 p-3 space-y-3">
                               <div className="text-[11px] font-semibold text-slate-700">Tambah Model Baru</div>
                               <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
                                 <input
-                                  className="border rounded px-3 py-2"
+                                  className={getItemFieldClass('reference')}
                                   placeholder="Kode Model"
                                   value={modelCatalogForm.code}
                                   onChange={(e) => setModelCatalogForm({ ...modelCatalogForm, code: e.target.value })}
                                 />
                                 <input
-                                  className="border rounded px-3 py-2"
+                                  className={getItemFieldClass('reference')}
                                   placeholder="Nama Model"
                                   value={modelCatalogForm.name}
                                   onChange={(e) => setModelCatalogForm({ ...modelCatalogForm, name: e.target.value })}
@@ -2226,8 +2571,39 @@ const TabMasterRef = (props) => {
                             </div>
                           )}
                         </div>
+                        {isProductionOutputItemCategory(itemMasterForm?.type) && (
+                          <div className="md:col-span-3 rounded-lg border border-indigo-200 bg-indigo-50/40 p-3">
+                            <div className="mb-2 flex items-center justify-between gap-2">
+                              <div>
+                                <div className="text-[11px] font-semibold text-slate-700">Production Source</div>
+                                <div className="text-[10px] text-slate-500">FG/Subassy/Assy menggunakan lokasi produksi, bukan supplier eksternal.</div>
+                              </div>
+                              <span className="rounded-full border border-indigo-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-indigo-700">
+                                Supplier locked
+                              </span>
+                            </div>
+                            <div className="grid grid-cols-1 gap-2 md:grid-cols-4">
+                              <div className="rounded border border-indigo-100 bg-white px-3 py-2">
+                                <div className="text-[9px] font-semibold uppercase text-slate-400">Warehouse</div>
+                                <div className="mt-0.5 font-semibold text-slate-700">{itemProductionSourceMeta.warehouse}</div>
+                              </div>
+                              <div className="rounded border border-indigo-100 bg-white px-3 py-2">
+                                <div className="text-[9px] font-semibold uppercase text-slate-400">Line / Work Center</div>
+                                <div className="mt-0.5 font-semibold text-slate-700">{itemProductionSourceMeta.line}</div>
+                              </div>
+                              <div className="rounded border border-indigo-100 bg-white px-3 py-2">
+                                <div className="text-[9px] font-semibold uppercase text-slate-400">Area</div>
+                                <div className="mt-0.5 font-semibold text-slate-700">{itemProductionSourceMeta.area}</div>
+                              </div>
+                              <div className="rounded border border-indigo-100 bg-white px-3 py-2">
+                                <div className="text-[9px] font-semibold uppercase text-slate-400">Plant / Site</div>
+                                <div className="mt-0.5 font-semibold text-slate-700">{itemProductionSourceMeta.plant}</div>
+                              </div>
+                            </div>
+                          </div>
+                        )}
                     </div>
-                    <div className="border rounded p-3 text-xs mb-4">
+                    <div className="border border-sky-200 rounded p-3 text-xs mb-4 bg-sky-50/30">
                       <div className="flex items-center justify-between">
                         <div className="font-semibold text-slate-700">Gambar Item</div>
                         <button
@@ -2270,13 +2646,25 @@ const TabMasterRef = (props) => {
                       />
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs mb-4">
-                      <div className="border rounded p-3">
+                      <div className={`border rounded p-3 ${isItemSupplierEnabled ? 'border-teal-200 bg-teal-50/40' : 'bg-slate-100 border-slate-200 text-slate-400'}`}>
                         <div className="flex items-center justify-between mb-2">
-                          <div className="font-semibold text-slate-700">Supplier</div>
+                          <div>
+                            <div className={`font-semibold ${isItemSupplierEnabled ? 'text-slate-700' : 'text-slate-400'}`}>Supplier</div>
+                            {!isItemSupplierEnabled && (
+                              <div className="mt-0.5 text-[10px] text-slate-500">
+                                Supplier tidak diisi untuk FG/Subassy/Assy. Gunakan Production Source.
+                              </div>
+                            )}
+                          </div>
                           <button
                             type="button"
-                            onClick={() => setItemMasterForm({ ...itemMasterForm, suppliers: [...(itemMasterForm.suppliers || []), { vendorId: '', sharePercent: '' }] })}
-                            className="px-2 py-1 text-[10px] border rounded inline-flex items-center gap-1"
+                            onClick={() => {
+                              if (!isItemSupplierEnabled) return;
+                              setItemMasterForm({ ...itemMasterForm, suppliers: [...(itemMasterForm.suppliers || []), { vendorId: '', sharePercent: '' }] });
+                            }}
+                            disabled={!isItemSupplierEnabled}
+                            className="px-2 py-1 text-[10px] border rounded inline-flex items-center gap-1 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-200 disabled:text-slate-400"
+                            title={isItemSupplierEnabled ? 'Tambah Supplier' : 'Supplier dikunci untuk FG/Subassy/Assy'}
                           >
                             <Plus size={12} />
                             <span>Tambah Supplier</span>
@@ -2284,13 +2672,16 @@ const TabMasterRef = (props) => {
                         </div>
                         <div className="space-y-2">
                           {(itemMasterForm.suppliers || []).length === 0 && (
-                            <div className="text-[10px] text-slate-400">Belum ada supplier.</div>
+                            <div className="text-[10px] text-slate-400">
+                              {isItemSupplierEnabled ? 'Belum ada supplier.' : 'Supplier terkunci untuk kategori produksi.'}
+                            </div>
                           )}
                           {(itemMasterForm.suppliers || []).map((row, idx) => (
                             <div key={`${row.vendorId}-${idx}`} className="grid grid-cols-[1fr_80px_24px] gap-2 items-center">
                               <select
-                                className="border rounded px-2 py-1"
+                                className={`${getItemCompactFieldClass('relation')} disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400`}
                                 value={row.vendorId}
+                                disabled={!isItemSupplierEnabled}
                                 onChange={(e) => {
                                   const next = [...(itemMasterForm.suppliers || [])];
                                   next[idx] = { ...row, vendorId: e.target.value };
@@ -2304,9 +2695,10 @@ const TabMasterRef = (props) => {
                               </select>
                               <input
                                 type="number"
-                                className="border rounded px-2 py-1 text-right"
+                                className={`${getItemCompactFieldClass('relation', 'text-right')} disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400`}
                                 placeholder="%"
                                 value={row.sharePercent}
+                                disabled={!isItemSupplierEnabled}
                                 onChange={(e) => {
                                   const next = [...(itemMasterForm.suppliers || [])];
                                   next[idx] = { ...row, sharePercent: e.target.value };
@@ -2320,7 +2712,8 @@ const TabMasterRef = (props) => {
                                   next.splice(idx, 1);
                                   setItemMasterForm({ ...itemMasterForm, suppliers: next });
                                 }}
-                                className="text-red-500"
+                                disabled={!isItemSupplierEnabled}
+                                className="text-red-500 disabled:cursor-not-allowed disabled:text-slate-300"
                                 title="Hapus"
                               >
                                 <XIcon size={14} />
@@ -2329,13 +2722,15 @@ const TabMasterRef = (props) => {
                           ))}
                         </div>
                       </div>
-                      <div className="border rounded p-3">
+                      <div className={`border rounded p-3 ${isItemCustomerEnabled ? 'border-teal-200 bg-teal-50/40' : 'bg-slate-100 border-slate-200 text-slate-400'}`}>
                         <div className="flex items-center justify-between mb-2">
-                          <div className="font-semibold text-slate-700">Customers</div>
+                          <div className={`font-semibold ${isItemCustomerEnabled ? 'text-slate-700' : 'text-slate-400'}`}>Customers</div>
                           <button
                             type="button"
                             onClick={() => setItemMasterForm({ ...itemMasterForm, customers: [...(itemMasterForm.customers || []), { customerId: '', sharePercent: '' }] })}
-                            className="px-2 py-1 text-[10px] border rounded inline-flex items-center gap-1"
+                            disabled={!isItemCustomerEnabled}
+                            className="px-2 py-1 text-[10px] border rounded inline-flex items-center gap-1 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-200 disabled:text-slate-400"
+                            title={isItemCustomerEnabled ? 'Tambah Customer' : 'Customer hanya untuk FG dan Sub-Assy'}
                           >
                             <Plus size={12} />
                             <span>Tambah Customer</span>
@@ -2343,13 +2738,16 @@ const TabMasterRef = (props) => {
                         </div>
                         <div className="space-y-2">
                           {(itemMasterForm.customers || []).length === 0 && (
-                            <div className="text-[10px] text-slate-400">Belum ada customer.</div>
+                            <div className="text-[10px] text-slate-400">
+                              {isItemCustomerEnabled ? 'Belum ada customer.' : 'Customer hanya diisi untuk FG dan Sub-Assy.'}
+                            </div>
                           )}
                           {(itemMasterForm.customers || []).map((row, idx) => (
                             <div key={`${row.customerId}-${idx}`} className="grid grid-cols-[1fr_80px_24px] gap-2 items-center">
                               <select
-                                className="border rounded px-2 py-1"
+                                className={`${getItemCompactFieldClass('relation')} disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400`}
                                 value={row.customerId}
+                                disabled={!isItemCustomerEnabled}
                                 onChange={(e) => {
                                   const next = [...(itemMasterForm.customers || [])];
                                   next[idx] = { ...row, customerId: e.target.value };
@@ -2363,9 +2761,10 @@ const TabMasterRef = (props) => {
                               </select>
                               <input
                                 type="number"
-                                className="border rounded px-2 py-1 text-right"
+                                className={`${getItemCompactFieldClass('relation', 'text-right')} disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400`}
                                 placeholder="%"
                                 value={row.sharePercent}
+                                disabled={!isItemCustomerEnabled}
                                 onChange={(e) => {
                                   const next = [...(itemMasterForm.customers || [])];
                                   next[idx] = { ...row, sharePercent: e.target.value };
@@ -2379,7 +2778,8 @@ const TabMasterRef = (props) => {
                                   next.splice(idx, 1);
                                   setItemMasterForm({ ...itemMasterForm, customers: next });
                                 }}
-                                className="text-red-500"
+                                disabled={!isItemCustomerEnabled}
+                                className="text-red-500 disabled:cursor-not-allowed disabled:text-slate-300"
                                 title="Hapus"
                               >
                                 <XIcon size={14} />
@@ -2580,6 +2980,11 @@ const TabMasterRef = (props) => {
                             : movingStatusValue === 'SEASONAL'
                               ? 'Seasonal'
                               : '-';
+                      const isProductionOutputItem = isProductionOutputItemCategory(item.type);
+                      const itemWarehouseLabel = item.location_id
+                        ? (item.location_name || buildWarehouseLabel(warehouseById.get(String(item.location_id || '').trim())) || item.location_id)
+                        : '-';
+                      const itemLineLabel = item.line_production ? getProcessWorkCenterLabel(item.line_production) : '-';
                       return (
                         <tr key={item.code} className="border-t">
                           <td className="p-2 text-center">
@@ -2618,10 +3023,22 @@ const TabMasterRef = (props) => {
                           <td className="p-2">{getItemPackingCode(item.type_pack)}</td>
                           <td className="p-2">{item.location_id || '-'}</td>
                           <td className="p-2 text-right">{item.pack_qty ?? '-'}</td>
-                          <td className="p-2">{formatRelationList(itemSupplierMap.get(item.code) || [], 'vendorId', 'vendorId')}</td>
+                          <td className="p-2">
+                            {isProductionOutputItem ? (
+                              <div className="space-y-0.5">
+                                <span className="inline-flex rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700">
+                                  Production
+                                </span>
+                                <div className="text-[10px] text-slate-500">{itemWarehouseLabel}</div>
+                                <div className="text-[10px] text-slate-500">{itemLineLabel}</div>
+                              </div>
+                            ) : (
+                              formatRelationList(itemSupplierMap.get(item.code) || [], 'vendorId', 'vendorId')
+                            )}
+                          </td>
                           <td className="p-2">{formatRelationList(itemCustomerMap.get(item.code) || [], 'customerId', 'customerId')}</td>
                           <td className="p-2">
-                            {formatModelCodes(masterModelsMap, item.modelCodes || parseModelCodes(item.model || '')) || item.model || '-'}
+                            {getItemModelCodesOnly(item)}
                           </td>
                           <td className="p-2">
                             <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold ${movingBadgeClass}`}>
@@ -2741,19 +3158,29 @@ const TabMasterRef = (props) => {
               <div className="bg-white rounded-xl border p-4">
                 <div className="flex items-center justify-between mb-3">
                   <div className="text-sm font-semibold">Packing</div>
-                  {allowMasterEdit && (
+                  <div className="flex items-center gap-2">
+                    <input
+                      className="border rounded px-3 py-1.5 text-xs"
+                      placeholder="Cari packing..."
+                      value={packingSearch}
+                      onChange={(e) => setPackingSearch(e.target.value)}
+                    />
                     <button
+                      type="button"
+                      disabled={!allowMasterEdit}
+                      title={getMasterActionTitle(allowMasterEdit, 'Tambah Baru')}
                       onClick={() => {
+                        if (!allowMasterEdit) return;
                         setPackingForm({ code: '', name: '' });
                         setEditingPackingCode(null);
                         setMasterFormVisible((prev) => ({ ...prev, packing: true }));
                       }}
-                      className="px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1"
+                      className={getMasterActionClassName('px-3 py-1.5 rounded border text-xs inline-flex items-center gap-1', !allowMasterEdit)}
                     >
                       <Plus size={14} />
                       <span>Tambah Baru</span>
                     </button>
-                  )}
+                  </div>
                 </div>
                 {masterFormVisible.packing && allowMasterEdit && (
                   <>
@@ -2782,7 +3209,7 @@ const TabMasterRef = (props) => {
                     </tr>
                   </thead>
                   <tbody>
-                    {masterPackings.map((packing) => (
+                    {filteredPackings.map((packing) => (
                       <tr key={packing.code} className="border-t">
                         <td className="p-2">{packing.code}</td>
                         <td className="p-2">{packing.name}</td>
@@ -3274,6 +3701,35 @@ const TabMasterRef = (props) => {
                             onChange={(e) => setItemBulkShelfLife(e.target.value)}
                           />
                         </div>
+                        <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50 p-3 space-y-2">
+                          <div className="flex items-center gap-2 font-semibold text-slate-700">
+                            <Route size={14} className="text-indigo-600" />
+                            <span>Bulk Routing Process</span>
+                          </div>
+                          <select
+                            className="border rounded px-3 py-2 w-full"
+                            value={itemBulkRoutingTemplateCode}
+                            onChange={(e) => setItemBulkRoutingTemplateCode(e.target.value)}
+                          >
+                            <option value="">Pilih template item routing</option>
+                            {routingTemplateItems.map((item) => (
+                              <option key={item.code} value={item.code}>
+                                {item.code} - {item.name}
+                              </option>
+                            ))}
+                          </select>
+                          <select
+                            className="border rounded px-3 py-2 w-full"
+                            value={itemBulkRoutingMode}
+                            onChange={(e) => setItemBulkRoutingMode(e.target.value)}
+                          >
+                            <option value="merge">Merge / Fill Empty Only</option>
+                            <option value="replace">Replace Existing</option>
+                          </select>
+                          <div className="text-[11px] text-slate-500 leading-relaxed">
+                            Template akan menyalin process_flow, process_routing, line, location, lead time, dan cycle time ke item terpilih.
+                          </div>
+                        </div>
                       </div>
                     <div className="flex justify-end gap-2 mt-4 text-xs">
                       <button type="button" onClick={() => setItemBulkOpen(false)} className="px-3 py-1.5 rounded border inline-flex items-center gap-1">
@@ -3323,6 +3779,45 @@ const TabMasterRef = (props) => {
                         >
                           <Save size={14} />
                           <span>{itemBulkSaving ? 'Menyimpan...' : 'Simpan'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={itemBulkRoutingSaving}
+                          onClick={async () => {
+                            if (selectedItemCodes.length === 0) {
+                              showToastMessage('Tidak ada item terpilih.');
+                              return;
+                            }
+                            if (!itemBulkRoutingTemplateCode) {
+                              showToastMessage('Pilih template routing terlebih dahulu.');
+                              return;
+                            }
+                            setItemBulkRoutingSaving(true);
+                            try {
+                              await apiFetch('/api/master/items/bulk-routing', {
+                                method: 'PUT',
+                                body: JSON.stringify({
+                                  itemCodes: selectedItemCodes,
+                                  templateCode: itemBulkRoutingTemplateCode,
+                                  mode: itemBulkRoutingMode,
+                                }),
+                              });
+                              showToastMessage('Routing massal berhasil diperbarui.');
+                              setItemBulkRoutingTemplateCode('');
+                              setItemBulkRoutingMode('merge');
+                              setItemBulkOpen(false);
+                              setSelectedItemCodes([]);
+                              await fetchMasterReferences();
+                            } catch (error) {
+                              showToastMessage(`Routing massal gagal: ${error.message || 'Unknown error'}`);
+                            } finally {
+                              setItemBulkRoutingSaving(false);
+                            }
+                          }}
+                          className="px-3 py-1.5 rounded bg-indigo-600 text-white disabled:opacity-70 inline-flex items-center gap-1"
+                        >
+                          <Route size={14} />
+                          <span>{itemBulkRoutingSaving ? 'Memperbarui...' : 'Apply Routing'}</span>
                         </button>
                       </div>
                     </div>

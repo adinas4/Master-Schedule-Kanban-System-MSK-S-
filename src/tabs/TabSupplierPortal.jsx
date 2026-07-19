@@ -7,10 +7,14 @@ import {
   FileSpreadsheet,
   Filter,
   Loader2,
+  Package,
   Printer,
   RefreshCw,
   Search,
+  X,
 } from 'lucide-react';
+import { QRCodeSVG } from 'qrcode.react';
+import logoPrl from '../assets/kop-mrp.png';
 
 const TabSupplierPortal = (props) => {
   const {
@@ -50,6 +54,13 @@ const TabSupplierPortal = (props) => {
   const [dnPage, setDnPage] = useState(1);
   const [dnPageSize, setDnPageSize] = useState(50);
   const [dnDetails, setDnDetails] = useState({});
+  const [labelModal, setLabelModal] = useState({ open: false, dnNumber: '', header: null, items: [], controls: {} });
+
+  useEffect(() => {
+    if (!labelModal.open) return undefined;
+    document.body.classList.add('supplier-label-print-active');
+    return () => document.body.classList.remove('supplier-label-print-active');
+  }, [labelModal.open]);
 
   const formatQty = useCallback((value) => {
     if (formatNumber0) {
@@ -72,6 +83,270 @@ const TabSupplierPortal = (props) => {
     if (Number.isNaN(date.getTime())) return value;
     return date.toLocaleString('id-ID', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   }, []);
+
+  const getDnItemCode = (item) => String(item?.item_code || item?.itemCode || '').trim();
+  const getDnItemName = (item) => String(item?.item_name || item?.itemName || '').trim();
+  const getDnDocQty = (item) => Number(item?.doc_qty ?? item?.docQty ?? item?.request_qty ?? item?.requestQty ?? 0);
+  const getDnPackQty = (item) => Number(item?.pack_qty ?? item?.packQty ?? 0);
+  const getDnItemKey = (item, index = 0) => `${getDnItemCode(item) || 'ITEM'}-${index}`;
+  const normalizeList = (value) => {
+    if (Array.isArray(value)) return value;
+    if (typeof value === 'string' && value.trim()) {
+      try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return value.split(/[>,;|]+/).map((entry) => entry.trim()).filter(Boolean);
+      }
+    }
+    return [];
+  };
+  const getDnLocationLabel = (item) => {
+    const code = String(item?.location_code || item?.locationCode || item?.drop_zone || item?.dropZone || item?.location_id || item?.locationId || '').trim();
+    const name = String(item?.location_name || item?.locationName || '').trim();
+    if (code && name && code !== name) return `${code} - ${name}`;
+    return code || name || '-';
+  };
+  const getDnNextProcessLabel = (item) => {
+    const routing = normalizeList(item?.process_routing || item?.processRouting);
+    const flow = normalizeList(item?.process_flow || item?.processFlow);
+    const firstStep = routing[0] || flow[0] || null;
+    if (firstStep && typeof firstStep === 'object') {
+      return String(
+        firstStep.processName
+        || firstStep.process_name
+        || firstStep.name
+        || firstStep.processCode
+        || firstStep.process_code
+        || firstStep.code
+        || firstStep.process
+        || '',
+      ).trim() || '-';
+    }
+    if (firstStep) return String(firstStep).trim();
+    return String(item?.line_production_name || item?.lineProductionName || item?.line_production || item?.lineProduction || '').trim() || '-';
+  };
+
+  const buildDefaultLotNo = (dnNumber, itemCode) => (
+    `LOT-${String(dnNumber || 'DN').replace(/[^a-zA-Z0-9-]/g, '')}-${String(itemCode || 'ITEM').replace(/[^a-zA-Z0-9-]/g, '')}`
+  );
+
+  const splitAutoPackages = (docQty, packQty) => {
+    const totalQty = Number(docQty || 0);
+    const snp = Number(packQty || 0);
+    if (!Number.isFinite(totalQty) || totalQty <= 0) return [];
+    if (!Number.isFinite(snp) || snp <= 0) return [totalQty];
+    const packages = [];
+    let remaining = totalQty;
+    while (remaining > 0) {
+      const qty = remaining > snp ? snp : remaining;
+      packages.push(qty);
+      remaining -= qty;
+    }
+    return packages;
+  };
+
+  const parsePackageQtyText = (value) => String(value || '')
+    .split(/[\n;,]+/)
+    .map((entry) => Number(String(entry).trim()))
+    .filter((qty) => Number.isFinite(qty) && qty > 0);
+
+  const getPackageStatus = (qty, packQty) => {
+    const snp = Number(packQty || 0);
+    const value = Number(qty || 0);
+    if (!Number.isFinite(snp) || snp <= 0) return 'NON SNP';
+    if (value === snp) return 'FULL SNP';
+    if (value < snp) return 'PARTIAL';
+    return 'OVER SNP';
+  };
+
+  const buildSupplierLabels = useCallback((modal = labelModal) => {
+    if (!modal?.open) return { labels: [], errors: [], warnings: [] };
+    const labels = [];
+    const errors = [];
+    const warnings = [];
+    const dnNumber = modal.dnNumber || modal.header?.dn_number || '';
+    const supplierValue = String(modal.header?.supplier_id || modal.header?.supplierId || modal.header?.supplier || '').trim();
+    (modal.items || []).forEach((item, index) => {
+      const itemCode = getDnItemCode(item);
+      const itemName = getDnItemName(item);
+      const docQty = getDnDocQty(item);
+      const packQty = getDnPackQty(item);
+      const key = getDnItemKey(item, index);
+      const control = modal.controls?.[key] || {};
+      const shipmentQty = Number(control.shipmentQty || docQty);
+      const customPackages = parsePackageQtyText(control.packageText);
+      const packages = customPackages.length > 0 ? customPackages : splitAutoPackages(shipmentQty, packQty);
+      const packageTotalQty = packages.reduce((sum, qty) => sum + Number(qty || 0), 0);
+      const lotNo = String(control.lotNo || buildDefaultLotNo(dnNumber, itemCode)).trim();
+      const locationLabel = getDnLocationLabel(item);
+      const nextProcessLabel = getDnNextProcessLabel(item);
+
+      if (!itemCode) errors.push(`Line ${index + 1}: item kosong.`);
+      if (!Number.isFinite(docQty) || docQty <= 0) errors.push(`${itemCode || `Line ${index + 1}`}: qty DN tidak valid.`);
+      if (!Number.isFinite(shipmentQty) || shipmentQty <= 0) errors.push(`${itemCode || `Line ${index + 1}`}: qty kirim tidak valid.`);
+      if (Number.isFinite(docQty) && Number.isFinite(shipmentQty) && shipmentQty > docQty) {
+        errors.push(`${itemCode || `Line ${index + 1}`}: qty kirim ${formatQty(shipmentQty)} melebihi qty DN ${formatQty(docQty)}.`);
+      }
+      if (Number.isFinite(docQty) && Number.isFinite(shipmentQty) && shipmentQty < docQty) {
+        warnings.push(`${itemCode}: qty kirim partial ${formatQty(shipmentQty)} dari DN ${formatQty(docQty)}.`);
+      }
+      if (packages.length === 0) errors.push(`${itemCode || `Line ${index + 1}`}: package kosong.`);
+      if (Math.abs(packageTotalQty - shipmentQty) > 0.0001) {
+        errors.push(`${itemCode || `Line ${index + 1}`}: total package ${formatQty(packageTotalQty)} tidak sama dengan qty kirim ${formatQty(shipmentQty)}.`);
+      }
+      if (!Number.isFinite(packQty) || packQty <= 0) {
+        warnings.push(`${itemCode}: SNP kosong, label dibuat NON SNP.`);
+      } else if (packages.every((qty) => Number(qty) !== packQty)) {
+        warnings.push(`${itemCode}: tidak ada package yang sesuai SNP ${formatQty(packQty)}.`);
+      } else if (packages.some((qty) => Number(qty) > packQty)) {
+        warnings.push(`${itemCode}: ada package lebih besar dari SNP ${formatQty(packQty)}.`);
+      }
+
+      packages.forEach((qty, packageIndex) => {
+        const seq = packageIndex + 1;
+        const total = packages.length;
+        const status = getPackageStatus(qty, packQty);
+        const qrValue = [
+          `type:incoming_label`,
+          `supplier:${supplierValue}`,
+          `dn:${dnNumber}`,
+          `item:${itemCode}`,
+          `qty:${qty}`,
+          `lot:${lotNo}`,
+          `pkg:${String(seq).padStart(3, '0')}/${String(total).padStart(3, '0')}`,
+          `loc:${locationLabel}`,
+          `next:${nextProcessLabel}`,
+        ].join('|');
+        labels.push({
+          key: `${dnNumber}-${itemCode}-${seq}`,
+          dnNumber,
+          itemCode,
+          itemName,
+          partNo: item?.part_no || item?.partNo || '-',
+          unit: item?.unit || '-',
+          docQty,
+          shipmentQty,
+          packQty,
+          packageQty: qty,
+          packageSeq: seq,
+          packageTotal: total,
+          lotNo,
+          locationLabel,
+          nextProcessLabel,
+          status,
+          qrValue,
+        });
+      });
+    });
+    return { labels, errors: Array.from(new Set(errors)), warnings: Array.from(new Set(warnings)) };
+  }, [formatQty, labelModal]);
+
+  const labelBuild = useMemo(() => buildSupplierLabels(labelModal), [buildSupplierLabels, labelModal]);
+  const supplierDnSummary = useMemo(() => {
+    const header = labelModal.header || {};
+    const dnNumber = labelModal.dnNumber || header.dn_number || '';
+    const supplierCode = String(header.supplier_id || header.supplierId || header.supplier || '').trim();
+    const supplierName = String(header.supplier_name || header.supplierName || header.supplier || '').trim();
+    const rows = (labelModal.items || []).map((item, index) => {
+      const itemCode = getDnItemCode(item);
+      const itemLabels = labelBuild.labels.filter((label) => label.itemCode === itemCode);
+      const shipmentQty = itemLabels.reduce((sum, label) => sum + Number(label.packageQty || 0), 0) || getDnDocQty(item);
+      const packQty = getDnPackQty(item);
+      return {
+        no: index + 1,
+        itemCode,
+        itemName: getDnItemName(item),
+        partNo: item?.part_no || item?.partNo || '-',
+        packing: item?.type_pack || item?.typePack || item?.packing || '-',
+        dropZone: getDnLocationLabel(item),
+        unit: item?.unit || '-',
+        snp: packQty,
+        orderKbn: itemLabels.length || (packQty > 0 ? Math.ceil(Number(shipmentQty || 0) / packQty) : 0),
+        orderUnit: shipmentQty,
+      };
+    });
+    const totals = rows.reduce((acc, row) => {
+      acc.orderKbn += Number(row.orderKbn || 0);
+      acc.orderUnit += Number(row.orderUnit || 0);
+      return acc;
+    }, { orderKbn: 0, orderUnit: 0 });
+    return {
+      dnNumber,
+      supplierCode,
+      supplierName,
+      supplierLabel: supplierName && supplierCode && supplierName !== supplierCode ? `${supplierCode} - ${supplierName}` : supplierCode || supplierName || '-',
+      plannedDate: header.planned_date || header.plannedDate || '',
+      cycle: header.cycle || '-',
+      rit: header.rit || '-',
+      deliveryTime: header.delivery_time || header.deliveryTime || '-',
+      remarks: header.remarks || '',
+      rows,
+      totals,
+      qrValue: [`type:dn`, `dn:${dnNumber}`, `supplier:${supplierCode || supplierName}`].join('|'),
+      printDate: new Date().toLocaleDateString('id-ID'),
+    };
+  }, [labelBuild.labels, labelModal]);
+
+  const openDnLabelModal = async (dnNumber) => {
+    if (!dnNumber || !apiFetch) return;
+    let detail = dnDetails[dnNumber];
+    if (!detail?.items || !detail?.header) {
+      setDnDetails((prev) => ({
+        ...prev,
+        [dnNumber]: { ...(prev[dnNumber] || {}), loading: true, error: '' },
+      }));
+      try {
+        const data = await apiFetch(`/api/supplier/dn/${encodeURIComponent(dnNumber)}`);
+        detail = { ...(detail || {}), loading: false, header: data?.header || null, items: data?.items || [] };
+        setDnDetails((prev) => ({
+          ...prev,
+          [dnNumber]: { ...(prev[dnNumber] || {}), ...detail },
+        }));
+      } catch (error) {
+        setDnDetails((prev) => ({
+          ...prev,
+          [dnNumber]: { ...(prev[dnNumber] || {}), loading: false, error: error.message || 'Gagal memuat detail DN.' },
+        }));
+        alert(error.message || 'Gagal memuat detail DN.');
+        return;
+      }
+    }
+    const itemsForLabel = Array.isArray(detail?.items) ? detail.items : [];
+    const controls = {};
+    itemsForLabel.forEach((item, index) => {
+      const itemCode = getDnItemCode(item);
+      controls[getDnItemKey(item, index)] = {
+        lotNo: buildDefaultLotNo(dnNumber, itemCode),
+        shipmentQty: String(getDnDocQty(item) || ''),
+        packageText: '',
+      };
+    });
+    setLabelModal({
+      open: true,
+      dnNumber,
+      header: detail?.header || null,
+      items: itemsForLabel,
+      controls,
+    });
+  };
+
+  const updateLabelControl = (itemKey, field, value) => {
+    setLabelModal((prev) => ({
+      ...prev,
+      controls: {
+        ...(prev.controls || {}),
+        [itemKey]: {
+          ...(prev.controls?.[itemKey] || {}),
+          [field]: value,
+        },
+      },
+    }));
+  };
+
+  const closeLabelModal = () => {
+    setLabelModal({ open: false, dnNumber: '', header: null, items: [], controls: {} });
+  };
 
   const buildQuery = useCallback((params = {}) => {
     const searchParams = new URLSearchParams();
@@ -1119,7 +1394,20 @@ const TabSupplierPortal = (props) => {
                       {detail?.open && (
                         <tr>
                           <td colSpan={11} className="bg-slate-50/60 p-4">
-                            <div className="text-xs font-semibold text-slate-500 mb-2">Detail Item DN</div>
+                            <div className="mb-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                              <div>
+                                <div className="text-xs font-semibold text-slate-500">Detail Item DN</div>
+                                <div className="text-[11px] text-slate-400">Cetak Label Incoming agar receiving cukup scan QR per package.</div>
+                              </div>
+                              <button
+                                className="inline-flex items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                                type="button"
+                                onClick={() => openDnLabelModal(dnNumber)}
+                                disabled={detail?.loading}
+                              >
+                                <Package size={14} /> Label 1 DN
+                              </button>
+                            </div>
                             {detail?.loading && (
                               <div className="text-sm text-slate-500"><Loader2 size={14} className="animate-spin inline-block mr-2" />Memuat detail...</div>
                             )}
@@ -1274,6 +1562,307 @@ const TabSupplierPortal = (props) => {
           </div>
         )}
       </div>
+
+      {labelModal.open && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 supplier-label-print-scope"
+          onClick={closeLabelModal}
+        >
+          <div
+            className="flex max-h-[92vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl supplier-label-print-shell"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-slate-100 px-5 py-4 supplier-label-print-hidden">
+              <div>
+                <div className="text-sm font-semibold text-slate-900">Label Incoming Supplier</div>
+                <div className="text-xs text-slate-500">
+                  DN {labelModal.dnNumber || '-'} - cover DN dan semua label package dicetak sekaligus.
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
+                  onClick={() => window.print()}
+                  disabled={labelBuild.errors.length > 0 || labelBuild.labels.length === 0}
+                >
+                  <Printer size={14} /> Print DN + Label 1 DN ({labelBuild.labels.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={closeLabelModal}
+                  className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                  title="Tutup"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+            </div>
+
+            <div className="overflow-y-auto bg-slate-50 p-5 supplier-label-print-wrap">
+              <div className="mb-4 grid grid-cols-1 gap-3 supplier-label-print-hidden md:grid-cols-2">
+                {(labelModal.items || []).map((item, index) => {
+                  const itemKey = getDnItemKey(item, index);
+                  const control = labelModal.controls?.[itemKey] || {};
+                  const docQty = getDnDocQty(item);
+                  const packQty = getDnPackQty(item);
+                  const shipmentQty = Number(control.shipmentQty || docQty);
+                  const autoPackages = splitAutoPackages(shipmentQty, packQty);
+                  return (
+                    <div key={`label-control-${itemKey}`} className="rounded-xl border border-slate-200 bg-white p-3">
+                      <div className="text-xs font-semibold text-slate-900">{getDnItemCode(item) || '-'} - {getDnItemName(item) || '-'}</div>
+                      <div className="mt-1 text-[11px] text-slate-500">
+                        Qty DN {formatQty(docQty)} {item.unit || ''} | SNP {packQty > 0 ? formatQty(packQty) : '-'} | Auto {autoPackages.join(' + ') || '-'}
+                      </div>
+                      <div className="mt-1 text-[11px] text-slate-500">
+                        Lokasi {getDnLocationLabel(item)} | Next Process {getDnNextProcessLabel(item)}
+                      </div>
+                      <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-3">
+                        <div>
+                          <label className="text-[10px] font-semibold uppercase text-slate-400">Qty Kirim Aktual</label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="any"
+                            className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                            value={control.shipmentQty || ''}
+                            onChange={(event) => updateLabelControl(itemKey, 'shipmentQty', event.target.value)}
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[10px] font-semibold uppercase text-slate-400">Lot Supplier</label>
+                          <input
+                            className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                            value={control.lotNo || ''}
+                            onChange={(event) => updateLabelControl(itemKey, 'lotNo', event.target.value)}
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[10px] font-semibold uppercase text-slate-400">Custom Package Qty</label>
+                          <input
+                            className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+                            placeholder="Kosong = auto, contoh: 700,500"
+                            value={control.packageText || ''}
+                            onChange={(event) => updateLabelControl(itemKey, 'packageText', event.target.value)}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {(labelBuild.errors.length > 0 || labelBuild.warnings.length > 0) && (
+                <div className="mb-4 space-y-2 supplier-label-print-hidden">
+                  {labelBuild.errors.map((message) => (
+                    <div key={`label-error-${message}`} className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                      {message}
+                    </div>
+                  ))}
+                  {labelBuild.warnings.map((message) => (
+                    <div key={`label-warning-${message}`} className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                      {message}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="mb-5 rounded-xl border border-slate-200 bg-white p-4 supplier-dn-cover">
+                <table className="w-full border border-slate-900 text-[10px] text-slate-900 supplier-dn-table">
+                  <thead>
+                    <tr>
+                      <th colSpan={9} className="border-b border-slate-900 p-0">
+                        <div className="grid grid-cols-[1.35fr_88px_1fr] gap-3 p-3 text-left">
+                          <div className="flex items-start gap-3">
+                            <img src={logoPrl} alt="MRP Logo" className="h-9 object-contain" />
+                            <div>
+                              <div className="text-[12px] font-black uppercase">PT. MATRA RODA PIRANTI</div>
+                              <div className="text-[9px] font-semibold text-slate-500">Departemen Logistik (PPIC)</div>
+                            </div>
+                          </div>
+                          <div className="flex justify-center">
+                            <div className="border border-slate-400 bg-white p-1">
+                              <QRCodeSVG value={supplierDnSummary.qrValue || supplierDnSummary.dnNumber || '-'} size={76} />
+                            </div>
+                          </div>
+                          <div className="text-right">
+                            <div className="text-sm font-black uppercase tracking-wide">Delivery Note</div>
+                            <div className="mt-1 font-bold">{supplierDnSummary.dnNumber || '-'}</div>
+                            <div className="text-[9px] text-slate-500">PRINT DATE : {supplierDnSummary.printDate}</div>
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-4 border-t border-slate-900 p-3 text-left">
+                          <div className="space-y-1">
+                            <div><span className="inline-block w-20 font-bold uppercase">Supplier</span>: {supplierDnSummary.supplierLabel}</div>
+                            <div><span className="inline-block w-20 font-bold uppercase">Date</span>: {formatDate(supplierDnSummary.plannedDate)}</div>
+                            <div><span className="inline-block w-20 font-bold uppercase">Del. To</span>: PT. MATRA RODA PIRANTI</div>
+                            <div><span className="inline-block w-20 font-bold uppercase">Recipient</span>: PPIC / Receiving Warehouse</div>
+                          </div>
+                          <div className="space-y-1">
+                            <div><span className="inline-block w-20 font-bold uppercase">Cycle</span>: {supplierDnSummary.cycle || '-'}</div>
+                            <div><span className="inline-block w-20 font-bold uppercase">Delivery</span>: {formatDate(supplierDnSummary.plannedDate)}</div>
+                            <div><span className="inline-block w-20 font-bold uppercase">Rit/Time</span>: {supplierDnSummary.rit || '-'} / {supplierDnSummary.deliveryTime || '-'}</div>
+                            <div><span className="inline-block w-20 font-bold uppercase">Area</span>: -</div>
+                          </div>
+                        </div>
+                      </th>
+                    </tr>
+                    <tr className="bg-slate-100">
+                      <th className="border border-slate-900 p-1 text-center">NO.</th>
+                      <th className="border border-slate-900 p-1 text-center">UNIQ</th>
+                      <th className="border border-slate-900 p-1 text-left">PART NUMBER / PART NAME</th>
+                      <th className="border border-slate-900 p-1 text-center">PACKING</th>
+                      <th className="border border-slate-900 p-1 text-center">DROP ZONE</th>
+                      <th className="border border-slate-900 p-1 text-center">UNIT</th>
+                      <th className="border border-slate-900 p-1 text-right">SNP</th>
+                      <th className="border border-slate-900 p-1 text-right">ORDER KBN</th>
+                      <th className="border border-slate-900 p-1 text-right">ORDER UNIT</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {supplierDnSummary.rows.map((row) => (
+                      <tr key={`supplier-dn-${row.itemCode}-${row.no}`}>
+                        <td className="border border-slate-900 p-1 text-center">{row.no}</td>
+                        <td className="border border-slate-900 p-1 text-center font-bold">{row.itemCode || '-'}</td>
+                        <td className="border border-slate-900 p-1">
+                          <div className="font-bold">{row.partNo || '-'}</div>
+                          <div className="text-[9px]">{row.itemName || '-'}</div>
+                        </td>
+                        <td className="border border-slate-900 p-1 text-center">{row.packing || '-'}</td>
+                        <td className="border border-slate-900 p-1 text-center">{row.dropZone || '-'}</td>
+                        <td className="border border-slate-900 p-1 text-center">{row.unit || '-'}</td>
+                        <td className="border border-slate-900 p-1 text-right">{row.snp > 0 ? formatQty(row.snp) : '-'}</td>
+                        <td className="border border-slate-900 p-1 text-right">{formatQty(row.orderKbn || 0)}</td>
+                        <td className="border border-slate-900 p-1 text-right">{formatQty(row.orderUnit || 0)}</td>
+                      </tr>
+                    ))}
+                    <tr className="font-bold">
+                      <td colSpan={7} className="border border-slate-900 p-1 text-right">Total</td>
+                      <td className="border border-slate-900 p-1 text-right">{formatQty(supplierDnSummary.totals.orderKbn)}</td>
+                      <td className="border border-slate-900 p-1 text-right">{formatQty(supplierDnSummary.totals.orderUnit)}</td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div className="border border-t-0 border-slate-900 p-2 text-[10px] text-slate-900">
+                  <div className="font-bold">Remarks :</div>
+                  <div className="min-h-[28px] whitespace-pre-wrap">{supplierDnSummary.remarks || ''}</div>
+                </div>
+                <div className="mt-3 grid grid-cols-[1fr_1.4fr_1fr] gap-3 text-[9px] text-slate-900">
+                  <div className="border border-slate-900">
+                    <div className="border-b border-slate-900 py-1 text-center font-bold">SECURITY</div>
+                    <div className="h-14 border-b border-slate-900" />
+                    <div className="px-2 py-1">Date:</div>
+                  </div>
+                  <div className="border border-slate-900">
+                    <div className="grid grid-cols-2 border-b border-slate-900 text-center font-bold">
+                      <div className="border-r border-slate-900 py-1">CONTROL MAN</div>
+                      <div className="py-1">RECEIVED</div>
+                    </div>
+                    <div className="grid grid-cols-2 border-b border-slate-900">
+                      <div className="h-14 border-r border-slate-900" />
+                      <div className="h-14" />
+                    </div>
+                    <div className="grid grid-cols-2">
+                      <div className="border-r border-slate-900 px-2 py-1">Date:</div>
+                      <div className="px-2 py-1">Date:</div>
+                    </div>
+                  </div>
+                  <div className="border border-slate-900">
+                    <div className="py-1 text-center font-bold">SUPPLIER</div>
+                    <div className="grid grid-cols-2 border-y border-slate-900 text-center font-bold">
+                      <div className="border-r border-slate-900 py-1">APPROVED</div>
+                      <div className="py-1">PREPARED</div>
+                    </div>
+                    <div className="grid grid-cols-2 border-b border-slate-900">
+                      <div className="h-14 border-r border-slate-900" />
+                      <div className="h-14" />
+                    </div>
+                    <div className="grid grid-cols-2">
+                      <div className="border-r border-slate-900 px-2 py-1">Date:</div>
+                      <div className="px-2 py-1">Date:</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-4 supplier-label-grid md:grid-cols-2">
+                {labelBuild.labels.map((label) => {
+                  const qtyText = formatQty(label.packageQty);
+                  const partNoSize = String(label.partNo || label.itemCode || '').length > 16 ? '18pt' : '22pt';
+                  const qtySize = String(qtyText || '').length > 5 ? '17pt' : '22pt';
+                  return (
+                    <div key={label.key} className="supplier-package-label supplier-kanban-card">
+                      <div className="supplier-kanban-card__body">
+                        <div className="supplier-kanban-card__top">
+                          <div className="border-r-2 border-black flex flex-col items-center justify-center px-1 text-center">
+                            <div className="text-[8pt] font-black leading-tight">{label.locationLabel || '-'}</div>
+                            <div className="text-[5pt] font-semibold uppercase tracking-wide text-slate-700">{supplierDnSummary.supplierCode || supplierDnSummary.supplierName || '-'}</div>
+                          </div>
+                          <div className="border-r-2 border-black flex flex-col items-center justify-center px-1 text-center leading-tight">
+                            <div className="text-[7pt] font-black">E-KANBAN CARD</div>
+                            <div className="text-[5pt] font-semibold">SUPPLIER INCOMING</div>
+                          </div>
+                          <div className="flex items-center justify-center">
+                            <QRCodeSVG value={label.dnNumber || supplierDnSummary.dnNumber || '-'} size={28} />
+                          </div>
+                        </div>
+
+                        <div className="supplier-kanban-card__middle">
+                          <div className="supplier-kanban-card__main">
+                            <div className="px-2 pt-2">
+                              <div className="text-[6pt] font-semibold uppercase tracking-wide text-slate-700">Part No</div>
+                              <div className="font-extrabold leading-none tracking-tight" style={{ fontSize: partNoSize }}>
+                                {label.partNo || label.itemCode || '-'}
+                              </div>
+                              <div className="mt-1 text-[6pt] font-semibold leading-tight text-slate-700">{label.itemName || '-'}</div>
+                              <div className="mt-1 text-[6pt] font-bold text-slate-900">UNIQ {label.itemCode || '-'}</div>
+                            </div>
+                            <div className="grid grid-cols-[32mm_1fr] border-t-2 border-black">
+                              <div className="border-r-2 border-black p-2">
+                                <div className="text-[6pt] font-semibold uppercase tracking-wide text-slate-700">Qty</div>
+                                <div className="font-extrabold leading-none tracking-tight" style={{ fontSize: qtySize }}>
+                                  {qtyText}
+                                </div>
+                                <div className="mt-1 text-[6pt] font-bold">{label.unit || ''}</div>
+                              </div>
+                              <div className="p-2">
+                                <div className="text-[6pt] font-semibold uppercase tracking-wide text-slate-700">DN / Lot</div>
+                                <div className="break-all text-[7pt] font-bold">{label.dnNumber || '-'} / {label.lotNo || '-'}</div>
+                                <div className="mt-1 text-[6pt] font-semibold uppercase tracking-wide text-slate-700">Package</div>
+                                <div className="text-[7pt] font-bold">{String(label.packageSeq).padStart(3, '0')} / {String(label.packageTotal).padStart(3, '0')} | SNP {label.packQty > 0 ? formatQty(label.packQty) : '-'}</div>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="supplier-kanban-card__meta">
+                            <div className="supplier-meta-line">
+                              <span>CYCLE</span>
+                              <strong>{supplierDnSummary.cycle || '-'}</strong>
+                            </div>
+                            <div className="supplier-meta-line">
+                              <span>AREA</span>
+                              <strong>{label.nextProcessLabel || '-'}</strong>
+                            </div>
+                            <div className="supplier-meta-chip">{label.status || '-'}</div>
+                            <div className="supplier-meta-qr">
+                              <QRCodeSVG value={label.qrValue} size={48} />
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+                {labelBuild.labels.length === 0 && (
+                  <div className="rounded-xl border border-slate-200 bg-white p-6 text-center text-sm text-slate-500">
+                    Tidak ada label untuk dicetak.
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

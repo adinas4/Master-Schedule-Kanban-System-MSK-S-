@@ -84,9 +84,20 @@ const TabDashboard = (props) => {
   const {
     mainTab,
     setMainTab,
+    setKanbanView,
+    setKanbanSubTab,
     setFilterStart,
     setFilterEnd,
     setPrlFilters,
+    canEditSchedules,
+    canViewMaster,
+    canManageMaster,
+    canManageVendors,
+    canManageItems,
+    canViewPrl,
+    canPrlProcess,
+    canPrlImport,
+    canViewReport,
     prlFilters,
     prlShortageSummary = {},
     currentYear,
@@ -115,6 +126,7 @@ const TabDashboard = (props) => {
     scheduleReadinessLoading,
     schedules = [],
     stats = {},
+    user,
     resolveSupplierLabel: resolveSupplierLabelProp,
   } = props;
 
@@ -125,6 +137,57 @@ const TabDashboard = (props) => {
 
   const formatMoney = typeof formatRupiah === 'function' ? formatRupiah : formatNumberFallback;
   const formatNum = typeof formatNumber0 === 'function' ? formatNumber0 : formatNumberFallback;
+  const isProductionUser = String(user?.role || '').trim().toLowerCase() === 'production';
+  const canOpenDashboardTarget = (target) => {
+    const normalized = String(target || '').trim();
+    if (!normalized) return false;
+    if (['dash-kanban', 'kanban'].includes(normalized)) return true;
+    if (['dash-prl', 'prl'].includes(normalized)) return Boolean(canViewPrl || canPrlProcess || canPrlImport);
+    if (['dash-inventory', 'inventory'].includes(normalized)) return Boolean(canViewReport);
+    if (['dash-masterref', 'masterref'].includes(normalized)) return Boolean(canViewMaster || canManageMaster || canManageVendors || canManageItems);
+    if (['dash-schedule', 'monitoring'].includes(normalized)) return Boolean(canEditSchedules || canViewReport);
+    if (normalized === 'dashboard') return true;
+    return true;
+  };
+  const getDashboardTargetAccessMessage = (target) => {
+    const normalized = String(target || '').trim();
+    if (['dash-prl', 'prl'].includes(normalized)) return 'Anda tidak memiliki akses PRL.';
+    if (['dash-inventory', 'inventory'].includes(normalized)) return 'Anda tidak memiliki akses inventory / report.';
+    if (['dash-masterref', 'masterref'].includes(normalized)) return 'Anda tidak memiliki akses master data.';
+    if (['dash-schedule', 'monitoring'].includes(normalized)) return 'Anda tidak memiliki akses schedule / monitoring.';
+    return 'Anda tidak memiliki akses ke menu ini.';
+  };
+  const getDashboardCardClassName = (target, baseClassName) => {
+    return `${baseClassName} disabled:opacity-60 disabled:cursor-not-allowed disabled:shadow-none`;
+  };
+  const getDashboardCardTitle = (target, label) => {
+    if (canOpenDashboardTarget(target)) return undefined;
+    return getDashboardTargetAccessMessage(target);
+  };
+  const openDashboardTarget = (target) => {
+    const normalized = String(target || '').trim();
+    if (!canOpenDashboardTarget(normalized)) return;
+    if (normalized === 'kanban') {
+      if (typeof setMainTab === 'function') setMainTab('kanban');
+      if (typeof setKanbanView === 'function') setKanbanView('board');
+      if (typeof setKanbanSubTab === 'function') setKanbanSubTab('scan');
+      return;
+    }
+    if (normalized === 'dashboard') {
+      if (typeof setMainTab === 'function') setMainTab('dashboard');
+      return;
+    }
+    if (typeof setMainTab === 'function') setMainTab(normalized);
+  };
+  const openKanbanTarget = () => {
+    if (isProductionUser) {
+      if (typeof setMainTab === 'function') setMainTab('kanban');
+      if (typeof setKanbanView === 'function') setKanbanView('board');
+      if (typeof setKanbanSubTab === 'function') setKanbanSubTab('scan');
+      return;
+    }
+    if (typeof setMainTab === 'function') setMainTab('dash-kanban');
+  };
 
   const pad = (value) => String(value).padStart(2, '0');
   const toDateKey = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
@@ -225,7 +288,7 @@ const TabDashboard = (props) => {
               <div className="text-xs uppercase tracking-wide text-emerald-100">PRL Coverage</div>
               <div className="text-2xl font-bold">Planning Coverage & Shortage</div>
             </div>
-            <button onClick={() => setMainTab('dashboard')} className="px-3 py-1.5 rounded-full bg-white/15 text-white text-xs">Kembali</button>
+            <button onClick={() => openDashboardTarget('dashboard')} className="px-3 py-1.5 rounded-full bg-white/15 text-white text-xs">Kembali</button>
           </div>
         </div>
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
@@ -304,7 +367,7 @@ const TabDashboard = (props) => {
               <div className="text-xs uppercase tracking-wide text-indigo-100">Kanban Flow</div>
               <div className="text-2xl font-bold">Request Status Breakdown</div>
             </div>
-            <button onClick={() => setMainTab('dashboard')} className="px-3 py-1.5 rounded-full bg-white/15 text-white text-xs">Kembali</button>
+            <button onClick={() => openDashboardTarget('dashboard')} className="px-3 py-1.5 rounded-full bg-white/15 text-white text-xs">Kembali</button>
           </div>
         </div>
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
@@ -356,7 +419,7 @@ const TabDashboard = (props) => {
               <div className="text-xs uppercase tracking-wide text-amber-100">Inventory</div>
               <div className="text-2xl font-bold">Aging Overview</div>
             </div>
-            <button onClick={() => setMainTab('dashboard')} className="px-3 py-1.5 rounded-full bg-white/15 text-white text-xs">Kembali</button>
+            <button onClick={() => openDashboardTarget('dashboard')} className="px-3 py-1.5 rounded-full bg-white/15 text-white text-xs">Kembali</button>
           </div>
         </div>
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
@@ -424,7 +487,7 @@ const TabDashboard = (props) => {
               <div className="text-xs uppercase tracking-wide text-slate-200">Master Data</div>
               <div className="text-2xl font-bold">Data Quality Health</div>
             </div>
-            <button onClick={() => setMainTab('dashboard')} className="px-3 py-1.5 rounded-full bg-white/15 text-white text-xs">Kembali</button>
+            <button onClick={() => openDashboardTarget('dashboard')} className="px-3 py-1.5 rounded-full bg-white/15 text-white text-xs">Kembali</button>
           </div>
         </div>
         <div className="bg-white rounded-2xl border p-4">
@@ -464,7 +527,7 @@ const TabDashboard = (props) => {
               <div className="text-xs uppercase tracking-wide text-sky-100">Schedule</div>
               <div className="text-2xl font-bold">Readiness & Supplier Lead Time</div>
             </div>
-            <button onClick={() => setMainTab('dashboard')} className="px-3 py-1.5 rounded-full bg-white/15 text-white text-xs">Kembali</button>
+            <button onClick={() => openDashboardTarget('dashboard')} className="px-3 py-1.5 rounded-full bg-white/15 text-white text-xs">Kembali</button>
           </div>
         </div>
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
@@ -536,8 +599,10 @@ const TabDashboard = (props) => {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <button
           type="button"
-          onClick={() => setMainTab('monitoring')}
-          className="bg-white rounded-2xl border p-4 text-left hover:shadow-sm transition"
+          onClick={() => openDashboardTarget('monitoring')}
+          disabled={!canOpenDashboardTarget('monitoring')}
+          title={getDashboardCardTitle('monitoring', 'Buka dashboard monitoring')}
+          className={getDashboardCardClassName('monitoring', 'bg-white rounded-2xl border p-4 text-left hover:shadow-sm transition')}
         >
           <div className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold">Total PO</div>
           <div className="text-2xl font-bold text-slate-900">
@@ -549,8 +614,10 @@ const TabDashboard = (props) => {
         </button>
         <button
           type="button"
-          onClick={() => setMainTab('monitoring')}
-          className="bg-emerald-50/60 rounded-2xl border border-emerald-100 p-4 text-left hover:shadow-sm transition"
+          onClick={() => openDashboardTarget('monitoring')}
+          disabled={!canOpenDashboardTarget('monitoring')}
+          title={getDashboardCardTitle('monitoring', 'Buka dashboard monitoring')}
+          className={getDashboardCardClassName('monitoring', 'bg-emerald-50/60 rounded-2xl border border-emerald-100 p-4 text-left hover:shadow-sm transition')}
         >
           <div className="text-[10px] uppercase tracking-wide text-emerald-600 font-semibold">On Time</div>
           <div className="text-2xl font-bold text-emerald-700">
@@ -559,8 +626,10 @@ const TabDashboard = (props) => {
         </button>
         <button
           type="button"
-          onClick={() => setMainTab('monitoring')}
-          className="bg-rose-50/60 rounded-2xl border border-rose-100 p-4 text-left hover:shadow-sm transition"
+          onClick={() => openDashboardTarget('monitoring')}
+          disabled={!canOpenDashboardTarget('monitoring')}
+          title={getDashboardCardTitle('monitoring', 'Buka dashboard monitoring')}
+          className={getDashboardCardClassName('monitoring', 'bg-rose-50/60 rounded-2xl border border-rose-100 p-4 text-left hover:shadow-sm transition')}
         >
           <div className="text-[10px] uppercase tracking-wide text-rose-600 font-semibold">Late</div>
           <div className="text-2xl font-bold text-rose-700">
@@ -569,8 +638,10 @@ const TabDashboard = (props) => {
         </button>
         <button
           type="button"
-          onClick={() => setMainTab('monitoring')}
-          className="bg-amber-50/60 rounded-2xl border border-amber-100 p-4 text-left hover:shadow-sm transition"
+          onClick={() => openDashboardTarget('monitoring')}
+          disabled={!canOpenDashboardTarget('monitoring')}
+          title={getDashboardCardTitle('monitoring', 'Buka dashboard monitoring')}
+          className={getDashboardCardClassName('monitoring', 'bg-amber-50/60 rounded-2xl border border-amber-100 p-4 text-left hover:shadow-sm transition')}
         >
           <div className="text-[10px] uppercase tracking-wide text-amber-600 font-semibold">Pending</div>
           <div className="text-2xl font-bold text-amber-700">
@@ -581,8 +652,10 @@ const TabDashboard = (props) => {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-2">
         <button
           type="button"
-          onClick={() => setMainTab('inventory')}
-          className="text-left w-full bg-white p-4 rounded-xl shadow-sm border border-emerald-200 hover:shadow-md transition"
+          onClick={() => openDashboardTarget('inventory')}
+          disabled={!canOpenDashboardTarget('inventory')}
+          title={getDashboardCardTitle('inventory', 'Buka dashboard inventory')}
+          className={getDashboardCardClassName('inventory', 'text-left w-full bg-white p-4 rounded-xl shadow-sm border border-emerald-200 hover:shadow-md transition')}
         >
           <div className="text-gray-500 text-xs uppercase font-bold tracking-wide">Inventory Value</div>
           <div className="text-xl font-bold text-emerald-600">{kpiLoading ? '...' : formatMoney(kpiSummary.inventoryValue || 0)}</div>
@@ -590,8 +663,10 @@ const TabDashboard = (props) => {
         </button>
         <button
           type="button"
-          onClick={() => setMainTab('inventory')}
-          className="text-left w-full bg-white p-4 rounded-xl shadow-sm border border-rose-200 hover:shadow-md transition"
+          onClick={() => openDashboardTarget('inventory')}
+          disabled={!canOpenDashboardTarget('inventory')}
+          title={getDashboardCardTitle('inventory', 'Buka dashboard inventory')}
+          className={getDashboardCardClassName('inventory', 'text-left w-full bg-white p-4 rounded-xl shadow-sm border border-rose-200 hover:shadow-md transition')}
         >
           <div className="text-gray-500 text-xs uppercase font-bold tracking-wide">Stock Alert</div>
           <div className="text-xl font-bold text-rose-600">{kpiLoading ? '...' : formatNum(kpiSummary.stockAlert || 0)}</div>
@@ -599,8 +674,10 @@ const TabDashboard = (props) => {
         </button>
         <button
           type="button"
-          onClick={() => setMainTab('monitoring')}
-          className="text-left w-full bg-white p-4 rounded-xl shadow-sm border border-amber-200 hover:shadow-md transition"
+          onClick={() => openDashboardTarget('monitoring')}
+          disabled={!canOpenDashboardTarget('monitoring')}
+          title={getDashboardCardTitle('monitoring', 'Buka dashboard monitoring')}
+          className={getDashboardCardClassName('monitoring', 'text-left w-full bg-white p-4 rounded-xl shadow-sm border border-amber-200 hover:shadow-md transition')}
         >
           <div className="text-gray-500 text-xs uppercase font-bold tracking-wide">Pending Inbound</div>
           <div className="text-xl font-bold text-amber-600">{kpiLoading ? '...' : formatNum(kpiSummary.pendingInbound || 0)}</div>
@@ -608,8 +685,10 @@ const TabDashboard = (props) => {
         </button>
         <button
           type="button"
-          onClick={() => setMainTab('prl')}
-          className="text-left w-full bg-white p-4 rounded-xl shadow-sm border border-indigo-200 hover:shadow-md transition"
+          onClick={() => openDashboardTarget('prl')}
+          disabled={!canOpenDashboardTarget('prl')}
+          title={getDashboardCardTitle('prl', 'Buka dashboard PRL')}
+          className={getDashboardCardClassName('prl', 'text-left w-full bg-white p-4 rounded-xl shadow-sm border border-indigo-200 hover:shadow-md transition')}
         >
           <div className="text-gray-500 text-xs uppercase font-bold tracking-wide">Outstanding PR</div>
           <div className="text-xl font-bold text-indigo-600">{kpiLoading ? '...' : formatNum(kpiSummary.outstandingPr || 0)}</div>
@@ -701,9 +780,11 @@ const TabDashboard = (props) => {
                 shortage: true,
               });
             }
-            setMainTab('prl');
+            openDashboardTarget('prl');
           }}
-          className="text-left bg-white border border-rose-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition"
+          disabled={!canOpenDashboardTarget('prl')}
+          title={getDashboardCardTitle('prl', 'Buka dashboard PRL')}
+          className={getDashboardCardClassName('prl', 'text-left bg-white border border-rose-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition')}
         >
           <div className="text-xs uppercase tracking-wide text-rose-600 font-semibold mb-2">PRL Alert</div>
           <div className="text-lg font-semibold text-slate-900">
@@ -719,9 +800,8 @@ const TabDashboard = (props) => {
         </button>
 
         <button
-          onClick={() => {
-            setMainTab('kanban');
-          }}
+          onClick={openKanbanTarget}
+          title="Buka dashboard Kanban"
           className="text-left bg-white border border-indigo-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition"
         >
           <div className="text-xs uppercase tracking-wide text-indigo-600 font-semibold mb-2">Kanban Pipeline</div>
@@ -740,8 +820,10 @@ const TabDashboard = (props) => {
         </button>
 
         <button
-          onClick={() => setMainTab('inventory')}
-          className="text-left bg-white border border-emerald-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition"
+          onClick={() => openDashboardTarget('inventory')}
+          disabled={!canOpenDashboardTarget('inventory')}
+          title={getDashboardCardTitle('inventory', 'Buka dashboard inventory')}
+          className={getDashboardCardClassName('inventory', 'text-left bg-white border border-emerald-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition')}
         >
           <div className="text-xs uppercase tracking-wide text-emerald-600 font-semibold mb-2">Stock Health</div>
           <div className="text-sm font-semibold text-slate-900">Total Value</div>
@@ -753,8 +835,10 @@ const TabDashboard = (props) => {
         </button>
 
         <button
-          onClick={() => setMainTab('monitoring')}
-          className="text-left bg-white border border-sky-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition"
+          onClick={() => openDashboardTarget('monitoring')}
+          disabled={!canOpenDashboardTarget('monitoring')}
+          title={getDashboardCardTitle('monitoring', 'Buka dashboard monitoring')}
+          className={getDashboardCardClassName('monitoring', 'text-left bg-white border border-sky-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition')}
         >
           <div className="text-xs uppercase tracking-wide text-sky-600 font-semibold mb-2">Production Today</div>
           <div className="text-lg font-semibold text-slate-900">{productionTodaySummary.label || '-'}</div>
@@ -766,8 +850,10 @@ const TabDashboard = (props) => {
 
       <div className="mt-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
         <button
-          onClick={() => setMainTab('dash-prl')}
-          className="text-left bg-gradient-to-br from-emerald-50 via-white to-emerald-100 border border-emerald-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition"
+          onClick={() => openDashboardTarget('dash-prl')}
+          disabled={!canOpenDashboardTarget('dash-prl')}
+          title={getDashboardCardTitle('dash-prl', 'Buka PRL Coverage')}
+          className={getDashboardCardClassName('dash-prl', 'text-left bg-gradient-to-br from-emerald-50 via-white to-emerald-100 border border-emerald-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition')}
         >
           <div className="text-xs uppercase tracking-wide text-emerald-700 font-semibold mb-2">PRL Coverage</div>
           <ChartBox height={140}>
@@ -784,7 +870,8 @@ const TabDashboard = (props) => {
         </button>
 
         <button
-          onClick={() => setMainTab('dash-kanban')}
+          onClick={openKanbanTarget}
+          title="Buka dashboard Kanban"
           className="text-left bg-gradient-to-br from-indigo-50 via-white to-indigo-100 border border-indigo-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition"
         >
           <div className="text-xs uppercase tracking-wide text-indigo-700 font-semibold mb-2">Kanban Status</div>
@@ -802,8 +889,10 @@ const TabDashboard = (props) => {
         </button>
 
         <button
-          onClick={() => setMainTab('dash-inventory')}
-          className="text-left bg-gradient-to-br from-amber-50 via-white to-amber-100 border border-amber-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition"
+          onClick={() => openDashboardTarget('dash-inventory')}
+          disabled={!canOpenDashboardTarget('dash-inventory')}
+          title={getDashboardCardTitle('dash-inventory', 'Buka inventory aging')}
+          className={getDashboardCardClassName('dash-inventory', 'text-left bg-gradient-to-br from-amber-50 via-white to-amber-100 border border-amber-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition')}
         >
           <div className="text-xs uppercase tracking-wide text-amber-700 font-semibold mb-2">Inventory Aging</div>
           <ChartBox height={140}>
@@ -822,8 +911,10 @@ const TabDashboard = (props) => {
         </button>
 
         <button
-          onClick={() => setMainTab('dash-masterref')}
-          className="text-left bg-gradient-to-br from-slate-50 via-white to-slate-100 border border-slate-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition"
+          onClick={() => openDashboardTarget('dash-masterref')}
+          disabled={!canOpenDashboardTarget('dash-masterref')}
+          title={getDashboardCardTitle('dash-masterref', 'Buka master data health')}
+          className={getDashboardCardClassName('dash-masterref', 'text-left bg-gradient-to-br from-slate-50 via-white to-slate-100 border border-slate-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition')}
         >
           <div className="text-xs uppercase tracking-wide text-slate-700 font-semibold mb-2">Master Data Health</div>
           <ChartBox height={140}>
@@ -840,8 +931,10 @@ const TabDashboard = (props) => {
 
       <div className="mt-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-2 gap-4">
         <button
-          onClick={() => setMainTab('dash-schedule')}
-          className="text-left bg-gradient-to-br from-sky-50 via-white to-sky-100 border border-sky-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition"
+          onClick={() => openDashboardTarget('dash-schedule')}
+          disabled={!canOpenDashboardTarget('dash-schedule')}
+          title={getDashboardCardTitle('dash-schedule', 'Buka schedule readiness')}
+          className={getDashboardCardClassName('dash-schedule', 'text-left bg-gradient-to-br from-sky-50 via-white to-sky-100 border border-sky-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition')}
         >
           <div className="text-xs uppercase tracking-wide text-sky-700 font-semibold mb-2">Schedule Readiness</div>
           <ChartBox height={160}>
@@ -863,8 +956,10 @@ const TabDashboard = (props) => {
         </button>
 
         <button
-          onClick={() => setMainTab('dash-schedule')}
-          className="text-left bg-gradient-to-br from-cyan-50 via-white to-cyan-100 border border-cyan-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition"
+          onClick={() => openDashboardTarget('dash-schedule')}
+          disabled={!canOpenDashboardTarget('dash-schedule')}
+          title={getDashboardCardTitle('dash-schedule', 'Buka supplier lead time')}
+          className={getDashboardCardClassName('dash-schedule', 'text-left bg-gradient-to-br from-cyan-50 via-white to-cyan-100 border border-cyan-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition')}
         >
           <div className="text-xs uppercase tracking-wide text-cyan-700 font-semibold mb-2">Supplier Lead Time</div>
           <ChartBox height={160}>

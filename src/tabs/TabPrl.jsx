@@ -1,4 +1,4 @@
-import React from 'react';
+﻿import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Calendar,
@@ -13,12 +13,24 @@ import {
   Users,
   Upload,
 } from 'lucide-react';
-import { useMemo, useState } from 'react';
+
+import ImportHistoryTable from '../components/ImportHistoryTable';
+import ImportSummaryModal from '../components/ImportSummaryModal';
+import TabPrlToSupplier from './TabPrlToSupplier';
+
+const PRL_FORECAST_TIMEOUT_MS = 180000;
 
 const TabPrl = (props) => {
   const {
     mainTab,
+    apiFetch,
+    currentYear,
     prlImportRef,
+    prlImportHistoryError,
+    prlImportHistoryLoading,
+    prlImportHistoryRows,
+    prlImportSummary,
+    setPrlImportSummary,
     handlePrlImport,
     handlePrlPrintPdf,
     setPrlMenuOpen,
@@ -55,12 +67,15 @@ const TabPrl = (props) => {
     formatNumber2,
     getPrlVolPerDay,
     renderPaginationControls,
+    showToastMessage,
+    refreshPrlImportHistory,
   } = props;
 
   const [modelFilterOpen, setModelFilterOpen] = useState(false);
   const [modelFilterQuery, setModelFilterQuery] = useState('');
   const [categoryFilterOpen, setCategoryFilterOpen] = useState(false);
   const [categoryFilterQuery, setCategoryFilterQuery] = useState('');
+  const [supplierPreviewOpen, setSupplierPreviewOpen] = useState(false);
 
   const filteredModelOptions = useMemo(() => {
     const keyword = modelFilterQuery.trim().toLowerCase();
@@ -151,6 +166,52 @@ const TabPrl = (props) => {
   const toggleAutoDraftFilter = () => {
     setPrlFilters({ ...prlFilters, autoDraft: !autoDraftOnly });
   };
+  const supplierPreviewCacheKey = useMemo(() => {
+    const year = String(prlFilters?.year || currentYear || new Date().getFullYear()).trim();
+    const month = String(prlFilters?.month || prlActiveMonthKey || '').trim().toLowerCase();
+    const supplierKey = String(prlFilters?.supplier || '').trim().toLowerCase() || 'all';
+    if (!year || !month) return '';
+    return `${year}:${month}:${supplierKey}`;
+  }, [currentYear, prlActiveMonthKey, prlFilters?.month, prlFilters?.supplier, prlFilters?.year]);
+  const [supplierPreviewPreparing, setSupplierPreviewPreparing] = useState(false);
+  const [supplierPreviewInitialReport, setSupplierPreviewInitialReport] = useState(null);
+  const supplierPreviewPrefetchRef = useRef({ key: '', requestId: 0 });
+
+  const prefetchSupplierPreview = useCallback(async (targetCacheKey, { showPreparing = false } = {}) => {
+    if (!apiFetch || !targetCacheKey) return null;
+    if (supplierPreviewPrefetchRef.current.key === targetCacheKey && supplierPreviewInitialReport) {
+      return supplierPreviewInitialReport;
+    }
+    const [year, month, supplierKey] = targetCacheKey.split(':');
+    if (!year || !month) return null;
+    const requestId = supplierPreviewPrefetchRef.current.requestId + 1;
+    supplierPreviewPrefetchRef.current.requestId = requestId;
+    if (showPreparing) setSupplierPreviewPreparing(true);
+    try {
+      const params = new URLSearchParams();
+      params.set('year', year);
+      params.set('month', month);
+      if (supplierKey && supplierKey !== 'all' && prlFilters.supplier) {
+        params.set('supplier', prlFilters.supplier);
+      }
+      const report = await apiFetch(`/api/prl/forecast-preview?${params.toString()}`, {
+        timeoutMs: PRL_FORECAST_TIMEOUT_MS,
+      });
+      if (requestId !== supplierPreviewPrefetchRef.current.requestId) return null;
+      const cachedReport = report ? { ...report, __previewCacheKey: targetCacheKey } : null;
+      supplierPreviewPrefetchRef.current.key = targetCacheKey;
+      setSupplierPreviewInitialReport(cachedReport);
+      return cachedReport;
+    } catch {
+      if (requestId !== supplierPreviewPrefetchRef.current.requestId) return null;
+      supplierPreviewPrefetchRef.current.key = targetCacheKey;
+      setSupplierPreviewInitialReport(null);
+      return null;
+    } finally {
+      if (showPreparing) setSupplierPreviewPreparing(false);
+    }
+  }, [apiFetch, prlFilters.supplier, supplierPreviewInitialReport]);
+
   const getMonthHeaderClass = (monthKey) => (
     monthKey === prlActiveMonthKey ? 'bg-slate-200 text-slate-900' : ''
   );
@@ -164,6 +225,14 @@ const TabPrl = (props) => {
     const modelLabel = formatModelCodes(masterModelsMap, row.modelCodes) || row.model || '-';
     return String(modelLabel).split(' - ')[0] || '-';
   };
+
+  const handleOpenSupplierPreview = useCallback(async () => {
+    if (supplierPreviewCacheKey && supplierPreviewInitialReport?.__previewCacheKey === supplierPreviewCacheKey) {
+      setSupplierPreviewOpen(true);
+      return;
+    }
+    setSupplierPreviewOpen(true);
+  }, [supplierPreviewCacheKey, supplierPreviewInitialReport]);
 
   return (
     <>
@@ -191,16 +260,23 @@ const TabPrl = (props) => {
                     />
                     <div className="relative">
                       <button
-                        className="px-3 py-2 text-xs border rounded flex items-center gap-2"
+                        className="px-3 py-2 text-xs border rounded flex items-center gap-2 whitespace-nowrap"
                         onClick={() => setPrlMenuOpen((prev) => !prev)}
                       >
                         <FileUp size={14} /> PRL Tools <ChevronDown size={12} />
                       </button>
                       {prlMenuOpen && (
-                        <div className="absolute right-0 mt-2 w-44 bg-white rounded-lg shadow-lg border border-gray-100 overflow-hidden z-20">
+                        <div
+                          className="absolute right-0 mt-2 w-44 bg-white rounded-lg shadow-lg border border-gray-100 overflow-hidden z-20"
+                          onClick={(e) => e.stopPropagation()}
+                        >
                           {canPrlImport && (
                             <button
-                              onClick={() => { setPrlMenuOpen(false); prlImportRef.current?.click(); }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                prlImportRef.current?.click();
+                                setPrlMenuOpen(false);
+                              }}
                               className="w-full text-left px-4 py-2 text-xs hover:bg-slate-50 flex items-center gap-2"
                             >
                               <Upload size={14} /> Import
@@ -229,9 +305,16 @@ const TabPrl = (props) => {
                         </div>
                       )}
                     </div>
+                    <button
+                      type="button"
+                      onClick={handleOpenSupplierPreview}
+                      disabled={supplierPreviewPreparing}
+                      className="px-3 py-2 text-xs border rounded flex items-center gap-2 bg-slate-900 text-white hover:bg-slate-800 whitespace-nowrap"
+                    >
+                      {supplierPreviewPreparing ? 'Menyiapkan...' : '🖨️ PRL to Supplier'}
+                    </button>
                   </div>
                 </div>
-
                 <div className="mt-4 border rounded-lg">
                   <button
                     type="button"
@@ -263,7 +346,7 @@ const TabPrl = (props) => {
                         <div className="font-semibold text-slate-700">Fase 3: Konsumsi & Sirkulasi Ulang (Pull)</div>
                         <div className="mt-1">6) Pemakaian Produksi: Bin ke line side; parts diambil untuk produksi.</div>
                         <div>7) Kanban Kosong: Bin kosong menjadi sinyal order ulang.</div>
-                        <div>8) Scan QR: Sistem validasi part & line; jika PRL masih ada → auto request baru, jika PRL selesai → catat konsumsi tanpa order ulang.</div>
+                        <div>8) Scan QR: Sistem validasi part & line; jika PRL masih ada â†’ auto request baru, jika PRL selesai â†’ catat konsumsi tanpa order ulang.</div>
                       </div>
                     </div>
                   )}
@@ -525,6 +608,7 @@ const TabPrl = (props) => {
                 </div>
               </div>
 
+              <div className="flex flex-col gap-4">
               <div className="bg-white rounded-xl border p-4 overflow-x-auto">
                 {prlLoading && (
                   <div className="text-xs text-slate-500 mb-3">Memuat data PRL...</div>
@@ -585,9 +669,79 @@ const TabPrl = (props) => {
                 </div>
               </div>
             </div>
+            <div className="space-y-4">
+              <ImportHistoryTable
+                title="Riwayat Import PRL"
+                subtitle="Menampilkan batch upload PRL terakhir beserta status dan error detail."
+                rows={prlImportHistoryRows}
+                loading={prlImportHistoryLoading}
+                error={prlImportHistoryError}
+                onRefresh={refreshPrlImportHistory}
+                noDataMessage="Belum ada riwayat import PRL."
+                columns={[
+                  { key: 'created_at', label: 'Upload Time' },
+                  { key: 'file_name', label: 'File Name', render: (row) => row.file_name || '-' },
+                  { key: 'total_rows', label: 'Rows', className: 'text-right', render: (row) => Number(row.total_rows || 0) },
+                  { key: 'status', label: 'Status' },
+                  { key: 'created_by_name', label: 'User', render: (row) => row.created_by_name || '-' },
+                  { key: 'error_message', label: 'Error', render: (row) => row.error_message || '-' },
+                ]}
+              />
+            </div>
+            </div>
+            )}
+            {prlImportSummary?.open && (
+              <ImportSummaryModal
+                open={Boolean(prlImportSummary?.open)}
+                title="Hasil Import PRL"
+                subtitle="Ringkasan eksekusi import dan baris bermasalah."
+                summary={prlImportSummary}
+                detailRows={Array.isArray(prlImportSummary.detailRows) ? prlImportSummary.detailRows : []}
+                detailColumns={[
+                  { key: 'rowNumber', label: 'Row', className: 'text-right' },
+                  { key: 'uniq', label: 'UNIQ' },
+                  { key: 'type', label: 'Type', render: (row) => String(row.type || '-').toUpperCase() },
+                  { key: 'reason', label: 'Reason' },
+                ]}
+                onClose={() => setPrlImportSummary(null)}
+              />
+            )}
+            {supplierPreviewOpen && (
+              <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/60 p-4 print:hidden">
+                <div className="flex h-[92vh] w-[96vw] max-w-[1600px] flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
+                  <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+                    <div>
+                      <div className="text-sm font-semibold text-slate-900">PRL to Supplier</div>
+                      <div className="text-xs text-slate-500">Preview forecast supplier dari hasil BOM explosion.</div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setSupplierPreviewOpen(false)}
+                      className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                    >
+                      Tutup
+                    </button>
+                  </div>
+                  <div className="flex-1 overflow-auto bg-slate-50 p-4">
+                    <TabPrlToSupplier
+                      apiFetch={apiFetch}
+                      canViewPrl={canViewPrl}
+                      currentYear={currentYear}
+                      initialReport={supplierPreviewInitialReport}
+                      masterModels={masterModels}
+                      masterVendors={masterVendors}
+                      prlFilters={prlFilters}
+                      showToastMessage={showToastMessage}
+                    />
+                  </div>
+                </div>
+              </div>
             )}
     </>
   );
 };
 
 export default TabPrl;
+
+
+

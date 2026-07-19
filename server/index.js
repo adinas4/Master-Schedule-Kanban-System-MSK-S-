@@ -2635,7 +2635,7 @@ const ensureSchema = async () => {
       po_number text not null,
       source_type text not null,
       schedule_id integer references schedules(id) on delete set null,
-      po_line_id integer references po_lines(id) on delete set null,
+      po_line_id integer,
       item_code text not null references items(code),
       planned_date date,
       request_date date,

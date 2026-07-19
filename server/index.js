@@ -4107,23 +4107,6 @@ const parsePositiveId = (value) => {
   return integerValue > 0 ? integerValue : null;
 };
 
-const ensureAdminUser = async () => {
-  const username = process.env.ADMIN_USER;
-  const password = process.env.ADMIN_PASSWORD;
-  if (!username || !password) return;
-
-  const existing = await pool.query("select id from users where username = $1", [username]);
-  if (existing.rows.length > 0) return;
-
-  const passwordHash = await bcrypt.hash(password, 10);
-  const permissions = normalizePermissions({}, "admin");
-  await pool.query(
-    "insert into users (username, password_hash, role, permissions) values ($1, $2, 'admin', $3)",
-    [username, passwordHash, permissions],
-  );
-  console.log(`Created admin user: ${username}`);
-};
-
 const toDbSchedule = (payload = {}) => {
   const itemCode = normalizeItemCode(payload.itemCode ?? payload.item_code);
   const itemValue = normalizeItemCode(payload.item ?? itemCode);
@@ -28599,7 +28582,6 @@ const startServer = async () => {
   try {
     await ensureSchema();
     await ensureUploadDirs();
-    await ensureAdminUser();
     if (String(process.env.RUN_MIGRATIONS_ONLY || "").trim() === "1") {
       console.log("Database migration completed.");
       await pool.end();

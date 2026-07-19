@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "migrate": "node scripts/migrate.js",
+    "create-admin": "node scripts/create-admin.js",
     "backup": "node scripts/backup.js",
     "restore": "node scripts/restore.js"
   },

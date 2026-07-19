@@ -33,8 +33,6 @@ Server (`server/.env`):
 ```
 DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/monitoring_supplier
 JWT_SECRET=change_this_secret
-ADMIN_USER=admin
-ADMIN_PASSWORD=admin123
 ```
 
 Frontend (`.env` di root):
@@ -208,14 +206,16 @@ Migration memakai mekanisme `ensureSchema()` yang idempotent: `CREATE TABLE IF N
 
 ### J. Admin Pertama
 
-Jika database baru belum punya user admin, isi sementara:
+Jika database baru belum punya user admin, buat admin pertama dengan script one-time:
 
 ```text
-ADMIN_USER=admin
-ADMIN_PASSWORD=<password awal yang kuat>
+INITIAL_ADMIN_USERNAME=<username admin>
+INITIAL_ADMIN_PASSWORD=<password awal yang kuat>
+INITIAL_ADMIN_NAME=<nama tampilan opsional>
+npm run create-admin
 ```
 
-Deploy sekali sampai user dibuat, lalu hapus `ADMIN_PASSWORD` dari Railway variables atau ganti password dari aplikasi. Jangan commit password admin ke repository.
+Script menolak username yang sudah ada dan tidak berjalan otomatis saat startup. Hapus `INITIAL_ADMIN_PASSWORD` dari Railway variables setelah admin berhasil dibuat. Jangan commit password admin ke repository.
 
 ### K. Health Check
 

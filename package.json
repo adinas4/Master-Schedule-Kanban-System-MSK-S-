@@ -14,6 +14,7 @@
     "build:railway": "npm --prefix server install && npm run build",
     "start:railway": "node server/index.js",
     "migrate:railway": "npm --prefix server run migrate",
+    "create-admin": "npm --prefix server run create-admin",
     "lint": "eslint .",
     "preview": "vite preview",
     "uat:report-shortage": "node scripts/uat-report-shortage-ui.cjs"

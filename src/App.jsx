@@ -7518,12 +7518,24 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
       return { ok: false, reason: 'Qty belum valid di master item/kanban.' };
     }
     try {
-      await apiFetch('/api/stock/consume', {
+      const resultPayload = await apiFetch('/api/kanban/empty', {
         method: 'POST',
-        body: JSON.stringify({ itemCode, qty: qtyValue }),
+        body: JSON.stringify({
+          itemCode,
+          requestQty: qtyValue,
+          kanbanId: result?.kanbanId || null,
+          area: result?.area || null,
+        }),
       });
       await fetchItems();
       await fetchKanbanRequests();
+      const consumedQty = Number(resultPayload?.consumedQty ?? qtyValue);
+      const consumedBatches = Number(resultPayload?.consumedBatches ?? resultPayload?.updatedLots ?? 0);
+      const stockNote = `Stok terpotong ${formatNumber0(consumedQty)}${consumedBatches ? ` (${consumedBatches} lot)` : ''}.`;
+      const lotSummary = buildLotSummaryText(resultPayload?.consumed, { label: 'Lot terpakai' });
+      const notice = resultPayload?.notice || resultPayload?.prlPlan?.notice || '';
+      const requestNote = resultPayload?.requestCreated ? 'Request dibuat.' : (notice || 'Request sudah ada / tidak perlu reorder.');
+      showToastMessage(`${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} ${requestNote}`);
       return { ok: true };
     } catch (error) {
       return { ok: false, reason: error.message || 'Gagal keluarkan material.' };

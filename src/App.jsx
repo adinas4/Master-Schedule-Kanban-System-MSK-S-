@@ -541,10 +541,22 @@ class TabErrorBoundary extends React.Component {
   componentDidCatch(error, info) {
     if (typeof window !== 'undefined') {
       console.error('Tab render error:', error, info);
+      const message = String(error?.message || '');
+      const isChunkLoadError = /Failed to fetch dynamically imported module|Importing a module script failed|Loading chunk|ChunkLoadError/i.test(message);
+      const reloadKey = 'msks-tab-chunk-reload';
+      if (isChunkLoadError && window.sessionStorage?.getItem(reloadKey) !== '1') {
+        window.sessionStorage.setItem(reloadKey, '1');
+        const url = new URL(window.location.href);
+        url.searchParams.set('v', String(Date.now()));
+        window.location.replace(url.toString());
+      }
     }
   }
 
   handleRetry() {
+    if (typeof window !== 'undefined') {
+      window.sessionStorage?.removeItem('msks-tab-chunk-reload');
+    }
     this.setState({ hasError: false, error: null });
     if (typeof this.props.onRetry === 'function') {
       this.props.onRetry();

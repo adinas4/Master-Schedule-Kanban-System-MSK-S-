@@ -29099,15 +29099,31 @@ const reconcileKanbanShortagePrlDrafts = async (poolInstance) => {
 
 const registerFrontendStatic = () => {
   if (String(process.env.SERVE_FRONTEND || "true").trim().toLowerCase() === "false") return;
-  app.use(express.static(frontendDistDir));
+  app.use(express.static(frontendDistDir, {
+    setHeaders: (res, filePath) => {
+      const normalized = String(filePath || "").replace(/\\/g, "/");
+      if (normalized.includes("/assets/")) {
+        res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+        return;
+      }
+      if (normalized.endsWith("/index.html")) {
+        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+      }
+    },
+  }));
   app.get("*", async (req, res, next) => {
     const requestPath = String(req.path || "");
     if (requestPath.startsWith("/api/") || requestPath === "/api" || requestPath.startsWith("/uploads/")) {
       next();
       return;
     }
+    if (requestPath.startsWith("/assets/")) {
+      res.status(404).type("text/plain").send("asset not found");
+      return;
+    }
     try {
       await fs.access(frontendIndexFile);
+      res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
       res.sendFile(frontendIndexFile);
     } catch {
       next();

@@ -3720,7 +3720,17 @@ const Dashboard = ({ onLogout, token, user }) => {
   };
 
   function extractKanbanIdToken(value) {
-    return String(value || '').trim();
+    const trimmed = String(value || '').trim();
+    if (!trimmed) return '';
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const payload = JSON.parse(trimmed);
+        return String(payload?.kanbanId || payload?.kanban_id || payload?.cardUid || payload?.card_uid || payload?.itemCode || payload?.item_code || payload?.uniq || trimmed).trim();
+      } catch (_error) {
+        return trimmed;
+      }
+    }
+    return trimmed;
   }
 
   function extractKanbanItemCodeCandidates(value) {
@@ -7299,6 +7309,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
     if (!trimmed) return '';
     if (/[:|,;]/.test(trimmed)) return '';
     if (masterItemsByCode.has(trimmed)) return trimmed;
+    const caseInsensitiveItem = masterItems.find((item) => String(item?.code || '').trim().toLowerCase() === trimmed.toLowerCase());
+    if (caseInsensitiveItem?.code) return caseInsensitiveItem.code;
     const format = requireConfigFormat(masterConfig.kanbanIdFormat || standardKanbanCardIdFormat, 'Kanban ID format');
     if (!format) return trimmed;
     const regex = buildKanbanIdRegex(format);
@@ -7310,6 +7322,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
       if (masterItemsByCode.has(candidate)) return candidate;
       const normalizedCandidate = candidate.toUpperCase();
       if (masterItemsByCode.has(normalizedCandidate)) return normalizedCandidate;
+      const matchedItem = masterItems.find((item) => String(item?.code || '').trim().toLowerCase() === candidate.toLowerCase());
+      if (matchedItem?.code) return matchedItem.code;
     }
     return trimmed;
   }
@@ -7558,8 +7572,9 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
       alert('Area tidak valid. Pilih dari Master Referensi.');
       return;
     }
-    const qty = resolveKanbanTransactionQty(code);
-    if (!qty) {
+    const knownItemCode = masterItemsByCode.has(code) || kanbanSettingsByCode.has(code);
+    const qty = knownItemCode ? resolveKanbanTransactionQty(code) : 0;
+    if (knownItemCode && !qty) {
       alert('Kanban qty belum diatur di master item/kanban.');
       return;
     }
@@ -7567,8 +7582,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
       const result = await apiFetch('/api/kanban/empty', {
         method: 'POST',
         body: JSON.stringify({
-          itemCode: code,
-          requestQty: qty,
+          itemCode: knownItemCode ? code : '',
+          requestQty: qty || undefined,
           area: emptyKanbanForm.area || null,
           kanbanId: kanbanInput || null,
         }),
@@ -7618,10 +7633,12 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
     const failed = [];
     const notices = [];
     for (const id of ids) {
-      const code = resolveKanbanItemCode(id);
+      const kanbanInput = extractKanbanIdToken(id);
+      const code = resolveKanbanItemCode(kanbanInput);
       const setting = kanbanSettingsByCode.get(code);
-      const qty = Number(setting?.lot_qty || setting?.min_qty || 0);
-      if (!setting || !qty) {
+      const knownItemCode = masterItemsByCode.has(code) || Boolean(setting);
+      const qty = knownItemCode ? Number(setting?.lot_qty || setting?.min_qty || 0) : 0;
+      if (knownItemCode && (!setting || !qty)) {
         failed.push(id);
         continue;
       }
@@ -7629,10 +7646,10 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         const result = await apiFetch('/api/kanban/empty', {
           method: 'POST',
           body: JSON.stringify({
-            itemCode: code,
-            requestQty: qty,
+            itemCode: knownItemCode ? code : '',
+            requestQty: qty || undefined,
             area: batchForm.area || null,
-            kanbanId: id,
+            kanbanId: kanbanInput,
           }),
         });
         if (result?.notice) {

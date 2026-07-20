@@ -7362,7 +7362,9 @@ const consumeStockFifo = async (client, itemCode, qtyNumber, reason = "consume")
     remaining -= consumeQty;
   }
   if (remaining > 0) {
-    throw new Error(`Stok ${itemCode} tidak cukup. Kurang ${remaining}.`);
+    const requestedQty = Number(qtyNumber || 0);
+    const consumedQty = requestedQty - remaining;
+    throw new Error(`Stok ${itemCode} tidak cukup. Tersedia ${consumedQty}, kebutuhan ${requestedQty}, kurang ${remaining}.`);
   }
   return { consumed, warnings };
 };
@@ -8344,20 +8346,56 @@ const getMasterConfigRow = async (client) => {
 const resolveKanbanItemCode = async (client, kanbanId) => {
   const trimmed = extractKanbanIdToken(kanbanId);
   if (!trimmed) return "";
-  if (/[:|,;]/.test(trimmed)) return "";
+  if (/[:|,;]/.test(trimmed)) {
+    try {
+      const payload = JSON.parse(trimmed);
+      const jsonCode = String(payload?.itemCode || payload?.item_code || payload?.uniq || "").trim();
+      if (jsonCode) return resolveKanbanItemCode(client, jsonCode);
+      const jsonKanbanId = String(payload?.kanbanId || payload?.kanban_id || payload?.cardUid || payload?.card_uid || "").trim();
+      if (jsonKanbanId) return resolveKanbanItemCode(client, jsonKanbanId);
+    } catch (_error) {
+      return "";
+    }
+  }
   const directResult = await client.query(
-    "select code from items where code = $1 limit 1",
+    "select code from items where lower(code) = lower($1) limit 1",
     [trimmed],
   );
   if (directResult.rows.length > 0) return directResult.rows[0].code;
+  const cardResult = await client.query(
+    `
+    select item_code
+    from kanban_cards
+    where lower(card_uid) = lower($1)
+    limit 1
+    `,
+    [trimmed],
+  );
+  if (cardResult.rows.length > 0) return cardResult.rows[0].item_code;
+  const inboundCardResult = await client.query(
+    `
+    select item_code
+    from inbound_cards
+    where lower(card_uid) = lower($1)
+    limit 1
+    `,
+    [trimmed],
+  );
+  if (inboundCardResult.rows.length > 0) return inboundCardResult.rows[0].item_code;
   const config = await getMasterConfigRow(client);
   const format = config?.kanban_id_format || "KB-{CATEGORY}-{UNIQ}-{TOTAL:02}-{SEQ:02}";
   const regex = buildKanbanIdRegex(format);
   const match = trimmed.match(regex);
-  if (match?.groups?.uniq) return match.groups.uniq;
+  if (match?.groups?.uniq) {
+    const uniqResult = await client.query(
+      "select code from items where lower(code) = lower($1) limit 1",
+      [match.groups.uniq],
+    );
+    return uniqResult.rows[0]?.code || match.groups.uniq;
+  }
   for (const candidate of extractKanbanItemCodeCandidates(trimmed)) {
     const prefixResult = await client.query(
-      "select code from items where code = $1 limit 1",
+      "select code from items where lower(code) = lower($1) limit 1",
       [candidate],
     );
     if (prefixResult.rows.length > 0) return prefixResult.rows[0].code;

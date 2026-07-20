@@ -3071,11 +3071,14 @@ export default function BOMManager({
     const childrenMap = new Map();
     const childCodes = new Set();
     treePreviewRelations.forEach((rel) => {
-      if (!childrenMap.has(rel.parent_code)) {
-        childrenMap.set(rel.parent_code, []);
+      const parentCode = String(rel.parent_code || '').trim();
+      const childCode = String(rel.child_code || '').trim();
+      if (!parentCode || !childCode || parentCode === childCode) return;
+      if (!childrenMap.has(parentCode)) {
+        childrenMap.set(parentCode, []);
       }
-      childrenMap.get(rel.parent_code).push(rel);
-      childCodes.add(rel.child_code);
+      childrenMap.get(parentCode).push(rel);
+      childCodes.add(childCode);
     });
     const parentCodes = Array.from(childrenMap.keys());
     const fgRoots = items
@@ -3511,7 +3514,7 @@ export default function BOMManager({
       const children = relationMap.get(normalizedParent) || [];
       children.forEach((relation) => {
         const childCode = String(relation.child_code || '').trim();
-        if (!childCode) return;
+        if (!childCode || childCode === normalizedParent) return;
         const childItem = masterItemsByCode.get(childCode) || {
           code: childCode,
           name: relation.component_description || childCode,

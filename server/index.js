@@ -632,7 +632,8 @@ const defaultPermissionsByRole = {
 const allowedRoles = new Set(["admin", "ppic", "warehouse", "production", "purchasing", "management", "user", "supplier"]);
 
 const normalizePermissions = (input, role) => {
-  if (String(role || "").trim().toLowerCase() === "production") {
+  const normalizedRole = String(role || "").trim().toLowerCase();
+  if (normalizedRole === "production") {
     return {
       viewReport: false,
       viewScorecard: false,
@@ -652,12 +653,25 @@ const normalizePermissions = (input, role) => {
       production: true,
     };
   }
-  const base = defaultPermissionsByRole[role] || defaultPermissionsByRole.user;
+  const base = defaultPermissionsByRole[normalizedRole] || defaultPermissionsByRole.user;
   const normalized = { ...base };
   if (input && typeof input === "object") {
     for (const key of permissionKeys) {
       if (typeof input[key] === "boolean") normalized[key] = input[key];
     }
+  }
+  if (normalizedRole === "ppic") {
+    normalized.viewReport = true;
+    normalized.viewScorecard = true;
+    normalized.viewMaster = true;
+    normalized.manageMaster = true;
+    normalized.manageItems = true;
+    normalized.viewPrl = true;
+    normalized.prlImport = true;
+    normalized.editSchedules = true;
+    normalized.importExport = true;
+    normalized.useAI = true;
+    normalized.production = true;
   }
   return normalized;
 };
@@ -1213,6 +1227,18 @@ const ensureSchema = async () => {
     on master_bom_headers (parent_code, revision_no desc nulls last);
   `);
   await pool.query(`
+    create index if not exists idx_master_bom_headers_active_lookup
+    on master_bom_headers (
+      parent_code,
+      revision_no desc nulls last,
+      effective_start_date,
+      effective_date,
+      effective_end_date,
+      created_at desc,
+      id desc
+    );
+  `);
+  await pool.query(`
     alter table master_bom_headers
     add column if not exists bom_version text,
     add column if not exists effective_date date,
@@ -1259,6 +1285,10 @@ const ensureSchema = async () => {
   await pool.query(`
     create index if not exists idx_master_bom_parent_code
     on master_bom (parent_code);
+  `);
+  await pool.query(`
+    create index if not exists idx_master_bom_header_child
+    on master_bom (header_id, child_code);
   `);
   await pool.query(`
     alter table master_bom
@@ -3782,6 +3812,10 @@ const ensureSchema = async () => {
       primary key (item_code, vendor_id)
     );
   `);
+  await pool.query(`
+    create index if not exists idx_item_suppliers_vendor_item
+    on item_suppliers (vendor_id, item_code);
+  `);
 
   await pool.query(`
     create table if not exists item_customers (
@@ -4331,6 +4365,7 @@ const isAllowedProductionOutputType = (typeValue) => {
   if (raw.includes("raw")) return false;
   if (raw.includes("finished") || raw === "fg" || raw.includes(" fg")) return true;
   if (raw.includes("child")) return true;
+  if (raw === "assy" || raw.includes(" assy")) return true;
   if (raw.includes("sub-assy") || raw.includes("sub assy") || raw.includes("subassy")) return true;
   if (raw.includes("sub") && !raw.includes("subcon")) return true;
   return false;
@@ -6606,12 +6641,14 @@ const ensureLegacyBomHeader = async (client, parentCode) => {
 };
 
 const getBomChildren = async (client, parentCode, asOfDate = getTodayDateOnly()) => {
+  const parentCodeValue = String(parentCode || "").trim();
+  if (!parentCodeValue) return [];
   const result = await client.query(
     `
     with active_header as (
       select h.id, h.parent_code, h.revision_no
       from master_bom_headers h
-      where h.parent_code = $1
+      where lower(h.parent_code) = lower($1)
         and coalesce(h.effective_start_date, h.effective_date, h.created_at::date, current_date) <= $2::date
         and (h.effective_end_date is null or h.effective_end_date >= $2::date)
       order by h.revision_no desc nulls last,
@@ -6631,10 +6668,10 @@ const getBomChildren = async (client, parentCode, asOfDate = getTodayDateOnly())
       i.type as child_type
     from master_bom b
     join active_header h on h.id = b.header_id
-    join items i on i.code = b.child_code
+    join items i on lower(i.code) = lower(b.child_code)
     order by b.id asc
     `,
-    [parentCode, asOfDate],
+    [parentCodeValue, asOfDate],
   );
   return result.rows;
 };
@@ -6817,33 +6854,42 @@ const resolvePrlForecastBomDemandMap = async (client, rootDemandRows, asOfDate =
 };
 
 const explodeBom = async (client, parentCode, qty, accumulator, stack = [], asOfDate = getTodayDateOnly()) => {
-  if (stack.includes(parentCode)) {
-    throw new Error(`BOM cycle detected: ${stack.join(" -> ")} -> ${parentCode}`);
+  const normalizedParentCode = String(parentCode || "").trim();
+  const stackKeys = stack.map((code) => String(code || "").trim().toLowerCase());
+  if (stackKeys.includes(normalizedParentCode.toLowerCase())) {
+    throw new Error(`BOM cycle detected: ${stack.join(" -> ")} -> ${normalizedParentCode}`);
   }
-  const children = await getBomChildren(client, parentCode, asOfDate);
+  const children = await getBomChildren(client, normalizedParentCode, asOfDate);
   if (children.length === 0) return;
   for (const child of children) {
     const yieldFactor = normalizeYieldFactor(child.yield_factor, 1);
     const baseQty = (Number(child.quantity || 0) / yieldFactor) * qty;
     const scrapFactor = Number(child.scrap_factor || 0) / 100;
     const requiredQty = baseQty * (1 + scrapFactor);
-    if ((child.child_type || "").toLowerCase().includes("raw")) {
-      if (!accumulator[child.child_code]) {
-        accumulator[child.child_code] = {
+    if (!Number.isFinite(requiredQty) || requiredQty <= 0) continue;
+    const childCode = String(child.child_code || "").trim();
+    if (!childCode) continue;
+    const grandChildren = await getBomChildren(client, childCode, asOfDate);
+    const isLeafMaterial = grandChildren.length === 0 && isPrlForecastLeafType(child.child_type, child.child_name, childCode);
+    if (isLeafMaterial) {
+      if (!accumulator[childCode]) {
+        accumulator[childCode] = {
           requiredQty: 0,
           positionCodes: new Set(),
           substituteMaterialCodes: new Set(),
         };
       }
-      accumulator[child.child_code].requiredQty += requiredQty;
+      accumulator[childCode].requiredQty += requiredQty;
       if (child.position_code) {
-        accumulator[child.child_code].positionCodes.add(String(child.position_code).trim());
+        accumulator[childCode].positionCodes.add(String(child.position_code).trim());
       }
       normalizeSubstituteMaterialCodes(child.substitute_material_codes).forEach((code) => {
-        accumulator[child.child_code].substituteMaterialCodes.add(code);
+        accumulator[childCode].substituteMaterialCodes.add(code);
       });
-    } else {
-      await explodeBom(client, child.child_code, requiredQty, accumulator, [...stack, parentCode], asOfDate);
+      continue;
+    }
+    if (grandChildren.length > 0) {
+      await explodeBom(client, childCode, requiredQty, accumulator, [...stack, normalizedParentCode], asOfDate);
     }
   }
 };
@@ -6877,6 +6923,7 @@ const applyProductionConsumption = async (client, productCode, qtyNumber, produc
   }
 
   for (const [itemCode, requirement] of Object.entries(requirements)) {
+    const requiredQty = Number(requirement?.requiredQty || 0);
     let remaining = Number(requirement?.requiredQty || 0);
     const supplierFilter = typeof supplier === "string" ? supplier.trim() : "";
     const orderClause = await getFifoOrderClause(client, itemCode, "b");
@@ -6946,6 +6993,47 @@ const applyProductionConsumption = async (client, productCode, qtyNumber, produc
   }
 
   return { requirements, warnings };
+};
+
+const receiveProductionOutput = async (client, productCode, qtyNumber, productionId, productionDateValue, userId = null) => {
+  const qtyValue = Number(qtyNumber);
+  if (!productCode || !Number.isFinite(qtyValue) || qtyValue <= 0) {
+    throw new Error("Output produksi tidak valid.");
+  }
+  const dateValue = normalizeDateOnly(productionDateValue) || getTodayDateOnly();
+  const batchNo = `PROD-${productionId}`;
+  const { productionDate, expiredDate } = await resolveBatchDates(client, productCode, dateValue, null);
+  const batchResult = await client.query(
+    `
+    insert into stock_batches (item_code, qty_in, qty_out, arrival_date, do_number, batch_no, schedule_id, production_date, expired_date)
+    values ($1, $2, 0, $3, $4, $5, null, $6, $7)
+    returning *
+    `,
+    [productCode, qtyValue, dateValue, batchNo, batchNo, productionDate, expiredDate],
+  );
+  const batch = batchResult.rows[0] || null;
+  await logStockMovement(client, {
+    itemCode: productCode,
+    batchId: batch?.id || null,
+    qty: qtyValue,
+    direction: "in",
+    reason: "production_output",
+    sourceRefType: "production_order",
+    sourceRefId: productionId,
+  });
+  await insertInventoryLedger(client, {
+    itemCode: productCode,
+    transactionType: "PRODUCTION",
+    referenceDoc: batchNo,
+    qtyIn: qtyValue,
+    qtyOut: 0,
+    userId,
+    remarks: "production_output",
+    batchId: batch?.id || null,
+    sourceRefType: "production_order",
+    sourceRefId: productionId,
+  });
+  return batch;
 };
 
 const logStockMovement = async (client, payload) => {
@@ -9186,6 +9274,12 @@ const resolveSupplierCode = async (client, supplierValue, options = {}) => {
   return strict ? "" : trimmed;
 };
 
+const extractKanbanIdFromNotes = (notes) => {
+  const text = String(notes || "");
+  const match = text.match(/(?:^|\s|\|)kanban:([^|]+)/i);
+  return match ? String(match[1] || "").trim() : "";
+};
+
 const normalizeDeliverySchedule = (input) => {
   let rows = input;
   if (typeof rows === "string") {
@@ -10729,7 +10823,7 @@ const authenticate = async (req, res, next) => {
       id: sessionRow.user_id,
       username: sessionRow.username,
       role: sessionRow.role,
-      permissions: sessionRow.permissions || {},
+      permissions: normalizePermissions(sessionRow.permissions, sessionRow.role),
       supplierId: sessionRow.supplier_id || null,
       sessionId: sessionRow.session_jti,
     };
@@ -14806,6 +14900,17 @@ app.get("/api/kanban/requests", authenticate, async (req, res) => {
         )
       `,
     );
+    await client.query(
+      `
+      update kanban_requests kr
+      set status = 'closed',
+          updated_at = now()
+      from delivery_notes dn
+      where dn.id = kr.dn_id
+        and lower(coalesce(dn.status, '')) in ('closed', 'received', 'cancelled', 'canceled', 'rejected')
+        and kr.status not in ('closed', 'rejected')
+      `,
+    );
     const { status, itemCode, dnId } = req.query;
     const limit = Number(req.query.limit);
     const offset = Number(req.query.offset);
@@ -14824,10 +14929,12 @@ app.get("/api/kanban/requests", authenticate, async (req, res) => {
       `
       select
         kr.*,
+        dn.status as dn_status,
         i.name as item_name,
         i.unit as item_unit
       from kanban_requests kr
       join items i on i.code = kr.item_code
+      left join delivery_notes dn on dn.id = kr.dn_id
       ${whereClause}
       order by kr.created_at desc, kr.id desc
       ${limitClause}
@@ -14841,10 +14948,12 @@ app.get("/api/kanban/requests", authenticate, async (req, res) => {
         `
         select
           kr.*,
+          dn.status as dn_status,
           i.name as item_name,
           i.unit as item_unit
         from kanban_requests kr
         join items i on i.code = kr.item_code
+        left join delivery_notes dn on dn.id = kr.dn_id
         ${whereClause}
         order by kr.created_at desc, kr.id desc
         ${limitClause}
@@ -14907,8 +15016,11 @@ app.get("/api/delivery-notes/open", authenticate, async (req, res) => {
         coalesce(sum(dni.request_qty), 0) as total_qty
       from delivery_notes dn
       left join delivery_note_items dni on dni.dn_id = dn.id
-      where lower(dn.supplier) = any($1::text[])
-        and lower(dn.status) in ('open', 'partial', 'in_transit')
+      where (
+          lower(coalesce(dn.supplier_id, '')) = any($1::text[])
+          or lower(coalesce(dn.supplier, '')) = any($1::text[])
+        )
+        and lower(dn.status) in ('open', 'sent', 'partial', 'in_transit')
       group by dn.id
       order by dn.created_at desc, dn.id desc
       `,
@@ -15036,16 +15148,10 @@ app.get("/api/delivery-notes/:id/kanban-cards", authenticate, async (req, res) =
     }
     const dn = dnResult.rows[0];
     const dnStatus = String(dn.status || "").toLowerCase();
-    if (dnStatus !== "open") {
+    const allowedStatuses = new Set(["open", "sent", "in_transit", "partial", "published"]);
+    if (!allowedStatuses.has(dnStatus)) {
       await client.query("rollback");
-      res.status(409).json({ error: "DN belum OPEN." });
-      return;
-    }
-    const statusValue = String(dn.status || "").toLowerCase();
-    const allowedStatuses = new Set(["open", "in_transit", "partial", "published"]);
-    if (!allowedStatuses.has(statusValue)) {
-      await client.query("commit");
-      res.json([]);
+      res.status(409).json({ error: "DN belum siap untuk kartu kanban." });
       return;
     }
 
@@ -15594,32 +15700,56 @@ app.post("/api/delivery-notes/:id/receive", authenticate, requirePermission("edi
 });
 
 app.post("/api/delivery-notes/:id/force-close", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) {
       res.status(400).json({ error: "id tidak valid" });
       return;
     }
-    const dnResult = await pool.query(
-      "select * from delivery_notes where id = $1",
+    await client.query("begin");
+    const dnResult = await client.query(
+      "select * from delivery_notes where id = $1 for update",
       [id],
     );
     if (dnResult.rows.length === 0) {
+      await client.query("rollback");
       res.status(404).json({ error: "DN tidak ditemukan" });
       return;
     }
     const dn = dnResult.rows[0];
     if (dn.status === "received" || dn.status === "closed") {
+      await client.query(
+        `
+        update kanban_requests
+        set status = 'closed', updated_at = now()
+        where dn_id = $1 and status not in ('closed', 'rejected')
+        `,
+        [id],
+      );
+      await client.query("commit");
       res.json(dn);
       return;
     }
-    const updated = await pool.query(
+    const updated = await client.query(
       "update delivery_notes set status = $1 where id = $2 returning *",
       ["closed", id],
     );
+    await client.query(
+      `
+      update kanban_requests
+      set status = 'closed', updated_at = now()
+      where dn_id = $1 and status not in ('closed', 'rejected')
+      `,
+      [id],
+    );
+    await client.query("commit");
     res.json(updated.rows[0]);
   } catch (error) {
+    await client.query("rollback");
     res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -19603,6 +19733,145 @@ app.put("/api/kanban/requests/:id/qty", authenticate, requirePermission("editSch
   }
 });
 
+app.post("/api/kanban/requests/:id/complete-production", authenticate, requireAnyPermission("editSchedules", "production"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+    const productionDateValue = normalizeDateOnly(req.body?.productionDate) || getTodayDateOnly();
+    await client.query("begin");
+    const requestResult = await client.query(
+      `
+      select
+        kr.*,
+        i.name as item_name,
+        i.part_no,
+        i.type as item_type,
+        i.unit as item_unit
+      from kanban_requests kr
+      join items i on i.code = kr.item_code
+      where kr.id = $1
+      for update
+      `,
+      [id],
+    );
+    if (requestResult.rows.length === 0) {
+      res.status(404).json({ error: "request tidak ditemukan" });
+      await client.query("rollback");
+      return;
+    }
+
+    const requestRow = requestResult.rows[0];
+    const statusKey = String(requestRow.status || "").trim().toLowerCase();
+    if (!["triggered", "requested", "approved"].includes(statusKey)) {
+      res.status(409).json({ error: "Request production sudah diproses atau status tidak valid." });
+      await client.query("rollback");
+      return;
+    }
+    if (requestRow.dn_id) {
+      res.status(409).json({ error: "Request ini sudah terhubung ke DN, tidak bisa diproses sebagai production." });
+      await client.query("rollback");
+      return;
+    }
+    if (!isAllowedProductionOutputType(requestRow.item_type)) {
+      res.status(409).json({ error: "Hanya FG, Subassy, atau Child Part yang bisa diproses sebagai output production." });
+      await client.query("rollback");
+      return;
+    }
+
+    const qtyNumber = Number(requestRow.request_qty || 0);
+    if (!Number.isFinite(qtyNumber) || qtyNumber <= 0) {
+      res.status(400).json({ error: "Qty request tidak valid." });
+      await client.query("rollback");
+      return;
+    }
+
+    const orderResult = await client.query(
+      `
+      insert into production_orders (product_code, supplier, qty, source, kanban_id, part_no, created_by, scanned_at, production_date)
+      values ($1, $2, $3, 'KANBAN_REQUEST', $4, $5, $6, now(), $7)
+      returning *
+      `,
+      [
+        requestRow.item_code,
+        null,
+        qtyNumber,
+        extractKanbanIdFromNotes(requestRow.notes) || null,
+        requestRow.part_no || null,
+        req.user?.id || null,
+        productionDateValue,
+      ],
+    );
+    const productionOrder = orderResult.rows[0];
+    const { requirements, warnings } = await applyProductionConsumption(
+      client,
+      requestRow.item_code,
+      qtyNumber,
+      productionOrder.id,
+      "",
+      req.user?.id || null,
+    );
+    const outputBatch = await receiveProductionOutput(
+      client,
+      requestRow.item_code,
+      qtyNumber,
+      productionOrder.id,
+      productionDateValue,
+      req.user?.id || null,
+    );
+
+    const updatedRequest = await client.query(
+      `
+      update kanban_requests
+      set status = 'closed',
+          updated_at = now()
+      where id = $1
+      returning *
+      `,
+      [id],
+    );
+    if (statusKey !== "approved") {
+      await createKanbanEvent(client, id, "approved", req.user?.id || null, { source: "production_complete" });
+    }
+    await createKanbanEvent(client, id, "production_completed", req.user?.id || null, {
+      productionId: productionOrder.id,
+      outputBatchId: outputBatch?.id || null,
+      qty: qtyNumber,
+      productionDate: productionDateValue,
+    });
+    await syncKanbanRequestHealthByIds(client, [id], { syncPrlDrafts: true });
+    const autoCreated = await autoTriggerKanbanRequests(client, { note: "auto-trigger (production request)", userId: req.user?.id || null });
+    await client.query("commit");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Kanban",
+      severity: "success",
+      title: `Production completed for ${requestRow.item_code}.`,
+      detail: `Qty ${qtyNumber} posted from request ${requestRow.request_code || id}.`,
+      entityType: "production_order",
+      entityId: String(productionOrder.id),
+      payload: { requestId: id, productionId: productionOrder.id, itemCode: requestRow.item_code, qty: qtyNumber },
+    }).catch((error) => console.warn("Kanban notification failed:", error.message));
+    res.json({
+      ok: true,
+      request: updatedRequest.rows[0],
+      productionOrder,
+      outputBatch,
+      requirements,
+      warnings,
+      autoTriggered: autoCreated.length,
+    });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/api/kanban/requests/:id/create-dn", authenticate, requirePermission("editSchedules"), async (req, res) => {
   const client = await pool.connect();
   try {
@@ -20085,9 +20354,6 @@ app.get("/api/prl/forecast-preview", authenticate, requirePermission("viewPrl"),
 
     const rootRows = rootRowsResult.rows || [];
     const monthlyTotalsBySlot = new Map();
-    const sharedBomChildrenCache = new Map();
-    const sharedBomMultiplierCache = new Map();
-    const rootLeafMultiplierByCode = new Map();
     const eligibleRootRows = rootRows.filter((row) => {
       const code = String(row?.item_code || "").trim();
       if (!code) return false;
@@ -20095,48 +20361,137 @@ app.get("/api/prl/forecast-preview", authenticate, requirePermission("viewPrl"),
       if (!isParentItem) return false;
       return monthSlots.some((slot) => Number(row.months?.[slot.monthKey] || 0) > 0);
     });
-    const getRootLeafMultiplierMap = async (itemCode) => {
-      const code = String(itemCode || "").trim();
-      if (!code) return new Map();
-      if (rootLeafMultiplierByCode.has(code)) return rootLeafMultiplierByCode.get(code);
-      const leafMap = await buildPrlForecastLeafMultiplierMap(
-        pool,
-        code,
-        getTodayDateOnly(),
-        sharedBomChildrenCache,
-        sharedBomMultiplierCache,
-        [],
-      );
-      rootLeafMultiplierByCode.set(code, leafMap);
-      return leafMap;
-    };
-    const uniqueRootCodes = [...new Set(
-      eligibleRootRows
-        .map((row) => String(row?.item_code || "").trim())
-        .filter(Boolean),
-    )];
-    await traceStep("root-leaf-maps", () => runWithConcurrency(
-      uniqueRootCodes,
-      Number(process.env.PRL_FORECAST_BOM_CONCURRENCY || 4),
-      (code) => getRootLeafMultiplierMap(code),
-    ));
-    await traceStep("bom-demand-build", async () => {
-      for (const slot of monthSlots) {
-        const explodedTotals = new Map();
-        for (const row of eligibleRootRows) {
-          const rootQty = Number(row.months?.[slot.monthKey] || 0);
-          if (rootQty <= 0) continue;
-          const code = String(row.item_code || "").trim();
-          if (!code) continue;
-          const leafMap = await getRootLeafMultiplierMap(code);
-          if (!leafMap || leafMap.size === 0) continue;
-          for (const [leafCode, leafFactor] of leafMap.entries()) {
-            explodedTotals.set(leafCode, (explodedTotals.get(leafCode) || 0) + (leafFactor * rootQty));
+    monthSlots.forEach((slot) => monthlyTotalsBySlot.set(slot.monthKey, new Map()));
+    const rootDemandPayload = eligibleRootRows
+      .map((row) => {
+        const rootCode = String(row?.item_code || "").trim();
+        if (!rootCode) return null;
+        const demand = monthSlots.map((slot) => Number(row.months?.[slot.monthKey] || 0));
+        if (!demand.some((qty) => qty > 0)) return null;
+        return {
+          rootCode,
+          q0: demand[0] || 0,
+          q1: demand[1] || 0,
+          q2: demand[2] || 0,
+          q3: demand[3] || 0,
+          q4: demand[4] || 0,
+        };
+      })
+      .filter(Boolean);
+    if (rootDemandPayload.length > 0) {
+      const bomDemandResult = await traceStep("bom-demand-batch", () => pool.query(
+        `
+        with recursive active_headers as (
+          select distinct on (h.parent_code)
+            h.id,
+            h.parent_code
+          from master_bom_headers h
+          where coalesce(h.effective_start_date, h.effective_date, h.created_at::date, current_date) <= $2::date
+            and (h.effective_end_date is null or h.effective_end_date >= $2::date)
+          order by h.parent_code,
+            h.revision_no desc nulls last,
+            coalesce(h.effective_start_date, h.effective_date, h.created_at::date, current_date) desc,
+            h.created_at desc,
+            h.id desc
+        ),
+        root_demand as (
+          select *
+          from jsonb_to_recordset($1::jsonb) as rd(
+            "rootCode" text,
+            q0 numeric,
+            q1 numeric,
+            q2 numeric,
+            q3 numeric,
+            q4 numeric
+          )
+        ),
+        explosion as (
+          select
+            rd."rootCode" as root_code,
+            b.child_code,
+            (
+              coalesce(b.quantity, 0)
+              / case when coalesce(b.yield_factor, 1) > 0 then coalesce(b.yield_factor, 1) else 1 end
+              * (1 + coalesce(b.scrap_factor, 0) / 100)
+            )::numeric as factor,
+            1 as depth,
+            array[rd."rootCode", b.child_code]::text[] as path
+          from root_demand rd
+          join active_headers h on h.parent_code = rd."rootCode"
+          join master_bom b on b.header_id = h.id
+          where coalesce(b.quantity, 0) > 0
+            and b.child_code <> h.parent_code
+          union all
+          select
+            e.root_code,
+            b.child_code,
+            (
+              e.factor
+              * coalesce(b.quantity, 0)
+              / case when coalesce(b.yield_factor, 1) > 0 then coalesce(b.yield_factor, 1) else 1 end
+              * (1 + coalesce(b.scrap_factor, 0) / 100)
+            )::numeric as factor,
+            e.depth + 1 as depth,
+            e.path || b.child_code
+          from explosion e
+          join active_headers h on h.parent_code = e.child_code
+          join master_bom b on b.header_id = h.id
+          where e.depth < 20
+            and coalesce(b.quantity, 0) > 0
+            and b.child_code <> h.parent_code
+            and not b.child_code = any(e.path)
+        )
+        select
+          e.child_code as item_code,
+          coalesce(sum(e.factor * rd.q0), 0)::numeric as q0,
+          coalesce(sum(e.factor * rd.q1), 0)::numeric as q1,
+          coalesce(sum(e.factor * rd.q2), 0)::numeric as q2,
+          coalesce(sum(e.factor * rd.q3), 0)::numeric as q3,
+          coalesce(sum(e.factor * rd.q4), 0)::numeric as q4
+        from explosion e
+        join root_demand rd on rd."rootCode" = e.root_code
+        join items i on i.code = e.child_code
+        where not exists (
+            select 1
+            from active_headers child_h
+            join master_bom child_b on child_b.header_id = child_h.id
+            where child_h.parent_code = e.child_code
+              and child_b.child_code <> child_h.parent_code
+          )
+          and (
+            lower(concat_ws(' ', i.type, i.name, i.code)) like '%raw material%'
+            or lower(concat_ws(' ', i.type, i.name, i.code)) ~ '\\mraw\\M'
+            or lower(concat_ws(' ', i.type, i.name, i.code)) ~ '\\mrm\\M'
+            or lower(concat_ws(' ', i.type, i.name, i.code)) like '%child part%'
+            or lower(concat_ws(' ', i.type, i.name, i.code)) ~ '\\mcp\\M'
+            or lower(concat_ws(' ', i.type, i.name, i.code)) like '%component%'
+            or lower(concat_ws(' ', i.type, i.name, i.code)) like '%stkm%'
+            or lower(concat_ws(' ', i.type, i.name, i.code)) like '%subcon%'
+          )
+          and lower(concat_ws(' ', i.type, i.name, i.code)) not like '%wip%'
+          and lower(concat_ws(' ', i.type, i.name, i.code)) not like '%work in progress%'
+          and lower(concat_ws(' ', i.type, i.name, i.code)) not like '%fg%'
+          and lower(concat_ws(' ', i.type, i.name, i.code)) not like '%finish%'
+          and lower(concat_ws(' ', i.type, i.name, i.code)) not like '%sub assy%'
+          and lower(concat_ws(' ', i.type, i.name, i.code)) not like '%subassy%'
+          and lower(concat_ws(' ', i.type, i.name, i.code)) not like '%sub-assy%'
+        group by e.child_code
+        `,
+        [JSON.stringify(rootDemandPayload), getTodayDateOnly()],
+      ));
+      for (const row of bomDemandResult.rows || []) {
+        const itemCode = String(row.item_code || "").trim();
+        if (!itemCode) continue;
+        monthSlots.forEach((slot, index) => {
+          const value = Number(row[`q${index}`] || 0);
+          if (value > 0) {
+            const slotMap = monthlyTotalsBySlot.get(slot.monthKey) || new Map();
+            slotMap.set(itemCode, value);
+            monthlyTotalsBySlot.set(slot.monthKey, slotMap);
           }
-        }
-        monthlyTotalsBySlot.set(slot.monthKey, explodedTotals);
+        });
       }
-    });
+    }
 
     const itemRowsResult = await traceStep("item-rows", () => pool.query(
       `
@@ -23016,6 +23371,184 @@ app.put("/api/dn/:id", authenticate, requirePermission("editSchedules"), async (
   }
 });
 
+app.post("/api/dn/:id/split-by-rit", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: "id tidak valid" });
+      return;
+    }
+
+    await client.query("begin");
+    const dnResult = await client.query(
+      "select * from delivery_notes where id = $1 for update",
+      [id],
+    );
+    if (dnResult.rows.length === 0) {
+      res.status(404).json({ error: "DN tidak ditemukan" });
+      await client.query("rollback");
+      return;
+    }
+
+    const sourceDn = dnResult.rows[0];
+    if (String(sourceDn.status || "").trim().toLowerCase() !== "draft") {
+      res.status(409).json({ error: "Split per rit hanya bisa untuk DN status draft." });
+      await client.query("rollback");
+      return;
+    }
+
+    const requestResult = await client.query(
+      `
+      select id, request_code, item_code, request_qty
+      from kanban_requests
+      where dn_id = $1
+      order by id asc
+      for update
+      `,
+      [id],
+    );
+    const requestRows = requestResult.rows || [];
+    if (requestRows.length <= 1) {
+      res.status(409).json({ error: "DN hanya berisi 1 request, tidak perlu dipecah per rit." });
+      await client.query("rollback");
+      return;
+    }
+
+    const supplierRef = sourceDn.supplier_id || sourceDn.supplier;
+    const scheduleRows = await resolveVendorSchedule(client, supplierRef);
+    if (scheduleRows.length === 0) {
+      res.status(400).json({ error: "Master Vendor belum memiliki delivery schedule/rit." });
+      await client.query("rollback");
+      return;
+    }
+
+    const maxLinesInput = Number(req.body?.maxLinesPerDn || 0);
+    const plannedChunkCount = Math.min(scheduleRows.length, requestRows.length);
+    const maxLinesPerDn = Number.isFinite(maxLinesInput) && maxLinesInput > 0
+      ? Math.floor(maxLinesInput)
+      : Math.ceil(requestRows.length / plannedChunkCount);
+    const chunks = [];
+    for (let index = 0; index < requestRows.length; index += maxLinesPerDn) {
+      chunks.push(requestRows.slice(index, index + maxLinesPerDn));
+    }
+    if (chunks.length > scheduleRows.length) {
+      res.status(400).json({
+        error: "Jumlah pecahan melebihi jumlah rit supplier. Tambah rit di Master Vendor atau naikkan batas item per DN.",
+      });
+      await client.query("rollback");
+      return;
+    }
+
+    const numbering = await getDocumentNumberingConfig(client);
+    const dnFormat = requireFormat(numbering.dnFormat, "DN format");
+    const supplierCodeRaw = await resolveSupplierCode(client, supplierRef);
+    const supplierCode = supplierCodeRaw || sourceDn.supplier_id || sourceDn.supplier || "SUPPLIER";
+    const supplierId = sourceDn.supplier_id || await resolveSupplierCode(client, supplierRef, { strict: true }) || null;
+    const buildSchedulePayload = (scheduleRow) => ({
+      cycle: scheduleRow?.cycle ? String(scheduleRow.cycle).trim() : null,
+      rit: scheduleRow?.rit !== undefined && scheduleRow?.rit !== null && String(scheduleRow.rit).trim() !== ""
+        ? String(scheduleRow.rit).trim()
+        : null,
+      time: scheduleRow?.time ? String(scheduleRow.time).trim() : null,
+    });
+
+    const createdDns = [];
+    const allRequestIds = requestRows.map((row) => row.id);
+    await client.query("delete from delivery_note_items where dn_id = $1", [id]);
+
+    for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+      const chunkRows = chunks[chunkIndex];
+      const requestIds = chunkRows.map((row) => row.id);
+      const schedule = buildSchedulePayload(scheduleRows[chunkIndex] || scheduleRows[0] || {});
+      if (!schedule.rit || !schedule.time) {
+        res.status(400).json({ error: "Setiap rit supplier wajib memiliki Rit dan Jam." });
+        await client.query("rollback");
+        return;
+      }
+
+      let targetDn = sourceDn;
+      if (chunkIndex === 0) {
+        const updateResult = await client.query(
+          `
+          update delivery_notes
+          set request_id = $1,
+              supplier_id = coalesce(supplier_id, $2),
+              cycle = $3,
+              rit = $4,
+              delivery_time = $5
+          where id = $6
+          returning *
+          `,
+          [chunkRows[0].id, supplierId, schedule.cycle, schedule.rit, schedule.time, id],
+        );
+        targetDn = updateResult.rows[0];
+      } else {
+        const dnNumber = await buildDocumentNumber(client, "delivery_notes", "dn_number", dnFormat, {
+          dept: numbering.dept,
+          supplier: sourceDn.supplier,
+          supplierCode,
+          prefix: "DN",
+          date: sourceDn.created_at || sourceDn.planned_date,
+        });
+        const insertResult = await client.query(
+          `
+          insert into delivery_notes
+            (dn_number, request_id, supplier, supplier_id, planned_date, status, delivery_type, remarks, cycle, rit, delivery_time)
+          values ($1, $2, $3, $4, $5, 'draft', $6, $7, $8, $9, $10)
+          returning *
+          `,
+          [
+            dnNumber,
+            chunkRows[0].id,
+            sourceDn.supplier,
+            supplierId,
+            sourceDn.planned_date,
+            sourceDn.delivery_type || "normal",
+            sourceDn.remarks || null,
+            schedule.cycle,
+            schedule.rit,
+            schedule.time,
+          ],
+        );
+        targetDn = insertResult.rows[0];
+      }
+
+      await client.query(
+        `
+        update kanban_requests
+        set status = 'dn_created', dn_id = $1, updated_at = now()
+        where id = any($2::int[])
+        `,
+        [targetDn.id, requestIds],
+      );
+      await insertDeliveryNoteItems(client, targetDn.id, requestIds);
+      for (const row of chunkRows) {
+        await createKanbanEvent(client, row.id, "dn_split_by_rit", req.user?.id || null, {
+          sourceDnId: sourceDn.id,
+          targetDnId: targetDn.id,
+          rit: schedule.rit,
+          deliveryTime: schedule.time,
+        });
+      }
+      createdDns.push({
+        ...targetDn,
+        item_count: chunkRows.length,
+        request_ids: requestIds,
+      });
+    }
+
+    await syncKanbanRequestHealthByIds(client, allRequestIds, { syncPrlDrafts: true });
+    await client.query("commit");
+    res.json({ ok: true, sourceDnId: id, dns: createdDns });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.put("/api/dn/:id/status", authenticate, requirePermission("editSchedules"), async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -23891,7 +24424,7 @@ app.get("/api/bom/headers", authenticate, requireMasterRead, async (req, res) =>
         count(b.id) as line_count
       from master_bom_headers h
       join items pi on pi.code = h.parent_code
-      left join master_bom b on b.header_id = h.id
+      left join master_bom b on b.header_id = h.id and b.parent_code <> b.child_code
       group by h.id, pi.name
       order by h.created_at desc
       `,
@@ -23954,6 +24487,7 @@ app.get("/api/bom/headers/:id", authenticate, requireMasterRead, async (req, res
       from master_bom b
       join items ci on ci.code = b.child_code
       where b.header_id = $1
+        and b.parent_code <> b.child_code
       order by b.id asc
       `,
       [id],
@@ -24091,7 +24625,8 @@ app.get("/api/bom", authenticate, requireMasterRead, async (req, res) => {
       values.push(String(req.query.parentCode).trim());
       filters.push(`b.parent_code = $${values.length}`);
     }
-    const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
+    filters.push(`b.parent_code <> b.child_code`);
+    const whereClause = `where ${filters.join(" and ")}`;
     const result = await pool.query(
       `
       select
@@ -24193,6 +24728,7 @@ app.get("/api/bom/:parentCode", authenticate, requireMasterRead, async (req, res
        join master_bom_headers h on h.id = b.header_id
        join items i on i.code = b.child_code
        where b.parent_code = $1
+         and b.parent_code <> b.child_code
        order by h.revision_no desc nulls last, b.id asc`,
       [parentCode],
     );
@@ -24638,18 +25174,19 @@ app.get("/api/bom/imports", authenticate, requireMasterRead, async (req, res) =>
   }
 });
 
-app.get("/api/production/requirements", authenticate, requirePermission("production"), async (req, res) => {
+app.get("/api/production/requirements", authenticate, requireAnyPermission("editSchedules", "production"), async (req, res) => {
   const client = await pool.connect();
   try {
     const { productCode, qty, supplier, asOfDate } = req.query;
+    const productCodeValue = String(productCode || "").trim();
     const qtyNumber = Number(qty);
-    if (!productCode || !Number.isFinite(qtyNumber) || qtyNumber <= 0) {
+    if (!productCodeValue || !Number.isFinite(qtyNumber) || qtyNumber <= 0) {
       res.status(400).json({ error: "productCode dan qty wajib diisi" });
       return;
     }
     const asOfDateValue = normalizeDateOnly(asOfDate) || getTodayDateOnly();
     const requirements = {};
-    await explodeBom(client, productCode, qtyNumber, requirements, [], asOfDateValue);
+    await explodeBom(client, productCodeValue, qtyNumber, requirements, [], asOfDateValue);
     const itemCodes = Object.keys(requirements);
     if (itemCodes.length === 0) {
       res.status(400).json({ error: "BOM kosong untuk item ini" });

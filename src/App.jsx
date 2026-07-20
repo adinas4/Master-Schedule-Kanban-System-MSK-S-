@@ -2467,7 +2467,21 @@ const Dashboard = ({ onLogout, token, user }) => {
   const isAdmin = user?.role === 'admin';
   const isSupplier = user?.role === 'supplier';
   const isProductionUser = user?.role === 'production';
-  const can = (perm) => user?.role === 'admin' || user?.permissions?.[perm];
+  const isPpicUser = String(user?.role || '').trim().toLowerCase() === 'ppic';
+  const ppicFullKanbanPermissions = new Set([
+    'viewReport',
+    'viewScorecard',
+    'viewMaster',
+    'manageMaster',
+    'manageItems',
+    'viewPrl',
+    'prlImport',
+    'editSchedules',
+    'production',
+    'importExport',
+    'useAI',
+  ]);
+  const can = (perm) => user?.role === 'admin' || (isPpicUser && ppicFullKanbanPermissions.has(perm)) || user?.permissions?.[perm];
   const canViewReport = can('viewReport');
   const canViewScorecard = can('viewScorecard');
   const canViewMaster = can('viewMaster');
@@ -3005,11 +3019,14 @@ const Dashboard = ({ onLogout, token, user }) => {
       receivedTotals.set(itemCode, prev + Number(note.received_qty || 0));
     });
     const reservedStatuses = new Set(['triggered', 'requested', 'approved', 'dn_created', 'scheduled', 'in_transit']);
+    const terminalDnStatuses = new Set(['closed', 'received', 'cancelled', 'canceled', 'rejected']);
     const reservedTotals = new Map();
     (kanbanRequests || []).forEach((row) => {
       const itemCode = row.item_code || '';
       const status = String(row.status || '').toLowerCase();
+      const dnStatus = String(row.dn_status || '').toLowerCase();
       if (!itemCode || !reservedStatuses.has(status)) return;
+      if (row.dn_id && terminalDnStatuses.has(dnStatus)) return;
       const prev = reservedTotals.get(itemCode) || 0;
       reservedTotals.set(itemCode, prev + Number(row.request_qty || 0));
     });
@@ -6947,10 +6964,10 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
   };
 
   const handleForceCloseDn = async (dn) => {
-    if (!dn?.id) return;
+    if (!dn?.id) return false;
     const label = dn.dn_number || dn.id;
     const ok = window.confirm(`Force close DN ${label}?`);
-    if (!ok) return;
+    if (!ok) return false;
     try {
       const updated = await apiFetch(`/api/delivery-notes/${dn.id}/force-close`, { method: 'POST' });
       setSelectedDnDetail((prev) => (
@@ -6958,8 +6975,10 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
       ));
       await fetchDeliveryNotes();
       alert('DN berhasil ditutup.');
+      return true;
     } catch (error) {
       alert(error.message || 'Gagal force close DN.');
+      return false;
     }
   };
 
@@ -8946,11 +8965,14 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       return;
     }
     const reservedStatuses = new Set(['triggered', 'requested', 'approved', 'dn_created', 'scheduled', 'in_transit']);
+    const terminalDnStatuses = new Set(['closed', 'received', 'cancelled', 'canceled', 'rejected']);
     const reservedTotals = new Map();
     (kanbanRequests || []).forEach((request) => {
       const itemCode = request.item_code || '';
       const status = String(request.status || '').toLowerCase();
+      const dnStatus = String(request.dn_status || '').toLowerCase();
       if (!itemCode || !reservedStatuses.has(status)) return;
+      if (request.dn_id && terminalDnStatuses.has(dnStatus)) return;
       reservedTotals.set(itemCode, Number(reservedTotals.get(itemCode) || 0) + Number(request.request_qty || 0));
     });
     const synced = kanbanSettings.map((row) => {

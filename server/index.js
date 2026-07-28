@@ -2005,6 +2005,7 @@ const ensureSchema = async () => {
       min_qty numeric not null default 0,
       max_qty numeric not null default 0,
       lot_qty numeric not null default 0,
+      max_delivery_per_rit numeric not null default 0,
       lead_time_days integer not null default 0,
       safety_factor numeric not null default 0,
       regular_kanban numeric not null default 2,
@@ -2042,6 +2043,7 @@ const ensureSchema = async () => {
     alter table kanban_settings
     add column if not exists safety_factor numeric not null default 0,
     add column if not exists regular_kanban numeric not null default 2,
+    add column if not exists max_delivery_per_rit numeric not null default 0,
     add column if not exists safety_hours numeric not null default 48,
     add column if not exists work_hours numeric not null default 24,
     add column if not exists cycle_x numeric not null default 1,
@@ -2059,6 +2061,15 @@ const ensureSchema = async () => {
     add column if not exists calculated_prl_year integer,
     add column if not exists calculated_prl_month text,
     add column if not exists calculated_at timestamptz;
+  `);
+
+  await pool.query(`
+    update kanban_settings ks
+    set max_delivery_per_rit = i.max_delivery_per_rit
+    from items i
+    where i.code = ks.item_code
+      and coalesce(ks.max_delivery_per_rit, 0) = 0
+      and coalesce(i.max_delivery_per_rit, 0) > 0;
   `);
 
   await pool.query(`
@@ -9898,7 +9909,7 @@ const resolveDeliveryItemRow = async (client, itemRef) => {
     select
       i.*,
       ks.lot_qty,
-      ks.max_delivery_per_rit
+      coalesce(nullif(ks.max_delivery_per_rit, 0), nullif(i.max_delivery_per_rit, 0), 0) as max_delivery_per_rit
     from items i
     left join kanban_settings ks on ks.item_code = i.code
     where lower(trim(coalesce(i.code, ''))) = any($1::text[])

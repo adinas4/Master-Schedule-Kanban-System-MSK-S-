@@ -5600,6 +5600,7 @@ const loadRemainingPoLines = async (client, poNumber) => {
     `
     with valid_receipts as (
       select
+        ra.po_number,
         coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
         lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
         sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
@@ -5612,8 +5613,32 @@ const loadRemainingPoLines = async (client, poNumber) => {
         and rnh.reversal_of is null
         and rni.line_status = 'posted'
       group by
+        ra.po_number,
         coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
         lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+    ),
+    po_line_receipts as (
+      select
+        pl.id as po_line_id,
+        sum(vr.received_qty)::numeric as received_qty
+      from po_lines pl
+      join valid_receipts vr
+        on vr.po_number = pl.po_number
+        and (
+          vr.po_line_id = pl.id
+          or (
+            vr.po_line_id is null
+            and vr.item_code_key = lower(trim(pl.item_code))
+            and (
+              select count(*)
+              from po_lines plx
+              where plx.po_number = vr.po_number
+                and lower(trim(plx.item_code)) = vr.item_code_key
+            ) = 1
+          )
+        )
+      where pl.po_number = $1
+      group by pl.id
     ),
     po_line_effective as (
       select
@@ -5622,11 +5647,9 @@ const loadRemainingPoLines = async (client, poNumber) => {
         pl.line_no,
         pl.item_code,
         pl.qty_order,
-        coalesce(vr.received_qty, pl.qty_received, 0)::numeric as qty_received
+        coalesce(plr.received_qty, pl.qty_received, 0)::numeric as qty_received
       from po_lines pl
-      left join valid_receipts vr
-        on vr.po_line_id = pl.id
-        or (vr.po_line_id is null and vr.item_code_key = lower(trim(pl.item_code)))
+      left join po_line_receipts plr on plr.po_line_id = pl.id
       where pl.po_number = $1
     )
     select
@@ -6074,6 +6097,7 @@ const loadActualDrivenPoLineCandidates = async (client, { supplierKeys = [], poN
     `
     with valid_receipts as (
       select
+        ra.po_number,
         coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
         lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
         sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
@@ -6086,8 +6110,32 @@ const loadActualDrivenPoLineCandidates = async (client, { supplierKeys = [], poN
         and rnh.reversal_of is null
         and rni.line_status = 'posted'
       group by
+        ra.po_number,
         coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
         lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+    ),
+    po_line_receipts as (
+      select
+        pl.id as po_line_id,
+        sum(vr.received_qty)::numeric as received_qty
+      from po_lines pl
+      join valid_receipts vr
+        on vr.po_number = pl.po_number
+        and (
+          vr.po_line_id = pl.id
+          or (
+            vr.po_line_id is null
+            and vr.item_code_key = lower(trim(pl.item_code))
+            and (
+              select count(*)
+              from po_lines plx
+              where plx.po_number = vr.po_number
+                and lower(trim(plx.item_code)) = vr.item_code_key
+            ) = 1
+          )
+        )
+      where pl.po_number = $2
+      group by pl.id
     )
     select
       pl.id as po_line_id,
@@ -6096,7 +6144,7 @@ const loadActualDrivenPoLineCandidates = async (client, { supplierKeys = [], poN
       ph.po_date,
       pl.line_no,
       (
-        pl.qty_order - coalesce(vr.received_qty, pl.qty_received, 0) - (
+        pl.qty_order - coalesce(plr.received_qty, pl.qty_received, 0) - (
           select coalesce(sum(greatest(s.request_qty - s.received_qty, 0)), 0)::numeric
           from schedules s
           where s.po_line_id = pl.id
@@ -6105,16 +6153,14 @@ const loadActualDrivenPoLineCandidates = async (client, { supplierKeys = [], poN
       )::numeric as outstanding_qty
     from po_lines pl
     join po_headers ph on ph.po_number = pl.po_number
-    left join valid_receipts vr
-      on vr.po_line_id = pl.id
-      or (vr.po_line_id is null and vr.item_code_key = lower(trim(pl.item_code)))
+    left join po_line_receipts plr on plr.po_line_id = pl.id
     where lower(trim(ph.supplier_id)) = any($1::text[])
       and pl.po_number = $2
       and lower(trim(pl.item_code)) = lower(trim($3))
       and ph.status in ('open', 'partial')
       and ($4::int is null or pl.id = $4::int)
       and (
-        pl.qty_order - coalesce(vr.received_qty, pl.qty_received, 0) - (
+        pl.qty_order - coalesce(plr.received_qty, pl.qty_received, 0) - (
           select coalesce(sum(greatest(s.request_qty - s.received_qty, 0)), 0)::numeric
           from schedules s
           where s.po_line_id = pl.id
@@ -15874,6 +15920,7 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
         `
         with valid_receipts as (
           select
+            ra.po_number,
             coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
             lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
             sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
@@ -15885,8 +15932,31 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
             and rnh.reversal_of is null
             and rni.line_status = 'posted'
           group by
+            ra.po_number,
             coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
             lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+        ),
+        po_line_receipts as (
+          select
+            pl.id as po_line_id,
+            sum(vr.received_qty)::numeric as received_qty
+          from po_lines pl
+          join valid_receipts vr
+            on vr.po_number = pl.po_number
+            and (
+              vr.po_line_id = pl.id
+              or (
+                vr.po_line_id is null
+                and vr.item_code_key = lower(trim(pl.item_code))
+                and (
+                  select count(*)
+                  from po_lines plx
+                  where plx.po_number = vr.po_number
+                    and lower(trim(plx.item_code)) = vr.item_code_key
+                ) = 1
+              )
+            )
+          group by pl.id
         ),
         po_line_effective as (
           select
@@ -15894,11 +15964,9 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
             pl.po_number,
             pl.item_code,
             pl.qty_order,
-            coalesce(vr.received_qty, pl.qty_received, 0)::numeric as qty_received
+            coalesce(plr.received_qty, pl.qty_received, 0)::numeric as qty_received
           from po_lines pl
-          left join valid_receipts vr
-            on vr.po_line_id = pl.id
-            or (vr.po_line_id is null and vr.item_code_key = lower(trim(pl.item_code)))
+          left join po_line_receipts plr on plr.po_line_id = pl.id
         )
         select count(*)::int as total
         from (
@@ -15944,6 +16012,7 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
     let sql = `
       with valid_receipts as (
         select
+          ra.po_number,
           coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
           lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
           sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
@@ -15955,8 +16024,31 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
           and rnh.reversal_of is null
           and rni.line_status = 'posted'
         group by
+          ra.po_number,
           coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
           lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+      ),
+      po_line_receipts as (
+        select
+          pl.id as po_line_id,
+          sum(vr.received_qty)::numeric as received_qty
+        from po_lines pl
+        join valid_receipts vr
+          on vr.po_number = pl.po_number
+          and (
+            vr.po_line_id = pl.id
+            or (
+              vr.po_line_id is null
+              and vr.item_code_key = lower(trim(pl.item_code))
+              and (
+                select count(*)
+                from po_lines plx
+                where plx.po_number = vr.po_number
+                  and lower(trim(plx.item_code)) = vr.item_code_key
+              ) = 1
+            )
+          )
+        group by pl.id
       ),
       po_line_effective as (
         select
@@ -15965,11 +16057,9 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
           pl.line_no,
           pl.item_code,
           pl.qty_order,
-          coalesce(vr.received_qty, pl.qty_received, 0)::numeric as qty_received
+          coalesce(plr.received_qty, pl.qty_received, 0)::numeric as qty_received
         from po_lines pl
-        left join valid_receipts vr
-          on vr.po_line_id = pl.id
-          or (vr.po_line_id is null and vr.item_code_key = lower(trim(pl.item_code)))
+        left join po_line_receipts plr on plr.po_line_id = pl.id
       ),
       schedule_per_po as (
         select
@@ -16028,7 +16118,7 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
           count(pl.id)::int as line_count
         from po_headers ph
         left join master_vendors mv on mv.id = ph.supplier_id
-        left join po_lines pl on pl.po_number = ph.po_number
+        left join po_line_effective pl on pl.po_number = ph.po_number
         left join po_line_remaining plr on plr.po_line_id = pl.id
         ${whereSql}
         group by lower(trim(ph.po_number))
@@ -16081,6 +16171,7 @@ app.get("/api/po/:poNumber", authenticate, requireAnyPermission("manageVendors",
       `
       with valid_receipts as (
         select
+          ra.po_number,
           coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
           lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
           sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
@@ -16093,8 +16184,32 @@ app.get("/api/po/:poNumber", authenticate, requireAnyPermission("manageVendors",
           and rnh.reversal_of is null
           and rni.line_status = 'posted'
         group by
+          ra.po_number,
           coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
           lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+      ),
+      po_line_receipts as (
+        select
+          pl.id as po_line_id,
+          sum(vr.received_qty)::numeric as received_qty
+        from po_lines pl
+        join valid_receipts vr
+          on vr.po_number = pl.po_number
+          and (
+            vr.po_line_id = pl.id
+            or (
+              vr.po_line_id is null
+              and vr.item_code_key = lower(trim(pl.item_code))
+              and (
+                select count(*)
+                from po_lines plx
+                where plx.po_number = vr.po_number
+                  and lower(trim(plx.item_code)) = vr.item_code_key
+              ) = 1
+            )
+          )
+        where pl.po_number = $1
+        group by pl.id
       )
       select
         pl.id,
@@ -16102,8 +16217,8 @@ app.get("/api/po/:poNumber", authenticate, requireAnyPermission("manageVendors",
         pl.line_no,
         pl.item_code,
         pl.qty_order,
-        coalesce(vr.received_qty, pl.qty_received, 0)::numeric as qty_received,
-        greatest(coalesce(pl.qty_order, 0) - coalesce(vr.received_qty, pl.qty_received, 0), 0)::numeric as qty_remaining,
+        coalesce(plr.received_qty, pl.qty_received, 0)::numeric as qty_received,
+        greatest(coalesce(pl.qty_order, 0) - coalesce(plr.received_qty, pl.qty_received, 0), 0)::numeric as qty_remaining,
         i.name as item_name,
         i.unit,
         i.part_no,
@@ -16122,7 +16237,7 @@ app.get("/api/po/:poNumber", authenticate, requireAnyPermission("manageVendors",
              or (s.po_line_id is null and s.po_number = pl.po_number and coalesce(s.item_code, s.item) = pl.item_code)
         ) as scheduled_outstanding,
         (
-          pl.qty_order - coalesce(vr.received_qty, pl.qty_received, 0) - (
+          pl.qty_order - coalesce(plr.received_qty, pl.qty_received, 0) - (
             select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
             from schedules s2
             where s2.po_line_id = pl.id
@@ -16130,9 +16245,7 @@ app.get("/api/po/:poNumber", authenticate, requireAnyPermission("manageVendors",
           )
         )::numeric as remaining_after_schedule
       from po_lines pl
-      left join valid_receipts vr
-        on vr.po_line_id = pl.id
-        or (vr.po_line_id is null and vr.item_code_key = lower(trim(pl.item_code)))
+      left join po_line_receipts plr on plr.po_line_id = pl.id
       left join items i on i.code = pl.item_code
       where pl.po_number = $1
       order by pl.line_no asc
@@ -16166,11 +16279,12 @@ app.get("/api/po-lines", authenticate, requireAnyPermission("manageVendors", "ma
         return;
       }
     }
-    const whereClause = remainingOnly ? "and pl.qty_order > coalesce(vr.received_qty, pl.qty_received, 0)" : "";
+    const whereClause = remainingOnly ? "and pl.qty_order > coalesce(plr.received_qty, pl.qty_received, 0)" : "";
     const result = await pool.query(
       `
       with valid_receipts as (
         select
+          ra.po_number,
           coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
           lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
           sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
@@ -16183,8 +16297,32 @@ app.get("/api/po-lines", authenticate, requireAnyPermission("manageVendors", "ma
           and rnh.reversal_of is null
           and rni.line_status = 'posted'
         group by
+          ra.po_number,
           coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
           lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+      ),
+      po_line_receipts as (
+        select
+          pl.id as po_line_id,
+          sum(vr.received_qty)::numeric as received_qty
+        from po_lines pl
+        join valid_receipts vr
+          on vr.po_number = pl.po_number
+          and (
+            vr.po_line_id = pl.id
+            or (
+              vr.po_line_id is null
+              and vr.item_code_key = lower(trim(pl.item_code))
+              and (
+                select count(*)
+                from po_lines plx
+                where plx.po_number = vr.po_number
+                  and lower(trim(plx.item_code)) = vr.item_code_key
+              ) = 1
+            )
+          )
+        where pl.po_number = $1
+        group by pl.id
       )
       select
         pl.id,
@@ -16192,8 +16330,8 @@ app.get("/api/po-lines", authenticate, requireAnyPermission("manageVendors", "ma
         pl.line_no,
         pl.item_code,
         pl.qty_order,
-        coalesce(vr.received_qty, pl.qty_received, 0)::numeric as qty_received,
-        greatest(coalesce(pl.qty_order, 0) - coalesce(vr.received_qty, pl.qty_received, 0), 0)::numeric as qty_remaining,
+        coalesce(plr.received_qty, pl.qty_received, 0)::numeric as qty_received,
+        greatest(coalesce(pl.qty_order, 0) - coalesce(plr.received_qty, pl.qty_received, 0), 0)::numeric as qty_remaining,
         i.name as item_name,
         i.unit,
         i.part_no,
@@ -16212,7 +16350,7 @@ app.get("/api/po-lines", authenticate, requireAnyPermission("manageVendors", "ma
              or (s.po_line_id is null and s.po_number = pl.po_number and coalesce(s.item_code, s.item) = pl.item_code)
         ) as scheduled_outstanding,
         (
-          pl.qty_order - coalesce(vr.received_qty, pl.qty_received, 0) - (
+          pl.qty_order - coalesce(plr.received_qty, pl.qty_received, 0) - (
             select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
             from schedules s2
             where s2.po_line_id = pl.id
@@ -16220,9 +16358,7 @@ app.get("/api/po-lines", authenticate, requireAnyPermission("manageVendors", "ma
           )
         )::numeric as remaining_after_schedule
       from po_lines pl
-      left join valid_receipts vr
-        on vr.po_line_id = pl.id
-        or (vr.po_line_id is null and vr.item_code_key = lower(trim(pl.item_code)))
+      left join po_line_receipts plr on plr.po_line_id = pl.id
       left join items i on i.code = pl.item_code
       where pl.po_number = $1
       ${whereClause}
@@ -16304,6 +16440,7 @@ app.get("/api/supplier/po", authenticate, requireSupplier, async (req, res) => {
     let sql = `
       with valid_receipts as (
         select
+          ra.po_number,
           coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
           lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
           sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
@@ -16315,8 +16452,31 @@ app.get("/api/supplier/po", authenticate, requireSupplier, async (req, res) => {
           and rnh.reversal_of is null
           and rni.line_status = 'posted'
         group by
+          ra.po_number,
           coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
           lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+      ),
+      po_line_receipts as (
+        select
+          pl.id as po_line_id,
+          sum(vr.received_qty)::numeric as received_qty
+        from po_lines pl
+        join valid_receipts vr
+          on vr.po_number = pl.po_number
+          and (
+            vr.po_line_id = pl.id
+            or (
+              vr.po_line_id is null
+              and vr.item_code_key = lower(trim(pl.item_code))
+              and (
+                select count(*)
+                from po_lines plx
+                where plx.po_number = vr.po_number
+                  and lower(trim(plx.item_code)) = vr.item_code_key
+              ) = 1
+            )
+          )
+        group by pl.id
       ),
       po_line_effective as (
         select
@@ -16324,11 +16484,9 @@ app.get("/api/supplier/po", authenticate, requireSupplier, async (req, res) => {
           pl.po_number,
           pl.item_code,
           pl.qty_order,
-          coalesce(vr.received_qty, pl.qty_received, 0)::numeric as qty_received
+          coalesce(plr.received_qty, pl.qty_received, 0)::numeric as qty_received
         from po_lines pl
-        left join valid_receipts vr
-          on vr.po_line_id = pl.id
-          or (vr.po_line_id is null and vr.item_code_key = lower(trim(pl.item_code)))
+        left join po_line_receipts plr on plr.po_line_id = pl.id
       ),
       schedule_per_po as (
         select

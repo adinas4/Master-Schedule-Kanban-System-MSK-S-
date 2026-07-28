@@ -2646,7 +2646,10 @@ const TabInbound = (props) => {
   function resolvePoScheduleStatusMeta(row) {
     const totalOrder = Number(row?.total_qty_order || 0);
     const totalReceived = Number(row?.total_qty_received || 0);
-    const remaining = totalOrder - totalReceived;
+    const rawAvailableRemaining = Number(row?.total_qty_remaining);
+    const remaining = Number.isFinite(rawAvailableRemaining)
+      ? rawAvailableRemaining
+      : totalOrder - totalReceived;
     const scheduled = Number(row?.total_qty_scheduled ?? row?.scheduled_qty ?? 0);
     const scheduleCount = Number(row?.schedule_count ?? row?.scheduleCount ?? 0);
     const hasSchedule = scheduled > 0 || scheduleCount > 0;
@@ -2656,10 +2659,7 @@ const TabInbound = (props) => {
     if (!hasSchedule) {
       return { label: 'BELUM DIJADWALKAN', className: 'border-rose-200 bg-rose-50 text-rose-700', dot: 'bg-rose-500' };
     }
-    if (scheduled < remaining) {
-      return { label: 'DIJADWALKAN SEBAGIAN', className: 'border-amber-200 bg-amber-50 text-amber-700', dot: 'bg-amber-500' };
-    }
-    return { label: 'FULL DIJADWALKAN', className: 'border-emerald-200 bg-emerald-50 text-emerald-700', dot: 'bg-emerald-500' };
+    return { label: 'DIJADWALKAN SEBAGIAN', className: 'border-amber-200 bg-amber-50 text-amber-700', dot: 'bg-amber-500' };
   }
 
   const resolveScheduleStatusMeta = (value) => {
@@ -4561,7 +4561,10 @@ const TabInbound = (props) => {
                         poRows.map((row) => {
                           const totalOrder = Number(row.total_qty_order || 0);
                           const totalReceived = Number(row.total_qty_received || 0);
-                          const remaining = totalOrder - totalReceived;
+                          const rawAvailableRemaining = Number(row.total_qty_remaining);
+                          const remaining = Number.isFinite(rawAvailableRemaining)
+                            ? rawAvailableRemaining
+                            : totalOrder - totalReceived;
                           const statusMeta = resolvePoStatusMeta(row.status);
                           const lifecycleMeta = resolvePoLifecycleMeta(row);
                           const scheduleStatusMeta = resolvePoScheduleStatusMeta(row);

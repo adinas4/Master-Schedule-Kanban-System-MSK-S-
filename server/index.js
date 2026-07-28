@@ -34,6 +34,7 @@ if (isProduction && jwtSecret === "dev-secret-change") {
 }
 
 app.disable("x-powered-by");
+app.set("etag", false);
 app.set("trust proxy", 1);
 
 const parseAllowedOrigins = (value = "") => String(value || "")
@@ -66,6 +67,10 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+app.use("/api", (_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
 // Increase payload limit to support large Excel imports
 app.use(express.json({ limit: "50mb" }));
 app.use((req, res, next) => {

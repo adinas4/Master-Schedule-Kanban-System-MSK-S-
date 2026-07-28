@@ -5598,7 +5598,39 @@ const loadRemainingPoLines = async (client, poNumber) => {
   if (!normalized) return [];
   const result = await client.query(
     `
-    select pl.*,
+    with valid_receipts as (
+      select
+        coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
+        lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
+        sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
+      from receipt_allocations ra
+      join receive_note_items rni on rni.id = ra.rn_item_id
+      join receive_note_headers rnh on rnh.id = rni.rn_id
+      left join schedules s on s.id = ra.schedule_id
+      where ra.po_number = $1
+        and rnh.status = 'posted'
+        and rnh.reversal_of is null
+        and rni.line_status = 'posted'
+      group by
+        coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
+        lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+    ),
+    po_line_effective as (
+      select
+        pl.id,
+        pl.po_number,
+        pl.line_no,
+        pl.item_code,
+        pl.qty_order,
+        coalesce(vr.received_qty, pl.qty_received, 0)::numeric as qty_received
+      from po_lines pl
+      left join valid_receipts vr
+        on vr.po_line_id = pl.id
+        or (vr.po_line_id is null and vr.item_code_key = lower(trim(pl.item_code)))
+      where pl.po_number = $1
+    )
+    select
+      pl.*,
       (
         select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
         from schedules s
@@ -5613,9 +5645,8 @@ const loadRemainingPoLines = async (client, poNumber) => {
              or (s2.po_line_id is null and s2.po_number = pl.po_number and coalesce(s2.item_code, s2.item) = pl.item_code)
         )
       )::numeric as remaining_after_schedule
-    from po_lines pl
-    where pl.po_number = $1
-      and (
+    from po_line_effective pl
+    where (
         pl.qty_order - pl.qty_received - (
           select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
           from schedules s3
@@ -15818,9 +15849,10 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
       filterValues.push(itemCode);
       whereClauses.push(`lower(trim(pl.item_code)) = lower(trim($${filterValues.length}))`);
     }
+    let statusFilterSql = "";
     if (statusValues.length > 0) {
       filterValues.push(statusValues);
-      whereClauses.push(`lower(trim(ph.status)) = any($${filterValues.length}::text[])`);
+      statusFilterSql = `lower(trim(po_group.status)) = any($${filterValues.length}::text[])`;
     }
     if (startDate) {
       filterValues.push(startDate);
@@ -15832,23 +15864,56 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
     }
 
     const whereSql = whereClauses.length ? ` where ${whereClauses.join(" and ")}` : "";
+    const groupedWhereClauses = [];
+    if (openOnly) groupedWhereClauses.push("coalesce(po_group.total_qty_remaining, 0) > 0 and lower(trim(po_group.status)) in ('open', 'partial')");
+    if (statusFilterSql) groupedWhereClauses.push(statusFilterSql);
+    const groupedWhereSql = groupedWhereClauses.length ? `where ${groupedWhereClauses.join(" and ")}` : "";
     let total = null;
     if (wantsMeta) {
       const countResult = await pool.query(
         `
+        with valid_receipts as (
+          select
+            coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
+            lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
+            sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
+          from receipt_allocations ra
+          join receive_note_items rni on rni.id = ra.rn_item_id
+          join receive_note_headers rnh on rnh.id = rni.rn_id
+          left join schedules s on s.id = ra.schedule_id
+          where rnh.status = 'posted'
+            and rnh.reversal_of is null
+            and rni.line_status = 'posted'
+          group by
+            coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
+            lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+        ),
+        po_line_effective as (
+          select
+            pl.id,
+            pl.po_number,
+            pl.item_code,
+            pl.qty_order,
+            coalesce(vr.received_qty, pl.qty_received, 0)::numeric as qty_received
+          from po_lines pl
+          left join valid_receipts vr
+            on vr.po_line_id = pl.id
+            or (vr.po_line_id is null and vr.item_code_key = lower(trim(pl.item_code)))
+        )
         select count(*)::int as total
         from (
           select
             lower(trim(ph.po_number)) as po_key,
             coalesce(sum(plr.remaining_after_schedule), 0) as total_qty_remaining,
             case
-              when bool_or(lower(trim(ph.status)) = 'partial') then 'partial'
-              when bool_or(lower(trim(ph.status)) = 'open') then 'open'
-              else lower(trim(coalesce(max(ph.status), 'open')))
+              when bool_or(coalesce(ph.force_closed, false)) then 'closed'
+              when coalesce(sum(pl.qty_order), 0) <= coalesce(sum(pl.qty_received), 0) then 'closed'
+              when coalesce(sum(pl.qty_received), 0) > 0 then 'partial'
+              else 'open'
             end as status
           from po_headers ph
           left join master_vendors mv on mv.id = ph.supplier_id
-          left join po_lines pl on pl.po_number = ph.po_number
+          left join po_line_effective pl on pl.po_number = ph.po_number
           left join (
             select
               pl.id as po_line_id,
@@ -15863,12 +15928,12 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
                 ), 0),
                 0
               )::numeric as remaining_after_schedule
-            from po_lines pl
+            from po_line_effective pl
           ) plr on plr.po_line_id = pl.id
           ${whereSql}
           group by lower(trim(ph.po_number))
         ) po_group
-        ${openOnly ? "where coalesce(po_group.total_qty_remaining, 0) > 0 and lower(trim(po_group.status)) in ('open', 'partial')" : ""}
+        ${groupedWhereSql}
         `,
         filterValues,
       );
@@ -15877,7 +15942,36 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
 
     const values = [...filterValues];
     let sql = `
-      with schedule_per_po as (
+      with valid_receipts as (
+        select
+          coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
+          lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
+          sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
+        from receipt_allocations ra
+        join receive_note_items rni on rni.id = ra.rn_item_id
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        left join schedules s on s.id = ra.schedule_id
+        where rnh.status = 'posted'
+          and rnh.reversal_of is null
+          and rni.line_status = 'posted'
+        group by
+          coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
+          lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+      ),
+      po_line_effective as (
+        select
+          pl.id,
+          pl.po_number,
+          pl.line_no,
+          pl.item_code,
+          pl.qty_order,
+          coalesce(vr.received_qty, pl.qty_received, 0)::numeric as qty_received
+        from po_lines pl
+        left join valid_receipts vr
+          on vr.po_line_id = pl.id
+          or (vr.po_line_id is null and vr.item_code_key = lower(trim(pl.item_code)))
+      ),
+      schedule_per_po as (
         select
           lower(trim(po_number)) as po_key,
           count(*)::int as schedule_count,
@@ -15899,7 +15993,7 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
             ), 0),
             0
           )::numeric as remaining_after_schedule
-        from po_lines pl
+        from po_line_effective pl
       )
       select
         po_group.po_number,
@@ -15922,9 +16016,10 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
           min(ph.supplier_id) as supplier_code,
           max(mv.name) as supplier_name,
           case
-            when bool_or(lower(trim(ph.status)) = 'partial') then 'partial'
-            when bool_or(lower(trim(ph.status)) = 'open') then 'open'
-            else lower(trim(coalesce(max(ph.status), 'open')))
+            when bool_or(coalesce(ph.force_closed, false)) then 'closed'
+            when coalesce(sum(pl.qty_order), 0) <= coalesce(sum(pl.qty_received), 0) then 'closed'
+            when coalesce(sum(pl.qty_received), 0) > 0 then 'partial'
+            else 'open'
           end as status,
           bool_or(coalesce(ph.force_closed, false)) as force_closed,
           coalesce(sum(pl.qty_order), 0) as total_qty_order,
@@ -15939,7 +16034,7 @@ app.get("/api/po", authenticate, requireAnyPermission("manageVendors", "manageIt
         group by lower(trim(ph.po_number))
       ) po_group
       left join schedule_per_po spp on po_group.po_key = spp.po_key
-      ${openOnly ? "where coalesce(po_group.total_qty_remaining, 0) > 0 and lower(trim(po_group.status)) in ('open', 'partial')" : ""}
+      ${groupedWhereSql}
       order by po_group.po_date desc nulls last, po_group.po_number desc
     `;
     if (limit) {
@@ -16071,11 +16166,34 @@ app.get("/api/po-lines", authenticate, requireAnyPermission("manageVendors", "ma
         return;
       }
     }
-    const whereClause = remainingOnly ? "and pl.qty_order > pl.qty_received" : "";
+    const whereClause = remainingOnly ? "and pl.qty_order > coalesce(vr.received_qty, pl.qty_received, 0)" : "";
     const result = await pool.query(
       `
+      with valid_receipts as (
+        select
+          coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
+          lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
+          sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
+        from receipt_allocations ra
+        join receive_note_items rni on rni.id = ra.rn_item_id
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        left join schedules s on s.id = ra.schedule_id
+        where ra.po_number = $1
+          and rnh.status = 'posted'
+          and rnh.reversal_of is null
+          and rni.line_status = 'posted'
+        group by
+          coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
+          lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+      )
       select
-        pl.*,
+        pl.id,
+        pl.po_number,
+        pl.line_no,
+        pl.item_code,
+        pl.qty_order,
+        coalesce(vr.received_qty, pl.qty_received, 0)::numeric as qty_received,
+        greatest(coalesce(pl.qty_order, 0) - coalesce(vr.received_qty, pl.qty_received, 0), 0)::numeric as qty_remaining,
         i.name as item_name,
         i.unit,
         i.part_no,
@@ -16094,7 +16212,7 @@ app.get("/api/po-lines", authenticate, requireAnyPermission("manageVendors", "ma
              or (s.po_line_id is null and s.po_number = pl.po_number and coalesce(s.item_code, s.item) = pl.item_code)
         ) as scheduled_outstanding,
         (
-          pl.qty_order - pl.qty_received - (
+          pl.qty_order - coalesce(vr.received_qty, pl.qty_received, 0) - (
             select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
             from schedules s2
             where s2.po_line_id = pl.id
@@ -16102,6 +16220,9 @@ app.get("/api/po-lines", authenticate, requireAnyPermission("manageVendors", "ma
           )
         )::numeric as remaining_after_schedule
       from po_lines pl
+      left join valid_receipts vr
+        on vr.po_line_id = pl.id
+        or (vr.po_line_id is null and vr.item_code_key = lower(trim(pl.item_code)))
       left join items i on i.code = pl.item_code
       where pl.po_number = $1
       ${whereClause}
@@ -16181,7 +16302,35 @@ app.get("/api/supplier/po", authenticate, requireSupplier, async (req, res) => {
 
     const values = [...filterValues];
     let sql = `
-      with schedule_per_po as (
+      with valid_receipts as (
+        select
+          coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
+          lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
+          sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
+        from receipt_allocations ra
+        join receive_note_items rni on rni.id = ra.rn_item_id
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        left join schedules s on s.id = ra.schedule_id
+        where rnh.status = 'posted'
+          and rnh.reversal_of is null
+          and rni.line_status = 'posted'
+        group by
+          coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
+          lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+      ),
+      po_line_effective as (
+        select
+          pl.id,
+          pl.po_number,
+          pl.item_code,
+          pl.qty_order,
+          coalesce(vr.received_qty, pl.qty_received, 0)::numeric as qty_received
+        from po_lines pl
+        left join valid_receipts vr
+          on vr.po_line_id = pl.id
+          or (vr.po_line_id is null and vr.item_code_key = lower(trim(pl.item_code)))
+      ),
+      schedule_per_po as (
         select
           s.po_number,
           count(*)::int as schedule_count,
@@ -16195,7 +16344,12 @@ app.get("/api/supplier/po", authenticate, requireSupplier, async (req, res) => {
         ph.po_number,
         to_char(ph.po_date, 'YYYY-MM-DD') as po_date,
         ph.supplier_id as supplier_code,
-        ph.status,
+        case
+          when coalesce(ph.force_closed, false) then 'closed'
+          when coalesce(sum(pl.qty_order), 0) <= coalesce(sum(pl.qty_received), 0) then 'closed'
+          when coalesce(sum(pl.qty_received), 0) > 0 then 'partial'
+          else 'open'
+        end as status,
         coalesce(sum(pl.qty_order), 0)::numeric as total_qty_order,
         coalesce(sum(pl.qty_received), 0)::numeric as total_qty_received,
         coalesce(sum(pl.qty_order - pl.qty_received), 0)::numeric as total_qty_remaining,
@@ -16203,10 +16357,10 @@ app.get("/api/supplier/po", authenticate, requireSupplier, async (req, res) => {
         coalesce(spp.schedule_count, 0)::int as schedule_count,
         coalesce(spp.scheduled_qty, 0)::numeric as total_qty_scheduled
       from po_headers ph
-      left join po_lines pl on pl.po_number = ph.po_number
+      left join po_line_effective pl on pl.po_number = ph.po_number
       left join schedule_per_po spp on spp.po_number = ph.po_number
       ${whereSql}
-      group by ph.po_number, ph.po_date, ph.supplier_id, ph.status, spp.schedule_count, spp.scheduled_qty
+      group by ph.po_number, ph.po_date, ph.supplier_id, ph.force_closed, spp.schedule_count, spp.scheduled_qty
       order by ph.po_date desc nulls last, ph.po_number desc
     `;
     if (limit) {

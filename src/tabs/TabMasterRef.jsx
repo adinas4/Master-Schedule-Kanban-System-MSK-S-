@@ -362,6 +362,33 @@ const TabMasterRef = (props) => {
   const isSupplierAllowedItemCategory = (value) => !isProductionOutputItemCategory(value);
   const isItemCustomerEnabled = isCustomerAllowedItemCategory(itemMasterForm?.type);
   const isItemSupplierEnabled = isSupplierAllowedItemCategory(itemMasterForm?.type);
+  const renderRelationCodeBadges = (rows = [], idKey = 'vendorId') => {
+    const entries = [];
+    const seen = new Set();
+    (Array.isArray(rows) ? rows : []).forEach((row) => {
+      const code = String(row?.[idKey] || '').trim();
+      if (!code) return;
+      const share = Number(row?.sharePercent || 0);
+      const key = `${code}-${Number.isFinite(share) ? share : 0}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      entries.push({ code, share: Number.isFinite(share) ? share : 0 });
+    });
+    if (entries.length === 0) return <span className="text-slate-400">-</span>;
+    return (
+      <div className="flex max-w-[150px] flex-wrap gap-1">
+        {entries.map((entry) => (
+          <span
+            key={`${idKey}-${entry.code}-${entry.share}`}
+            className="inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] font-semibold text-sky-700"
+          >
+            <span>{entry.code}</span>
+            {entry.share > 0 && <span className="text-sky-500">({entry.share}%)</span>}
+          </span>
+        ))}
+      </div>
+    );
+  };
 
   useEffect(() => {
     if (isItemCustomerEnabled) return;
@@ -652,6 +679,8 @@ const TabMasterRef = (props) => {
   const [processSearch, setProcessSearch] = useState('');
   const [categorySearch, setCategorySearch] = useState('');
   const [packingSearch, setPackingSearch] = useState('');
+  const [masterRefPagination, setMasterRefPagination] = useState({});
+  const masterRefPageSizeOptions = [25, 50, 100, 250];
 
   const matchesSearch = (row, query, selectors) => {
     const normalizedQuery = String(query || '').trim().toLowerCase();
@@ -760,6 +789,90 @@ const TabMasterRef = (props) => {
       (row) => row.address,
     ]))
   ), [areaById, masterDeliveries, orgSearch]);
+
+  const getLocalPage = (key, rows = []) => {
+    const safeRows = Array.isArray(rows) ? rows : [];
+    const pagination = masterRefPagination[key] || {};
+    const pageSize = masterRefPageSizeOptions.includes(Number(pagination.pageSize))
+      ? Number(pagination.pageSize)
+      : 25;
+    const totalRows = safeRows.length;
+    const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+    const currentPage = Math.min(Math.max(1, Number(pagination.page) || 1), totalPages);
+    const startIndex = totalRows === 0 ? 0 : (currentPage - 1) * pageSize;
+    const endIndex = Math.min(startIndex + pageSize, totalRows);
+    return {
+      key,
+      rows: safeRows.slice(startIndex, endIndex),
+      totalRows,
+      totalPages,
+      currentPage,
+      pageSize,
+      startDisplay: totalRows === 0 ? 0 : startIndex + 1,
+      endDisplay: endIndex,
+    };
+  };
+
+  const setLocalPage = (key, patch) => {
+    setMasterRefPagination((prev) => ({
+      ...prev,
+      [key]: {
+        ...(prev[key] || {}),
+        ...patch,
+      },
+    }));
+  };
+
+  const renderLocalPagination = (pageData) => {
+    if (!pageData) return null;
+    return (
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-3 text-xs text-slate-500">
+        <div>
+          Showing {pageData.startDisplay} to {pageData.endDisplay} of {pageData.totalRows} entries
+        </div>
+        <div className="flex items-center gap-2">
+          <span>Rows per page</span>
+          <select
+            className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700"
+            value={pageData.pageSize}
+            onChange={(e) => setLocalPage(pageData.key, { pageSize: Number(e.target.value), page: 1 })}
+          >
+            {masterRefPageSizeOptions.map((size) => (
+              <option key={size} value={size}>{size}</option>
+            ))}
+          </select>
+          <span>Halaman {pageData.currentPage} dari {pageData.totalPages}</span>
+          <button
+            type="button"
+            disabled={pageData.currentPage <= 1}
+            onClick={() => setLocalPage(pageData.key, { page: pageData.currentPage - 1 })}
+            className="rounded border border-slate-200 px-3 py-1 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Previous
+          </button>
+          <button
+            type="button"
+            disabled={pageData.currentPage >= pageData.totalPages}
+            onClick={() => setLocalPage(pageData.key, { page: pageData.currentPage + 1 })}
+            className="rounded border border-slate-200 px-3 py-1 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Next
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  const warehousePage = getLocalPage('org-warehouse', filteredWarehouses);
+  const areaPage = getLocalPage('org-area', filteredAreas);
+  const locationPage = getLocalPage('org-location', filteredLocations);
+  const deliveryPage = getLocalPage('org-delivery', filteredDeliveries);
+  const vendorPage = getLocalPage('vendor', filteredVendors);
+  const customerPage = getLocalPage('customer', filteredCustomers);
+  const modelPage = getLocalPage('model', filteredModels);
+  const processPage = getLocalPage('process', filteredProcesses);
+  const categoryPage = getLocalPage('category', filteredCategories);
+  const packingPage = getLocalPage('packing', filteredPackings);
   const isLocationProcessEnabled = isProcessLocationType(locationForm?.lineDescription);
   const getProcessScopeLabel = (value) => {
     const normalized = String(value || '').trim().toLowerCase();
@@ -1035,7 +1148,7 @@ const TabMasterRef = (props) => {
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredWarehouses.map((wh) => (
+                      {warehousePage.rows.map((wh) => (
                         <tr key={wh.id} className="border-t">
                           <td className="p-2">{wh.id}</td>
                           <td className="p-2">{wh.name}</td>
@@ -1071,6 +1184,7 @@ const TabMasterRef = (props) => {
                       ))}
                     </tbody>
                   </table>
+                  {renderLocalPagination(warehousePage)}
                 </div>
               )}
             {orgSubTab === 'area' && (
@@ -1141,7 +1255,7 @@ const TabMasterRef = (props) => {
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredAreas.map((area) => (
+                      {areaPage.rows.map((area) => (
                         <tr key={area.id} className="border-t">
                           <td className="p-2">{area.id}</td>
                           <td className="p-2">{area.name}</td>
@@ -1176,6 +1290,7 @@ const TabMasterRef = (props) => {
                       ))}
                     </tbody>
                   </table>
+                  {renderLocalPagination(areaPage)}
                 </div>
               )}
             {orgSubTab === 'location' && (
@@ -1329,7 +1444,7 @@ const TabMasterRef = (props) => {
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredLocations.map((loc) => {
+                      {locationPage.rows.map((loc) => {
                         const resolvedAreaId = loc.area_id
                           || loc.areaId
                           || masterAreas.find((area) => getAreaWarehouseId(area) === loc.warehouse_id)?.id
@@ -1379,6 +1494,7 @@ const TabMasterRef = (props) => {
                       })}
                     </tbody>
                   </table>
+                  {renderLocalPagination(locationPage)}
                 </div>
               )}
             {orgSubTab === 'delivery' && (
@@ -1446,7 +1562,7 @@ const TabMasterRef = (props) => {
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredDeliveries.map((delivery) => (
+                      {deliveryPage.rows.map((delivery) => (
                         <tr key={delivery.id} className="border-t">
                           <td className="p-2">{delivery.id}</td>
                           <td className="p-2">{delivery.area_id}</td>
@@ -1481,6 +1597,7 @@ const TabMasterRef = (props) => {
                       ))}
                     </tbody>
                   </table>
+                  {renderLocalPagination(deliveryPage)}
                 </div>
               )}
 
@@ -1542,7 +1659,7 @@ const TabMasterRef = (props) => {
                         <option value="Delivery Note">Delivery Note</option>
                         <option value="Schedule">Schedule</option>
                       </select>
-                      <input className="border rounded px-3 py-2" placeholder="Email DN" value={vendorForm.email} onChange={(e) => setVendorForm({ ...vendorForm, email: e.target.value })} />
+                      <input className="border rounded px-3 py-2" placeholder="Email DN/Schedule, pisahkan koma" value={vendorForm.email} onChange={(e) => setVendorForm({ ...vendorForm, email: e.target.value })} />
                       <input
                         type="number"
                         min="0"
@@ -1626,7 +1743,7 @@ const TabMasterRef = (props) => {
                       <th className="text-left p-2">Vendor Name</th>
                       <th className="text-left p-2">Type</th>
                       <th className="text-left p-2">Role</th>
-                      <th className="text-left p-2">Email DN</th>
+                      <th className="text-left p-2">Email Dokumen</th>
                       <th className="text-left p-2">Lead Time</th>
                       <th className="text-left p-2">Qty/Day</th>
                       <th className="text-left p-2">Schedule</th>
@@ -1634,7 +1751,7 @@ const TabMasterRef = (props) => {
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredVendors.map((vendor) => (
+                    {vendorPage.rows.map((vendor) => (
                       <tr key={vendor.id} className="border-t">
                         <td className="p-2">{vendor.id}</td>
                         <td className="p-2">{vendor.name}</td>
@@ -1671,7 +1788,7 @@ const TabMasterRef = (props) => {
                                 <span>Edit</span>
                               </button>
                               <button
-                                onClick={() => handleDeleteMaster(`/api/master/vendors/${vendor.id}`)}
+                                onClick={() => handleDeleteMaster(`/api/master/vendors/${encodeURIComponent(vendor.id)}`)}
                                 className="inline-flex items-center gap-1 text-red-600 hover:text-red-700"
                                 title="Hapus"
                                 aria-label="Hapus"
@@ -1688,6 +1805,7 @@ const TabMasterRef = (props) => {
                     ))}
                   </tbody>
                 </table>
+                {renderLocalPagination(vendorPage)}
               </div>
               )}
 
@@ -1758,7 +1876,7 @@ const TabMasterRef = (props) => {
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredCustomers.map((customer) => (
+                    {customerPage.rows.map((customer) => (
                       <tr key={customer.id} className="border-t">
                         <td className="p-2">{customer.id}</td>
                         <td className="p-2">{customer.name}</td>
@@ -1794,6 +1912,7 @@ const TabMasterRef = (props) => {
                     ))}
                   </tbody>
                 </table>
+                {renderLocalPagination(customerPage)}
               </div>
               )}
 
@@ -1888,7 +2007,7 @@ const TabMasterRef = (props) => {
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredModels.map((model) => (
+                      {modelPage.rows.map((model) => (
                         <tr key={model.code} className="border-t">
                           <td className="p-2">{model.code}</td>
                           <td className="p-2">{model.name}</td>
@@ -1928,6 +2047,7 @@ const TabMasterRef = (props) => {
                     </tbody>
                   </table>
                 </div>
+                {renderLocalPagination(modelPage)}
               </div>
               )}
 
@@ -2054,7 +2174,7 @@ const TabMasterRef = (props) => {
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredProcesses.map((process) => (
+                      {processPage.rows.map((process) => (
                         <tr key={process.code} className="border-t">
                           <td className="p-2">{process.code}</td>
                           <td className="p-2">{process.name}</td>
@@ -2099,6 +2219,7 @@ const TabMasterRef = (props) => {
                     </tbody>
                   </table>
                 </div>
+                {renderLocalPagination(processPage)}
               </div>
               )}
 
@@ -2157,7 +2278,7 @@ const TabMasterRef = (props) => {
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredCategories.map((category) => (
+                    {categoryPage.rows.map((category) => (
                       <tr key={category.code} className="border-t">
                         <td className="p-2">{category.code}</td>
                         <td className="p-2">{category.name}</td>
@@ -2191,6 +2312,7 @@ const TabMasterRef = (props) => {
                     ))}
                   </tbody>
                 </table>
+                {renderLocalPagination(categoryPage)}
               </div>
               )}
 
@@ -2981,10 +3103,6 @@ const TabMasterRef = (props) => {
                               ? 'Seasonal'
                               : '-';
                       const isProductionOutputItem = isProductionOutputItemCategory(item.type);
-                      const itemWarehouseLabel = item.location_id
-                        ? (item.location_name || buildWarehouseLabel(warehouseById.get(String(item.location_id || '').trim())) || item.location_id)
-                        : '-';
-                      const itemLineLabel = item.line_production ? getProcessWorkCenterLabel(item.line_production) : '-';
                       return (
                         <tr key={item.code} className="border-t">
                           <td className="p-2 text-center">
@@ -3025,15 +3143,11 @@ const TabMasterRef = (props) => {
                           <td className="p-2 text-right">{item.pack_qty ?? '-'}</td>
                           <td className="p-2">
                             {isProductionOutputItem ? (
-                              <div className="space-y-0.5">
-                                <span className="inline-flex rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700">
-                                  Production
-                                </span>
-                                <div className="text-[10px] text-slate-500">{itemWarehouseLabel}</div>
-                                <div className="text-[10px] text-slate-500">{itemLineLabel}</div>
-                              </div>
+                              <span className="inline-flex rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700">
+                                Production
+                              </span>
                             ) : (
-                              formatRelationList(itemSupplierMap.get(item.code) || [], 'vendorId', 'vendorId')
+                              renderRelationCodeBadges(itemSupplierMap.get(item.code) || [], 'vendorId')
                             )}
                           </td>
                           <td className="p-2">{formatRelationList(itemCustomerMap.get(item.code) || [], 'customerId', 'customerId')}</td>
@@ -3100,7 +3214,7 @@ const TabMasterRef = (props) => {
                                           cycleTimeSeconds: String(matchedProcess?.standard_time ?? item.cycle_time_seconds ?? ''),
                                             };
                                           })
-                                          : (item.line_production || item.cycle_time_seconds)
+                                          : (matchedItemProcess && (item.line_production || item.cycle_time_seconds))
                                             ? [{
                                               processCode: matchedItemProcess?.code || itemLineProductionValue,
                                               processName: matchedItemProcess?.name || itemLineProductionValue,
@@ -3209,7 +3323,7 @@ const TabMasterRef = (props) => {
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredPackings.map((packing) => (
+                    {packingPage.rows.map((packing) => (
                       <tr key={packing.code} className="border-t">
                         <td className="p-2">{packing.code}</td>
                         <td className="p-2">{packing.name}</td>
@@ -3243,6 +3357,7 @@ const TabMasterRef = (props) => {
                     ))}
                   </tbody>
                 </table>
+                {renderLocalPagination(packingPage)}
               </div>
               )}
 

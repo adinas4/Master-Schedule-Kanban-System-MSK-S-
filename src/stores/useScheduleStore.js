@@ -582,19 +582,88 @@ export const useScheduleStore = ({
     if (!arrDate) return 'Pending';
     const reqDate = parseDateOnly(requestDate);
     if (!reqDate) return 'Pending';
-    const reqKey = toDateKey(reqDate);
-    const arrKey = toDateKey(arrDate);
-    if (arrKey === reqKey) return 'On Time';
+    const diffDays = Math.round((arrDate - reqDate) / 86400000);
+    if (diffDays >= -1 && diffDays <= 0) return 'On Time';
     return arrDate > reqDate ? 'Late' : 'Too Early';
+  };
+
+  const getDeliveryMetrics = (row = {}) => {
+    const requestDate = row?.requestDate || row?.request_date || '';
+    const requestQty = Math.max(0, Number(row?.requestQty ?? row?.request_qty ?? 0));
+    const fallbackReceived = Math.max(0, Number(row?.receivedQty ?? row?.received_qty ?? 0));
+    const receipts = (Array.isArray(row?.relatedReceipts || row?.related_receipts)
+      ? (row.relatedReceipts || row.related_receipts)
+      : [])
+      .map((receipt) => ({
+        arrivalDate: receipt?.arrivalDate || receipt?.arrival_date || '',
+        receivedQty: Math.max(0, Number(receipt?.receivedQty ?? receipt?.received_qty ?? 0)),
+      }))
+      .filter((receipt) => receipt.arrivalDate || receipt.receivedQty > 0);
+    if (receipts.length === 0 && (row?.arrivalDate || row?.arrival_date || fallbackReceived > 0)) {
+      receipts.push({
+        arrivalDate: row?.arrivalDate || row?.arrival_date || '',
+        receivedQty: fallbackReceived,
+      });
+    }
+
+    const reqDate = parseDateOnly(requestDate);
+    let onTimeQty = 0;
+    let lateQty = 0;
+    let tooEarlyQty = 0;
+    let datedReceivedQty = 0;
+    receipts
+      .filter((receipt) => receipt.arrivalDate)
+      .sort((left, right) => String(left.arrivalDate || '').localeCompare(String(right.arrivalDate || '')))
+      .forEach((receipt) => {
+        const qty = Math.max(0, Number(receipt.receivedQty || 0));
+        datedReceivedQty += qty;
+        const arrDate = parseDateOnly(receipt.arrivalDate);
+        if (!reqDate || !arrDate) return;
+        const diffDays = Math.round((arrDate - reqDate) / 86400000);
+        if (diffDays >= -1 && diffDays <= 0) onTimeQty += qty;
+        else if (arrDate > reqDate) lateQty += qty;
+        else tooEarlyQty += qty;
+      });
+
+    const totalReceived = receipts.length > 0 ? Math.max(datedReceivedQty, fallbackReceived) : fallbackReceived;
+    let status = 'Pending';
+    if (totalReceived > 0) {
+      if (requestQty > 0 && totalReceived < requestQty) {
+        if (onTimeQty > 0 && lateQty <= 0) status = 'Partial On Time';
+        else if (lateQty > 0) status = 'Partial Late';
+        else if (tooEarlyQty > 0) status = 'Partial Too Early';
+        else status = 'Partial';
+      } else if (lateQty > 0 && onTimeQty > 0) {
+        status = 'Late Completion';
+      } else if (lateQty > 0) {
+        status = 'Late';
+      } else if (onTimeQty > 0) {
+        status = 'On Time';
+      } else if (tooEarlyQty > 0) {
+        status = 'Too Early';
+      } else {
+        status = resolveTimingStatus(requestDate, row?.arrivalDate || row?.arrival_date);
+      }
+    }
+    return { status, onTimeQty, lateQty, tooEarlyQty, totalReceived };
+  };
+
+  const getTimingFlag = (requestDate, arrivalDate) => {
+    const arrDate = parseDateOnly(arrivalDate);
+    const reqDate = parseDateOnly(requestDate);
+    if (!arrDate || !reqDate) return '';
+    const diffDays = Math.round((arrDate - reqDate) / 86400000);
+    if (diffDays === -1) return 'H-1 EARLY';
+    return '';
   };
 
   const getRemainingQty = (item) => {
     const request = Number(item?.requestQty || 0);
-    const received = Number(item?.receivedQty || 0);
+    const received = Number(getDeliveryMetrics(item).totalReceived || item?.receivedQty || 0);
     return Math.max(0, request - received);
   };
 
-  const getTimeStatus = (row) => resolveTimingStatus(row?.requestDate, row?.arrivalDate);
+  const getTimeStatus = (row) => getDeliveryMetrics(row).status;
 
   const getKpiStatus = (row) => getTimeStatus(row);
 
@@ -641,6 +710,14 @@ export const useScheduleStore = ({
       row?.part_no,
       row?.doNumber,
       row?.do_number,
+      row?.relatedDoNumbers,
+      row?.related_do_numbers,
+      ...(Array.isArray(row?.relatedReceipts || row?.related_receipts)
+        ? (row.relatedReceipts || row.related_receipts).flatMap((receipt) => [
+          receipt?.doNumber,
+          receipt?.do_number,
+        ])
+        : []),
     ];
     return haystacks.some((value) => String(value || '').toLowerCase().includes(query));
   }, [filterEnd, filterStart, filterStatus, getKpiStatus, searchQuery]);
@@ -658,9 +735,9 @@ export const useScheduleStore = ({
     let tooEarly = 0;
     rows.forEach((row) => {
       const kpiStatus = getKpiStatus(row);
-      if (kpiStatus === 'On Time') onTime += 1;
-      else if (kpiStatus === 'Late') late += 1;
-      else if (kpiStatus === 'Too Early') tooEarly += 1;
+      if (kpiStatus === 'On Time' || kpiStatus === 'Partial On Time') onTime += 1;
+      else if (kpiStatus === 'Late' || kpiStatus === 'Late Completion' || kpiStatus === 'Partial Late') late += 1;
+      else if (kpiStatus === 'Too Early' || kpiStatus === 'Partial Too Early') tooEarly += 1;
       else pending += 1;
     });
     const uniqueDates = new Set(rows.map((item) => item?.requestDate).filter(Boolean));
@@ -749,9 +826,10 @@ export const useScheduleStore = ({
 
   const getPrintStatusClass = (status) => {
     if (status === 'On Time') return 'print-status--ontime';
-    if (status === 'Late') return 'print-status--late';
-    if (status === 'Too Early') return 'print-status--early';
-    if (status === 'Pending') return 'print-status--pending';
+    if (status === 'Partial On Time') return 'print-status--partial';
+    if (status === 'Late' || status === 'Late Completion' || status === 'Partial Late') return 'print-status--late';
+    if (status === 'Too Early' || status === 'Partial Too Early') return 'print-status--early';
+    if (status === 'Pending' || status === 'Partial') return 'print-status--pending';
     return 'print-status--pending';
   };
 
@@ -1846,6 +1924,7 @@ export const useScheduleStore = ({
     getRemainingQty,
     getPoLineRemainingAfterSchedule,
     getKpiStatus,
+    getTimingFlag,
     getPrintStatusClass,
     handleAddPlan,
     handleCancelEdit,

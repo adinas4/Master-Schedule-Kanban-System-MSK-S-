@@ -8,7 +8,8 @@ import {
   FileSpreadsheet, ChevronDown, FileUp, Calendar, Bot, Send, MessageCircle, 
   Minimize2, FileText, Mail, Truck, GitFork, LogOut, Lock, User, Rocket,
   QrCode, BarChart3, ArrowDownUp, MapPin, TrendingDown, TrendingUp, Scissors,
-  Play, Pause, Eye, EyeOff, Check, X as XIcon, Coins, ListChecks, HelpCircle
+  Play, Pause, Eye, EyeOff, Check, X as XIcon, Coins, ListChecks, HelpCircle,
+  ShieldCheck
 } from 'lucide-react';
 import logoMatra from './assets/logo-matra.png';
 import logoPrl from './assets/kop-mrp.png';
@@ -25,7 +26,7 @@ const standardKanbanIdFormat = 'KB-{CATEGORY}-{UNIQ}';
 const standardKanbanCardIdFormat = 'KB-{CATEGORY}-{UNIQ}-{TOTAL:02}-{SEQ:02}';
 const standardKanbanQrRule = 'KANBAN_ID|ITEM|CATEGORY|QTY|AREA|CYCLE|RIT|TIME';
 
-// âš ï¸ PENTING: Hapus tanda '//' di bawah ini di komputer Anda agar fitur Excel aktif
+// PENTING: Hapus tanda '//' di bawah ini di komputer Anda agar fitur Excel aktif
 
 const TabDashboard = React.lazy(() => import('./tabs/TabDashboard'));
 const TabInbound = React.lazy(() => import('./tabs/TabInbound'));
@@ -36,6 +37,7 @@ const TabMasterRef = React.lazy(() => import('./tabs/TabMasterRef'));
 const TabKanban = React.lazy(() => import('./tabs/TabKanban'));
 const TabReports = React.lazy(() => import('./tabs/TabReports'));
 const TabSubcon = React.lazy(() => import('./tabs/TabSubcon'));
+const TabQuality = React.lazy(() => import('./tabs/TabQuality'));
 const TabSettings = React.lazy(() => import('./tabs/TabSettings'));
 const TabSupplierPortal = React.lazy(() => import('./tabs/TabSupplierPortal'));
 const TabAuditLogs = React.lazy(() => import('./tabs/TabAuditLogs'));
@@ -64,8 +66,26 @@ const HELP_REPORT_LABELS = {
   'supplier-shortage': 'Report Shortage Supplier',
   'all-mutations': 'All Laporan Mutasi',
   'sasaran-mutu': 'Sasaran Mutu',
+  'qc-report': 'Laporan QC',
   'outstanding-prl': 'Outstanding PRL',
   'capacity-planning': 'Capacity Planning',
+};
+
+const REPORT_CATEGORY_BY_TAB = {
+  rekap: 'supplier',
+  scorecard: 'supplier',
+  'supplier-shortage': 'supplier',
+  'stock-coverage': 'inventory',
+  'slow-moving': 'inventory',
+  'fifo-violations': 'inventory',
+  'inventory-value': 'inventory',
+  'all-mutations': 'inventory',
+  'inbound-performance': 'inbound',
+  'inbound-matrix': 'inbound',
+  'sasaran-mutu': 'supplier',
+  'qc-report': 'quality',
+  'outstanding-prl': 'prl',
+  'capacity-planning': 'production',
 };
 
 const HELP_MASTER_REF_LABELS = {
@@ -97,11 +117,13 @@ const HELP_KANBAN_LABELS = {
 const HELP_CONTENT = {
   dashboard: {
     title: 'Dashboard',
-    subtitle: 'Pantau ringkasan operasional dan buka tindak lanjut dari satu halaman.',
+    subtitle: 'Pantau ringkasan operasional, risiko keterlambatan, dan tindak lanjut lintas modul.',
     sop: [
-      'Cek kartu ringkasan untuk melihat kondisi PRL, kanban, inventory, inbound, dan master data.',
-      'Gunakan kartu atau notifikasi untuk membuka data yang perlu ditindaklanjuti.',
-      'Jika angka terlihat kosong, cek master referensi lalu cek laporan mutasi untuk sumber transaksinya.',
+      'Cek kartu ringkasan harian untuk membaca kondisi PRL, kanban, inbound, inventory, quality, dan master data.',
+      'Prioritaskan kartu atau notifikasi yang menunjukkan stok kritis, inbound terlambat, request pending, atau data master tidak lengkap.',
+      'Klik menu terkait untuk menelusuri sumber angka sebelum membuat koreksi transaksi.',
+      'Jika angka kosong atau tidak wajar, validasi master referensi, periode laporan, dan histori mutasi.',
+      'Gunakan dashboard sebagai monitoring awal; input atau koreksi tetap dilakukan di menu transaksi masing-masing.',
     ],
     links: [
       { label: 'Kanban Board', description: 'Cek scan, request, delivery, dan receiving.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'dashboard' },
@@ -112,11 +134,15 @@ const HELP_CONTENT = {
   },
   monitoring: {
     title: 'Inbound Schedule',
-    subtitle: 'Kelola jadwal kedatangan, PO, receiving, dan follow up supplier.',
+    subtitle: 'Kelola PO inbound, jadwal kedatangan, penerimaan aktual, dan follow up supplier.',
     sop: [
-      'Cari PO atau item yang akan diterima, lalu cek tanggal request dan status inbound.',
-      'Buat atau update jadwal sesuai data PO dan supplier.',
-      'Setelah barang diterima, pastikan transaksi masuk tercatat di inventory dan laporan inbound.',
+      'Gunakan pencarian PO atau supplier untuk memuat data supplier dan item secara otomatis.',
+      'Validasi tanggal jadwal terhadap surat jalan aktual sebelum menyimpan penerimaan; kedatangan H-1 tetap dihitung On Time dengan tanda H-1 Early.',
+      'Isi No. SJ/DO sebagai bukti wajib; lengkapi nomor polisi, nama sopir, dan remarks bila tersedia.',
+      'Aktifkan Izin Over Qty hanya bila penerimaan melebihi sisa PO sudah disetujui oleh pihak berwenang.',
+      'Saat import Excel, cek template, mapping kolom, dan ringkasan hasil import sebelum data dipakai operasional.',
+      'Setelah receiving tersimpan, cocokkan perubahan stok di Inventory dan cek performa di laporan inbound.',
+      'Jika status tidak berubah, refresh data lalu telusuri transaksi sumber lewat Global Search atau notifikasi.',
     ],
     links: [
       { label: 'Receiving Kanban', description: 'Lanjutkan penerimaan kanban.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'receiving' },
@@ -145,6 +171,25 @@ const HELP_CONTENT = {
       { label: 'Kanban Kosong', description: 'Cek kartu kosong yang perlu diisi ulang.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'empty' },
       { label: 'Inventory', description: 'Cek efek scan ke stok.', mainTab: 'inventory' },
       { label: 'PRL', description: 'Cek kebutuhan reorder per bulan.', mainTab: 'prl' },
+    ],
+  },
+  quality: {
+    title: 'Quality Control',
+    subtitle: 'Kontrol mutu receiving, klaim supplier, dan sasaran mutu operasional.',
+    sop: [
+      'Incoming dari RN atau Inbound masuk ke Incoming QC terlebih dahulu sebagai sampling sebelum benar-benar release ke stok.',
+      'Jika hasil incoming sampling OK, release barang agar stok bisa dipakai produksi.',
+      'Jika RN sudah dibatalkan/reversal karena salah item, qty, SJ/DO, atau tanggal, QC tidak boleh Release/Hold/Reject/Return lagi. Row tersebut ditutup dengan Close Review sebagai bukti koreksi.',
+      'Close Review RN batal hanya memastikan alasan reversal jelas, stok/PO/schedule sudah kembali benar, dan penerimaan baru dibuat ulang bila barang fisik tetap diterima.',
+      'Jika masalahnya defect/NG material, jangan batalkan RN. Gunakan Hold, Reject, atau Return Supplier agar histori kualitas supplier tetap tercatat.',
+      'Jika raw material NG baru ditemukan di line setelah release, jangan batalkan RN dan jangan balik ke Incoming QC. Catat sebagai Material NG Line.',
+      'Pada Material NG Line, pilih item lalu ketik/cari batch FIFO/RN, isi qty NG, line, proses, operator/shift, dan detail defect. Sistem akan menahan stok batch terkait.',
+      'Gunakan disposition Sortir, Return, Scrap, Rework, atau Use As Is sesuai keputusan QC. Performance supplier membaca QC incoming dan Line Claim.',
+    ],
+    links: [
+      { label: 'Inbound Schedule', description: 'Cek dokumen penerimaan sumber quality.', mainTab: 'monitoring' },
+      { label: 'Inventory', description: 'Validasi status stok setelah QC.', mainTab: 'inventory' },
+      { label: 'Sasaran Mutu', description: 'Pantau KPI mutu supplier.', mainTab: 'reports', reportTab: 'sasaran-mutu' },
     ],
   },
   fifo: {
@@ -188,9 +233,11 @@ const HELP_CONTENT = {
     title: 'Subcon',
     subtitle: 'Kelola kebutuhan dan pergerakan material subcontractor.',
     sop: [
-      'Cek item dan supplier/customer subcon dari master referensi.',
-      'Pastikan transaksi kirim/terima tercatat agar inventory tetap sesuai.',
+      'Cek item, supplier, customer, dan lokasi subcon dari Master Referensi sebelum membuat transaksi.',
+      'Catat material keluar ke subcon dengan qty, dokumen, dan tujuan yang jelas.',
+      'Catat material kembali dari subcon agar saldo inventory dan histori proses tetap sinkron.',
       'Gunakan laporan mutasi untuk membandingkan saldo sebelum dan sesudah proses subcon.',
+      'Jika ada selisih, tahan proses berikutnya sampai dokumen, stok, dan pihak terkait sudah dikonfirmasi.',
     ],
     links: [
       { label: 'Inventory', description: 'Cek stok yang terdampak proses subcon.', mainTab: 'inventory' },
@@ -202,10 +249,12 @@ const HELP_CONTENT = {
     title: 'PRL',
     subtitle: 'Daftar kebutuhan part per model dan bulan.',
     sop: [
-      'Pilih bulan fokus, model, category, supplier, lalu tampilkan data.',
-      'Pastikan model item berasal dari Master Model dan master item hanya menampilkan kode model.',
-      'Rilis PRL setelah kebutuhan sudah benar.',
-      'Jika scan kanban tanpa PRL, cek notifikasi lalu buka PRL bulan terkait.',
+      'Pilih tahun, bulan fokus, model, category, dan supplier sebelum menampilkan kebutuhan.',
+      'Pastikan model item berasal dari Master Model dan master item hanya memakai kode model yang valid.',
+      'Review qty kebutuhan, forecast, dan item mapping sebelum PRL dirilis.',
+      'Rilis PRL setelah kebutuhan disetujui; jangan mengubah master item dari halaman transaksi.',
+      'Jika scan kanban terjadi tanpa PRL, buka notifikasi lalu cek PRL bulan terkait.',
+      'Pantau Outstanding PRL untuk memastikan kebutuhan yang sudah rilis benar-benar ditindaklanjuti.',
     ],
     links: [
       { label: 'Master Model', description: 'Validasi kode model sumber PRL.', mainTab: 'masterref', masterRefTab: 'model' },
@@ -218,10 +267,12 @@ const HELP_CONTENT = {
     title: 'Master Referensi',
     subtitle: 'Sumber utama Org, Vendor, Customer, Model, Process, Category, Packing, Config, dan Item.',
     sop: [
-      'Tambah atau update referensi dari tab sesuai jenis datanya.',
-      'Pastikan kode referensi unik dan konsisten karena dipakai oleh kanban, inventory, PRL, dan laporan.',
-      'Jangan mengisi default manual di modul lain; semua modul harus mengambil dari master referensi.',
-      'Gunakan pencarian di setiap tab untuk validasi data sebelum proses transaksi.',
+      'Tambah atau update referensi dari tab yang sesuai: org, vendor, customer, model, process, category, item, packing, atau config.',
+      'Pastikan kode referensi unik, konsisten, dan tidak berubah sembarangan karena dipakai transaksi lintas modul.',
+      'Lengkapi relasi item ke supplier, customer, model, lokasi, kategori, packing, dan parameter min/max.',
+      'Gunakan pencarian di setiap tab untuk validasi data sebelum import atau proses transaksi.',
+      'Jangan mengisi default manual di modul lain; modul operasional harus mengambil data dari Master Referensi.',
+      'Setelah update besar, cek Dashboard, Inventory, Kanban, PRL, dan laporan untuk memastikan data terbaca benar.',
     ],
     links: [
       { label: 'Master Item', description: 'Mapping referensi ke item.', mainTab: 'masterref', masterRefTab: 'item' },
@@ -234,9 +285,11 @@ const HELP_CONTENT = {
     title: 'Pengaturan',
     subtitle: 'Atur parameter sistem, akses, dan konfigurasi pendukung.',
     sop: [
-      'Ubah konfigurasi hanya jika dampaknya sudah dipahami oleh admin.',
+      'Ubah konfigurasi hanya jika dampaknya sudah dipahami oleh admin dan sudah disetujui.',
+      'Kelola user, role, akses menu, dan parameter sistem sesuai tanggung jawab operasional.',
       'Cek kembali master referensi setelah perubahan konfigurasi yang memengaruhi transaksi.',
-      'Gunakan audit log untuk menelusuri perubahan penting.',
+      'Lakukan uji singkat pada menu terdampak setelah konfigurasi disimpan.',
+      'Gunakan Audit Log untuk menelusuri perubahan penting dan aktivitas user.',
     ],
     links: [
       { label: 'Master Config', description: 'Cek konfigurasi referensi operasional.', mainTab: 'masterref', masterRefTab: 'config' },
@@ -247,9 +300,11 @@ const HELP_CONTENT = {
     title: 'Audit Log',
     subtitle: 'Lacak aktivitas dan perubahan penting di sistem.',
     sop: [
-      'Gunakan filter untuk mencari user, modul, atau rentang tanggal.',
-      'Cek detail aktivitas sebelum melakukan koreksi data.',
-      'Hubungkan temuan audit dengan laporan mutasi atau master referensi terkait.',
+      'Gunakan filter user, modul, status, dan rentang tanggal untuk mempersempit pencarian aktivitas.',
+      'Buka detail audit sebelum melakukan koreksi data atau eskalasi masalah.',
+      'Bandingkan temuan audit dengan transaksi sumber di laporan mutasi, inbound, kanban, atau master referensi.',
+      'Catat aktivitas berisiko seperti perubahan master, pembatalan transaksi, dan update akses user.',
+      'Gunakan hasil audit sebagai bukti pendukung, bukan sebagai tempat koreksi transaksi.',
     ],
     links: [
       { label: 'Pengaturan', description: 'Cek konfigurasi dan akses.', mainTab: 'settings' },
@@ -260,10 +315,12 @@ const HELP_CONTENT = {
     title: 'Laporan',
     subtitle: 'Baca rekap operasional, mutasi, performa, FIFO, shortage, dan capacity planning.',
     sop: [
-      'Pilih jenis laporan dari menu Laporan.',
-      'Isi periode dan filter yang diperlukan, lalu tampilkan data.',
-      'Gunakan Print/PDF atau export jika laporan perlu dibagikan.',
-      'Jika laporan kosong, cek periode, kategori, lokasi, dan apakah transaksi sumber sudah tercatat.',
+      'Pilih jenis laporan dari menu Laporan sesuai kebutuhan analisis.',
+      'Isi periode, supplier, kategori, lokasi, model, atau filter lain yang diperlukan.',
+      'Tampilkan data lalu cek total, status, dan baris exception sebelum export atau print.',
+      'Gunakan Print/PDF atau export hanya setelah filter dan periode sudah benar.',
+      'Jika laporan kosong, cek periode, kategori, lokasi, serta apakah transaksi sumber sudah tercatat.',
+      'Untuk angka yang tidak sesuai, telusuri detail melalui laporan mutasi, inbound, kanban, atau master referensi.',
     ],
     links: [
       { label: 'All Laporan Mutasi', description: 'Sumber utama histori masuk/keluar.', mainTab: 'reports', reportTab: 'all-mutations' },
@@ -276,11 +333,11 @@ const HELP_CONTENT = {
     title: 'Supplier Portal',
     subtitle: 'Area supplier untuk melihat jadwal, dokumen, dan tindak lanjut pengiriman.',
     sop: [
-      'Cek jadwal dan kebutuhan pengiriman yang aktif.',
+      'Supplier login lalu cek jadwal dan kebutuhan pengiriman yang aktif.',
       'Buka Tracking DN, expand detail DN, lalu cetak Label Incoming per package sebelum barang dikirim.',
       'Isi Qty Kirim Aktual jika pengiriman partial, isi Lot Supplier, dan gunakan custom package jika packing aktual tidak sesuai SNP.',
-      'Update status sesuai proses yang tersedia untuk supplier.',
-      'Koordinasikan perubahan jadwal melalui menu inbound atau notifikasi terkait.',
+      'Update status sesuai proses yang tersedia agar admin dapat memantau progress pengiriman.',
+      'Koordinasikan perubahan jadwal, qty, atau dokumen melalui Inbound Schedule dan notifikasi terkait.',
     ],
     links: [
       { label: 'Inbound Schedule', description: 'Cek jadwal pengiriman.', mainTab: 'monitoring' },
@@ -323,8 +380,23 @@ const resolveNotificationTarget = (item) => {
   const detail = String(item?.detail || '').trim().toLowerCase();
   const itemCode = getNotificationItemCode(item);
   const prlPlan = normalizeNotificationPayload(payload.prlPlan || payload.prl_plan);
+  const rnNumber = String(payload.rnNumber || payload.rn_number || '').trim();
+  const rnId = String(payload.rnId || payload.rn_id || item?.entity_id || '').trim();
 
   if (moduleKey.includes('kanban')) {
+    if (
+      entityType.includes('receive_note')
+      || entityType.includes('receipt')
+      || entityType === 'rn'
+      || rnNumber
+    ) {
+      return {
+        mainTab: 'kanban',
+        kanbanView: 'board',
+        kanbanSubTab: 'receiving',
+        rnSearch: rnNumber || rnId,
+      };
+    }
     const isPrlGap = entityType.includes('scan')
       && (
         String(payload.actionType || payload.action_type || '').toLowerCase() === 'consumption_only'
@@ -996,8 +1068,13 @@ const Dashboard = ({ onLogout, token, user }) => {
   });
   const [supplierShortageSupplier, setSupplierShortageSupplier] = useState('');
   const [qualityObjectivesMonth, setQualityObjectivesMonth] = useState(() => formatMonthKeyLocal(new Date()));
+  const [qualityObjectivesSupplier, setQualityObjectivesSupplier] = useState('');
+  const [qualityObjectivesMonthStart, setQualityObjectivesMonthStart] = useState('jan');
+  const [qualityObjectivesMonthEnd, setQualityObjectivesMonthEnd] = useState('dec');
+  const [qualityObjectivesYear, setQualityObjectivesYear] = useState(String(new Date().getFullYear()));
   const [qualityObjectivesData, setQualityObjectivesData] = useState({
     period: null,
+    sps: null,
     inboundSchedule: [],
     dnVsRn: [],
     deliveryVsPrl: [],
@@ -1097,6 +1174,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [itemsLoading, setItemsLoading] = useState(false);
   const [kanbanSettings, setKanbanSettings] = useState([]);
   const [kanbanRequests, setKanbanRequests] = useState([]);
+  const [kanbanEmptyLogs, setKanbanEmptyLogs] = useState([]);
   const [deliveryNotes, setDeliveryNotes] = useState([]);
   const [receiveNotes, setReceiveNotes] = useState([]);
   const [kanbanLoading, setKanbanLoading] = useState(false);
@@ -1283,6 +1361,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [scanInput, setScanInput] = useState('');
   const [scanResults, setScanResults] = useState([]);
   const [scanActiveResult, setScanActiveResult] = useState(null);
+  const [scanHistory, setScanHistory] = useState([]);
   const [scanError, setScanError] = useState('');
   const [scanCameraStatus, setScanCameraStatus] = useState('');
   const [scanCameraEnabled, setScanCameraEnabled] = useState(false);
@@ -1290,7 +1369,10 @@ const Dashboard = ({ onLogout, token, user }) => {
   const scanInstanceRef = useRef(null);
   const scanStartPendingRef = useRef(false);
   const scanStartTokenRef = useRef(0);
+  const lastScanRef = useRef({ value: '', time: 0 });
+  const scanAutoProcessingRef = useRef(false);
   const fetchScanPreviewRef = useRef(null);
+  const executeScanResultFlowRef = useRef(null);
   const getScanCameraErrorMessage = (error) => {
     const rawMessage = String(error?.message || error || '').trim();
     const lowered = rawMessage.toLowerCase();
@@ -1626,6 +1708,16 @@ const Dashboard = ({ onLogout, token, user }) => {
       if (target.kanbanView) setKanbanView(target.kanbanView);
       if (target.kanbanSubTab) setKanbanSubTab(target.kanbanSubTab);
       if (target.kanbanSearch || itemCode) setKanbanSearch(target.kanbanSearch || itemCode);
+      if (target.rnSearch) {
+        setRnSearch(target.rnSearch);
+        setRnStatus('all');
+        setRnDateStart('');
+        setRnDateEnd('');
+        setTablePagination((prev) => ({
+          ...prev,
+          kanbanReceiving: { ...(prev.kanbanReceiving || {}), page: 1 },
+        }));
+      }
       if (target.kanbanRequestFilters) {
         setKanbanRequestFilters((prev) => ({
           ...prev,
@@ -1672,6 +1764,10 @@ const Dashboard = ({ onLogout, token, user }) => {
     setMainTab,
     setMasterRefTab,
     setPrlFilters,
+    setRnDateEnd,
+    setRnDateStart,
+    setRnSearch,
+    setRnStatus,
     setTablePagination,
   ]);
   const handleNotificationCardKeyDown = useCallback((event, item) => {
@@ -1831,16 +1927,19 @@ const Dashboard = ({ onLogout, token, user }) => {
   const normalizeItemProcessRouting = (routingRows = [], fallbackLineProduction = '', fallbackCycleTimeSeconds = '') => {
     const normalizedRows = [];
     (Array.isArray(routingRows) ? routingRows : []).forEach((row, index) => {
-      const processCode = resolveMasterProcessCode(row?.processCode || row?.code || row?.process || row?.processName || row?.name || '');
+      const rawProcessValue = String(row?.processCode || row?.code || row?.process || row?.processName || row?.name || '').trim();
+      if (!rawProcessValue) return;
+      const processCode = resolveMasterProcessCode(rawProcessValue);
       const masterProcess = masterProcessesByCode.get(String(processCode || '').trim()) || null;
+      if (!masterProcess) return;
       const cycleTimeValue = Number(row?.cycleTimeSeconds ?? row?.cycle_time_seconds ?? row?.standardTime ?? row?.standard_time ?? masterProcess?.standard_time ?? 0);
       const workCenterValue = String(row?.workCenter || row?.work_center || masterProcess?.work_center || '').trim();
       const processNameValue = String(row?.processName || row?.name || masterProcess?.name || '').trim();
       const processTypeValue = String(row?.processType || row?.process_type || masterProcess?.process_type || '').trim();
       const appliesToLevelValue = String(row?.appliesToLevel || row?.applies_to_level || masterProcess?.applies_to_level || 'All').trim() || 'All';
       normalizedRows.push({
-        code: processCode || processNameValue || workCenterValue || `STEP-${index + 1}`,
-        name: processNameValue || processCode || workCenterValue || `Step ${index + 1}`,
+        code: processCode,
+        name: processNameValue || processCode,
         processType: processTypeValue,
         appliesToLevel: appliesToLevelValue,
         workCenter: workCenterValue || 'UNASSIGNED',
@@ -1851,17 +1950,14 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (normalizedRows.length > 0) return normalizedRows;
     const fallbackProcessCode = resolveMasterProcessCode(fallbackLineProduction);
     const fallbackProcess = masterProcessesByCode.get(String(fallbackProcessCode || '').trim()) || null;
+    if (!fallbackProcess) return [];
     const fallbackCycleTime = Number(fallbackCycleTimeSeconds || 0);
-    const fallbackLineValue = String(fallbackLineProduction || '').trim();
-    if (!fallbackProcessCode && !fallbackLineValue && (!Number.isFinite(fallbackCycleTime) || fallbackCycleTime <= 0)) {
-      return [];
-    }
     return [{
-      code: fallbackProcessCode || fallbackLineValue || 'STEP-1',
-      name: fallbackProcess?.name || fallbackProcessCode || fallbackLineValue || 'Step 1',
+      code: fallbackProcess.code,
+      name: fallbackProcess.name || fallbackProcess.code,
       processType: fallbackProcess?.process_type || '',
       appliesToLevel: fallbackProcess?.applies_to_level || 'All',
-      workCenter: fallbackProcess?.work_center || fallbackLineValue || 'UNASSIGNED',
+      workCenter: fallbackProcess?.work_center || 'UNASSIGNED',
       sequence: 1,
       standardTime: Number.isFinite(fallbackCycleTime) ? Math.max(0, fallbackCycleTime) : 0,
     }];
@@ -1908,8 +2004,8 @@ const Dashboard = ({ onLogout, token, user }) => {
         locationType,
         fifoLane,
         `${locationId} - ${locationType}`,
-        `${locationId} â€¢ ${locationType}`,
-        `${locationId} â€¢ ${locationType}${fifoLane ? ` â€¢ ${fifoLane}` : ''}`,
+        `${locationId} - ${locationType}`,
+        `${locationId} - ${locationType}${fifoLane ? ` - ${fifoLane}` : ''}`,
       ].filter(Boolean);
       return aliases.some((alias) => String(alias).trim().toLowerCase() === lowered);
     });
@@ -2044,8 +2140,50 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [editingProductionId, setEditingProductionId] = useState(null);
   const [editingProductionQty, setEditingProductionQty] = useState('');
   const [reportTab, setReportTab] = useState('rekap');
+  const [reportCategory, setReportCategory] = useState('supplier');
+  const [reportMenuCategory, setReportMenuCategory] = useState('supplier');
   const [reportMenuOpen, setReportMenuOpen] = useState(false);
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
+  const [incomingMenuOpen, setIncomingMenuOpen] = useState(false);
+  const [incomingQuickAction, setIncomingQuickAction] = useState(null);
+  const isAdmin = user?.role === 'admin';
+  const isSupplier = user?.role === 'supplier';
+  const isProductionUser = user?.role === 'production';
+  const isPpicUser = String(user?.role || '').trim().toLowerCase() === 'ppic';
+  const ppicFullKanbanPermissions = new Set([
+    'viewReport',
+    'viewScorecard',
+    'viewMaster',
+    'manageMaster',
+    'manageItems',
+    'viewPrl',
+    'prlImport',
+    'editSchedules',
+    'production',
+    'importExport',
+    'useAI',
+  ]);
+  const can = (perm) => user?.role === 'admin' || (isPpicUser && ppicFullKanbanPermissions.has(perm)) || user?.permissions?.[perm];
+  const canViewReport = can('viewReport');
+  const canViewScorecard = can('viewScorecard');
+  const canViewMaster = can('viewMaster');
+  const canManageMaster = can('manageMaster');
+  const canManageVendors = can('manageVendors');
+  const canManageItems = can('manageItems');
+  const canViewPrl = can('viewPrl');
+  const canPrlProcess = can('prlProcess');
+  const canPrlImport = can('prlImport');
+  const canEditSchedules = can('editSchedules');
+  const canDeleteRecords = can('deleteRecords');
+  const canImportExport = can('importExport');
+  const canImportSchedules = canImportExport || canEditSchedules;
+  const canUseAI = can('useAI');
+  const canManageUsers = can('manageUsers');
+  const canResetAll = can('resetAll');
+  const canSubcon = canEditSchedules || canViewReport;
+  const canProduction = can('production') || isProductionUser;
+  const canQuality = can('quality');
+  const canOpenReportMenu = canViewReport || canViewScorecard;
   const activeHelpContent = useMemo(() => {
     const base = HELP_CONTENT[mainTab] || HELP_CONTENT.dashboard;
     let detailLabel = '';
@@ -2062,6 +2200,83 @@ const Dashboard = ({ onLogout, token, user }) => {
       title: detailLabel ? `${base.title} - ${detailLabel}` : base.title,
     };
   }, [kanbanSubTab, kanbanView, mainTab, masterRefTab, reportTab]);
+  const reportMenuGroups = useMemo(() => {
+    const groups = [
+      {
+        key: 'supplier',
+        label: 'Supplier',
+        icon: Trophy,
+        reports: [
+          { key: 'rekap', label: 'Report Rekap Supplier/PO', icon: FileText, access: canViewReport },
+          { key: 'scorecard', label: 'Rapor Kinerja Supplier', icon: Trophy, access: canViewScorecard },
+          { key: 'sasaran-mutu', label: 'Sasaran Mutu', icon: CheckCircle, access: canViewReport },
+          { key: 'supplier-shortage', label: 'Report Shortage Supplier', icon: AlertTriangle, access: canViewReport },
+        ],
+      },
+      {
+        key: 'inventory',
+        label: 'Inventory',
+        icon: Package,
+        reports: [
+          { key: 'stock-coverage', label: 'Stock Coverage', icon: BarChart3, access: canViewReport },
+          { key: 'slow-moving', label: 'Slow & Dead Stock', icon: TrendingDown, access: canViewReport },
+          { key: 'fifo-violations', label: 'FIFO Violation Log', icon: AlertTriangle, access: canViewReport },
+          { key: 'inventory-value', label: 'Inventory Value', icon: Coins, access: canViewReport },
+          { key: 'all-mutations', label: 'All Laporan Mutasi', icon: FileText, access: canViewReport },
+        ],
+      },
+      {
+        key: 'inbound',
+        label: 'Inbound',
+        icon: Truck,
+        reports: [
+          { key: 'inbound-performance', label: 'Inbound Performance', icon: ArrowDownUp, access: canViewReport },
+          { key: 'inbound-matrix', label: 'Delivery Matrix Inbound', icon: FileSpreadsheet, access: canViewReport },
+        ],
+      },
+      {
+        key: 'quality',
+        label: 'Quality',
+        icon: CheckCircle,
+        reports: [
+          { key: 'qc-report', label: 'Laporan QC', icon: ShieldCheck, access: canViewReport },
+        ],
+      },
+      {
+        key: 'prl',
+        label: 'PRL',
+        icon: ListChecks,
+        reports: [
+          { key: 'outstanding-prl', label: 'Outstanding PRL', icon: ListChecks, access: canViewReport },
+        ],
+      },
+      {
+        key: 'production',
+        label: 'Produksi',
+        icon: BarChart3,
+        reports: [
+          { key: 'capacity-planning', label: 'Capacity Planning', icon: BarChart3, access: canViewReport },
+        ],
+      },
+    ];
+    return groups
+      .map((group) => ({ ...group, reports: group.reports.filter((report) => report.access) }))
+      .filter((group) => group.reports.length > 0);
+  }, [canViewReport, canViewScorecard]);
+  const activeReportMenuGroup = reportMenuGroups.find((group) => group.key === reportMenuCategory) || reportMenuGroups[0] || null;
+  const openReportFromTree = useCallback((categoryKey, tabKey) => {
+    setMainTab('reports');
+    setReportCategory(categoryKey || REPORT_CATEGORY_BY_TAB[tabKey] || 'supplier');
+    setReportMenuCategory(categoryKey || REPORT_CATEGORY_BY_TAB[tabKey] || 'supplier');
+    setReportTab(tabKey);
+    setReportMenuOpen(false);
+    setSettingsMenuOpen(false);
+  }, [setMainTab]);
+  useEffect(() => {
+    const nextCategory = REPORT_CATEGORY_BY_TAB[reportTab] || 'supplier';
+    setReportCategory(nextCategory);
+    setReportMenuCategory(nextCategory);
+  }, [reportTab]);
   const [fifoLots, setFifoLots] = useState([]);
   const [selectedFifoKanban, setSelectedFifoKanban] = useState('');
   const [inventoryItems, setInventoryItems] = useState([]);
@@ -2144,6 +2359,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       importExport: true,
       deleteRecords: true,
       resetAll: true,
+      quality: true,
     },
     ppic: {
       viewReport: true,
@@ -2162,6 +2378,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       importExport: true,
       deleteRecords: false,
       resetAll: false,
+      quality: false,
     },
     warehouse: {
       viewReport: true,
@@ -2180,6 +2397,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       importExport: true,
       deleteRecords: false,
       resetAll: false,
+      quality: false,
     },
     production: {
       viewReport: false,
@@ -2198,6 +2416,26 @@ const Dashboard = ({ onLogout, token, user }) => {
       importExport: false,
       deleteRecords: false,
       resetAll: false,
+      quality: false,
+    },
+    qc: {
+      viewReport: true,
+      viewScorecard: false,
+      viewMaster: true,
+      manageMaster: false,
+      manageVendors: false,
+      manageItems: false,
+      viewPrl: false,
+      prlProcess: false,
+      prlImport: false,
+      editSchedules: false,
+      production: false,
+      manageUsers: false,
+      useAI: false,
+      importExport: false,
+      deleteRecords: false,
+      resetAll: false,
+      quality: true,
     },
     purchasing: {
       viewReport: true,
@@ -2216,6 +2454,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       importExport: true,
       deleteRecords: false,
       resetAll: false,
+      quality: false,
     },
     management: {
       viewReport: true,
@@ -2234,6 +2473,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       importExport: false,
       deleteRecords: false,
       resetAll: false,
+      quality: false,
     },
     user: {
       viewReport: true,
@@ -2252,6 +2492,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       importExport: false,
       deleteRecords: false,
       resetAll: false,
+      quality: false,
     },
     supplier: {
       viewReport: false,
@@ -2266,10 +2507,11 @@ const Dashboard = ({ onLogout, token, user }) => {
       editSchedules: false,
       production: false,
       manageUsers: false,
-      useAI: false,
+      useAI: true,
       importExport: false,
       deleteRecords: false,
       resetAll: false,
+      quality: false,
     },
   };
   const defaultUserPermissions = {
@@ -2289,13 +2531,15 @@ const Dashboard = ({ onLogout, token, user }) => {
     importExport: false,
     deleteRecords: false,
     resetAll: false,
+    quality: false,
   };
-  const userRoleOptions = ['user', 'ppic', 'warehouse', 'production', 'purchasing', 'management', 'supplier', 'admin'];
+  const userRoleOptions = ['user', 'ppic', 'warehouse', 'production', 'qc', 'purchasing', 'management', 'supplier', 'admin'];
   const userRoleDescriptions = {
     user: 'Akses dasar untuk user umum.',
     ppic: 'Fokus planning, PRL, dan monitoring.',
     warehouse: 'Fokus stok, schedule, dan operasi gudang.',
     production: 'Fokus scan QR dan kanban kosong di lapangan.',
+    qc: 'Fokus inspeksi RN, NG produksi, dan return delivery.',
     purchasing: 'Fokus pembelian, PRL, dan supplier.',
     management: 'Fokus dashboard, report, dan review.',
     supplier: 'Akses terbatas ke data supplier sendiri.',
@@ -2312,7 +2556,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     },
     {
       title: 'Transaksi & PR',
-      keys: ['viewPrl', 'prlProcess', 'prlImport', 'editSchedules', 'production'],
+      keys: ['viewPrl', 'prlProcess', 'prlImport', 'editSchedules', 'production', 'quality'],
     },
     {
       title: 'Sistem & Admin',
@@ -2331,6 +2575,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     prlImport: 'PRL Import',
     editSchedules: 'Edit Schedule',
     production: 'Production',
+    quality: 'Quality Control',
     manageUsers: 'Manage User',
     useAI: 'Use AI',
     importExport: 'Import / Export',
@@ -2446,7 +2691,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   // Chatbot States
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState([
-    { role: 'ai', text: 'Halo! Saya Asisten Logistik Anda. ðŸ¤–nAda yang bisa saya bantu mengenai data jadwal pengiriman hari ini?' }
+    { role: 'ai', text: 'Halo, saya Asisten Logistik. Buka menu yang ingin dianalisis, lalu tanyakan masalahnya di sini.' }
   ]);
   const [chatInput, setChatInput] = useState('');
   const [isChatLoading, setIsChatLoading] = useState(false);
@@ -2476,47 +2721,11 @@ const Dashboard = ({ onLogout, token, user }) => {
     { label: 'Cycle 4 (01:30)', value: '01:30 (Cycle 4)' },
   ];
 
-  const isAdmin = user?.role === 'admin';
-  const isSupplier = user?.role === 'supplier';
-  const isProductionUser = user?.role === 'production';
-  const isPpicUser = String(user?.role || '').trim().toLowerCase() === 'ppic';
-  const ppicFullKanbanPermissions = new Set([
-    'viewReport',
-    'viewScorecard',
-    'viewMaster',
-    'manageMaster',
-    'manageItems',
-    'viewPrl',
-    'prlImport',
-    'editSchedules',
-    'production',
-    'importExport',
-    'useAI',
-  ]);
-  const can = (perm) => user?.role === 'admin' || (isPpicUser && ppicFullKanbanPermissions.has(perm)) || user?.permissions?.[perm];
-  const canViewReport = can('viewReport');
-  const canViewScorecard = can('viewScorecard');
-  const canViewMaster = can('viewMaster');
-  const canManageMaster = can('manageMaster');
-  const canManageVendors = can('manageVendors');
-  const canManageItems = can('manageItems');
-  const canViewPrl = can('viewPrl');
-  const canPrlProcess = can('prlProcess');
-  const canPrlImport = can('prlImport');
-  const canEditSchedules = can('editSchedules');
-  const canDeleteRecords = can('deleteRecords');
-  const canImportExport = can('importExport');
-  const canImportSchedules = canImportExport || canEditSchedules;
-  const canUseAI = can('useAI');
-  const canManageUsers = can('manageUsers');
-  const canResetAll = can('resetAll');
-  const canSubcon = canEditSchedules || canViewReport;
-  const canProduction = can('production') && !isProductionUser;
-  const canOpenReportMenu = canViewReport || canViewScorecard;
   const getMainNavAccessMessage = (target) => {
     const normalized = String(target || '').trim();
     if (normalized === 'kanban') return 'Anda tidak memiliki akses Kanban Board.';
     if (normalized === 'subcon') return 'Anda tidak memiliki akses Subcon.';
+    if (normalized === 'quality') return 'Anda tidak memiliki akses Quality Control.';
     if (normalized === 'prl') return 'Anda tidak memiliki akses PRL.';
     if (normalized === 'masterref') return 'Anda tidak memiliki akses Master Referensi.';
     if (normalized === 'reports') return 'Anda tidak memiliki akses Laporan.';
@@ -2559,6 +2768,34 @@ const Dashboard = ({ onLogout, token, user }) => {
     getMainNavAccessMessage,
     isAdmin,
     isProductionUser,
+    showToastMessage,
+  ]);
+
+  const openIncomingQuickAction = useCallback((type) => {
+    if (!canEditSchedules) {
+      showToastMessage(getMainNavAccessMessage('kanban'), '', null, 'error');
+      return;
+    }
+    setActiveMenu(null);
+    setSettingsMenuOpen(false);
+    setReportMenuOpen(false);
+    setIncomingMenuOpen(false);
+    setShowForm(false);
+    const nextAction = { type, nonce: Date.now() };
+    setIncomingQuickAction(nextAction);
+    if (type === 'schedule') {
+      setMainTab('monitoring');
+      return;
+    }
+    setMainTab('kanban');
+    setKanbanView('board');
+    setKanbanSubTab('receiving');
+  }, [
+    canEditSchedules,
+    getMainNavAccessMessage,
+    setKanbanSubTab,
+    setKanbanView,
+    setMainTab,
     showToastMessage,
   ]);
 
@@ -2880,10 +3117,9 @@ const Dashboard = ({ onLogout, token, user }) => {
   };
 
   const fetchItems = async ({ silent = false } = {}) => {
-    if (isProductionUser) return [];
     if (!silent && !items.length) setItemsLoading(true);
     try {
-      const data = await fetchPagedCollection('/api/items', { pageSize: 250 });
+      const data = await fetchPagedCollection(isProductionUser ? '/api/master/items' : '/api/items', { pageSize: 250 });
       setItems(data);
       dataCacheRef.current.itemsLoaded = true;
     } catch (error) {
@@ -2939,6 +3175,20 @@ const Dashboard = ({ onLogout, token, user }) => {
       setKanbanError(error.message || 'Gagal memuat kanban requests.');
     } finally {
       if (!silent && !kanbanRequests.length) setKanbanLoading(false);
+    }
+  };
+
+  const fetchKanbanEmptyLogs = async ({ silent = false } = {}) => {
+    if (!silent && !kanbanEmptyLogs.length) setKanbanLoading(true);
+    setKanbanError('');
+    try {
+      const data = await apiFetch('/api/kanban/empty-log?limit=1000');
+      setKanbanEmptyLogs(Array.isArray(data) ? data : []);
+      dataCacheRef.current.kanbanEmptyLogsLoaded = true;
+    } catch (error) {
+      setKanbanError(error.message || 'Gagal memuat log kanban kosong.');
+    } finally {
+      if (!silent && !kanbanEmptyLogs.length) setKanbanLoading(false);
     }
   };
 
@@ -3325,6 +3575,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     getRemainingQty,
     getPoLineRemainingAfterSchedule,
     getKpiStatus,
+    getTimingFlag,
     getPrintStatusClass,
     handleAddPlan,
     handleCancelEdit,
@@ -3463,6 +3714,25 @@ const Dashboard = ({ onLogout, token, user }) => {
     return num.toLocaleString('id-ID', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   };
 
+  const formatQuantity = (value, fallback = '-') => {
+    if (value === null || value === undefined || value === '') return fallback;
+    const num = Number(value);
+    if (!Number.isFinite(num)) return fallback;
+    const isWhole = Math.abs(num - Math.round(num)) < 1e-9;
+    return num.toLocaleString('id-ID', {
+      minimumFractionDigits: isWhole ? 0 : 2,
+      maximumFractionDigits: isWhole ? 0 : 2,
+    });
+  };
+
+  const formatSignedQuantity = (value, fallback = '-') => {
+    if (value === null || value === undefined || value === '') return fallback;
+    const num = Number(value);
+    if (!Number.isFinite(num)) return fallback;
+    if (Math.abs(num) < 1e-9) return '-';
+    return num > 0 ? `+${formatQuantity(num, fallback)}` : formatQuantity(num, fallback);
+  };
+
   const formatRupiah = (value) => {
     const num = Number(value);
     if (!Number.isFinite(num)) return value ?? '';
@@ -3478,6 +3748,8 @@ const Dashboard = ({ onLogout, token, user }) => {
   };
 
   const globalSearchGroupMeta = useMemo(() => ({
+    rn: { label: 'Receiving Notes', icon: '[RN]' },
+    dn: { label: 'Delivery Notes', icon: '[DN]' },
     po: { label: 'Master PO', icon: '[PO]' },
     vendors: { label: 'Master Vendor', icon: '[VENDOR]' },
     items: { label: 'Master Item', icon: '[ITEM]' },
@@ -3495,7 +3767,35 @@ const Dashboard = ({ onLogout, token, user }) => {
   }, [setMainTab]);
 
   const handleGlobalSearchResultClick = useCallback((groupKey, item) => {
-    if (groupKey === 'po') {
+    if (groupKey === 'rn') {
+      const rnNumber = item?.rn_number || item?.rnNumber || '';
+      setMainTab('kanban');
+      setKanbanView('board');
+      setKanbanSubTab('receiving');
+      setRnSearch(rnNumber);
+      setRnStatus('all');
+      setRnDateStart('');
+      setRnDateEnd('');
+      setTablePagination((prev) => ({
+        ...prev,
+        kanbanReceiving: { ...(prev.kanbanReceiving || {}), page: 1 },
+      }));
+    } else if (groupKey === 'dn') {
+      const dnNumber = item?.dn_number || item?.dnNumber || '';
+      setMainTab('kanban');
+      setKanbanView('board');
+      setKanbanSubTab('dn');
+      setKanbanDnFilters((prev) => ({
+        ...prev,
+        search: dnNumber,
+        supplier: 'all',
+        status: 'all',
+      }));
+      setTablePagination((prev) => ({
+        ...prev,
+        kanbanDn: { ...(prev.kanbanDn || {}), page: 1 },
+      }));
+    } else if (groupKey === 'po') {
       const poNumber = item?.po_number || item?.poNumber || '';
       setMainTab('monitoring');
       setInboundNav({ tab: 'master-po', poSearch: poNumber, expandPo: poNumber });
@@ -3516,7 +3816,21 @@ const Dashboard = ({ onLogout, token, user }) => {
       }
     }
     setGlobalSearchOpen(false);
-  }, [openInboundScheduleFromToast, setItemTableFilters, setMainTab, setMasterRefTab, setMasterVendorSearch]);
+  }, [
+    openInboundScheduleFromToast,
+    setItemTableFilters,
+    setKanbanDnFilters,
+    setKanbanSubTab,
+    setKanbanView,
+    setMainTab,
+    setMasterRefTab,
+    setMasterVendorSearch,
+    setRnDateEnd,
+    setRnDateStart,
+    setRnSearch,
+    setRnStatus,
+    setTablePagination,
+  ]);
 
   useEffect(() => {
     if (!globalSearchOpen) return;
@@ -3687,6 +4001,11 @@ const Dashboard = ({ onLogout, token, user }) => {
       return String(seqValue).padStart(padValue, '0');
     });
 
+    const hasCardSequenceToken = /{(?:SEQ|TOTAL|COUNTER)(?::\d+)?}/i.test(format);
+    if (!hasCardSequenceToken) {
+      result = `${result}-${String(totalValue).padStart(2, '0')}-${String(seqValue).padStart(2, '0')}`;
+    }
+
     return result;
   };
 
@@ -3725,10 +4044,15 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
       try {
         const payload = JSON.parse(trimmed);
-        return String(payload?.kanbanId || payload?.kanban_id || payload?.cardUid || payload?.card_uid || payload?.itemCode || payload?.item_code || payload?.uniq || trimmed).trim();
+        return extractKanbanIdToken(payload?.kanbanId || payload?.kanban_id || payload?.cardUid || payload?.card_uid || payload?.itemCode || payload?.item_code || payload?.uniq || trimmed);
       } catch (_error) {
         return trimmed;
       }
+    }
+    for (let len = 1; len <= Math.floor(trimmed.length / 2); len += 1) {
+      if (trimmed.length % len !== 0) continue;
+      const prefix = trimmed.slice(0, len);
+      if (prefix.repeat(trimmed.length / len) === trimmed) return prefix;
     }
     return trimmed;
   }
@@ -3746,7 +4070,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     };
 
     pushCandidate(trimmed);
-    const directMatch = trimmed.match(/^KB-([A-Za-z0-9_-]+)-(.+)$/i);
+    const directMatch = trimmed.match(/^KB-([A-Za-z0-9_]+)-(.+)$/i);
     if (directMatch) {
       const parts = String(directMatch[2] || '')
         .split('-')
@@ -3754,6 +4078,9 @@ const Dashboard = ({ onLogout, token, user }) => {
         .filter(Boolean);
       for (let endIndex = parts.length; endIndex >= 1; endIndex -= 1) {
         pushCandidate(parts.slice(0, endIndex).join('-'));
+      }
+      for (let startIndex = 0; startIndex < parts.length; startIndex += 1) {
+        pushCandidate(parts.slice(startIndex).join('-'));
       }
     }
 
@@ -3764,6 +4091,9 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (genericParts.length >= 2) {
       for (let endIndex = genericParts.length - 1; endIndex >= 1; endIndex -= 1) {
         pushCandidate(genericParts.slice(0, endIndex).join('-'));
+      }
+      for (let startIndex = 1; startIndex < genericParts.length; startIndex += 1) {
+        pushCandidate(genericParts.slice(startIndex).join('-'));
       }
     }
 
@@ -4123,6 +4453,10 @@ const Dashboard = ({ onLogout, token, user }) => {
   }, [masterItemsWithModelCodes, itemTableFilters, itemSupplierMap, itemCustomerMap, itemDuplicateKeySets, masterModelsMap, resolveModelCodesFromMaster]);
 
   const fetchPrlRows = async (yearValue, { silent = false } = {}) => {
+    if (!canViewPrl) {
+      if (!silent) setPrlLoading(false);
+      return;
+    }
     if (!silent && !prlRows.length) setPrlLoading(true);
     try {
       const yearParam = yearValue || prlFilters.year || currentYear;
@@ -4285,6 +4619,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       setPrlRows(normalized);
       dataCacheRef.current.prlLoadedYear = `${yearParam}:${prlFilters.supplier || 'all'}`;
     } catch (error) {
+      if (!canViewPrl && /forbidden|unauthorized|403|401/i.test(String(error?.message || ''))) return;
       showToastMessage(`Gagal memuat PRL: ${error.message || 'Unknown error'}`);
     } finally {
       if (!silent && !prlRows.length) setPrlLoading(false);
@@ -4293,12 +4628,13 @@ const Dashboard = ({ onLogout, token, user }) => {
 
   useEffect(() => {
     if (mainTab !== 'prl') return;
+    if (!canViewPrl) return;
     const yearParam = prlFilters.year || currentYear;
     const cacheKey = `${yearParam}:${prlFilters.supplier || 'all'}`;
     const supplierScopedMasterReady = !prlFilters.supplier || (masterItems.length > 0 && itemSupplierMap.size > 0);
     const silent = dataCacheRef.current.prlLoadedYear === cacheKey && supplierScopedMasterReady;
     fetchPrlRows(yearParam, { silent });
-  }, [mainTab, prlFilters.year, prlFilters.supplier, masterItems.length, itemSupplierMap.size, masterModels.length]);
+  }, [mainTab, canViewPrl, prlFilters.year, prlFilters.supplier, masterItems.length, itemSupplierMap.size, masterModels.length]);
 
   const buildPrlTemplateRows = () => ([
     {
@@ -4664,17 +5000,17 @@ const Dashboard = ({ onLogout, token, user }) => {
         const nMinus = getMonthValue(row, monthSlots[0]);
         const nValue = getMonthValue(row, monthSlots[1]);
         let diffPct = 0;
-        let trend = 'â†’';
+        let trend = '->';
         if (nMinus > 0) {
           diffPct = ((nValue - nMinus) / nMinus) * 100;
-          if (diffPct > 5) trend = 'â–²';
-          else if (diffPct < -5) trend = 'â–¼';
+          if (diffPct > 5) trend = 'UP';
+          else if (diffPct < -5) trend = 'DOWN';
         }
         const diffValue = nMinus > 0 ? Math.round(diffPct) : null;
         const diffLabel = nMinus > 0 ? `${trend} ${formatNumber0(diffValue)}%` : '-';
-        const color = trend === 'â–²'
+        const color = trend === 'UP'
           ? [185, 28, 28]
-          : trend === 'â–¼'
+          : trend === 'DOWN'
             ? [21, 128, 61]
             : [31, 41, 55];
 
@@ -4818,19 +5154,19 @@ const Dashboard = ({ onLogout, token, user }) => {
           </td>
           <td class="center">${escapeHtml(formatModelCodes(masterModelsMap, resolveModelCodesFromMaster(row.model)) || row.model || '-')}</td>
           <td class="center">${formatCellNumber(row.snp, 0)}</td>
-          <td class="center">${formatCellNumber(row.qtyDayMinusOne, 2)}</td>
-          <td class="center">${formatCellNumber(row.qtyDayCurrent, 2)}</td>
+          <td class="center">${formatCellNumber(row.qtyDayMinusOne, 0)}</td>
+          <td class="center">${formatCellNumber(row.qtyDayCurrent, 0)}</td>
           <td class="center">${escapeHtml(row.uom || '-')}</td>
           <td class="center">${escapeHtml(row.typePack || '-')}</td>
-          <td class="center">${formatCellNumber(row.weekI, 2)}</td>
-          <td class="center">${formatCellNumber(row.weekII, 2)}</td>
-          <td class="center">${formatCellNumber(row.weekIII, 2)}</td>
-          <td class="center">${formatCellNumber(row.weekIV, 2)}</td>
-          <td class="center">${formatCellNumber(row.months?.nMinus1, 2)}</td>
-          <td class="center">${formatCellNumber(row.months?.n, 2)}</td>
-          <td class="center">${formatCellNumber(row.months?.nPlus1, 2)}</td>
-          <td class="center">${formatCellNumber(row.months?.nPlus2, 2)}</td>
-          <td class="center">${formatCellNumber(row.months?.nPlus3, 2)}</td>
+          <td class="center">${formatCellNumber(row.weekI, 0)}</td>
+          <td class="center">${formatCellNumber(row.weekII, 0)}</td>
+          <td class="center">${formatCellNumber(row.weekIII, 0)}</td>
+          <td class="center">${formatCellNumber(row.weekIV, 0)}</td>
+          <td class="center">${formatCellNumber(row.months?.nMinus1, 0)}</td>
+          <td class="center">${formatCellNumber(row.months?.n, 0)}</td>
+          <td class="center">${formatCellNumber(row.months?.nPlus1, 0)}</td>
+          <td class="center">${formatCellNumber(row.months?.nPlus2, 0)}</td>
+          <td class="center">${formatCellNumber(row.months?.nPlus3, 0)}</td>
           <td class="center">${row.fluctuation === null || row.fluctuation === undefined ? '-' : `${formatCellNumber(row.fluctuation, 0)}%`}</td>
         </tr>
       `).join('');
@@ -5817,7 +6153,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       deliveryTime: deliveryTimeValue,
     };
     if (editingVendorId) {
-      await apiFetch(`/api/master/vendors/${editingVendorId}`, { method: 'PUT', body: JSON.stringify(payload) });
+      await apiFetch(`/api/master/vendors/${encodeURIComponent(editingVendorId)}`, { method: 'PUT', body: JSON.stringify(payload) });
     } else {
       await apiFetch('/api/master/vendors', { method: 'POST', body: JSON.stringify(payload) });
     }
@@ -7225,6 +7561,14 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
     return `${prefix}-${ref || 'DOC'}-${dateCode}`;
   };
 
+  const normalizeMailtoRecipients = (value) => (
+    String(value || '')
+      .split(/[;,\n]+/)
+      .map((email) => email.trim())
+      .filter(Boolean)
+      .join(',')
+  );
+
   const handleDnEmail = async (dn) => {
     if (!dn?.id) return;
     try {
@@ -7255,7 +7599,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
       if (payload.remarksText) {
         body += `\n\nRemarks: ${payload.remarksText}`;
       }
-      const email = payload.supplierEmail || '';
+      const email = normalizeMailtoRecipients(payload.supplierEmail || '');
       const currentStatus = String(resolvedDn?.status || dn.status || '').toLowerCase();
       if (!['sent', 'in_transit', 'partial', 'closed', 'received', 'cancelled'].includes(currentStatus)) {
         await apiFetch(`/api/dn/${dn.id}/status`, {
@@ -7264,7 +7608,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         });
         await fetchDeliveryNotes();
       }
-      window.location.href = `mailto:${email}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+      window.location.href = `mailto:${encodeURI(email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
     } catch (error) {
       alert(error.message || 'Gagal menyiapkan email DN.');
     }
@@ -7344,6 +7688,25 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
     if (!line) return null;
     const trimmed = String(line || '').trim();
     if (!trimmed) return null;
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const payload = JSON.parse(trimmed);
+        const kanbanId = String(payload?.kanbanId || payload?.kanban_id || payload?.cardUid || payload?.card_uid || trimmed).trim();
+        const item = String(payload?.itemCode || payload?.item_code || payload?.uniq || '').trim();
+        return {
+          kanbanId,
+          item,
+          category: String(payload?.category || payload?.itemCategory || payload?.item_category || '').trim(),
+          qty: payload?.qty ?? payload?.requestQty ?? payload?.request_qty ?? '',
+          area: String(payload?.area || '').trim(),
+          cycle: String(payload?.cycle || '').trim(),
+          rit: String(payload?.rit || '').trim(),
+          time: String(payload?.time || '').trim(),
+        };
+      } catch (_error) {
+        return null;
+      }
+    }
     return {
       kanbanId: trimmed,
       item: '',
@@ -7543,6 +7906,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
       });
       await fetchItems();
       await fetchKanbanRequests();
+      await fetchKanbanEmptyLogs({ silent: true });
       const consumedQty = Number(resultPayload?.consumedQty ?? qtyValue);
       const consumedBatches = Number(resultPayload?.consumedBatches ?? resultPayload?.updatedLots ?? 0);
       const stockNote = `Stok terpotong ${formatNumber0(consumedQty)}${consumedBatches ? ` (${consumedBatches} lot)` : ''}.`;
@@ -7556,27 +7920,31 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
     }
   };
 
-  const handleEmptyKanbanSubmit = async (e) => {
-    e.preventDefault();
+  const processEmptyKanbanValue = async (rawValue, options = {}) => {
+    const selectedArea = options.area ?? emptyKanbanForm.area;
     if (isStockOpnameLocked) {
-      alert('Selesaikan dulu Stock Opname!');
-      return;
+      const reason = 'Selesaikan dulu Stock Opname!';
+      showToastMessage(reason, '', null, 'warning');
+      return { ok: false, reason };
     }
-    const kanbanInput = extractKanbanIdToken(emptyKanbanForm.kanbanId);
+    const kanbanInput = extractKanbanIdToken(rawValue);
     const code = resolveKanbanItemCode(kanbanInput);
     if (!code) {
-      alert('Kanban ID wajib diisi.');
-      return;
+      const reason = 'Kanban ID wajib diisi.';
+      showToastMessage(reason, '', null, 'warning');
+      return { ok: false, reason };
     }
-    if (emptyKanbanForm.area && !masterAreas.some((area) => area.id === emptyKanbanForm.area)) {
-      alert('Area tidak valid. Pilih dari Master Referensi.');
-      return;
+    if (selectedArea && !masterAreas.some((area) => area.id === selectedArea)) {
+      const reason = 'Area tidak valid. Pilih dari Master Referensi.';
+      showToastMessage(reason, '', null, 'warning');
+      return { ok: false, reason };
     }
     const knownItemCode = masterItemsByCode.has(code) || kanbanSettingsByCode.has(code);
     const qty = knownItemCode ? resolveKanbanTransactionQty(code) : 0;
     if (knownItemCode && !qty) {
-      alert('Kanban qty belum diatur di master item/kanban.');
-      return;
+      const reason = 'Kanban qty belum diatur di master item/kanban.';
+      showToastMessage(reason, '', null, 'warning');
+      return { ok: false, reason };
     }
     try {
       const result = await apiFetch('/api/kanban/empty', {
@@ -7584,32 +7952,53 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         body: JSON.stringify({
           itemCode: knownItemCode ? code : '',
           requestQty: qty || undefined,
-          area: emptyKanbanForm.area || null,
+          area: selectedArea || null,
           kanbanId: kanbanInput || null,
         }),
       });
-      setEmptyKanbanForm({ area: '', kanbanId: '' });
       const consumedQty = Number(result?.consumedQty ?? qty);
       const consumedBatches = Number(result?.consumedBatches ?? result?.updatedLots ?? 0);
       const stockNote = `Stok terpotong ${formatNumber0(consumedQty)}${consumedBatches ? ` (${consumedBatches} lot)` : ''}.`;
       const lotSummary = buildLotSummaryText(result?.consumed, { label: 'Lot terpakai' });
       const prlNotice = result?.prlPlan?.notice || result?.notice || '';
       const scanWarning = Array.isArray(result?.warnings) && result.warnings.length ? ` ${result.warnings.join(' ')}` : '';
+      let message = '';
       if (result?.notice) {
-        showToastMessage(`${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} ${result.notice}${scanWarning}`);
+        message = `${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} ${result.notice}${scanWarning}`;
       } else if (result?.requestCreated) {
         const prlLabel = result?.prlPlan?.monthLabel ? ` PRL ${result.prlPlan.monthLabel} tersisa ${formatNumber0(result.prlPlan.remainingQty || 0)}.` : '';
-        showToastMessage(`Kanban kosong diproses. ${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} Request dibuat.${prlLabel}${scanWarning}`);
+        message = `Kanban kosong diproses. ${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} Request dibuat.${prlLabel}${scanWarning}`;
       } else if (prlNotice) {
-        showToastMessage(`Kanban kosong diproses. ${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} ${prlNotice}${scanWarning}`);
+        message = `Kanban kosong diproses. ${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} ${prlNotice}${scanWarning}`;
       } else {
-        showToastMessage(`Kanban kosong diproses. ${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} Request sudah ada.${scanWarning}`);
+        message = `Kanban kosong diproses. ${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} Request sudah ada.${scanWarning}`;
       }
+      showToastMessage(message);
       await fetchKanbanRequests();
       await fetchItems();
+      await fetchKanbanEmptyLogs({ silent: true });
+      return { ok: true, message };
     } catch (error) {
-      alert(`Gagal catat kanban kosong: ${error.message || 'Unknown error'}`);
+      const reason = error.message || 'Unknown error';
+      showToastMessage(`Gagal catat kanban kosong: ${reason}`, '', null, 'error');
+      return { ok: false, reason };
     }
+  };
+
+  const handleEmptyKanbanSubmit = async (e) => {
+    e.preventDefault();
+    const outcome = await processEmptyKanbanValue(emptyKanbanForm.kanbanId, { area: emptyKanbanForm.area });
+    if (outcome?.ok) {
+      setEmptyKanbanForm({ area: '', kanbanId: '' });
+    }
+  };
+
+  const handleEmptyKanbanScanValue = async (value) => {
+    const outcome = await processEmptyKanbanValue(value, { area: emptyKanbanForm.area, source: 'scanner' });
+    if (outcome?.ok) {
+      setEmptyKanbanForm((prev) => ({ ...prev, kanbanId: '' }));
+    }
+    return outcome;
   };
 
   const handleBatchSubmit = async (e) => {
@@ -7762,25 +8151,107 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
     }
   };
 
-  const handleProcessScan = async () => {
-    const lines = scanInput
+  const pushScanHistory = useCallback((entry = {}) => {
+    const timestamp = new Date().toISOString();
+    setScanHistory((prev) => [
+      {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        scannedAt: timestamp,
+        status: entry.status || 'error',
+        kanbanId: entry.kanbanId || '-',
+        itemCode: entry.itemCode || '',
+        itemName: entry.itemName || '',
+        actionLabel: entry.actionLabel || '',
+        message: entry.message || '',
+      },
+      ...prev,
+    ].slice(0, 50));
+  }, []);
+
+  const buildScanHistoryMessage = (result, outcome) => {
+    const warnings = Array.isArray(result?.scanWarnings) ? result.scanWarnings.filter(Boolean) : [];
+    const baseMessage = outcome?.message || 'Scan berhasil diproses.';
+    return warnings.length ? `${warnings.join(' ')} ${baseMessage}` : baseMessage;
+  };
+
+  const handleProcessScan = async (options = {}) => {
+    const autoExecute = Boolean(options?.autoExecute);
+    const clearInputAfterSuccess = Boolean(options?.clearInput);
+    const sourceInput = options?.inputValue ?? scanInput;
+    const lines = sourceInput
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter(Boolean);
     if (lines.length === 0) {
       setScanError('Masukkan data QR terlebih dahulu.');
+      showToastMessage('Masukkan data QR terlebih dahulu.', '', null, 'warning');
       return;
     }
     setScanError('');
     const parsed = lines.map((line) => parseScanLine(line)).filter(Boolean);
+    if (parsed.length === 0) {
+      setScanError('Format QR tidak terbaca.');
+      showToastMessage('Format QR tidak terbaca.', '', null, 'warning');
+      return;
+    }
     const results = await Promise.all(parsed.map((payload, idx) => fetchScanPreview(payload, idx)));
-    setScanResults(results);
-    setScanActiveResult(results[0] || null);
+    if (!autoExecute) {
+      setScanResults(results);
+      setScanActiveResult(results[0] || null);
+    }
     const failures = results
       .filter((result) => result.scanPreviewError)
       .map((result) => `${result.kanbanId}: ${result.scanPreviewError}`);
     if (failures.length > 0) {
-      setScanError(failures.join('\n'));
+      const message = failures.join('\n');
+      setScanError(message);
+      results
+        .filter((result) => result.scanPreviewError)
+        .forEach((result) => pushScanHistory({
+          status: 'error',
+          kanbanId: result.kanbanId,
+          itemCode: result.itemCode,
+          itemName: result.itemName,
+          actionLabel: result.actionLabel,
+          message: result.scanPreviewError,
+        }));
+      if (autoExecute) {
+        setScanResults([]);
+        setScanActiveResult(null);
+        if (clearInputAfterSuccess) setScanInput('');
+      }
+      return;
+    }
+    if (autoExecute && results.length === 1) {
+      const outcome = await executeScanResultFlowRef.current?.(results[0], { source: 'manual' });
+      if (outcome?.ok) {
+        setScanError('');
+        pushScanHistory({
+          status: 'success',
+          kanbanId: results[0].kanbanId,
+          itemCode: results[0].itemCode,
+          itemName: results[0].itemName,
+          actionLabel: results[0].actionLabel,
+          message: buildScanHistoryMessage(results[0], outcome),
+        });
+        setScanResults([]);
+        setScanActiveResult(null);
+        if (clearInputAfterSuccess) setScanInput('');
+      } else {
+        const reason = outcome?.reason || 'Gagal eksekusi scan.';
+        setScanError(reason);
+        pushScanHistory({
+          status: 'error',
+          kanbanId: results[0].kanbanId,
+          itemCode: results[0].itemCode,
+          itemName: results[0].itemName,
+          actionLabel: results[0].actionLabel,
+          message: reason,
+        });
+        setScanResults([]);
+        setScanActiveResult(null);
+        if (clearInputAfterSuccess) setScanInput('');
+      }
     }
   };
 
@@ -8891,9 +9362,66 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     }
   };
 
+  const executeScanResultFlow = async (result, options = {}) => {
+    if (!result) {
+      return { ok: false, reason: 'Hasil scan belum tersedia.' };
+    }
+    if (result.scanPreviewError) {
+      return { ok: false, reason: result.scanPreviewError };
+    }
+    const actionType = String(result?.actionType || '').trim();
+    const categoryText = [
+      result?.itemCategoryCode,
+      result?.itemCategoryLabel,
+      result?.category,
+      result?.actionLabel,
+      result?.actionHint,
+      result?.cardMeta?.itemCategoryCode,
+      result?.cardMeta?.itemCategoryLabel,
+    ].map((value) => String(value || '').trim().toLowerCase()).join(' ');
+    const issueAction = actionType === 'issue'
+      || actionType === 'consumption'
+      || actionType === 'consumption_only'
+      || /\brm\b|raw|indirect|consum/.test(categoryText);
+    const routingAction = actionType === 'routing_execution';
+    const subconAction = actionType === 'external_transfer';
+
+    try {
+      if (issueAction) {
+        const outcome = await consumeStockFromScan(result);
+        if (!outcome.ok) return { ok: false, reason: outcome.reason || 'Gagal potong stok.' };
+        return { ok: true, actionType };
+      }
+      if (routingAction) {
+        const currentStatus = String(result.processState?.status || result.currentProcess?.status || '').trim().toLowerCase();
+        const currentStepStatus = String(result.processState?.currentStep?.status || '').trim().toLowerCase();
+        const isInProcess = currentStatus === 'in_process' || currentStepStatus === 'started' || currentStepStatus === 'in_process';
+        const outcome = isInProcess
+          ? await handleKanbanProcessFinish(result)
+          : await handleKanbanProcessStart(result);
+        if (!outcome.ok) return { ok: false, reason: outcome.reason || (isInProcess ? 'Gagal finish proses.' : 'Gagal start proses.') };
+        return { ok: true, actionType };
+      }
+      if (subconAction) {
+        if (isProductionUser || options.source === 'camera') {
+          return { ok: false, reason: 'Kartu ini termasuk flow Subcon dan tidak diproses otomatis.' };
+        }
+        setMainTab('subcon');
+        return { ok: true, actionType };
+      }
+      return { ok: false, reason: 'Kategori item belum dikenali.' };
+    } catch (error) {
+      return { ok: false, reason: error.message || 'Gagal eksekusi scan.' };
+    }
+  };
+
   useEffect(() => {
     fetchScanPreviewRef.current = fetchScanPreview;
   }, [fetchScanPreview]);
+
+  useEffect(() => {
+    executeScanResultFlowRef.current = executeScanResultFlow;
+  });
 
   const stopScanner = useCallback(async () => {
     scanStartTokenRef.current += 1;
@@ -8933,15 +9461,69 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
           const value = result?.data || '';
           const now = Date.now();
           if (!value) return;
-          if (lastScanRef.current.value === value && now - lastScanRef.current.time < 2000) {
+          if (scanAutoProcessingRef.current) return;
+          if (lastScanRef.current.value === value && now - lastScanRef.current.time < 7000) {
             return;
           }
+          scanAutoProcessingRef.current = true;
           lastScanRef.current = { value, time: now };
-          const payload = parseScanLine(value);
-          const built = await (fetchScanPreviewRef.current || fetchScanPreview)(payload, 0);
-          setScanResults([built]);
-          setScanActiveResult(built);
-          setScanError(built.scanPreviewError ? built.scanPreviewError : '');
+          setScanCameraStatus('QR terbaca, memproses...');
+          try {
+            const payload = parseScanLine(value);
+            const built = await (fetchScanPreviewRef.current || fetchScanPreview)(payload, 0);
+            if (built.scanPreviewError) {
+              setScanError(built.scanPreviewError);
+              pushScanHistory({
+                status: 'error',
+                kanbanId: built.kanbanId,
+                itemCode: built.itemCode,
+                itemName: built.itemName,
+                actionLabel: built.actionLabel,
+                message: built.scanPreviewError,
+              });
+              setScanResults([]);
+              setScanActiveResult(null);
+              setScanCameraStatus('QR tidak valid. Siap scan berikutnya.');
+              return;
+            }
+            const outcome = await executeScanResultFlowRef.current?.(built, { source: 'camera' });
+            if (outcome?.ok) {
+              setScanError('');
+              pushScanHistory({
+                status: 'success',
+                kanbanId: built.kanbanId,
+                itemCode: built.itemCode,
+                itemName: built.itemName,
+                actionLabel: built.actionLabel,
+                message: buildScanHistoryMessage(built, outcome),
+              });
+              setScanResults([]);
+              setScanActiveResult(null);
+              setScanCameraStatus('Scan tersimpan. Siap scan berikutnya.');
+            } else {
+              const reason = outcome?.reason || 'Gagal eksekusi scan.';
+              setScanError(reason);
+              pushScanHistory({
+                status: 'error',
+                kanbanId: built.kanbanId,
+                itemCode: built.itemCode,
+                itemName: built.itemName,
+                actionLabel: built.actionLabel,
+                message: reason,
+              });
+              setScanResults([]);
+              setScanActiveResult(null);
+              setScanCameraStatus('Gagal memproses. Siap scan berikutnya.');
+            }
+          } catch (scanError) {
+            setScanError(scanError.message || 'Gagal memproses QR.');
+            setScanCameraStatus('Gagal memproses. Siap scan berikutnya.');
+          } finally {
+            lastScanRef.current = { value, time: Date.now() };
+            window.setTimeout(() => {
+              scanAutoProcessingRef.current = false;
+            }, 600);
+          }
         },
         {
           returnDetailedScanResult: true,
@@ -8982,7 +9564,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
         scanStartPendingRef.current = false;
       }
     }
-  }, [kanbanSubTab, scanMode, stopScanner]);
+  }, [kanbanSubTab, pushScanHistory, scanMode, stopScanner]);
 
   const handleBatchApproveAndDn = async () => handleRequestDnBatch({ approveBeforeDn: true });
 
@@ -9081,12 +9663,9 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     setReportLoading(true);
     try {
       const query = buildReportQuery();
-      const [summary, rows] = await Promise.all([
-        apiFetch(`/api/reports/summary${query}`),
-        apiFetch(`/api/reports/by-supplier-po${query}`),
-      ]);
-      setReportSummary(summary);
-      setReportRows(rows);
+      const data = await apiFetch(`/api/reports/supplier-performance${query}`);
+      setReportSummary(data?.summary || null);
+      setReportRows(Array.isArray(data?.suppliers) ? data.suppliers : []);
     } catch (error) {
       alert('Gagal memuat report.');
     } finally {
@@ -9098,17 +9677,34 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     const XLSX = await ensureXlsx();
     if (!XLSX) return;
     const exportRows = reportRows.map(row => ({
-      Supplier: resolveSupplierLabel(row),
-      'No PO': row.poNumber,
-      'Qty PO': row.totalRequested,
-      'Qty Incoming': row.totalReceived,
-      'On Time': row.onTimeCount,
-      Late: row.lateCount,
-      'Too Early': row.tooEarlyCount,
-      Pending: row.pendingCount,
-      'SNP Tidak Sesuai': row.looseCount || 0,
-      'Packing/SNP %': row.rnCount > 0 ? Math.round(((row.rnCount - (row.looseCount || 0)) / row.rnCount) * 100) : '-',
-      Fulfilled: row.totalReceived >= row.totalRequested ? 'Ya' : 'Tidak',
+      Supplier: row?.supplier?.name || row?.supplier?.code || resolveSupplierLabel(row),
+      'Kode Supplier': row?.supplier?.code || row?.supplier || '',
+      'Kategori Supplier': row?.supplier?.category || '',
+      'Total Score': row?.summary?.weightedScore ?? 0,
+      Rating: row?.summary?.ratingLabel || '',
+      'Ketepatan Waktu %': row?.summary?.timeScore ?? 0,
+      'Fulfillment Qty %': row?.summary?.qtyScoreRaw ?? row?.summary?.qtyScore ?? 0,
+      'QC Incoming %': row?.summary?.qcScore ?? 0,
+      Jadwal: row?.summary?.totalSchedules ?? 0,
+      'On Time': row?.summary?.onTime ?? 0,
+      Late: row?.summary?.late ?? 0,
+      'Late Completion': row?.summary?.lateCompletion ?? 0,
+      'Partial OK': row?.summary?.partialOnTime ?? 0,
+      'Partial Late': row?.summary?.partialLate ?? 0,
+      'Too Early': row?.summary?.tooEarly ?? 0,
+      Pending: row?.summary?.pending ?? 0,
+      'Qty Rencana': row?.summary?.requestQty ?? 0,
+      'Qty Diterima': row?.summary?.receivedQty ?? 0,
+      'On Time Qty': row?.summary?.onTimeQty ?? 0,
+      'Late Qty': row?.summary?.lateQty ?? 0,
+      'QC Open': row?.summary?.qcOpen ?? 0,
+      'QC Reject': row?.summary?.qcReject ?? 0,
+      'Total DN': row?.summary?.dnCount ?? 0,
+      'DN Completed': row?.summary?.dnCompleted ?? 0,
+      'DN Pending': row?.summary?.dnPending ?? 0,
+      'DN Selisih/Reject': row?.summary?.dnIssue ?? 0,
+      'Qty DN': row?.summary?.dnDocQty ?? 0,
+      'Qty DN Diterima': row?.summary?.dnReceivedQty ?? 0,
     }));
     const ws = XLSX.utils.json_to_sheet(exportRows);
     const wb = XLSX.utils.book_new();
@@ -9469,10 +10065,15 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     try {
       const params = new URLSearchParams();
       if (qualityObjectivesMonth) params.set('month', qualityObjectivesMonth);
+      if (qualityObjectivesSupplier) params.set('supplier', qualityObjectivesSupplier);
+      if (qualityObjectivesMonthStart) params.set('monthStart', qualityObjectivesMonthStart);
+      if (qualityObjectivesMonthEnd) params.set('monthEnd', qualityObjectivesMonthEnd);
+      if (qualityObjectivesYear) params.set('year', qualityObjectivesYear);
       const query = params.toString();
       const data = await apiFetch(`/api/reports/quality-objectives${query ? `?${query}` : ''}`);
       setQualityObjectivesData({
         period: data?.period || null,
+        sps: data?.sps || null,
         inboundSchedule: Array.isArray(data?.inboundSchedule) ? data.inboundSchedule : [],
         dnVsRn: Array.isArray(data?.dnVsRn) ? data.dnVsRn : [],
         deliveryVsPrl: Array.isArray(data?.deliveryVsPrl) ? data.deliveryVsPrl : [],
@@ -9481,6 +10082,10 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
         const monthValue = String(data.period.month).padStart(2, '0');
         setQualityObjectivesMonth(`${data.period.year}-${monthValue}`);
       }
+      if (data?.period?.year) setQualityObjectivesYear(String(data.period.year));
+      if (data?.period?.supplier !== undefined) setQualityObjectivesSupplier(data.period.supplier || '');
+      if (data?.period?.monthStart) setQualityObjectivesMonthStart(monthKeyByIndex[Number(data.period.monthStart) - 1] || 'jan');
+      if (data?.period?.monthEnd) setQualityObjectivesMonthEnd(monthKeyByIndex[Number(data.period.monthEnd) - 1] || 'dec');
     } catch (error) {
       alert('Gagal memuat report sasaran mutu.');
     } finally {
@@ -9583,6 +10188,30 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
   const handleExportQualityObjectivesExcel = async () => {
     const XLSX = await ensureXlsx();
     if (!XLSX) return;
+    const sps = qualityObjectivesData?.sps || {};
+    const spsMonths = Array.isArray(sps.months) ? sps.months : [];
+    const yearLabel = sps.year || qualityObjectivesYear || new Date().getFullYear();
+    const supplierLabel = sps.supplier || qualityObjectivesSupplier || 'ALL';
+    if (spsMonths.length > 0) {
+      const monthHeaders = spsMonths.map((month) => month.label || month.key || '');
+      const rows = [
+        ['SPS', ...monthHeaders, 'AVG'],
+        ['Total Incoming (Pcs)', ...spsMonths.map((month) => month.hasData ? Number(month.incomingQty || 0) : ''), Number(sps.avgIncoming || 0)],
+        ['Total DN Order (Pcs)', ...spsMonths.map((month) => month.hasData ? Number(month.dnOrderQty || 0) : ''), Number(sps.avgDnOrder || 0)],
+        ['%', ...spsMonths.map((month) => month.hasData ? `${Math.round(Number(month.percent || 0))}%` : ''), sps.avgStatus ? `${Math.round(Number(sps.avgPercent || 0))}%` : ''],
+        ['Hasil 100% +-20%', ...spsMonths.map((month) => month.status || ''), sps.avgStatus || ''],
+      ];
+      const ws = XLSX.utils.aoa_to_sheet([
+        [`SASARAN MUTU PPIC TAHUN ${yearLabel}`],
+        [`Supplier: ${supplierLabel}`],
+        [],
+        ...rows,
+      ]);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Sasaran Mutu');
+      XLSX.writeFile(wb, `Sasaran_Mutu_PPIC_${yearLabel}_${supplierLabel || 'ALL'}_${new Date().toISOString().split('T')[0]}.xlsx`);
+      return;
+    }
     const periodLabel = qualityObjectivesData?.period?.label || qualityObjectivesMonth || '';
     const sheets = [
       {
@@ -9842,10 +10471,38 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
   }, [mainTab, reportTab, scorecardFilterMonthStart, scorecardFilterMonthEnd, scorecardFilterSupplier, masterVendors.length, canViewMaster]);
 
   useEffect(() => {
+    if (!user || isProductionUser) return;
+    if (mainTab !== 'reports') return;
+    if (reportTab !== 'rekap') return;
+    fetchReport();
+    if (!masterVendors.length && canViewMaster) {
+      fetchMasterReferences({ silent: true });
+    }
+  }, [mainTab, reportTab]);
+
+  useEffect(() => {
     if (mainTab !== 'reports') return;
     if (reportTab !== 'capacity-planning') return;
     fetchCapacityPlanningReport();
   }, [mainTab, reportTab, capacityPlanningMonth, capacityPlanningYear]);
+
+  useEffect(() => {
+    if (mainTab !== 'reports') return;
+    if (reportTab !== 'sasaran-mutu') return;
+    fetchQualityObjectivesReport();
+    if (!masterVendors.length && canViewMaster) {
+      fetchMasterReferences({ silent: true });
+    }
+  }, [
+    mainTab,
+    reportTab,
+    qualityObjectivesSupplier,
+    qualityObjectivesMonthStart,
+    qualityObjectivesMonthEnd,
+    qualityObjectivesYear,
+    masterVendors.length,
+    canViewMaster,
+  ]);
 
   useEffect(() => {
     if (mainTab === 'kanban') {
@@ -9859,6 +10516,12 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
         if (cancelled) return;
         await fetchKanbanRequests({ silent: dataCacheRef.current.kanbanRequestsLoaded });
         if (cancelled) return;
+        await fetchKanbanEmptyLogs({ silent: dataCacheRef.current.kanbanEmptyLogsLoaded });
+        if (cancelled) return;
+        if (isProductionUser) {
+          await fetchItems({ silent: dataCacheRef.current.itemsLoaded });
+          return;
+        }
         if (!isProductionUser) {
           await fetchDeliveryNotes({ silent: dataCacheRef.current.deliveryNotesLoaded });
           if (cancelled) return;
@@ -9879,13 +10542,16 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     if (!['dashboard', 'dash-prl', 'dash-kanban', 'dash-inventory', 'dash-schedule'].includes(mainTab)) return;
     fetchItems({ silent: dataCacheRef.current.itemsLoaded });
     fetchKanbanRequests({ silent: dataCacheRef.current.kanbanRequestsLoaded });
-    fetchPrlRows(prlFilters.year, { silent: dataCacheRef.current.prlLoadedYear === `${prlFilters.year || currentYear}:${prlFilters.supplier || 'all'}` });
-  }, [mainTab]);
+    if (canViewPrl) {
+      fetchPrlRows(prlFilters.year, { silent: dataCacheRef.current.prlLoadedYear === `${prlFilters.year || currentYear}:${prlFilters.supplier || 'all'}` });
+    }
+  }, [mainTab, canViewPrl]);
 
   useEffect(() => {
     if (mainTab !== 'prl') return;
+    if (!canViewPrl) return;
     fetchPrlImportHistory();
-  }, [mainTab, fetchPrlImportHistory]);
+  }, [mainTab, canViewPrl, fetchPrlImportHistory]);
 
   useEffect(() => {
     if (!['dashboard', 'dash-prl', 'dash-kanban', 'dash-inventory', 'dash-schedule'].includes(mainTab)) return;
@@ -9933,6 +10599,14 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       setMainTab('dashboard');
       return;
     }
+    if (!canQuality && mainTab === 'quality') {
+      setMainTab('dashboard');
+      return;
+    }
+    if (user.role === 'qc' && mainTab !== 'quality') {
+      setMainTab('quality');
+      return;
+    }
     if (user.role === 'supplier' && mainTab !== 'supplier') {
       setMainTab('supplier');
     }
@@ -9942,7 +10616,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     if (user.role !== 'admin' && mainTab === 'audit') {
       setMainTab('dashboard');
     }
-  }, [user, mainTab, kanbanSubTab, isProductionUser, canViewPrl, setKanbanSubTab, setMainTab]);
+  }, [user, mainTab, kanbanSubTab, isProductionUser, canViewPrl, canQuality, setKanbanSubTab, setMainTab]);
 
   useEffect(() => {
     if (!receiveNotes.length && !kanbanSettings.length) {
@@ -9955,7 +10629,15 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
   }, [receiveNotes, kanbanSettings, kanbanRequests, masterItems, masterLocations, masterVendors]);
 
   useEffect(() => {
-    if (scanMode === 'camera' && kanbanSubTab === 'scan' && scanCameraEnabled) {
+    const shouldAutoEnableScanner = kanbanSubTab === 'scan' && scanMode === 'camera';
+    if (shouldAutoEnableScanner) {
+      setScanCameraEnabled(true);
+    }
+  }, [kanbanSubTab, scanMode]);
+
+  useEffect(() => {
+    const shouldRunScanner = kanbanSubTab === 'scan' && scanMode === 'camera' && scanCameraEnabled;
+    if (shouldRunScanner) {
       void startScanner();
     } else {
       void stopScanner();
@@ -10153,7 +10835,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
           {sequence.map((item, index) => (
             item.type === 'ellipsis' ? (
               <span key={`ell-${index}`} className="px-2 text-[12px]">
-                â€¦
+                ...
               </span>
             ) : (
               <button
@@ -10183,16 +10865,49 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
   };
 
   const getKanbanCardsLabel = (row) => {
+    const plan = getKanbanCardPlan(row);
+    if (!plan.lotQty) return '-';
+    return `${plan.totalCards} x ${formatNumber0(plan.lotQty)}`;
+  };
+
+  const getKanbanCardPlan = (row) => {
     const lot = Number(row?.lot_qty ?? 0);
-    const effectiveCardCount = Number(row?.effective_card_count ?? row?.calculated_card_count ?? 0);
+    const effectiveCardCountRaw = row?.effective_card_count ?? row?.calculated_card_count;
+    const effectiveCardCount = Number(effectiveCardCountRaw ?? 0);
     const prlQtyValue = row?.effective_prl_qty ?? row?.prl_month_qty;
-    if (Number.isFinite(lot) && lot > 0 && effectiveCardCount > 0) return `${effectiveCardCount} x ${lot}`;
-    if (Number.isFinite(lot) && lot > 0 && effectiveCardCount === 0 && prlQtyValue !== null && prlQtyValue !== undefined && prlQtyValue !== '') return `0 x ${lot}`;
     const hasPrlQty = prlQtyValue !== null && prlQtyValue !== undefined && prlQtyValue !== '';
+    if (Number.isFinite(lot) && lot > 0 && effectiveCardCount > 0) {
+      return {
+        lotQty: lot,
+        totalCards: effectiveCardCount,
+        plannedQty: effectiveCardCount * lot,
+        source: hasPrlQty ? 'PRL aktif' : 'Perhitungan kanban',
+      };
+    }
+    if (Number.isFinite(lot) && lot > 0 && effectiveCardCountRaw !== null && effectiveCardCountRaw !== undefined && effectiveCardCount === 0 && hasPrlQty) {
+      return {
+        lotQty: lot,
+        totalCards: 0,
+        plannedQty: 0,
+        source: 'PRL aktif',
+      };
+    }
     const max = Number(hasPrlQty ? row?.effective_max_qty ?? prlQtyValue : row?.max_qty ?? 0);
-    if (!Number.isFinite(lot) || lot <= 0) return '-';
+    if (!Number.isFinite(lot) || lot <= 0) {
+      return {
+        lotQty: 0,
+        totalCards: 0,
+        plannedQty: 0,
+        source: 'Qty kanban belum diatur',
+      };
+    }
     const cards = hasPrlQty ? Math.ceil(Math.max(max, 0) / lot) : Math.max(1, Math.ceil(max / lot));
-    return `${cards} x ${lot}`;
+    return {
+      lotQty: lot,
+      totalCards: cards,
+      plannedQty: cards * lot,
+      source: hasPrlQty ? 'PRL aktif' : 'Max qty',
+    };
   };
 
   const getCategoryLabel = (value) => {
@@ -10295,35 +11010,104 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
 
   const filteredKanbanItems = useMemo(() => {
     const search = kanbanSearch.trim().toLowerCase();
-    const category = kanbanCategoryFilter;
+    const category = String(kanbanCategoryFilter || 'all').trim().toLowerCase();
+    const normalizeCategoryForFilter = (value) => {
+      const raw = String(value || '').trim();
+      if (!raw) return '';
+      const lowered = raw.toLowerCase();
+      const masterCategory = (masterCategories || []).find((entry) => (
+        String(entry?.code || '').trim().toLowerCase() === lowered
+        || String(entry?.name || '').trim().toLowerCase() === lowered
+      ));
+      return String(masterCategory?.code || raw).trim().toLowerCase();
+    };
     return kanbanSettings.filter((row) => {
       const name = String(row.item_name || '').toLowerCase();
       const code = String(row.item_code || '').toLowerCase();
-      const categoryLabel = getCategoryLabel(row.item_type || '').toLowerCase();
+      const masterItem = masterItemsByCode.get(row.item_code);
+      const rawCategory = row.item_type || masterItem?.type || '';
+      const categoryCode = normalizeCategoryForFilter(rawCategory);
+      const categoryLabel = getCategoryLabel(rawCategory).toLowerCase();
       const matchesSearch = !search || code.includes(search) || name.includes(search);
       const matchesCategory =
         category === 'all' ||
-        (category === 'raw' && categoryLabel.includes('raw')) ||
-        (category === 'indirect' && categoryLabel.includes('indirect')) ||
-        (category === 'consumable' && categoryLabel.includes('consumable')) ||
-        (category === 'subcon' && categoryLabel.includes('subcon'));
+        categoryCode === category ||
+        categoryLabel.includes(category);
       return matchesSearch && matchesCategory;
     });
-  }, [kanbanSettings, kanbanSearch, kanbanCategoryFilter]);
+  }, [kanbanSettings, kanbanSearch, kanbanCategoryFilter, masterCategories, masterItemsByCode]);
 
   const kanbanCardPayloads = useMemo(() => {
     if (!showKanbanCardModal || !kanbanCardPreviewReady) return [];
     const payloads = [];
+    const normalizeRoutingSource = (value) => {
+      if (Array.isArray(value)) return value;
+      if (typeof value === 'string' && value.trim()) {
+        try {
+          const parsed = JSON.parse(value);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch (_error) {
+          return value.split(/[;,|]/).map((part) => part.trim()).filter(Boolean);
+        }
+      }
+      return [];
+    };
+    const getCardCategoryKey = (categoryValue) => {
+      const text = String(categoryValue || '').trim().toLowerCase();
+      if (/(^|[^a-z0-9])fg([^a-z0-9]|$)/i.test(categoryValue || '') || text.includes('finish')) return 'fg';
+      if (/(^|[^a-z0-9])sa([^a-z0-9]|$)/i.test(categoryValue || '') || text.includes('assy') || text.includes('subassy') || text.includes('sub-assy')) return 'assy';
+      if (/(^|[^a-z0-9])cp([^a-z0-9]|$)/i.test(categoryValue || '') || text.includes('child')) return 'child';
+      if (text.includes('subcon')) return 'subcon';
+      if (text.includes('raw') || /(^|[^a-z0-9])rm([^a-z0-9]|$)/i.test(categoryValue || '')) return 'raw';
+      if (text.includes('indirect') || /(^|[^a-z0-9])im([^a-z0-9]|$)/i.test(categoryValue || '')) return 'indirect';
+      if (text.includes('consumable') || /(^|[^a-z0-9])cb([^a-z0-9]|$)/i.test(categoryValue || '')) return 'consumable';
+      return 'other';
+    };
+    const formatRoutingStepDestination = (step) => {
+      if (step && typeof step === 'object') {
+        const rawCode = String(step.code || step.processCode || step.process_code || '').trim();
+        const masterProcess = rawCode ? masterProcessesByCode.get(rawCode) : null;
+        const label = step.name || step.processName || masterProcess?.name || rawCode || '';
+        const workCenter = step.workCenter || step.work_center || masterProcess?.work_center || '';
+        return [workCenter, label].filter(Boolean).join(' / ') || '-';
+      }
+      const raw = String(step || '').trim();
+      const masterProcess = raw ? masterProcessesByCode.get(raw) : null;
+      return masterProcess
+        ? [masterProcess.work_center, masterProcess.name || masterProcess.code].filter(Boolean).join(' / ')
+        : raw;
+    };
+    const resolveCardNextProcess = (row, masterItem, supplierMeta) => {
+      const categoryKey = getCardCategoryKey(row?.item_type || masterItem?.type || '');
+      const vendorKey = String(supplierMeta?.supplierCode || supplierMeta?.supplierName || '').trim();
+      const vendor = vendorKey
+        ? masterVendorsById.get(vendorKey)
+          || masterVendors.find((candidate) => String(candidate.id || '').trim().toLowerCase() === vendorKey.toLowerCase()
+            || String(candidate.name || '').trim().toLowerCase() === vendorKey.toLowerCase())
+        : null;
+      const vendorRole = String(vendor?.role || '').trim().toLowerCase();
+      const vendorType = String(vendor?.type || '').trim().toLowerCase();
+      const isSubconRoute = categoryKey === 'subcon' || vendorRole.includes('subcon') || vendorType.includes('subcon');
+      if (isSubconRoute) {
+        const subconTarget = vendor?.subcon_warehouse_id || vendor?.subconWarehouseId || vendor?.id || vendorKey || vendor?.name || 'SUBCON';
+        return `SUBCON ${subconTarget}`;
+      }
+      const routingSource = normalizeRoutingSource(masterItem?.process_routing);
+      const flowSource = normalizeRoutingSource(masterItem?.process_flow);
+      const firstStep = routingSource[0] || flowSource[0] || null;
+      const routingLabel = formatRoutingStepDestination(firstStep);
+      if (routingLabel) {
+        const isNonParentRoutingCategory = categoryKey === 'child' || !['fg', 'assy', 'raw', 'subcon'].includes(categoryKey);
+        if (isNonParentRoutingCategory) return `NEXT LINE ${routingLabel}`;
+        return routingLabel;
+      }
+      return masterItem?.line_production || masterItem?.location_name || masterItem?.location_id || '-';
+    };
     filteredKanbanItems.forEach((row) => {
-      const lotQty = Number(row.lot_qty ?? row.min_qty ?? 0);
-      const prlQtyValue = row.effective_prl_qty ?? row.prl_month_qty;
-      const hasPrlQty = prlQtyValue !== null && prlQtyValue !== undefined && prlQtyValue !== '';
-      const maxQty = Number(hasPrlQty ? row.effective_max_qty ?? prlQtyValue : row.max_qty ?? 0);
-      const totalCards = lotQty > 0
-        ? hasPrlQty
-          ? Math.ceil(Math.max(maxQty, 0) / lotQty)
-          : Math.max(1, Math.ceil(maxQty / lotQty))
-        : 1;
+      const cardPlan = getKanbanCardPlan(row);
+      const lotQty = Number(cardPlan.lotQty || row.lot_qty || row.min_qty || 0);
+      const totalCards = Math.max(0, Number(cardPlan.totalCards || 0));
+      if (totalCards <= 0) return;
       const masterItem = masterItemsByCode.get(row.item_code);
       const masterLocation = masterLocationsById.get(masterItem?.location_id || row.drop_zone);
       const masterWarehouse = masterWarehouses.find((warehouse) => warehouse.id === masterLocation?.warehouse_id);
@@ -10343,18 +11127,32 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       ));
       const supplierMeta = resolveItemPrimarySupplier(row.item_code, masterItem);
       const supplier = supplierMeta.supplierCode || supplierMeta.supplierName || '';
+      const supplierName = supplierMeta.supplierName || supplierMeta.supplier || supplier || '';
+      const categoryKey = getCardCategoryKey(row.item_type || masterItem?.type || '');
+      const customerRows = itemCustomerMap.get(row.item_code) || [];
+      const customerCode = (categoryKey === 'fg' || categoryKey === 'assy')
+        ? customerRows.map((customer) => customer.customerId).filter(Boolean).join(', ')
+        : '';
       const itemName = row.item_name || masterItem?.name || row.item_code || '';
       const sidNumber = row.item_code || '';
+      const itemImageUrl = masterItem?.image_thumb_url || masterItem?.imageThumbUrl || masterItem?.image_url || masterItem?.imageUrl || '';
       const qtyBox = lotQty || row.min_qty || '';
+      const itemUnit = row.item_unit || masterItem?.unit || '';
       const areaId = masterArea?.id || row.drop_zone || masterLocation?.id || '';
       const dockCode = masterDelivery?.id || '';
       const progressLine = masterWarehouse?.id || masterLocation?.warehouse_id || '';
       const plantName = masterPlant?.name || masterPlant?.id || '';
+      const nextProcessLabel = resolveCardNextProcess(row, masterItem, supplierMeta);
       Array.from({ length: totalCards }).forEach((_, idx) => {
-        const arrivalTime = new Date().toISOString().slice(0, 16).replace('T', ' ');
+        const printTime = new Date().toLocaleString('id-ID', {
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+        });
       const orderNo = `${String(idx + 1).padStart(2, '0')} / ${totalCards}`;
       const kanbanId = buildKanbanCardId(row.item_code || '', row.item_type, idx + 1, totalCards);
-      const conveyanceNo = `CV-${String(idx + 1).padStart(2, '0')}`;
       const pressBarcodeValue = kanbanId;
       const lotBatch = String(
         row.lot_batch
@@ -10370,128 +11168,251 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       payloads.push({
         key: `${row.item_code}-${idx}-${row.item_name}`,
         supplier,
+        supplierName,
+        customerCode,
         itemName,
+        itemImageUrl,
           sidNumber,
           qtyBox,
+          itemUnit,
           areaId,
           dockCode,
           progressLine,
-          arrivalTime,
+          printTime,
           orderNo,
           uniqueNo: kanbanId,
           kanbanId,
+        internalId: kanbanId,
+        kanbanQrValue: JSON.stringify({
+          kanbanId,
+          itemCode: sidNumber,
+          category: row.item_type || masterItem?.type || '',
+          qty: qtyBox,
+          seq: idx + 1,
+          totalCards,
+        }),
         pressLocation: areaId,
-        conveyanceNo,
         pressBarcodeValue,
         plantName,
         lotBatch,
+        plannedQty: cardPlan.plannedQty,
+        planSource: cardPlan.source,
+        nextProcessLabel,
+        categoryKey,
+        categoryLabel: getCategoryLabel(row.item_type || masterItem?.type || ''),
       });
     });
   });
     return payloads;
-  }, [showKanbanCardModal, kanbanCardPreviewReady, filteredKanbanItems, masterAreas, masterDeliveries, masterWarehouses, masterPlants, masterItemsByCode, masterLocationsById]);
+  }, [
+    showKanbanCardModal,
+    kanbanCardPreviewReady,
+    filteredKanbanItems,
+    masterAreas,
+    masterDeliveries,
+    masterWarehouses,
+    masterPlants,
+    masterVendors,
+    masterVendorsById,
+    masterProcessesByCode,
+    masterItemsByCode,
+    masterLocationsById,
+    itemCustomerMap,
+  ]);
 
   const kanbanCardPageSize = 4;
   const kanbanCardPageCount = useMemo(
     () => Math.max(1, Math.ceil(kanbanCardPayloads.length / kanbanCardPageSize)),
     [kanbanCardPayloads.length],
   );
+  const kanbanCardPreviewSummary = useMemo(() => {
+    const itemCodes = Array.from(new Set(kanbanCardPayloads.map((payload) => payload.sidNumber).filter(Boolean)));
+    const firstPayload = kanbanCardPayloads[0] || null;
+    const qtyLabel = firstPayload
+      ? `${formatNumber0(firstPayload.qtyBox || 0)}${firstPayload.itemUnit ? ` ${firstPayload.itemUnit}` : ''}`
+      : '-';
+    const totalQtyLabel = firstPayload
+      ? `${formatNumber0(firstPayload.plannedQty || 0)}${firstPayload.itemUnit ? ` ${firstPayload.itemUnit}` : ''}`
+      : '-';
+    return {
+      itemCount: itemCodes.length,
+      itemLabel: itemCodes.length === 1 ? itemCodes[0] : '',
+      qtyLabel,
+      totalQtyLabel,
+    };
+  }, [kanbanCardPayloads]);
 
   useEffect(() => {
     if (!showKanbanCardModal) return;
     setKanbanCardPreviewPageIndex((prev) => Math.min(prev, Math.max(kanbanCardPageCount - 1, 0)));
   }, [showKanbanCardModal, kanbanCardPageCount]);
 
-  const renderKanbanCard = (payload) => (
-    <div
-      key={payload.key}
-      className="bg-white border border-slate-400 text-[10px] text-slate-900 shadow-sm print:shadow-none kanban-card"
-      style={{ width: '190mm', height: '65mm' }}
-    >
-      <div className="grid grid-cols-[2fr_1fr] gap-1 p-2 h-full">
-        <div className="border border-slate-400 flex flex-col h-full">
-          <div className="grid grid-cols-3 border-b border-slate-400">
-            <div className="col-span-2 border-r border-slate-400 p-1">
-              <div className="text-[9px] uppercase text-slate-500">Supplier Part / Kode Supplier</div>
-              <div className="text-[12px] font-bold">{payload.supplier} / {payload.sidNumber}</div>
-            </div>
-            <div className="p-1">
-              <div className="text-[9px] uppercase text-slate-500">Penerima Part</div>
-              <div className="text-[11px] font-bold">{payload.plantName}</div>
-            </div>
-          </div>
-          <div className="grid grid-cols-3 border-b border-slate-400">
-            <div className="col-span-2 border-r border-slate-400 p-1">
-              <div className="text-[9px] uppercase text-slate-500">Waktu Kedatangan Truck</div>
-              <div className="text-[11px] font-bold">{payload.arrivalTime}</div>
-            </div>
-            <div className="p-1">
-              <div className="text-[9px] uppercase text-slate-500">Kanban ID</div>
-              <div className="text-[12px] font-bold">{payload.kanbanId}</div>
-            </div>
-          </div>
-          <div className="grid grid-cols-3 border-b border-slate-400 flex-1">
-            <div className="col-span-2 border-r border-slate-400 p-1">
-              <div className="text-[9px] uppercase text-slate-500">Barcode Nomor Part</div>
-              <div className="mt-2 flex items-center gap-2">
-                <QRCodeCanvas value={payload.sidNumber} size={42} includeMargin={false} />
-                <div className="text-[10px] font-semibold">{payload.sidNumber}</div>
+  const renderKanbanCard = (payload) => {
+    const supplierLabel = payload.supplierName && payload.supplierName !== payload.supplier
+      ? `${payload.supplier} - ${payload.supplierName}`
+      : payload.supplier || '-';
+    const qtyLabel = `${formatNumber0(payload.qtyBox || 0)}${payload.itemUnit ? ` ${payload.itemUnit}` : ''}`;
+    const totalLabel = `${formatNumber0(payload.plannedQty || 0)}${payload.itemUnit ? ` ${payload.itemUnit}` : ''}`;
+    const headerThemeMap = {
+      fg: { backgroundColor: '#7dd3fc', color: '#0f172a' },
+      assy: { backgroundColor: '#c4b5fd', color: '#0f172a' },
+      child: { backgroundColor: '#fdba74', color: '#0f172a' },
+      raw: { backgroundColor: '#86efac', color: '#0f172a' },
+      subcon: { backgroundColor: '#fca5a5', color: '#0f172a' },
+      indirect: { backgroundColor: '#67e8f9', color: '#0f172a' },
+      consumable: { backgroundColor: '#fde047', color: '#0f172a' },
+      other: { backgroundColor: '#cbd5e1', color: '#0f172a' },
+    };
+    const headerTheme = headerThemeMap[payload.categoryKey] || headerThemeMap.other;
+    return (
+      <div
+        key={payload.key}
+        className="bg-white border border-slate-500 text-[10px] text-slate-900 shadow-sm print:shadow-none kanban-card"
+        style={{ width: '190mm', height: '65mm' }}
+      >
+        <div className="grid grid-cols-[132mm_52mm] gap-1.5 p-2 h-full">
+          <div className="border border-slate-500 flex flex-col h-full">
+            <div className="grid grid-cols-[1fr_28mm] border-b border-slate-500">
+              <div>
+                <div
+                  className="grid grid-cols-[1fr_1.15fr] border-b border-slate-500"
+                  style={headerTheme}
+                >
+                  <div className="border-r border-slate-500 px-2 py-1 text-[15px] font-black">
+                    KANBAN TRANSPORT
+                  </div>
+                  <div className="px-2 py-1">
+                    <div className="text-[8px] uppercase opacity-80">Identitas Internal</div>
+                    <div className="text-[11px] font-bold leading-tight">PT MRP</div>
+                  </div>
+                </div>
+                <div className="grid grid-cols-[1fr_29mm_24mm]">
+                  <div className="border-r border-slate-500 p-1">
+                    <div className="text-[8px] uppercase text-slate-500">Part Number / Unique</div>
+                    <div className="text-[14px] font-bold leading-tight">{payload.sidNumber}</div>
+                  </div>
+                  <div className="border-r border-slate-500 p-1">
+                    <div className="text-[8px] uppercase text-slate-500">Qty / Kanban</div>
+                    <div className="text-[14px] font-bold leading-tight">{qtyLabel}</div>
+                  </div>
+                  <div className="p-1">
+                    <div className="text-[8px] uppercase text-slate-500">No Kartu</div>
+                    <div className="text-[13px] font-bold leading-tight">{payload.orderNo}</div>
+                  </div>
+                </div>
+              </div>
+              <div className="border-l border-slate-500 p-1 flex items-center justify-center bg-white">
+                <div className="h-[16mm] w-[25mm] overflow-hidden rounded border border-slate-300 bg-slate-50 flex items-center justify-center">
+                  {payload.itemImageUrl ? (
+                    <img
+                      src={payload.itemImageUrl}
+                      alt={payload.itemName || payload.sidNumber}
+                      className="h-full w-full object-contain"
+                    />
+                  ) : (
+                    <span className="text-[8px] font-semibold text-slate-400">No Img</span>
+                  )}
+                </div>
               </div>
             </div>
-            <div className="p-1">
-              <div className="text-[9px] uppercase text-slate-500">Qty per Kanban</div>
-              <div className="text-[14px] font-bold">{payload.qtyBox}</div>
-              <div className="text-[9px] uppercase text-slate-500 mt-2">Nomor Urut Order</div>
-              <div className="text-[12px] font-bold">{payload.orderNo}</div>
-              <div className="text-[9px] uppercase text-slate-500 mt-2">Batch / Lot</div>
-              <div className="text-[11px] font-bold break-all">{payload.lotBatch || '-'}</div>
+            <div className="grid grid-cols-[34mm_1fr] border-b border-slate-500 flex-1">
+              <div className="border-r border-slate-500 p-1 flex flex-col">
+                <div className="text-[8px] uppercase text-slate-500">QR Part</div>
+                <div className="mt-1 flex flex-col items-center justify-center gap-1">
+                  <QRCodeCanvas value={payload.sidNumber} size={52} includeMargin={false} />
+                  <div className="text-[9px] font-semibold break-all text-center">{payload.sidNumber}</div>
+                </div>
+              </div>
+              <div className="grid grid-rows-[auto_1fr_auto]">
+                <div className="grid grid-cols-2 border-b border-slate-500">
+                  <div className="border-r border-slate-500 p-1">
+                    <div className="text-[8px] uppercase text-slate-500">Nama Part</div>
+                    <div className="text-[11px] font-bold leading-tight">{payload.itemName || '-'}</div>
+                  </div>
+                  <div className="p-1">
+                    <div className="text-[8px] uppercase text-slate-500">Kategori</div>
+                    <div className="text-[11px] font-bold leading-tight">{payload.categoryLabel || '-'}</div>
+                  </div>
+                </div>
+                <div
+                  className="grid border-b border-slate-500"
+                  style={{ gridTemplateColumns: payload.customerCode ? '1.2fr 0.7fr 0.9fr' : '1fr 1fr' }}
+                >
+                  <div className="border-r border-slate-500 p-1">
+                    <div className="text-[8px] uppercase text-slate-500">Supplier</div>
+                    <div className="text-[10px] font-bold leading-tight">{supplierLabel}</div>
+                  </div>
+                  {payload.customerCode && (
+                    <div className="border-r border-slate-500 p-1">
+                      <div className="text-[8px] uppercase text-slate-500">Customer</div>
+                      <div className="text-[10px] font-bold leading-tight">{payload.customerCode}</div>
+                    </div>
+                  )}
+                  <div className="p-1">
+                    <div className="text-[8px] uppercase text-slate-500">Penerima / Plant</div>
+                    <div className="text-[10px] font-bold leading-tight">{payload.plantName || '-'}</div>
+                  </div>
+                </div>
+                <div className="grid grid-cols-3">
+                  <div className="border-r border-slate-500 p-1">
+                    <div className="text-[8px] uppercase text-slate-500">Total Plan</div>
+                    <div className="text-[10px] font-bold">{totalLabel}</div>
+                  </div>
+                  <div className="border-r border-slate-500 p-1">
+                    <div className="text-[8px] uppercase text-slate-500">Batch / Lot</div>
+                    <div className="text-[10px] font-bold break-all">{payload.lotBatch || '-'}</div>
+                  </div>
+                  <div className="p-1">
+                    <div className="text-[8px] uppercase text-slate-500">Dasar Hitung</div>
+                    <div className="text-[10px] font-bold">{payload.planSource || '-'}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="grid grid-cols-[23mm_23mm_1fr_31mm]">
+              <div className="border-r border-slate-500 p-1">
+                <div className="text-[8px] uppercase text-slate-500">Area Store</div>
+                <div className="text-[10px] font-bold">{payload.areaId || '-'}</div>
+              </div>
+              <div className="border-r border-slate-500 p-1">
+                <div className="text-[8px] uppercase text-slate-500">Lokasi Part</div>
+                <div className="text-[10px] font-bold">{payload.pressLocation || '-'}</div>
+              </div>
+              <div className="border-r border-slate-500 p-1">
+                <div className="text-[8px] uppercase text-slate-500">Next Proses</div>
+                <div className="text-[10px] font-bold leading-tight" style={{ overflowWrap: 'anywhere' }}>{payload.nextProcessLabel || '-'}</div>
+              </div>
+              <div className="p-1">
+                <div className="text-[8px] uppercase text-slate-500">Tanggal Cetak</div>
+                <div className="text-[10px] font-bold">{payload.printTime}</div>
+              </div>
             </div>
           </div>
-          <div className="grid grid-cols-2 border-b border-slate-400">
-            <div className="border-r border-slate-400 p-1">
-              <div className="text-[9px] uppercase text-slate-500">Nomor & Nama Part</div>
-              <div className="text-[10px] font-semibold">{payload.sidNumber} - {payload.itemName}</div>
+          <div className="border border-slate-500 flex flex-col h-full">
+            <div className="border-b border-slate-500 p-1">
+              <div className="text-[8px] uppercase text-slate-500">Kanban ID</div>
+              <div className="text-[13px] font-bold leading-tight break-all">{payload.kanbanId}</div>
             </div>
-            <div className="p-1">
-              <div className="text-[9px] uppercase text-slate-500">Lokasi Press Part</div>
-              <div className="text-[11px] font-bold">{payload.pressLocation}</div>
+            <div className="flex-1 p-1 flex flex-col items-center justify-center">
+              <div className="text-[8px] uppercase text-slate-500 self-start">QR Kanban ID</div>
+              <QRCodeCanvas value={payload.kanbanQrValue || payload.kanbanId} size={78} includeMargin={false} />
+              <div className="mt-1 text-[9px] font-semibold break-all text-center">{payload.kanbanId}</div>
             </div>
-          </div>
-          <div className="grid grid-cols-2 p-1">
-            <div>
-              <div className="text-[9px] uppercase text-slate-500">Supplier</div>
-              <div className="text-[10px] font-semibold">{payload.supplier}</div>
-            </div>
-            <div>
-              <div className="text-[9px] uppercase text-slate-500">Area Store</div>
-              <div className="text-[10px] font-semibold">{payload.areaId}</div>
-            </div>
-          </div>
-        </div>
-        <div className="border border-slate-400 flex flex-col h-full">
-          <div className="border-b border-slate-400 p-1">
-            <div className="text-[9px] uppercase text-slate-500">Dock Code</div>
-            <div className="text-[14px] font-bold">{payload.dockCode}</div>
-          </div>
-          <div className="border-b border-slate-400 p-1">
-            <div className="text-[9px] uppercase text-slate-500">Progress Line</div>
-            <div className="text-[14px] font-bold">{payload.progressLine}</div>
-          </div>
-          <div className="border-b border-slate-400 p-1">
-            <div className="text-[9px] uppercase text-slate-500">Conveyance No</div>
-            <div className="text-[12px] font-bold">{payload.conveyanceNo}</div>
-          </div>
-            <div className="flex-1 p-1">
-            <div className="text-[9px] uppercase text-slate-500">QR Kanban ID</div>
-            <div className="mt-2 flex items-center gap-2">
-              <QRCodeCanvas value={payload.kanbanId} size={60} includeMargin={false} />
-              <div className="text-[10px] font-semibold">{payload.kanbanId}</div>
+            <div className="grid grid-cols-2 border-t border-slate-500">
+              <div className="border-r border-slate-500 p-1">
+                <div className="text-[8px] uppercase text-slate-500">Dock</div>
+                <div className="text-[11px] font-bold">{payload.dockCode || '-'}</div>
+              </div>
+              <div className="p-1">
+                <div className="text-[8px] uppercase text-slate-500">Line / Store</div>
+                <div className="text-[11px] font-bold">{payload.progressLine || '-'}</div>
+              </div>
             </div>
           </div>
         </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   const renderKanbanCardPage = (payloadSlice, pageKey) => (
     <div key={pageKey} className="kanban-page">
@@ -10546,7 +11467,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
         <div className="border border-slate-400 flex flex-col h-full">
           <div className="border-b border-slate-400 p-1">
             <div className="text-[9px] uppercase text-slate-500">PO / Supplier</div>
-            <div className="text-[12px] font-bold">{card.po_number || '-'} â€¢ {resolveSupplierLabel(card)}</div>
+            <div className="text-[12px] font-bold">{card.po_number || '-'} - {resolveSupplierLabel(card)}</div>
           </div>
           <div className="border-b border-slate-400 p-1">
             <div className="text-[9px] uppercase text-slate-500">Item</div>
@@ -10832,7 +11753,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     if (row?.dn_id) {
       parts.push(`Sudah punya DN ${row.dn_number || row.dn_id}`);
     }
-    return parts.filter(Boolean).join(' â€¢ ');
+    return parts.filter(Boolean).join(' - ');
   };
 
   const describeKanbanSelectionIssues = (rows, { mode = 'dn' } = {}) => {
@@ -11082,11 +12003,12 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
           rn_type: note.rn_type || 'legacy',
           rn_header_id: note.rn_header_id || null,
           supplier: note.supplier || '-',
-          received_at: note.received_at || note.arrival_date || null,
+          received_at: note.arrival_date || note.received_at || null,
           notes: note.notes || '',
           truck_no: note.truck_no || '',
           driver_name: note.driver_name || '',
           dn_numbers: new Set(),
+          do_numbers: new Set(),
           qc_statuses: new Set(),
           status_set: new Set(),
           expected_total: 0,
@@ -11100,7 +12022,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       const actual = Number(note.received_qty ?? 0);
       group.expected_total += Number.isFinite(expected) ? expected : 0;
       group.received_total += Number.isFinite(actual) ? actual : 0;
-      const receivedAt = note.received_at || note.arrival_date || null;
+      const receivedAt = note.arrival_date || note.received_at || null;
       if (receivedAt && (!group.received_at || new Date(receivedAt) > new Date(group.received_at))) {
         group.received_at = receivedAt;
       }
@@ -11109,6 +12031,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       if (!group.truck_no && note.truck_no) group.truck_no = note.truck_no;
       if (!group.driver_name && note.driver_name) group.driver_name = note.driver_name;
       if (note.dn_number) group.dn_numbers.add(note.dn_number);
+      if (note.do_number) group.do_numbers.add(note.do_number);
       if (note.qc_status) group.qc_statuses.add(String(note.qc_status).toUpperCase());
       if (note.status) group.status_set.add(String(note.status).toLowerCase());
       if (note.id) group.item_ids.push(note.id);
@@ -11116,6 +12039,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     });
     const rows = Array.from(groups.values()).map((group) => {
       const dnList = Array.from(group.dn_numbers);
+      const doList = Array.from(group.do_numbers);
+      const referenceList = dnList.length > 0 ? dnList : doList;
       const qcList = Array.from(group.qc_statuses);
       const statusList = Array.from(group.status_set);
       const expectedTotal = group.expected_total;
@@ -11123,7 +12048,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       return {
         ...group,
         dn_numbers: dnList,
-        dn_reference: dnList.length > 1 ? `${dnList[0]} +${dnList.length - 1}` : (dnList[0] || '-'),
+        do_numbers: doList,
+        dn_reference: referenceList.length > 1 ? `${referenceList[0]} +${referenceList.length - 1}` : (referenceList[0] || '-'),
         qc_status: qcList.length > 1 ? 'MIX' : (qcList[0] || 'OK'),
         status: statusList.length > 1 ? 'mixed' : (statusList[0] || 'posted'),
         expected_total: expectedTotal,
@@ -11154,11 +12080,13 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       if (rnStatus && rnStatus !== 'all' && statusKey !== rnStatus) return false;
       if (!search) return true;
       const dnText = Array.isArray(row.dn_numbers) ? row.dn_numbers.join(' ') : String(row.dn_reference || '');
+      const doText = Array.isArray(row.do_numbers) ? row.do_numbers.join(' ') : '';
       const haystack = [
         row.rn_number,
         row.supplier,
         row.dn_reference,
         dnText,
+        doText,
       ]
         .filter(Boolean)
         .join(' ')
@@ -11171,8 +12099,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     [filteredReceiveNoteHeaders, tablePagination.kanbanReceiving?.page, tablePagination.kanbanReceiving?.perPage],
   );
   const kanbanEmptyPaginationMeta = useMemo(
-    () => paginateRows('kanbanEmpty', kanbanRequests),
-    [kanbanRequests, tablePagination.kanbanEmpty?.page, tablePagination.kanbanEmpty?.perPage],
+    () => paginateRows('kanbanEmpty', kanbanEmptyLogs),
+    [kanbanEmptyLogs, tablePagination.kanbanEmpty?.page, tablePagination.kanbanEmpty?.perPage],
   );
 
   const getGroupedSchedules = () => {
@@ -11477,6 +12405,12 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
           late: 0,
           pending: 0,
           tooEarly: 0,
+          partialOnTime: 0,
+          partialLate: 0,
+          lateCompletion: 0,
+          onTimeQty: 0,
+          lateQty: 0,
+          tooEarlyQty: 0,
           items: new Set(),
           totalOrdered: 0,
           totalReceived: 0,
@@ -11488,14 +12422,37 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       performance[bucketKey].name = supplierMeta.name || performance[bucketKey].name || supplierKey;
       performance[bucketKey].totalSchedules += 1;
       performance[bucketKey].items.add(item.item);
-      performance[bucketKey].totalOrdered += parseInt(item.requestQty || 0);
-      performance[bucketKey].totalReceived += parseInt(item.receivedQty || 0);
+      const requestQty = Number(item.requestQty || 0);
+      const receivedQty = Number(item.receivedQty || 0);
+      const kpiStatus = getKpiStatus(item);
+      const onTimeQty = Number.isFinite(Number(item.onTimeQty))
+        ? Number(item.onTimeQty)
+        : (kpiStatus === 'On Time' || kpiStatus === 'Partial On Time' ? receivedQty : 0);
+      const lateQty = Number.isFinite(Number(item.lateQty))
+        ? Number(item.lateQty)
+        : (kpiStatus === 'Late' || kpiStatus === 'Late Completion' || kpiStatus === 'Partial Late' ? receivedQty : 0);
+      const tooEarlyQty = Number.isFinite(Number(item.tooEarlyQty))
+        ? Number(item.tooEarlyQty)
+        : (kpiStatus === 'Too Early' || kpiStatus === 'Partial Too Early' ? receivedQty : 0);
+      performance[bucketKey].totalOrdered += requestQty;
+      performance[bucketKey].totalReceived += receivedQty;
+      performance[bucketKey].onTimeQty += Math.max(0, onTimeQty);
+      performance[bucketKey].lateQty += Math.max(0, lateQty);
+      performance[bucketKey].tooEarlyQty += Math.max(0, tooEarlyQty);
       if(new Date(item.requestDate) > new Date(performance[bucketKey].lastDate)) performance[bucketKey].lastDate = item.requestDate;
 
-      const kpiStatus = getKpiStatus(item);
       if (kpiStatus === 'On Time') performance[bucketKey].onTime += 1;
       else if (kpiStatus === 'Late') performance[bucketKey].late += 1;
-      else if (kpiStatus === 'Too Early') performance[bucketKey].tooEarly += 1;
+      else if (kpiStatus === 'Late Completion') {
+        performance[bucketKey].late += 1;
+        performance[bucketKey].lateCompletion += 1;
+      } else if (kpiStatus === 'Partial On Time') {
+        performance[bucketKey].partialOnTime += 1;
+      } else if (kpiStatus === 'Partial Late') {
+        performance[bucketKey].late += 1;
+        performance[bucketKey].partialLate += 1;
+      } else if (kpiStatus === 'Too Early') performance[bucketKey].tooEarly += 1;
+      else if (kpiStatus === 'Partial Too Early') performance[bucketKey].tooEarly += 1;
       else performance[bucketKey].pending += 1;
     });
 
@@ -11526,6 +12483,12 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
           late: 0,
           pending: 0,
           tooEarly: 0,
+          partialOnTime: 0,
+          partialLate: 0,
+          lateCompletion: 0,
+          onTimeQty: 0,
+          lateQty: 0,
+          tooEarlyQty: 0,
           items: new Set(),
           totalOrdered: 0,
           totalReceived: 0,
@@ -11555,8 +12518,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
 
     return Object.keys(performance).map(key => {
       const data = performance[key];
-      const timeScore = data.totalSchedules > 0 ? (data.onTime / data.totalSchedules) * 100 : 0;
-      const qtyScore = data.totalOrdered > 0 ? (data.totalReceived / data.totalOrdered) * 100 : 0;
+      const timeScore = data.totalOrdered > 0 ? (data.onTimeQty / data.totalOrdered) * 100 : 0;
+      const qtyScore = data.totalOrdered > 0 ? Math.min(100, (data.totalReceived / data.totalOrdered) * 100) : 0;
       const hasPacking = data.packingTotal > 0;
       const packingScore = hasPacking ? ((data.packingTotal - data.packingLoose) / data.packingTotal) * 100 : null;
       const timeWeight = hasPacking ? 0.6 : 0.7;
@@ -11623,7 +12586,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       if (!Array.isArray(rows) || rows.length === 0) { alert("Data kosong!"); return; }
       const summary = rows.map(s => `- ${s.supplier}: PO ${s.poNumber}, Item ${s.item}, Status ${s.status}, Qty ${s.requestQty}, Tiba ${s.receivedQty}`).join('\n');
       const prompt = `Analisis data logistik ini dan berikan respons dalam format JSON murni. Data:n${summary}nFormat JSON: {"summary": "Ringkasan singkat...", "stats": {"onTime": 0, "late": 0, "pending": 0, "totalQtyReceived": 0}, "criticalIssues": ["Isu 1"], "recommendations": ["Saran 1"]}`;
-      callGeminiAI(prompt, "âœ¨ Laporan Statistik Cerdas (AI)", true);
+      callGeminiAI(prompt, "Laporan Statistik Cerdas (AI)", true);
   };
 
   const handleAnalyzeData = async () => {
@@ -11656,24 +12619,418 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     } catch (e) { alert("Error: " + e.message); } finally { setIsParsing(false); }
   };
 
+  const compactAiRows = (rows, mapper, limit = 80) => {
+    const sourceRows = Array.isArray(rows) ? rows : [];
+    return sourceRows.slice(0, limit).map((row, index) => {
+      try {
+        return mapper ? mapper(row, index) : row;
+      } catch {
+        return row;
+      }
+    });
+  };
+
+  const formatChatMessageText = (value) => String(value || '')
+    .replace(/\*\*/g, '')
+    .replace(/\\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  const buildAiActiveContext = useCallback(async () => {
+    const tabKey = String(mainTab || 'dashboard');
+    const help = activeHelpContent || HELP_CONTENT[tabKey] || HELP_CONTENT.dashboard;
+    const base = {
+      menu: help.title || tabKey,
+      detail: help.detailLabel || '',
+      role: user?.role || '',
+      batasan: [
+        'Gunakan hanya data ringkas yang tersedia pada konteks ini.',
+        'Jangan menyarankan edit langsung tanpa user melakukan validasi transaksi sumber.',
+        'Jika data tidak cukup, minta user membuka/filter menu terkait.',
+      ],
+    };
+
+    if (tabKey === 'quality' && canQuality) {
+      try {
+        const queue = await apiFetch('/api/quality/queue');
+        return {
+          ...base,
+          source: 'Quality Control queue',
+          summary: {
+            incoming: Array.isArray(queue?.incoming) ? queue.incoming.length : 0,
+            production: Array.isArray(queue?.production) ? queue.production.filter((row) => row?.sourceType !== 'material_line_ng').length : 0,
+            materialLineNg: Array.isArray(queue?.production) ? queue.production.filter((row) => row?.sourceType === 'material_line_ng').length : 0,
+            returns: Array.isArray(queue?.returns) ? queue.returns.length : 0,
+            cases: Array.isArray(queue?.cases) ? queue.cases.length : 0,
+          },
+          rows: {
+            incoming: compactAiRows(queue?.incoming, (row) => ({
+              source: row.sourceDoc,
+              item: row.itemCode,
+              partner: row.supplier,
+              qty: row.qty,
+              status: row.status,
+              defect: row.defectCategory,
+            }), 30),
+            materialLineNg: compactAiRows((queue?.production || []).filter((row) => row?.sourceType === 'material_line_ng'), (row) => ({
+              case: row.caseNumber,
+              source: row.sourceDoc,
+              batchId: row.batchId,
+              item: row.itemCode,
+              supplier: row.supplier,
+              qty: row.qty,
+              defect: row.defectCategory,
+              line: row.lineName,
+              process: row.processName,
+              status: row.status,
+            }), 30),
+          },
+        };
+      } catch (error) {
+        return { ...base, warning: `Gagal mengambil queue Quality: ${error.message || error}` };
+      }
+    }
+
+    if (tabKey === 'monitoring') {
+      const rows = filteredSchedules?.length ? filteredSchedules : await ensureSchedulesLoaded();
+      return {
+        ...base,
+        source: 'Inbound Schedule',
+        filters: { start: filterStart, end: filterEnd, supplier: filterSupplier, status: filterStatus },
+        rows: compactAiRows(rows, (row) => ({
+          supplier: row.supplier,
+          po: row.poNumber,
+          item: row.item,
+          requestQty: row.requestQty,
+          receivedQty: row.receivedQty,
+          scheduleDate: row.requestDate,
+          status: row.status,
+          doNumber: row.doNumber,
+        })),
+      };
+    }
+
+    if (tabKey === 'kanban') {
+      return {
+        ...base,
+        source: `Kanban ${kanbanView || ''} ${kanbanSubTab || ''}`.trim(),
+        summary: {
+          requests: kanbanRequests.length,
+          deliveryNotes: deliveryNotes.length,
+          receiveNotes: receiveNotes.length,
+          emptyCards: scanHistory.length,
+        },
+        rows: {
+          requests: compactAiRows(kanbanRequests, (row) => ({
+            request: row.request_id || row.id,
+            kanbanId: row.kanban_id,
+            item: row.item_code,
+            supplier: row.supplier,
+            qty: row.request_qty,
+            status: row.status,
+            createdAt: row.created_at,
+          }), 50),
+          deliveryNotes: compactAiRows(deliveryNotes, (row) => ({
+            dn: row.dn_number || row.dnNumber,
+            supplier: row.supplier,
+            status: row.status,
+            qty: row.total_qty || row.totalQty,
+            createdAt: row.created_at || row.createdAt,
+          }), 30),
+          receiveNotes: compactAiRows(receiveNotes, (row) => ({
+            rn: row.rn_number || row.rnNumber,
+            supplier: row.supplier,
+            dn: row.dn_reference || row.dnReference,
+            status: row.status,
+            qty: row.received_total || row.receivedTotal,
+          }), 30),
+        },
+      };
+    }
+
+    if (tabKey === 'fifo') {
+      return {
+        ...base,
+        source: 'FIFO lots',
+        summary: { totalLots: fifoTotalLots, activeLots: fifoActiveLots, depletedLots: fifoDepletedLots, totalStock: fifoTotalStock },
+        rows: compactAiRows(filteredFifoLots, (row) => ({
+          item: row.itemCode,
+          itemName: row.itemName,
+          lot: row.lotNo || row.batchNo,
+          receivedDate: row.receivedDate,
+          remainingQty: row.remainingQty,
+          status: row.status,
+          supplier: row.supplier,
+        })),
+      };
+    }
+
+    if (tabKey === 'inventory') {
+      return {
+        ...base,
+        source: 'Inventory overview',
+        summary: {
+          totalItems: inventoryItems.length,
+          critical: criticalStockRows.length,
+          expiringSoon: expiringSoonRows.length,
+        },
+        rows: {
+          criticalStock: compactAiRows(criticalStockRows, (row) => ({
+            item: row.code || row.itemCode,
+            name: row.name || row.itemName,
+            onHand: row.onHand,
+            reserved: row.reserved,
+            available: row.available,
+            minQty: row.minQty,
+            supplier: row.supplier,
+          }), 40),
+          expiringSoon: compactAiRows(expiringSoonRows, (row) => ({
+            item: row.itemCode,
+            lot: row.lotNo || row.batchNo,
+            remainingQty: row.remainingQty,
+            expiredDate: row.expiredDate,
+            supplier: row.supplier,
+          }), 30),
+        },
+      };
+    }
+
+    if (tabKey === 'prl') {
+      return {
+        ...base,
+        source: 'PRL',
+        filters: prlFilters,
+        rows: compactAiRows(prlRows, (row) => ({
+          item: row.item_code || row.itemCode,
+          name: row.item_name || row.itemName,
+          model: row.model,
+          supplier: row.supplier,
+          category: row.category,
+          status: row.status,
+          total: row.total || row.total_qty || row.totalQty,
+        })),
+      };
+    }
+
+    if (tabKey === 'masterref') {
+      return {
+        ...base,
+        source: `Master Referensi ${masterRefTab || ''}`.trim(),
+        summary: { items: masterItems.length, vendors: masterVendors.length, locations: masterLocations.length },
+        rows: compactAiRows(masterItems, (row) => ({
+          code: row.code,
+          name: row.name,
+          type: row.type,
+          unit: row.unit,
+          model: row.model,
+          supplier: row.vendorId || row.vendor_id || row.supplierName || row.supplier_name,
+          location: row.locationId || row.location_id || row.locationName || row.location_name,
+          packQty: row.packQty || row.pack_qty,
+        }), 60),
+      };
+    }
+
+    if (tabKey === 'reports') {
+      return {
+        ...base,
+        source: `Laporan ${HELP_REPORT_LABELS[reportTab] || reportTab || ''}`.trim(),
+        filters: { start: reportStart, end: reportEnd, supplier: reportSupplier },
+        summary: reportSummary || {},
+        rows: compactAiRows(reportRows, (row) => row, 80),
+      };
+    }
+
+    if (tabKey === 'supplier') {
+      const today = new Date();
+      const start = formatDateKey(new Date(today.getFullYear(), today.getMonth(), 1));
+      const end = formatDateKey(today);
+      const prlMonthKeys = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+      const performanceQuery = new URLSearchParams({ start, end }).toString();
+      const listQuery = new URLSearchParams({ limit: '50', offset: '0', includeTotal: '1' }).toString();
+      const periodListQuery = new URLSearchParams({ start, end, limit: '50', offset: '0', includeTotal: '1' }).toString();
+      const prlQuery = new URLSearchParams({
+        year: String(today.getFullYear()),
+        month: prlMonthKeys[today.getMonth()] || 'jan',
+      }).toString();
+      try {
+        const [performance, poPayload, prlPayload, schedulePayload, dnPayload, millsheetPayload] = await Promise.all([
+          apiFetch(`/api/supplier/performance?${performanceQuery}`),
+          apiFetch(`/api/supplier/po?${listQuery}`),
+          apiFetch(`/api/prl/forecast-preview?${prlQuery}`, { timeoutMs: 60000 }),
+          apiFetch(`/api/supplier/schedules?${periodListQuery}`),
+          apiFetch(`/api/supplier/dn?${periodListQuery}`),
+          apiFetch(`/api/supplier/millsheets`),
+        ]);
+        return {
+          ...base,
+          source: 'Supplier Portal',
+          filters: { start, end },
+          supplier: performance?.supplier || {},
+          summary: performance?.summary || {},
+          rows: {
+            po: compactAiRows(poPayload?.rows || poPayload, (row) => ({
+              po: row.po_number,
+              status: row.status,
+              poDate: row.po_date,
+              orderQty: row.total_qty_order,
+              receivedQty: row.total_qty_received,
+              remainingQty: row.total_qty_remaining,
+              lineCount: row.line_count,
+            }), 30),
+            prlReleased: compactAiRows((prlPayload?.rows || []).filter((row) => Number(row?.months?.n || 0) > 0), (row) => ({
+              prl: prlPayload?.documentNumber,
+              item: row.itemCode,
+              itemName: row.description,
+              period: prlPayload?.monthLabel,
+              year: prlPayload?.year,
+              releasedQty: row.months?.n,
+              uom: row.uom,
+              status: 'active',
+            }), 30),
+            schedules: compactAiRows(schedulePayload?.rows || schedulePayload, (row) => ({
+              po: row.po_number,
+              item: row.item_code,
+              itemName: row.item_name,
+              requestDate: row.request_date,
+              arrivalDate: row.arrival_date,
+              requestQty: row.request_qty,
+              receivedQty: row.received_qty,
+              status: row.status,
+              doNumber: row.do_number,
+            }), 40),
+            deliveryNotes: compactAiRows(dnPayload?.rows || dnPayload, (row) => ({
+              dn: row.dn_number,
+              status: row.status,
+              deliveryStatus: row.delivery_status,
+              createdAt: row.created_at,
+              plannedDate: row.planned_date,
+              docQty: row.doc_qty,
+              receivedQty: row.received_qty,
+              variance: row.variance,
+            }), 30),
+            millSheets: {
+              pendingDn: compactAiRows(millsheetPayload?.pendingDns, (row) => ({
+                dn: row.dnNumber || row.dn_number,
+                dueAt: row.millsheetDueAt || row.millsheet_due_at,
+                status: row.millsheetStatus || row.millsheet_status,
+              }), 20),
+              documents: compactAiRows(millsheetPayload?.documents, (row) => ({
+                dn: row.dnNumber || row.dn_number,
+                item: row.itemCode || row.item_code,
+                status: row.status,
+                uploadedAt: row.uploadedAt || row.uploaded_at,
+              }), 20),
+            },
+            performanceSchedules: compactAiRows(performance?.schedules, (row) => ({
+              po: row.poNumber,
+              item: row.itemCode,
+              scheduleDate: row.requestDate,
+              actualDate: row.arrivalDate,
+              requestQty: row.requestQty,
+              receivedQty: row.receivedQty,
+              status: row.status,
+            }), 30),
+          },
+        };
+      } catch (error) {
+        return {
+          ...base,
+          source: 'Supplier Portal',
+          warning: `Gagal mengambil data supplier portal: ${error.message || error}`,
+          note: 'Konteks supplier tetap dibatasi pada data supplier login.',
+        };
+      }
+    }
+
+    return {
+      ...base,
+      source: 'Dashboard',
+      summary: dashboardStats,
+      rows: {
+        criticalStock: compactAiRows(criticalStockRows, (row) => ({
+          item: row.code || row.itemCode,
+          name: row.name || row.itemName,
+          available: row.available,
+          minQty: row.minQty,
+        }), 20),
+        expiringSoon: compactAiRows(expiringSoonRows, (row) => ({
+          item: row.itemCode,
+          lot: row.lotNo || row.batchNo,
+          remainingQty: row.remainingQty,
+          expiredDate: row.expiredDate,
+        }), 20),
+      },
+    };
+  }, [
+    activeHelpContent,
+    apiFetch,
+    canQuality,
+    criticalStockRows,
+    dashboardStats,
+    deliveryNotes,
+    ensureSchedulesLoaded,
+    expiringSoonRows,
+    fifoActiveLots,
+    fifoDepletedLots,
+    fifoTotalLots,
+    fifoTotalStock,
+    filterEnd,
+    filterStart,
+    filterStatus,
+    filterSupplier,
+    filteredFifoLots,
+    filteredSchedules,
+    inventoryItems,
+    kanbanRequests,
+    kanbanSubTab,
+    kanbanView,
+    mainTab,
+    masterItems,
+    masterLocations,
+    masterRefTab,
+    masterVendors,
+    prlFilters,
+    prlRows,
+    receiveNotes,
+    reportEnd,
+    reportRows,
+    reportCategory,
+    reportStart,
+    reportSummary,
+    reportSupplier,
+    reportTab,
+    scanHistory,
+    user?.role,
+  ]);
+
   // --- CHATBOT HANDLER ---
   const handleChatSubmit = async (e) => {
     e.preventDefault(); if (!chatInput.trim()) return;
     const ready = await ensureAiConfigured();
     if (!ready) return;
-    const newMessages = [...chatMessages, { role: 'user', text: chatInput }]; setChatMessages(newMessages); setChatInput(''); setIsChatLoading(true);
-    const rows = await ensureSchedulesLoaded();
-    const contextData = (Array.isArray(rows) ? rows : []).map(s => `${s.supplier} (PO ${s.poNumber}): ${s.item} ${s.requestQty}pcs, Jadwal ${s.requestDate}, Status: ${s.status}`).join('\n');
-    const prompt = `Asisten Logistik. Data:n${contextData}nJawab user: ${chatInput}`;
+    const userQuestion = chatInput;
+    const newMessages = [...chatMessages, { role: 'user', text: userQuestion }]; setChatMessages(newMessages); setChatInput(''); setIsChatLoading(true);
     try {
+        const activeContext = await buildAiActiveContext();
+        const history = newMessages.slice(-6).map((msg) => `${msg.role === 'user' ? 'User' : 'AI'}: ${msg.text}`).join('\n');
+        const prompt = [
+          'Anda adalah Asisten Logistik untuk sistem MSKS PT. Matra Roda Piranti.',
+          'Jawab dalam bahasa Indonesia, ringkas, praktis, dan sesuai SOP sistem.',
+          'Gunakan teks polos yang rapi. Jangan gunakan markdown tebal, heading markdown, tabel markdown, atau blok kode.',
+          'Jika perlu daftar, gunakan baris pendek diawali tanda "-".',
+          'Gunakan konteks menu aktif berikut. Jangan mengarang angka di luar konteks.',
+          `Konteks JSON:\n${JSON.stringify(activeContext, null, 2)}`,
+          `Riwayat chat singkat:\n${history}`,
+          `Pertanyaan user:\n${userQuestion}`,
+        ].join('\n\n');
         const data = await callAiGenerate({ contents: [{ parts: [{ text: prompt }] }] });
         if (data?.candidates?.length) {
             const aiText = String(data.candidates[0].content.parts[0].text);
             setChatMessages([...newMessages, { role: 'ai', text: aiText }]);
         } else {
-            setChatMessages([...newMessages, { role: 'ai', text: "Maaf, saya sedang pusing." }]);
+            setChatMessages([...newMessages, { role: 'ai', text: "AI tidak memberikan jawaban." }]);
         }
-    } catch (error) { setChatMessages([...newMessages, { role: 'ai', text: "Gagal terhubung ke AI." }]); } finally { setIsChatLoading(false); }
+    } catch (error) { setChatMessages([...newMessages, { role: 'ai', text: `Gagal terhubung ke AI: ${error.message || error}` }]); } finally { setIsChatLoading(false); }
   };
 
   const inboundPrintMeta = (() => {
@@ -11749,7 +13106,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                 <div className="summary-value">{supplierGroup.stats.late}</div>
               </div>
               <div className="summary-card summary-card--early">
-                <div className="summary-label">TOO EARLY</div>
+                <div className="summary-label">TOO EARLY &gt; H-1</div>
                 <div className="summary-value">{supplierGroup.stats.tooEarly}</div>
               </div>
               <div className="summary-card summary-card--pending">
@@ -11786,8 +13143,10 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                         {group.rows.map((row) => {
                           const displayOrderQty = getDisplayOrderQty(row);
                           const balance = (Number(row.receivedQty) || 0) - (Number(displayOrderQty) || 0);
-                          const balanceText = balance === 0 ? '-' : (balance > 0 ? `+${balance}` : `${balance}`);
+                          const balanceText = formatSignedQuantity(balance);
                           const balanceClass = balance < 0 ? 'print-balance--negative' : 'print-balance--positive';
+                          const displayStatus = typeof getKpiStatus === 'function' ? getKpiStatus(row) : row.status;
+                          const timingFlag = typeof getTimingFlag === 'function' ? getTimingFlag(row.requestDate, row.arrivalDate) : '';
                           return (
                             <tr key={`print-${supplierGroup.supplierKey}-${row.id}`}>
                               <td>{row.poNumber}</td>
@@ -11795,13 +13154,14 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                               <td>{row.itemName || row.item}</td>
                               <td>{row.deliveryTime || '-'}</td>
                               <td>{row.doNumber || '-'}</td>
-                              <td>{displayOrderQty ?? '-'}</td>
-                              <td>{row.receivedQty ?? '-'}</td>
+                              <td>{formatQuantity(displayOrderQty)}</td>
+                              <td>{formatQuantity(row.receivedQty)}</td>
                               <td className={balanceClass}>{balanceText}</td>
                               <td>
-                                <span className={`print-status-badge ${getPrintStatusClass(row.status)}`}>
-                                  {row.status || '-'}
+                                <span className={`print-status-badge ${getPrintStatusClass(displayStatus)}`}>
+                                  {displayStatus || '-'}
                                 </span>
+                                {timingFlag && <div className="mt-1 text-[9px] font-semibold text-cyan-700">{timingFlag}</div>}
                               </td>
                               <td>{row.notes || '-'}</td>
                             </tr>
@@ -11840,10 +13200,12 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     inboundCardScanLoading,
     inboundCardScanOpen,
     inboundCardScanValue,
+    incomingQuickAction,
     inboundNav,
     clearInboundNav,
     calculateSupplierPerformance,
     canEditSchedules,
+    canQuality,
     isStockOpnameLocked,
     canImportExport,
     canProduction,
@@ -11963,6 +13325,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     getPrlVolPerDay,
     getRemainingQty,
     getPoLineRemainingAfterSchedule,
+    getKpiStatus,
+    getTimingFlag,
     getRequestIdLabel,
     getUniqueSuppliers,
     ensureXlsx,
@@ -12008,6 +13372,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     handleEdit,
     handleEditModel,
     handleEditProcess,
+    handleEmptyKanbanScanValue,
     handleEmptyKanbanSubmit,
     handleExportItemsXls,
     handleExportBomProjectXls,
@@ -12224,6 +13589,15 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     setCapacityPlanningYear,
     capacityPlanningData,
     qualityObjectivesMonth,
+    setQualityObjectivesMonth,
+    qualityObjectivesSupplier,
+    setQualityObjectivesSupplier,
+    qualityObjectivesMonthStart,
+    setQualityObjectivesMonthStart,
+    qualityObjectivesMonthEnd,
+    setQualityObjectivesMonthEnd,
+    qualityObjectivesYear,
+    setQualityObjectivesYear,
     qualityObjectivesData,
     stockCoverageDays,
     stockCoverageRows,
@@ -12277,6 +13651,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     scanActiveResult,
     scanError,
     scanCameraStatus,
+    scanHistory,
     scanInput,
     scanMode,
     scanResults,
@@ -12391,8 +13766,9 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     setReportEnd,
     setReportStart,
     setReportSupplier,
+    setReportCategory,
+    setReportTab,
     setStockCoverageDays,
-    setQualityObjectivesMonth,
     setOutstandingPrlMonth,
     setOutstandingPrlYear,
     setScanCameraEnabled,
@@ -12501,11 +13877,47 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                           </span>
                         )}
                       </button>
+                      <div className={`relative ${incomingMenuOpen ? 'z-[260]' : 'z-10'}`}>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setActiveMenu(null);
+                            setSettingsMenuOpen(false);
+                            setReportMenuOpen(false);
+                            setIncomingMenuOpen((prev) => !prev);
+                          }}
+                          className="bg-white border border-slate-200 text-slate-600 p-2 rounded-lg shadow-sm hover:bg-slate-50 hover:text-emerald-700 transition"
+                          title="Incoming Cepat"
+                          aria-label="Incoming Cepat"
+                        >
+                          <Truck size={20} />
+                        </button>
+                        {incomingMenuOpen && (
+                          <div className="absolute right-0 top-full z-[270] mt-2 w-52 overflow-hidden rounded-lg border border-gray-100 bg-white shadow-xl">
+                            <button
+                              type="button"
+                              onClick={() => openIncomingQuickAction('schedule')}
+                              className="flex w-full items-center gap-2 px-4 py-3 text-left text-sm text-slate-700 hover:bg-slate-50"
+                            >
+                              <CalendarDays size={16} /> Schedule
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => openIncomingQuickAction('dn')}
+                              className="flex w-full items-center gap-2 border-t border-slate-100 px-4 py-3 text-left text-sm text-slate-700 hover:bg-slate-50"
+                            >
+                              <FileText size={16} /> DN
+                            </button>
+                          </div>
+                        )}
+                      </div>
                     <button
                       type="button"
                       onClick={(e) => {
                         e.stopPropagation();
                         setActiveMenu(null);
+                        setIncomingMenuOpen(false);
                         setReportMenuOpen(false);
                         setShowForm(false);
                         setMainTab('kanban');
@@ -12602,22 +14014,54 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                   >
                     Kanban Board
                   </button>
+                  <button
+                    onClick={() => {
+                      setMainTab('kanban');
+                      setKanbanView('board');
+                      setKanbanSubTab('scan');
+                    }}
+                    className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'kanban' && kanbanSubTab === 'scan' ? 'bg-indigo-600 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
+                  >
+                    Scan QR
+                  </button>
+                  <button
+                    onClick={() => {
+                      setMainTab('kanban');
+                      setKanbanView('board');
+                      setKanbanSubTab('empty');
+                    }}
+                    className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'kanban' && kanbanSubTab === 'empty' ? 'bg-indigo-600 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
+                  >
+                    Kanban Kosong
+                  </button>
                 </div>
               </div>
             ) : (
-              <div className="mb-6 flex flex-wrap gap-3 print:hidden">
-                <div className="flex flex-wrap items-center gap-1.5 rounded-full border border-slate-200 bg-white/80 p-1 shadow-sm backdrop-blur">
+              <div className="relative z-40 mb-6 flex flex-wrap gap-3 overflow-visible print:hidden">
+                <div className="relative z-40 flex flex-nowrap items-center gap-1.5 overflow-visible rounded-full border border-slate-200 bg-white/80 p-1 shadow-sm backdrop-blur">
                   <button
                     onClick={() => setMainTab('dashboard')}
-                    className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'dashboard' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
+                    className={`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'dashboard' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                   >
                     Dashboard
                   </button>
                   <button
                     onClick={() => setMainTab('monitoring')}
-                    className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'monitoring' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
+                    className={`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'monitoring' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                   >
                     Inbound Schedule
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!canQuality) return;
+                      setMainTab('quality');
+                    }}
+                    disabled={!canQuality}
+                    title={canQuality ? 'Buka Quality Control' : getMainNavAccessMessage('quality')}
+                    className={getMainNavButtonClassName(`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'quality' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canQuality)}
+                  >
+                    Quality Control
                   </button>
                   <button
                     type="button"
@@ -12629,19 +14073,19 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                     }}
                     disabled={!canEditSchedules}
                     title={canEditSchedules ? 'Buka Kanban Board' : getMainNavAccessMessage('kanban')}
-                    className={getMainNavButtonClassName(`px-4 py-2 rounded-full text-sm transition ${mainTab === 'kanban' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canEditSchedules)}
+                    className={getMainNavButtonClassName(`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'kanban' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canEditSchedules)}
                   >
                     Kanban Board
                   </button>
                   <button
                     onClick={() => setMainTab('fifo')}
-                    className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'fifo' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
+                    className={`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'fifo' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                   >
                     Management FIFO
                   </button>
                   <button
                     onClick={() => setMainTab('inventory')}
-                    className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'inventory' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
+                    className={`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'inventory' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                   >
                     Inventory
                   </button>
@@ -12653,7 +14097,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                     }}
                     disabled={!canSubcon}
                     title={canSubcon ? 'Buka Subcon' : getMainNavAccessMessage('subcon')}
-                    className={getMainNavButtonClassName(`px-4 py-2 rounded-full text-sm transition ${mainTab === 'subcon' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canSubcon)}
+                    className={getMainNavButtonClassName(`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'subcon' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canSubcon)}
                   >
                     Subcon
                   </button>
@@ -12665,7 +14109,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                     }}
                     disabled={!canViewPrl}
                     title={canViewPrl ? 'Buka PRL' : getMainNavAccessMessage('prl')}
-                    className={getMainNavButtonClassName(`px-4 py-2 rounded-full text-sm transition ${mainTab === 'prl' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canViewPrl)}
+                    className={getMainNavButtonClassName(`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'prl' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canViewPrl)}
                   >
                     PRL
                   </button>
@@ -12677,25 +14121,25 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                     }}
                     disabled={!canViewMaster}
                     title={canViewMaster ? 'Buka Master Referensi' : getMainNavAccessMessage('masterref')}
-                    className={getMainNavButtonClassName(`px-4 py-2 rounded-full text-sm transition ${mainTab === 'masterref' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canViewMaster)}
+                    className={getMainNavButtonClassName(`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'masterref' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canViewMaster)}
                   >
                     Master Referensi
                   </button>
                   {isAdmin ? (
-                    <div className={`relative ${settingsMenuOpen ? 'z-[120]' : 'z-10'}`}>
+                    <div className={`relative ${settingsMenuOpen ? 'z-[100]' : 'z-10'}`}>
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
                           setReportMenuOpen(false);
                           setSettingsMenuOpen((prev) => !prev);
                         }}
-                        className={`px-4 py-2 rounded-full text-sm border transition flex items-center gap-2 ${(mainTab === 'settings' || mainTab === 'audit') ? 'bg-slate-900 text-white border-slate-900 shadow' : 'bg-white/80 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
+                        className={`shrink-0 px-3.5 py-2 rounded-full text-sm border transition flex items-center gap-2 ${(mainTab === 'settings' || mainTab === 'audit') ? 'bg-slate-900 text-white border-slate-900 shadow' : 'bg-white/80 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
                       >
                         Pengaturan
                         <ChevronDown size={14} />
                       </button>
                       {settingsMenuOpen && (
-                        <div className="absolute left-0 top-full mt-2 w-48 overflow-hidden rounded-lg border border-gray-100 bg-white shadow-xl z-[130]">
+                        <div className="absolute left-0 top-full z-[110] mt-2 w-48 overflow-hidden rounded-lg border border-gray-100 bg-white shadow-xl">
                           <button
                             onClick={() => {
                               setMainTab('settings');
@@ -12720,132 +14164,70 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                   ) : (
                     <button
                       onClick={() => setMainTab('settings')}
-                      className={`px-4 py-2 rounded-full text-sm border transition ${(mainTab === 'settings') ? 'bg-slate-900 text-white border-slate-900 shadow' : 'bg-white/80 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
+                      className={`shrink-0 px-3.5 py-2 rounded-full text-sm border transition ${(mainTab === 'settings') ? 'bg-slate-900 text-white border-slate-900 shadow' : 'bg-white/80 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
                     >
                       Pengaturan
                     </button>
                   )}
-                </div>
 
                 {canOpenReportMenu ? (
-                  <div className={`relative ${reportMenuOpen ? 'z-[120]' : 'z-10'}`}>
+                  <div className={`relative shrink-0 ${reportMenuOpen ? 'z-[100]' : 'z-10'}`}>
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
                         setSettingsMenuOpen(false);
                         setReportMenuOpen((prev) => !prev);
                       }}
-                      className={`px-4 py-2 rounded-full text-sm border transition flex items-center gap-2 ${mainTab === 'reports' ? 'bg-slate-900 text-white border-slate-900 shadow' : 'bg-white/80 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
+                      className={`px-3.5 py-2 rounded-full text-sm border transition flex items-center gap-2 ${mainTab === 'reports' ? 'bg-slate-900 text-white border-slate-900 shadow' : 'bg-white/80 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
                     >
                       Laporan
                       <ChevronDown size={14} />
                     </button>
                     {reportMenuOpen && (
-                      <div className="absolute left-0 top-full mt-2 w-56 overflow-hidden rounded-lg border border-gray-100 bg-white shadow-xl z-[130]">
-                        {canViewReport && (
-                          <button
-                            onClick={() => { setMainTab('reports'); setReportTab('rekap'); setReportMenuOpen(false); }}
-                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
-                          >
-                            <FileText size={14} /> Report Rekap Supplier/PO
-                          </button>
-                        )}
-                        {canViewScorecard && (
-                          <button
-                            onClick={() => { setMainTab('reports'); setReportTab('scorecard'); setReportMenuOpen(false); }}
-                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
-                          >
-                            <Trophy size={14} /> Rapor Kinerja Supplier
-                          </button>
-                        )}
-                        {canViewReport && (
-                          <button
-                            onClick={() => { setMainTab('reports'); setReportTab('stock-coverage'); setReportMenuOpen(false); }}
-                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
-                          >
-                            <BarChart3 size={14} /> Stock Coverage
-                          </button>
-                        )}
-                        {canViewReport && (
-                          <button
-                            onClick={() => { setMainTab('reports'); setReportTab('slow-moving'); setReportMenuOpen(false); }}
-                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
-                          >
-                            <TrendingDown size={14} /> Slow &amp; Dead Stock
-                          </button>
-                        )}
-                        {canViewReport && (
-                          <button
-                            onClick={() => { setMainTab('reports'); setReportTab('inbound-performance'); setReportMenuOpen(false); }}
-                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
-                          >
-                            <ArrowDownUp size={14} /> Inbound Performance
-                          </button>
-                        )}
-                        {canViewReport && (
-                          <button
-                            onClick={() => { setMainTab('reports'); setReportTab('inbound-matrix'); setReportMenuOpen(false); }}
-                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
-                          >
-                            <FileSpreadsheet size={14} /> Delivery Matrix Inbound
-                          </button>
-                        )}
-                        {canViewReport && (
-                          <button
-                            onClick={() => { setMainTab('reports'); setReportTab('fifo-violations'); setReportMenuOpen(false); }}
-                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
-                          >
-                            <AlertTriangle size={14} /> FIFO Violation Log
-                          </button>
-                        )}
-                        {canViewReport && (
-                          <button
-                            onClick={() => { setMainTab('reports'); setReportTab('inventory-value'); setReportMenuOpen(false); }}
-                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
-                          >
-                            <Coins size={14} /> Inventory Value
-                          </button>
-                        )}
-                        {canViewReport && (
-                          <button
-                            onClick={() => { setMainTab('reports'); setReportTab('supplier-shortage'); setReportMenuOpen(false); }}
-                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
-                          >
-                            <AlertTriangle size={14} /> Report Shortage Supplier
-                          </button>
-                        )}
-                        {canViewReport && (
-                          <button
-                            onClick={() => { setMainTab('reports'); setReportTab('all-mutations'); setReportMenuOpen(false); }}
-                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
-                          >
-                            <FileText size={14} /> All Laporan Mutasi
-                          </button>
-                        )}
-                        {canViewReport && (
-                          <button
-                            onClick={() => { setMainTab('reports'); setReportTab('sasaran-mutu'); setReportMenuOpen(false); }}
-                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
-                          >
-                            <CheckCircle size={14} /> Sasaran Mutu
-                          </button>
-                        )}
-                        {canViewReport && (
-                          <button
-                            onClick={() => { setMainTab('reports'); setReportTab('outstanding-prl'); setReportMenuOpen(false); }}
-                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
-                          >
-                            <ListChecks size={14} /> Outstanding PRL
-                          </button>
-                        )}
-                        {canViewReport && (
-                          <button
-                            onClick={() => { setMainTab('reports'); setReportTab('capacity-planning'); setReportMenuOpen(false); }}
-                            className="w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2"
-                          >
-                            <BarChart3 size={14} /> Capacity Planning
-                          </button>
-                        )}
+                      <div className="absolute right-0 top-full z-[110] mt-2 w-[520px] overflow-hidden rounded-xl border border-gray-100 bg-white shadow-2xl">
+                        <div className="grid grid-cols-[190px_1fr]">
+                          <div className="border-r border-slate-100 bg-slate-50 p-2">
+                            {reportMenuGroups.map((group) => {
+                              const GroupIcon = group.icon;
+                              const active = activeReportMenuGroup?.key === group.key;
+                              return (
+                                <button
+                                  key={group.key}
+                                  type="button"
+                                  onMouseEnter={() => setReportMenuCategory(group.key)}
+                                  onClick={() => {
+                                    setReportMenuCategory(group.key);
+                                    openReportFromTree(group.key, group.reports[0]?.key);
+                                  }}
+                                  className={`flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2 text-left text-sm ${active ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:bg-white/70'}`}
+                                >
+                                  <span className="flex items-center gap-2">
+                                    <GroupIcon size={15} /> {group.label}
+                                  </span>
+                                  <ChevronDown size={13} className="-rotate-90 text-slate-400" />
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <div className="p-2">
+                            <div className="px-3 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                              {activeReportMenuGroup?.label || 'Laporan'}
+                            </div>
+                            {(activeReportMenuGroup?.reports || []).map((report) => {
+                              const ReportIcon = report.icon;
+                              return (
+                                <button
+                                  key={report.key}
+                                  type="button"
+                                  onClick={() => openReportFromTree(activeReportMenuGroup.key, report.key)}
+                                  className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-left text-sm text-slate-700 hover:bg-slate-50"
+                                >
+                                  <ReportIcon size={15} /> {report.label}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -12854,12 +14236,13 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                     type="button"
                     disabled
                     title={getMainNavAccessMessage('reports')}
-                    className={getMainNavButtonClassName('px-4 py-2 rounded-full text-sm border transition flex items-center gap-2 bg-white/80 text-slate-400 border-slate-200', true)}
+                    className={getMainNavButtonClassName('shrink-0 px-3.5 py-2 rounded-full text-sm border transition flex items-center gap-2 bg-white/80 text-slate-400 border-slate-200', true)}
                   >
                     Laporan
                     <ChevronDown size={14} />
                   </button>
                 )}
+                </div>
               </div>
             )}
         </div>
@@ -12880,6 +14263,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                 {mainTab === 'prl' && <TabPrl {...tabProps} />}
                 {mainTab === 'masterref' && <TabMasterRef {...tabProps} />}
                 {mainTab === 'kanban' && <TabKanban {...tabProps} />}
+                {mainTab === 'quality' && <TabQuality {...tabProps} />}
                 {mainTab === 'reports' && <TabReports {...tabProps} />}
                 {mainTab === 'subcon' && <TabSubcon {...tabProps} />}
                 {mainTab === 'audit' && <TabAuditLogs {...tabProps} />}
@@ -12943,7 +14327,15 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                           </div>
                           <div className="flex items-center justify-between border-b bg-slate-50 px-4 py-2 text-xs text-slate-500 print:hidden">
                             <div>
-                              Preview halaman {Math.min(kanbanCardPreviewPageIndex + 1, kanbanCardPageCount)} / {kanbanCardPageCount}
+                              <div>
+                                Preview halaman {Math.min(kanbanCardPreviewPageIndex + 1, kanbanCardPageCount)} / {kanbanCardPageCount}
+                                {' '}-- {kanbanCardPayloads.length} kartu dari {kanbanCardPreviewSummary.itemCount} item
+                              </div>
+                              {kanbanCardPreviewSummary.itemLabel && (
+                                <div className="mt-0.5 text-[11px] text-slate-600">
+                                  {kanbanCardPreviewSummary.itemLabel}: {kanbanCardPayloads.length} kartu x {kanbanCardPreviewSummary.qtyLabel} = {kanbanCardPreviewSummary.totalQtyLabel}
+                                </div>
+                              )}
                             </div>
                             <div className="flex items-center gap-2">
                               <button
@@ -13372,7 +14764,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
               </div>
             )}
         {helpOpen && (
-          <div className="fixed inset-0 z-[60] print:hidden">
+          <div className="fixed inset-0 z-[1200] print:hidden">
             <div className="absolute inset-0 bg-slate-900/30" onClick={() => setHelpOpen(false)} />
             <div className="absolute right-0 top-0 h-full w-full max-w-md overflow-hidden border-l border-slate-200 bg-white shadow-2xl">
               <div className="flex items-start justify-between gap-3 border-b border-slate-100 px-5 py-4">
@@ -13433,12 +14825,12 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
         )}
 
         {globalSearchOpen && (
-          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/40 backdrop-blur-sm print:hidden">
+          <div className="fixed inset-0 z-[1200] flex items-center justify-center bg-slate-900/40 backdrop-blur-sm print:hidden">
             <div className="w-full max-w-3xl rounded-2xl border border-slate-200 bg-white shadow-2xl">
               <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3">
                 <div>
                   <div className="text-sm font-semibold text-slate-900">Pencarian Global</div>
-                  <div className="text-xs text-slate-500">Cari PO, vendor, item, dan jadwal inbound dalam satu tempat.</div>
+                  <div className="text-xs text-slate-500">Cari nomor dokumen, PO, vendor, item, dan jadwal inbound dalam satu tempat.</div>
                 </div>
                 <button
                   type="button"
@@ -13455,7 +14847,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                     ref={globalSearchInputRef}
                     value={globalSearchQuery}
                     onChange={(e) => setGlobalSearchQuery(e.target.value)}
-                    placeholder="Ketik No. PO / Item / Supplier / Vendor..."
+                    placeholder="Ketik No. RN / DN / PO / Item / Supplier..."
                     className="h-11 w-full rounded-xl border border-slate-200 bg-white pl-10 pr-3 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
                   />
                 </div>
@@ -13479,6 +14871,36 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                           </div>
                           <div className="divide-y divide-slate-100">
                             {group.items.map((item) => {
+                              if (group.key === 'rn') {
+                                return (
+                                  <button
+                                    key={`rn-${item.rn_number || item.id}`}
+                                    type="button"
+                                    onClick={() => handleGlobalSearchResultClick(group.key, item)}
+                                    className="w-full px-4 py-3 text-left text-sm text-slate-700 hover:bg-slate-50"
+                                  >
+                                    <div className="font-semibold text-slate-900">{item.rn_number}</div>
+                                    <div className="text-xs text-slate-500">
+                                      DN {item.dn_number || '-'} - SJ/DO {item.do_number || '-'} - {item.supplier || '-'}
+                                    </div>
+                                  </button>
+                                );
+                              }
+                              if (group.key === 'dn') {
+                                return (
+                                  <button
+                                    key={`dn-${item.dn_number || item.id}`}
+                                    type="button"
+                                    onClick={() => handleGlobalSearchResultClick(group.key, item)}
+                                    className="w-full px-4 py-3 text-left text-sm text-slate-700 hover:bg-slate-50"
+                                  >
+                                    <div className="font-semibold text-slate-900">{item.dn_number}</div>
+                                    <div className="text-xs text-slate-500">
+                                      {item.supplier_name || item.supplier || '-'} - {String(item.status || '-').toUpperCase()} - {item.planned_date || item.created_date || '-'}
+                                    </div>
+                                  </button>
+                                );
+                              }
                               if (group.key === 'po') {
                                 const supplierLabel = item.supplier_name || item.supplier_code || '-';
                                 return (
@@ -13543,7 +14965,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
         )}
 
         {notificationsOpen && (
-          <div className="fixed inset-0 z-[60] print:hidden">
+          <div className="fixed inset-0 z-[1200] print:hidden">
             <div className="absolute inset-0 bg-slate-900/30" onClick={() => setNotificationsOpen(false)} />
             <div className="absolute right-0 top-0 h-full w-full max-w-sm bg-white shadow-2xl border-l border-slate-200">
               <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
@@ -13659,7 +15081,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                         )}
                         <div className="mt-2 text-[10px] text-slate-400">
                           {item.created_at ? new Date(item.created_at).toLocaleString('id-ID') : '-'}
-                          {item.status ? ` â€¢ ${String(item.status).toUpperCase()}` : ''}
+                          {item.status ? ` - ${String(item.status).toUpperCase()}` : ''}
                           <span className="ml-2 inline-flex items-center gap-1 rounded-full bg-white/70 px-2 py-0.5 font-semibold text-amber-700">
                             <MapPin size={10} /> Buka
                           </span>
@@ -13706,7 +15128,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                         )}
                         <div className="mt-2 text-[10px] text-slate-400">
                           {item.read_at ? `Dibaca: ${new Date(item.read_at).toLocaleString('id-ID')}` : ''}
-                          {item.created_at ? ` â€¢ Dibuat: ${new Date(item.created_at).toLocaleString('id-ID')}` : ''}
+                          {item.created_at ? ` - Dibuat: ${new Date(item.created_at).toLocaleString('id-ID')}` : ''}
                           <span className="ml-2 inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 font-semibold text-slate-600">
                             <MapPin size={10} /> Buka
                           </span>
@@ -13721,7 +15143,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
         )}
 
         {toast.open && (
-            <div className="fixed top-6 right-6 z-50 print:hidden">
+            <div className="fixed top-6 right-6 z-[1210] print:hidden">
               <div
                 role={toast.onAction ? 'button' : undefined}
                 tabIndex={toast.onAction ? 0 : undefined}
@@ -13741,7 +15163,9 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                     ? 'bg-rose-50 border-rose-200 text-rose-700'
                     : toast.tone === 'success'
                       ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
-                    : 'bg-white border-slate-200 text-slate-700'
+                      : toast.tone === 'warning'
+                        ? 'bg-amber-50 border-amber-200 text-amber-800'
+                        : 'bg-white border-slate-200 text-slate-700'
                 } ${toast.onAction ? 'cursor-pointer hover:shadow-xl focus:outline-none focus:ring-2 focus:ring-indigo-200' : ''}`}
               >
                 <div className="text-sm">{toast.message}</div>
@@ -13776,13 +15200,16 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
           {isChatOpen && (
             <div className="bg-white rounded-xl shadow-2xl w-80 h-96 flex flex-col border border-gray-200 mb-2 overflow-hidden animate-fade-in-up">
               <div className="bg-indigo-600 p-3 flex justify-between items-center text-white">
-                <div className="flex items-center gap-2"><Bot size={18} /><span className="font-bold text-sm">Asisten Logistik</span></div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2"><Bot size={18} /><span className="font-bold text-sm">Asisten Logistik</span></div>
+                  <div className="truncate text-[10px] text-indigo-100">Konteks: {activeHelpContent?.title || 'Dashboard'}</div>
+                </div>
                 <button onClick={() => setIsChatOpen(false)} className="hover:bg-indigo-700 p-1 rounded"><Minimize2 size={16} /></button>
               </div>
               <div className="flex-1 p-3 overflow-y-auto bg-gray-50 space-y-3">
                 {chatMessages.map((msg, i) => (
                   <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <div className={`max-w-[85%] p-3 rounded-lg text-xs leading-relaxed ${msg.role === 'user' ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-white border border-gray-200 text-gray-700 rounded-bl-none shadow-sm'}`}>{msg.text}</div>
+                    <div className={`max-w-[88%] whitespace-pre-line break-words p-3 rounded-lg text-xs leading-relaxed ${msg.role === 'user' ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-white border border-gray-200 text-gray-700 rounded-bl-none shadow-sm'}`}>{formatChatMessageText(msg.text)}</div>
                   </div>
                 ))}
                 <div ref={chatEndRef} />
@@ -13790,7 +15217,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
               <form onSubmit={handleChatSubmit} className="p-2 bg-white border-t flex gap-2">
                 <input 
                   className="flex-1 border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                  placeholder="Tanya jadwal, status, dll..."
+                  placeholder={`Tanya menu ${activeHelpContent?.title || 'aktif'}...`}
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
                   disabled={isChatLoading}
@@ -13884,6 +15311,14 @@ const MainApp = () => {
       idleLogoutPendingRef.current = false;
       return undefined;
     }
+    if (String(auth.user?.role || '').toLowerCase() === 'production') {
+      if (idleLogoutTimerRef.current) {
+        clearTimeout(idleLogoutTimerRef.current);
+        idleLogoutTimerRef.current = null;
+      }
+      idleLogoutPendingRef.current = false;
+      return undefined;
+    }
 
     const triggerIdleLogout = () => {
       if (idleLogoutPendingRef.current) return;
@@ -13914,7 +15349,7 @@ const MainApp = () => {
         idleLogoutTimerRef.current = null;
       }
     };
-  }, [auth.token, handleLogout]);
+  }, [auth.token, auth.user?.role, handleLogout]);
 
   if (auth.loading) {
     return <div className="min-h-screen bg-slate-100 flex items-center justify-center text-slate-600">Loading...</div>;

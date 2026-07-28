@@ -14,3 +14,4 @@ if %errorlevel% neq 0 (
 
 timeout /t 6 /nobreak >nul
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT_DIR%\scripts\open-dev-browser.ps1"
+exit /b %errorlevel%

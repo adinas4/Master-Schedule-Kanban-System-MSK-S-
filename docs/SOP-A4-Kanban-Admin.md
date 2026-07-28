@@ -75,6 +75,15 @@ Login -> cek role/permission -> master data -> kanban setting -> auto/manual/sca
 
 `triggered` -> `requested` -> `approved` -> `dn_created` -> `scheduled` -> `in_transit` -> `receiving` -> `fifo` -> `closed`
 
+## Koreksi Receiving / Inbound
+
+- RN `posted` tidak diedit langsung.
+- Salah input item/qty/SJ/tanggal harus lewat **Batalkan/Reversal RN** di `Kanban Board > Receiving Notes`.
+- Reversal membalik stok, ledger, sisa PO, dan actual Inbound Schedule.
+- Jika schedule kembali qty `0`, sistem mengosongkan tanggal datang dan nomor SJ/DO agar bisa input ulang.
+- RN asli tetap menjadi audit dengan status `reversed`; nomor SJ/DO bisa dipakai lagi setelah reversal.
+- Jika stok dari RN sudah terpakai keluar, reversal otomatis ditolak.
+
 ## Tanda Masalah
 
 - request tidak muncul: cek `active`, `minQty`, stok, `lotQty`, supplier, role vendor

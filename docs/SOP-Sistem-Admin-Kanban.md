@@ -70,7 +70,33 @@ Referensi implementasi role dan permission ada di `src/App.jsx` dan `server/inde
 ### 7) Receiving dan Close
 - Warehouse menerima barang berdasarkan DN.
 - Status lanjut ke `scheduled`, `in_transit`, `receiving`, `fifo`, lalu `closed`.
+- Sebelum stok benar-benar dipakai produksi, incoming dari RN atau Inbound wajib masuk proses `Quality Control > Incoming RN` untuk sampling QC.
+- Jika sampling incoming OK, QC release barang sehingga stok batch dapat digunakan.
+- Jika raw material NG ditemukan setelah release saat proses line produksi, jangan batalkan RN dan jangan kembalikan ke Incoming QC. Buat kasus baru di `Quality Control > Material NG Line`.
+- Pada Material NG Line, pilih item raw material, ketik/cari batch FIFO/RN, isi qty NG, line/proses/operator/shift, kategori defect, dan detail defect.
+- Saat kasus Material NG Line disimpan, sistem menahan stok batch terkait. Disposition yang dipakai: `Sortir`, `Return`, `Scrap`, `Rework`, atau `Use As Is`.
+- Performance supplier menghitung dua sumber kualitas: QC incoming sampling dan line claim material yang lolos sampling tetapi NG di proses.
 - Jika ada masalah, request bisa `rejected` atau dihapus sesuai izin.
+- RN yang sudah `posted` tidak boleh diedit langsung dan tidak menjadi data mentah.
+- Jika salah input item, qty, nomor SJ/DO, atau tanggal aktual, lakukan **Batalkan/Reversal RN** dari menu `Kanban Board > Receiving Notes`.
+- Reversal wajib memakai alasan koreksi, misalnya `Salah input BR45, seharusnya BR50`.
+- Setelah reversal berhasil:
+  - RN asli berubah status menjadi `reversed` sebagai audit/history.
+  - Sistem membuat dokumen reversal resmi.
+  - Stok batch dan ledger dibalik.
+  - Data actual di Inbound Schedule ikut dibatalkan: `received_qty` kembali sesuai sisa, dan jika qty menjadi 0 maka `arrival_date` serta `do_number` dikosongkan.
+  - Nomor SJ/DO yang sama boleh dipakai lagi untuk input ulang penerimaan yang benar.
+- Di `Quality Control > Incoming RN`, RN reversal atau RN yang sudah dibatalkan hanya boleh diproses sebagai `Close Review`.
+- QC tidak boleh klik `Release`, `Hold`, `Reject`, atau `Return` untuk RN batal/reversal karena dokumen tersebut adalah bukti koreksi, bukan penerimaan barang baru.
+- Checklist `Close Review` RN batal:
+  - alasan reversal jelas;
+  - stok batch dan ledger sudah dibalik;
+  - sisa PO/schedule sudah kembali benar;
+  - jika barang fisik tetap diterima, penerimaan dibuat ulang dengan RN baru yang benar.
+- Jika masalahnya defect/NG material, jangan batalkan RN. Pakai proses QC `Hold`, `Reject`, atau `Return Supplier` supaya histori kualitas supplier tetap tercatat.
+- Jika masalahnya duplicate RN, batalkan RN duplicate, link/rujuk ke RN valid pada catatan, lalu tutup review QC sebagai koreksi duplicate.
+- Jika stok batch dari RN tersebut sudah dipakai keluar (`qty_out > 0`), reversal otomatis ditolak. Lakukan pengecekan mutasi stok dulu sebelum koreksi.
+- Untuk SOP harian, gunakan reversal, bukan hapus fisik. Hapus fisik hanya untuk admin pada data yang memang belum perlu audit dan belum berdampak transaksi.
 
 ### 8) Reporting
 - Management dan role yang diberi akses melihat dashboard dan report.

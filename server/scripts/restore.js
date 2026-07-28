@@ -1,8 +1,17 @@
 import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
+import { fileURLToPath } from "url";
+import dotenv from "dotenv";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+dotenv.config({ path: path.resolve(__dirname, "..", ".env"), override: false });
+dotenv.config({ path: path.resolve(__dirname, "..", "..", ".env"), override: false });
 
 const dbName = process.env.PGDATABASE || "monitoring_supplier";
+const databaseUrl = String(process.env.DATABASE_URL || "").trim();
 const restoreFile = process.argv[2] || process.env.RESTORE_FILE;
 
 if (!restoreFile) {
@@ -21,7 +30,21 @@ const env = {
   PGPASSWORD: process.env.PGPASSWORD || "",
 };
 
-const args = ["--clean", "--if-exists", "-d", dbName, fullPath];
+const args = databaseUrl
+  ? ["--clean", "--if-exists", "-d", databaseUrl, fullPath]
+  : [
+    "--clean",
+    "--if-exists",
+    "-h",
+    process.env.PGHOST || "localhost",
+    "-p",
+    String(process.env.PGPORT || 5432),
+    "-U",
+    process.env.PGUSER || "postgres",
+    "-d",
+    dbName,
+    fullPath,
+  ];
 const child = spawn("pg_restore", args, { env, stdio: "inherit" });
 
 child.on("exit", (code) => {

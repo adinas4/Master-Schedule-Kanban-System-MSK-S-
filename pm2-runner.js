@@ -7,6 +7,7 @@ const child = spawn('C:\\\\Windows\\\\System32\\\\cmd.exe', ['/c', 'npm run host
   cwd: root,
   stdio: 'inherit',
   shell: false,
+  windowsHide: true,
 });
 
 child.on('close', (code) => {

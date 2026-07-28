@@ -1734,6 +1734,60 @@ export default function BOMManager({
     return consumables.length ? consumables : [createBulkProcessConsumable()];
   };
 
+  const deriveBulkChildrenFromRelations = (parentCode) => {
+    const normalizedCode = String(parentCode || '').trim();
+    if (!normalizedCode) return [createBulkChild()];
+    const childRows = (activeBomRelations || [])
+      .filter((rel) => String(rel.parent_code || rel.parentCode || '').trim() === normalizedCode)
+      .filter((rel) => {
+        if (isRawMaterialRelation(rel)) return false;
+        if (String(rel.component_type || '').toUpperCase() === 'PROCESS CONSUMABLE') return false;
+        const childCode = String(rel.child_code || rel.childCode || '').trim();
+        const childItem = itemsByCode.get(childCode) || masterItemsByCode.get(childCode);
+        return getBomItemBucket(childItem) === 'CP'
+          || String(rel.component_type || rel.child_type || '').trim().toUpperCase() === 'CP';
+      })
+      .map((rel) => {
+        const childCode = String(rel.child_code || rel.childCode || '').trim();
+        const childItem = itemsByCode.get(childCode) || masterItemsByCode.get(childCode) || {};
+        const childProcessFlow = Array.isArray(rel.process_flow) && rel.process_flow.length
+          ? rel.process_flow
+          : Array.isArray(childItem.process_flow) && childItem.process_flow.length
+            ? childItem.process_flow
+            : Array.isArray(childItem.processes) && childItem.processes.length
+              ? childItem.processes
+              : [];
+        const modelCodes = parseModelCodes(childItem.model || rel.child_model || '');
+        return {
+          ...createBulkChild(),
+          id: rel.id ? `rel-child-${rel.id}` : `${Date.now()}-${Math.random()}`,
+          code: childCode,
+          name: rel.child_name || rel.component_description || childItem.name || '',
+          type: 'CP',
+          uom: rel.child_unit || childItem.unit || childItem.uom || 'PCS',
+          qty: Number(rel.quantity) || 1,
+          scrap: Number(rel.scrap_factor) || 0,
+          weight: Number(childItem.weight || 0),
+          leadTime: Number(childItem.lead_time_days || rel.lead_time_days || 0),
+          line: rel.line_production || childItem.line_production || childItem.line || '',
+          supplier: childItem.supplier_name || childItem.supplier || '',
+          customer: getItemCustomerLabel(childCode),
+          location: rel.location_name || childItem.location_name || childItem.location || '',
+          packing: rel.packing || childItem.packing_name || childItem.packing || '',
+          cycleTime: Number(rel.cycle_time_seconds || childItem.cycle_time_seconds || 0),
+          modelCodes: modelCodes.length ? modelCodes : [''],
+          processCodes: mapProcessFlowToCodes(childProcessFlow).length ? mapProcessFlowToCodes(childProcessFlow) : [''],
+          note: rel.assembly_note || '',
+          yieldFactor: Number(rel.yield_factor || 1) || 1,
+          positionCode: rel.position_code || '',
+          substituteCodesText: formatSubstituteCodes(rel.substitute_material_codes || []),
+          materials: deriveParentMaterialsFromRelations(childCode),
+          processConsumables: deriveParentProcessConsumablesFromRelations(childCode),
+        };
+      });
+    return childRows.length ? childRows : [createBulkChild()];
+  };
+
   const addBulkParentMaterial = () => {
     setBulkParentMaterials((prev) => [...prev, createBulkMaterial()]);
   };
@@ -2275,6 +2329,25 @@ export default function BOMManager({
     hydrateBulkParentDetails(parentCode);
     setBulkParentMaterials(deriveParentMaterialsFromRelations(parentCode));
     setBulkParentProcessConsumables(deriveParentProcessConsumablesFromRelations(parentCode));
+    setIsFormOpen(true);
+    requestAnimationFrame(() => {
+      formTopRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  };
+
+  const openBomEditorForParent = (parent) => {
+    const parentCode = String(parent?.code || '').trim();
+    if (!parentCode) return;
+    const parentItem = masterItemsByCode.get(parentCode) || itemsByCode.get(parentCode) || parent;
+    if (getBomItemBucket(parentItem) !== 'SUB_ASSY') {
+      openSingleLevelBomEditor(parentItem);
+      return;
+    }
+    setBulkMode('multi');
+    setBulkParentCode(parentCode);
+    syncBomHeaderForParent(parentCode, { parentCode });
+    hydrateBulkParentDetails(parentCode);
+    setBulkChildren(deriveBulkChildrenFromRelations(parentCode));
     setIsFormOpen(true);
     requestAnimationFrame(() => {
       formTopRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -6384,7 +6457,7 @@ export default function BOMManager({
                         {allowEdit && (
                           <button
                             type="button"
-                            onClick={() => handleSelectParent(i)}
+                            onClick={() => openBomEditorForParent(i)}
                             className="text-slate-500 hover:text-slate-700"
                             title="Edit / Kelola BOM"
                           >

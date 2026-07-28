@@ -55,7 +55,8 @@ const getScheduleStatusFromActual = ({ requestDate, arrivalDate }) => {
   const reqKey = formatDateOnly(requestDate);
   const arrKey = formatDateOnly(arrivalDate);
   if (!reqKey || !arrKey) return "Pending";
-  if (arrKey === reqKey) return "On Time";
+  const diffDays = Math.round((new Date(`${arrKey}T00:00:00`) - new Date(`${reqKey}T00:00:00`)) / 86400000);
+  if (diffDays >= -1 && diffDays <= 0) return "On Time";
   return arrKey > reqKey ? "Late" : "Too Early";
 };
 

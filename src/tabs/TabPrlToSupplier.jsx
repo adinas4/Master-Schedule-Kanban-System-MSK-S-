@@ -247,7 +247,7 @@ const TabPrlToSupplier = ({
           note: row?.parentPlanNote || '',
           parentTooltip: Array.isArray(row?.parentPlanParents) && row.parentPlanParents.length > 0
             ? row.parentPlanParents
-              .map((parent) => `${parent.parentCode || '-'}${parent.parentName ? ` - ${parent.parentName}` : ''}: ${formatNumber(parent.parentPlanQty || 0, 2)}`)
+              .map((parent) => `${parent.parentCode || '-'}${parent.parentName ? ` - ${parent.parentName}` : ''}: ${formatNumber(parent.parentPlanQty || 0, 0)}`)
               .join('\n')
             : '',
         })),
@@ -305,19 +305,19 @@ const TabPrlToSupplier = ({
         </td>
         <td class="center">${escapeHtml(resolveModelLabel(row.model))}</td>
         <td class="center">${formatNumber(row.snp, 0)}</td>
-        <td class="center">${formatNumber(row.qtyDayMinusOne, 2)}</td>
-        <td class="center">${formatNumber(row.qtyDayCurrent, 2)}</td>
+        <td class="center">${formatNumber(row.qtyDayMinusOne, 0)}</td>
+        <td class="center">${formatNumber(row.qtyDayCurrent, 0)}</td>
         <td class="center">${escapeHtml(row.uom || '-')}</td>
         <td class="center">${escapeHtml(row.typePack || '-')}</td>
-        <td class="center">${formatNumber(row.weekI, 2)}</td>
-        <td class="center">${formatNumber(row.weekII, 2)}</td>
-        <td class="center">${formatNumber(row.weekIII, 2)}</td>
-        <td class="center">${formatNumber(row.weekIV, 2)}</td>
-        <td class="center">${formatNumber(row.months?.nMinus1, 2)}</td>
-        <td class="center">${formatNumber(row.months?.n, 2)}</td>
-        <td class="center">${formatNumber(row.months?.nPlus1, 2)}</td>
-        <td class="center">${formatNumber(row.months?.nPlus2, 2)}</td>
-        <td class="center">${formatNumber(row.months?.nPlus3, 2)}</td>
+        <td class="center">${formatNumber(row.weekI, 0)}</td>
+        <td class="center">${formatNumber(row.weekII, 0)}</td>
+        <td class="center">${formatNumber(row.weekIII, 0)}</td>
+        <td class="center">${formatNumber(row.weekIV, 0)}</td>
+        <td class="center">${formatNumber(row.months?.nMinus1, 0)}</td>
+        <td class="center">${formatNumber(row.months?.n, 0)}</td>
+        <td class="center">${formatNumber(row.months?.nPlus1, 0)}</td>
+        <td class="center">${formatNumber(row.months?.nPlus2, 0)}</td>
+        <td class="center">${formatNumber(row.months?.nPlus3, 0)}</td>
         <td class="center">${row.fluctuation === null || row.fluctuation === undefined ? '-' : `${formatNumber(row.fluctuation, 0)}%`}</td>
       </tr>
     `).join('');
@@ -598,7 +598,7 @@ const TabPrlToSupplier = ({
                           <td className="p-2">{row.rowNumber || index + 1}</td>
                           <td className="p-2">{row.partNo || '-'}</td>
                           <td className="p-2">{row.description || '-'}</td>
-                          <td className="p-2 text-right">{formatNumber(row.calculatedQty || 0, 2)}</td>
+                          <td className="p-2 text-right">{formatNumber(row.calculatedQty || 0, 0)}</td>
                           <td className="p-2">
                             <div>{row.reason || '-'}</div>
                             {row.note && (
@@ -827,19 +827,19 @@ const TabPrlToSupplier = ({
                         </td>
                         <td className="border border-slate-200 px-1 py-1 text-center whitespace-nowrap">{resolveModelLabel(row.model)}</td>
                         <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.snp, 0)}</td>
-                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.qtyDayMinusOne, 2)}</td>
-                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.qtyDayCurrent, 2)}</td>
+                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.qtyDayMinusOne, 0)}</td>
+                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.qtyDayCurrent, 0)}</td>
                         <td className="border border-slate-200 px-1 py-1 text-center whitespace-nowrap">{row.uom || '-'}</td>
                         <td className="border border-slate-200 px-1 py-1 text-center whitespace-nowrap">{row.typePack || '-'}</td>
-                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.weekI, 2)}</td>
-                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.weekII, 2)}</td>
-                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.weekIII, 2)}</td>
-                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.weekIV, 2)}</td>
-                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.months?.nMinus1, 2)}</td>
-                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.months?.n, 2)}</td>
-                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.months?.nPlus1, 2)}</td>
-                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.months?.nPlus2, 2)}</td>
-                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.months?.nPlus3, 2)}</td>
+                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.weekI, 0)}</td>
+                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.weekII, 0)}</td>
+                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.weekIII, 0)}</td>
+                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.weekIV, 0)}</td>
+                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.months?.nMinus1, 0)}</td>
+                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.months?.n, 0)}</td>
+                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.months?.nPlus1, 0)}</td>
+                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.months?.nPlus2, 0)}</td>
+                        <td className="border border-slate-200 px-1 py-1 text-right whitespace-nowrap">{formatNumber(row.months?.nPlus3, 0)}</td>
                         <td className="border border-slate-200 px-1 py-1 text-center whitespace-nowrap">
                           {row.fluctuation === null || row.fluctuation === undefined ? '-' : `${formatNumber(row.fluctuation, 0)}%`}
                         </td>

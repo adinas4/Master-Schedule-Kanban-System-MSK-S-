@@ -64,7 +64,6 @@ const TabPrl = (props) => {
     formatNumber0,
     packingNameByCode,
     getPrlTypePack,
-    formatNumber2,
     getPrlVolPerDay,
     renderPaginationControls,
     showToastMessage,
@@ -346,7 +345,7 @@ const TabPrl = (props) => {
                         <div className="font-semibold text-slate-700">Fase 3: Konsumsi & Sirkulasi Ulang (Pull)</div>
                         <div className="mt-1">6) Pemakaian Produksi: Bin ke line side; parts diambil untuk produksi.</div>
                         <div>7) Kanban Kosong: Bin kosong menjadi sinyal order ulang.</div>
-                        <div>8) Scan QR: Sistem validasi part & line; jika PRL masih ada â†’ auto request baru, jika PRL selesai â†’ catat konsumsi tanpa order ulang.</div>
+                        <div>8) Scan QR: Sistem validasi part & line; jika PRL masih ada maka auto request baru, jika PRL selesai maka catat konsumsi tanpa order ulang.</div>
                       </div>
                     </div>
                   )}
@@ -644,7 +643,7 @@ const TabPrl = (props) => {
                         <td className="p-2 whitespace-nowrap">{formatNumber0(row.qtyPerKanban)}</td>
                         <td className="p-2 whitespace-nowrap">{row.uom}</td>
                         <td className="p-2 whitespace-nowrap">{row.typePackName || packingNameByCode.get(getPrlTypePack(row)) || getPrlTypePack(row) || '-'}</td>
-                        <td className="p-2 whitespace-nowrap">{formatNumber2(getPrlVolPerDay(row))}</td>
+                        <td className="p-2 whitespace-nowrap">{formatNumber0(getPrlVolPerDay(row))}</td>
                         {prlMonthKeys.map((month) => (
                           <td
                             key={`${row.uniq}-${month.key}`}

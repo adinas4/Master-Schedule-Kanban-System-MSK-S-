@@ -1,16 +1,18 @@
-# 🚀 Panduan Setup Lokal (Local Development)
+# Panduan Setup Lokal
 
-Panduan ini untuk menjalankan proyek **Monitoring Supplier & Kanban MRP System** di laptop Anda sendiri.
+Panduan ini untuk menjalankan proyek Monitoring Supplier & Kanban MRP System di laptop atau server lokal.
 
 ---
 
-## 📋 Prerequisites (Yang Perlu Diinstall Dulu)
+## Prerequisites
 
-- **Node.js** v18+ ([Download](https://nodejs.org/))
-- **PostgreSQL** v12+ ([Download](https://www.postgresql.org/download/))
-- **Git** ([Download](https://git-scm.com/))
+- Node.js v18+ atau lebih baru
+- PostgreSQL v12+ atau lebih baru
+- Git
+- PowerShell untuk script otomasi Windows
 
 Cek versi:
+
 ```bash
 node --version
 npm --version
@@ -19,7 +21,7 @@ psql --version
 
 ---
 
-## 🔧 Step 1: Clone Repository
+## Step 1: Clone Repository
 
 ```bash
 git clone https://github.com/adinas4/Master-Schedule-Kanban-System-MSK-S-.git
@@ -28,14 +30,16 @@ cd Master-Schedule-Kanban-System-MSK-S-
 
 ---
 
-## 📦 Step 2: Install Dependencies
+## Step 2: Install Dependencies
 
-**Frontend:**
+Frontend:
+
 ```bash
 npm install
 ```
 
-**Backend:**
+Backend:
+
 ```bash
 cd server
 npm install
@@ -44,7 +48,7 @@ cd ..
 
 ---
 
-## ⚙️ Step 3: Setup Database PostgreSQL
+## Step 3: Setup Database PostgreSQL
 
 ### 3a. Buat Database Baru
 
@@ -61,9 +65,9 @@ CREATE DATABASE monitoring_supplier;
 
 ### 3b. Setup Environment Variables
 
-**Backend** - Buat file `server/.env`:
+Buat file `server/.env`:
 
-```
+```env
 PORT=4000
 PGHOST=localhost
 PGPORT=5432
@@ -71,26 +75,26 @@ PGUSER=postgres
 PGPASSWORD=your_password_here
 PGDATABASE=monitoring_supplier
 JWT_SECRET=your_secret_key_here
-ADMIN_USER=admin
-ADMIN_PASSWORD=admin123
 BACKUP_DIR=backups
+BACKUP_RETENTION_DAYS=30
+BACKUP_CLOUD_DIR=
 ```
 
-> ⚠️ **Ganti `your_password_here` dengan password PostgreSQL Anda**
+Ganti `your_password_here` dengan password PostgreSQL lokal.
 
-**Frontend** - Buat file `.env` di root folder:
+Buat file `.env` di root folder:
 
-```
+```env
 VITE_API_BASE=
 ```
 
-Biarkan kosong agar otomatis auto-detect backend di `localhost:4000`
+Biarkan kosong agar frontend otomatis memakai backend di `localhost:4000`.
 
 ---
 
-## ▶️ Step 4: Jalankan Aplikasi
+## Step 4: Jalankan Aplikasi
 
-### Terminal 1 - Jalankan Backend:
+Terminal 1, jalankan backend:
 
 ```bash
 cd server
@@ -98,97 +102,156 @@ npm run start
 ```
 
 Expected output:
-```
+
+```text
 Server running on http://localhost:4000
 ```
 
-### Terminal 2 - Jalankan Frontend (baru):
+Terminal 2, jalankan frontend:
 
 ```bash
 npm run host
 ```
 
 Expected output:
-```
-  VITE v7.x.x  ready in xxx ms
 
-  ➜  Local:   http://localhost:3000/
-  ➜  Network: http://192.168.x.x:3000/
+```text
+VITE v7.x.x ready in xxx ms
+Local:   http://localhost:3000/
+Network: http://192.168.x.x:3000/
 ```
 
 ---
 
-## 🌐 Akses Aplikasi
+## Akses Aplikasi
 
-- **Frontend:** http://localhost:3000
-- **Backend API:** http://localhost:4000
+- Frontend: http://localhost:3000
+- Backend API: http://localhost:4000
 
-### Login Credentials:
+Launcher tanpa terminal:
+
+```text
+start-monitoring-supplier-tray.vbs
 ```
+
+Launcher ini menampilkan icon di hidden tray Windows. Klik kanan icon `Monitoring Supplier` untuk membuka aplikasi, melihat status, atau restart service.
+
+Login awal:
+
+```text
 Username: admin
 Password: admin123
 ```
 
 ---
 
-## 🧪 Verifikasi Setup
+## Backup Otomatis
+
+Backup manual lengkap, termasuk database PostgreSQL dan folder `server/uploads`:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\auto-backup.ps1 -RetentionDays 30
+```
+
+Pasang jadwal backup otomatis harian jam 23:00:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-backup-task.ps1 -At 23:00 -RetentionDays 30
+```
+
+Jika ingin backup ikut tersalin ke cloud, isi `BACKUP_CLOUD_DIR` di `server/.env` dengan folder sinkronisasi cloud, misalnya folder OneDrive atau Google Drive Desktop.
+
+Di mesin ini konfigurasi yang disarankan:
+
+```env
+BACKUP_CLOUD_DIR=C:\Users\matra\OneDrive\Monitoring Supplier Backups
+```
+
+Jika `BACKUP_CLOUD_DIR` kosong, script akan mencoba otomatis memakai folder OneDrive atau Google Drive Desktop yang sudah login di Windows.
+
+---
+
+## Akses Online Cloudflare Tunnel
+
+Gunakan Cloudflare Tunnel agar aplikasi lokal bisa diakses online tanpa memindahkan database dan tanpa membuka port router.
+
+1. Buka `https://dash.cloudflare.com/?to=/:account/zero-trust/networks/tunnels`.
+2. Login Cloudflare.
+3. Masuk ke `Zero Trust > Networks > Tunnels`.
+4. Buat tunnel baru, misalnya `monitoring-supplier-local`.
+5. Pilih connector `Windows`.
+6. Copy token atau command install yang diberikan Cloudflare.
+7. Jalankan salah satu command berikut di folder project:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-cloudflare-tunnel.ps1 -Token "TOKEN_DARI_CLOUDFLARE"
+```
+
+atau:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-cloudflare-tunnel.ps1 -InstallCommand "COMMAND_INSTALL_DARI_CLOUDFLARE"
+```
+
+Saat menambahkan `Public hostname` di Cloudflare:
+
+```text
+Service Type: HTTP
+URL: http://localhost:3000
+```
+
+Frontend dan API akan tetap memakai service lokal. Database tetap di PostgreSQL lokal.
+
+---
+
+## Verifikasi Setup
 
 Cek apakah semua berjalan baik:
 
-1. **Frontend terbuka?** → Buka http://localhost:3000
-2. **Bisa login?** → Gunakan admin/admin123
-3. **Dashboard muncul?** → Data sample ada?
+1. Frontend terbuka: http://localhost:3000
+2. Bisa login memakai user awal
+3. Dashboard muncul
 
 Jika ada error, cek:
 
 ```bash
-# Cek backend running
-curl http://localhost:4000
-
-# Cek database connection
+curl http://localhost:4000/health
 psql -U postgres -d monitoring_supplier -c "SELECT 1"
 ```
 
 ---
 
-## 🛑 Troubleshooting
+## Troubleshooting
 
-### Error: "Connection refused on port 4000"
+### Error: Connection refused on port 4000
+
+Backend belum running. Jalankan:
+
 ```bash
-# Backend tidak running. Pastikan:
-cd server && npm run start
+cd server
+npm run start
 ```
 
-### Error: "PGPASSWORD"
-```bash
-# Password PostgreSQL salah. Cek di server/.env
-# Atau reset password PostgreSQL
-```
+### Error: PGPASSWORD
 
-### Error: "database monitoring_supplier does not exist"
+Password PostgreSQL salah. Cek nilai `PGPASSWORD` di `server/.env`.
+
+### Error: database monitoring_supplier does not exist
+
+Database belum dibuat. Jalankan:
+
 ```bash
-# Database belum dibuat. Jalankan:
 psql -U postgres -c "CREATE DATABASE monitoring_supplier;"
 ```
 
-### Port 3000/4000 sudah terpakai?
-```bash
-# Ganti port di package.json atau script
-npm run start -- --port 5000
-```
+### Port 3000 atau 4000 sudah terpakai
+
+Matikan service lama atau ubah port sesuai kebutuhan.
 
 ---
 
-## 📚 Informasi Lebih Lanjut
+## Informasi Lanjut
 
-- Lihat `README.md` untuk dokumentasi lengkap
-- Docs ada di folder `docs/`
-- Database schema ada di `docs/`
-
----
-
-## ✅ Selesai!
-
-Sekarang Anda bisa mulai testing dan development! 🎉
-
-Jika ada pertanyaan, buka issue di GitHub atau hubungi tim development.
+- Lihat `README.md` untuk dokumentasi lengkap.
+- Docs tambahan ada di folder `docs/`.
+- Database schema ada di folder `docs/`.

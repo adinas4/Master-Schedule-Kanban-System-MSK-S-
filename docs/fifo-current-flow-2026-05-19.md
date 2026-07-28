@@ -61,14 +61,15 @@ flowchart TD
     I7 --> I8[Insert inventory_ledgers transaction_type = RECEIVING]
   end
 
-  subgraph Reversal["C. Delete / Reversal RN"]
-    R1[Delete RN oleh admin] --> R2[Lock batch terkait]
+  subgraph Reversal["C. Batalkan / Reversal RN"]
+    R1[Reversal RN oleh admin] --> R2[Lock batch terkait]
     R2 --> R3{qty_out batch sudah > 0?}
-    R3 -- Ya --> R4[Tolak delete]
-    R3 -- Tidak --> R5[Kurangi atau hapus stock_batches.qty_in]
-    R5 --> R6[Insert stock_movements reason = receive_delete]
+    R3 -- Ya --> R4[Tolak reversal otomatis]
+    R3 -- Tidak --> R5[Kurangi stock_batches.qty_in; set 0 bila habis]
+    R5 --> R6[Insert stock_movements reason = receipt_reverse]
     R6 --> R7[Kurangi items.qty_on_hand]
     R7 --> R8[Insert inventory_ledgers transaction_type = REVERSAL]
+    R8 --> R9[Update schedule: received_qty berkurang, actual SJ/tanggal kosong bila qty 0]
   end
 ```
 

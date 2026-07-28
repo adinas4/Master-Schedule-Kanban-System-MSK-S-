@@ -3,6 +3,7 @@ import {
   Bar,
   CartesianGrid,
   ComposedChart,
+  LabelList,
   Line,
   LineChart,
   Legend,
@@ -16,6 +17,7 @@ import {
   ArrowDownUp,
   BarChart3,
   CheckCircle,
+  Clock3,
   Coins,
   FileText,
   Loader2,
@@ -23,12 +25,14 @@ import {
   Printer,
   Sparkles,
   Star,
+  ShieldCheck,
   TrendingDown,
   Trophy,
+  Truck,
   Wand2,
   X,
 } from 'lucide-react';
-import logoMatra from '../assets/logo-matra.png';
+import logoPrl from '../assets/kop-mrp.png';
 import SearchableSelectDropdown from '../components/SearchableSelectDropdown';
 import TabReportInbound from './TabReportInbound';
 
@@ -78,8 +82,12 @@ const SafeResponsiveContainer = ({ children }) => {
 
 const TabReports = (props) => {
   const {
+    apiFetch,
     mainTab,
     reportTab,
+    setReportTab,
+    reportCategory,
+    setReportCategory,
     canViewReport,
     fetchReport,
     handleExportReportExcel,
@@ -141,6 +149,14 @@ const TabReports = (props) => {
     setOutstandingPrlYear,
     qualityObjectivesMonth,
     setQualityObjectivesMonth,
+    qualityObjectivesSupplier,
+    setQualityObjectivesSupplier,
+    qualityObjectivesMonthStart,
+    setQualityObjectivesMonthStart,
+    qualityObjectivesMonthEnd,
+    setQualityObjectivesMonthEnd,
+    qualityObjectivesYear,
+    setQualityObjectivesYear,
     qualityObjectivesData,
     canViewScorecard,
     scorecardFilterSupplier,
@@ -173,7 +189,7 @@ const TabReports = (props) => {
     handleExportSupplierShortageExcel,
     handleExportOutstandingPrlExcel,
     handleExportQualityObjectivesExcel,
-    handlePrintQualityObjectives,
+    ensureXlsx,
     masterAreas,
     masterCategories,
     masterLocations,
@@ -239,6 +255,89 @@ const TabReports = (props) => {
     ...(Array.isArray(masterAreas) ? masterAreas.flatMap((row) => [row.name, row.id]).filter(Boolean) : []),
     ...(Array.isArray(masterProcesses) ? masterProcesses.flatMap((row) => [row.name, row.code]).filter(Boolean) : []),
   ])).sort((a, b) => String(a).localeCompare(String(b)));
+  const reportMenuGroups = useMemo(() => {
+    const groups = [
+      {
+        key: 'supplier',
+        label: 'Supplier',
+        icon: Trophy,
+        reports: [
+          { key: 'rekap', label: 'Rekap Supplier/PO', icon: FileText, access: canViewReport },
+          { key: 'scorecard', label: 'Rapor Kinerja', icon: Trophy, access: canViewScorecard },
+          { key: 'sasaran-mutu', label: 'Sasaran Mutu', icon: CheckCircle, access: canViewReport },
+          { key: 'supplier-shortage', label: 'Shortage Supplier', icon: AlertTriangle, access: canViewReport },
+        ],
+      },
+      {
+        key: 'inventory',
+        label: 'Inventory',
+        icon: Coins,
+        reports: [
+          { key: 'stock-coverage', label: 'Stock Coverage', icon: BarChart3, access: canViewReport },
+          { key: 'slow-moving', label: 'Slow & Dead Stock', icon: TrendingDown, access: canViewReport },
+          { key: 'fifo-violations', label: 'FIFO Violation', icon: AlertTriangle, access: canViewReport },
+          { key: 'inventory-value', label: 'Inventory Value', icon: Coins, access: canViewReport },
+          { key: 'all-mutations', label: 'All Mutasi', icon: FileText, access: canViewReport },
+        ],
+      },
+      {
+        key: 'inbound',
+        label: 'Inbound',
+        icon: Truck,
+        reports: [
+          { key: 'inbound-performance', label: 'Inbound Performance', icon: ArrowDownUp, access: canViewReport },
+          { key: 'inbound-matrix', label: 'Delivery Matrix', icon: Truck, access: canViewReport },
+        ],
+      },
+      {
+        key: 'quality',
+        label: 'Quality',
+        icon: CheckCircle,
+        reports: [
+          { key: 'qc-report', label: 'Laporan QC', icon: ShieldCheck, access: canViewReport },
+        ],
+      },
+      {
+        key: 'prl',
+        label: 'PRL',
+        icon: ListChecks,
+        reports: [
+          { key: 'outstanding-prl', label: 'Outstanding PRL', icon: ListChecks, access: canViewReport },
+        ],
+      },
+      {
+        key: 'production',
+        label: 'Produksi',
+        icon: BarChart3,
+        reports: [
+          { key: 'capacity-planning', label: 'Capacity Planning', icon: BarChart3, access: canViewReport },
+        ],
+      },
+    ];
+    return groups
+      .map((group) => ({ ...group, reports: group.reports.filter((report) => report.access) }))
+      .filter((group) => group.reports.length > 0);
+  }, [canViewReport, canViewScorecard]);
+  const reportCategoryByTab = useMemo(() => {
+    const map = new Map();
+    reportMenuGroups.forEach((group) => {
+      group.reports.forEach((report) => map.set(report.key, group.key));
+    });
+    return map;
+  }, [reportMenuGroups]);
+  const activeReportCategory = reportCategory || reportCategoryByTab.get(reportTab) || reportMenuGroups[0]?.key || 'supplier';
+  const activeReportGroup = reportMenuGroups.find((group) => group.key === activeReportCategory) || reportMenuGroups[0] || null;
+  const selectReportCategory = (group) => {
+    if (!group) return;
+    setReportCategory?.(group.key);
+    if (!group.reports.some((report) => report.key === reportTab)) {
+      setReportTab?.(group.reports[0]?.key);
+    }
+  };
+  const selectReportTab = (group, tabKey) => {
+    setReportCategory?.(group?.key || reportCategoryByTab.get(tabKey) || activeReportCategory);
+    setReportTab?.(tabKey);
+  };
 
   const ledgerCategoryOptions = useMemo(() => {
     const normalizeCategory = (value) => {
@@ -438,7 +537,7 @@ const TabReports = (props) => {
   const renderReportHeader = (title, periodStart, periodEnd) => (
     <div className="report-print-header print-only">
       <div className="report-header-left">
-        <img src={logoMatra} alt="Logo" className="report-logo" />
+        <img src={logoPrl} alt="Logo" className="report-logo" />
         <div>
           <div className="report-company">PT. MATRA RODA PIRANTI</div>
           <div className="report-dept">Departemen Logistik (PPIC)</div>
@@ -604,60 +703,374 @@ const TabReports = (props) => {
 
   const [reportPrintOrientation, setReportPrintOrientation] = useState('portrait');
   const [scorecardExpanded, setScorecardExpanded] = useState({});
+  const [rekapExpanded, setRekapExpanded] = useState({});
   const [capacityPlanningWorkCenter, setCapacityPlanningWorkCenter] = useState('');
   const [capacityPlanningShiftCount, setCapacityPlanningShiftCount] = useState(3);
   const [capacityPlanningShiftHours, setCapacityPlanningShiftHours] = useState(8);
+  const [qcReportData, setQcReportData] = useState({
+    period: null,
+    summary: {},
+    sourceBreakdown: [],
+    dispositionBreakdown: [],
+    monthlyTrend: [],
+    topDefects: [],
+    supplierRows: [],
+    openCases: [],
+    millsheet: {},
+  });
+  const [qcReportLoading, setQcReportLoading] = useState(false);
+  const [qcReportError, setQcReportError] = useState('');
 
-  const qualityPeriodLabel = qualityObjectivesData?.period?.label || qualityObjectivesMonth || '-';
-  const formatQualityPercent = (value) => {
-    const num = Number(value || 0);
-    return Number.isFinite(num) ? num.toFixed(2) : '0.00';
+  const qcSourceLabels = {
+    incoming_rn: 'Incoming RN',
+    production_ng: 'Production NG',
+    material_line_ng: 'Material NG Line',
+    delivery_return: 'Delivery Return',
+    manual: 'Manual',
   };
-  const getQualityStatusBadge = (status) => (
-    status === 'TERCAPAI'
-      ? 'bg-emerald-100 text-emerald-700 border-emerald-200'
-      : 'bg-rose-100 text-rose-700 border-rose-200'
-  );
-  const renderQualityTable = (title, rows, nameLabel) => (
-    <div className="bg-white rounded-lg border overflow-x-auto">
-      <div className="px-4 py-3 border-b bg-slate-50 text-sm font-semibold text-slate-700">{title}</div>
-      <table className="min-w-full text-sm">
-        <thead className="bg-slate-100">
+  const qcDispositionLabels = {
+    ok: 'OK / Release',
+    use_as_is: 'Use As Is',
+    hold: 'Hold',
+    sortir: 'Sortir',
+    reject: 'Reject',
+    rework: 'Rework',
+    scrap: 'Scrap',
+    return_supplier: 'Return Supplier',
+    claim_customer: 'Claim Customer',
+    correction_review: 'Correction Review',
+    open_pending: 'Open / Pending',
+  };
+  const fetchQcReport = async () => {
+    if (!apiFetch) return;
+    setQcReportLoading(true);
+    setQcReportError('');
+    try {
+      const params = new URLSearchParams();
+      if (reportStart) params.set('start', reportStart);
+      if (reportEnd) params.set('end', reportEnd);
+      if (reportSupplier) params.set('supplier', reportSupplier);
+      const data = await apiFetch(`/api/reports/qc?${params.toString()}`);
+      setQcReportData({
+        period: data?.period || null,
+        summary: data?.summary || {},
+        sourceBreakdown: Array.isArray(data?.sourceBreakdown) ? data.sourceBreakdown : [],
+        dispositionBreakdown: Array.isArray(data?.dispositionBreakdown) ? data.dispositionBreakdown : [],
+        monthlyTrend: Array.isArray(data?.monthlyTrend) ? data.monthlyTrend : [],
+        topDefects: Array.isArray(data?.topDefects) ? data.topDefects : [],
+        supplierRows: Array.isArray(data?.supplierRows) ? data.supplierRows : [],
+        openCases: Array.isArray(data?.openCases) ? data.openCases : [],
+        millsheet: data?.millsheet || {},
+      });
+    } catch (error) {
+      setQcReportError(error?.message || 'Gagal memuat laporan QC.');
+    } finally {
+      setQcReportLoading(false);
+    }
+  };
+  const handleExportQcReportExcel = async () => {
+    const rows = [
+      ...(qcReportData.supplierRows || []).map((row) => ({
+        Section: 'Supplier Performance',
+        Supplier: row.supplierCode,
+        'Nama Supplier': row.supplierName,
+        'Total Case': row.totalCases,
+        'Incoming QC': row.incomingCases,
+        'Material NG Line': row.materialLineNg,
+        Open: row.openCases,
+        Closed: row.closedCases,
+        'Reject/Return/Scrap': row.rejectCases,
+        'Qty Defect': row.defectQty,
+        'Closure Rate': row.closureRate,
+        'Quality Score': row.qualityScore,
+      })),
+      ...(qcReportData.topDefects || []).map((row) => ({
+        Section: 'Top Defect',
+        Defect: row.defect,
+        'Total Case': row.totalCases,
+        'Qty Defect': row.defectQty,
+        Major: row.major,
+        Critical: row.critical,
+      })),
+      ...(qcReportData.openCases || []).map((row) => ({
+        Section: 'Open Case',
+        Tanggal: formatPrintDate(row.eventAt || row.createdAt),
+        Case: row.caseNumber,
+        Source: qcSourceLabels[row.sourceType] || row.sourceType,
+        Dokumen: row.sourceDoc,
+        Item: row.itemCode,
+        Supplier: row.supplierCode || row.supplier,
+        Qty: row.qty,
+        Defect: row.defectCategory,
+        Severity: row.severity,
+        Status: row.status,
+      })),
+    ];
+    if (ensureXlsx) {
+      const XLSX = await ensureXlsx();
+      if (XLSX) {
+        const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ Info: 'Tidak ada data' }]);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'Laporan QC');
+        XLSX.writeFile(wb, `Laporan_QC_${new Date().toISOString().slice(0, 10)}.xlsx`);
+        return;
+      }
+    }
+    const headers = rows.length ? Object.keys(rows[0]) : ['Info'];
+    const bodyRows = rows.length ? rows : [{ Info: 'Tidak ada data' }];
+    const csv = [
+      headers.join(','),
+      ...bodyRows.map((row) => headers.map((header) => `"${String(row[header] ?? '').replace(/"/g, '""')}"`).join(',')),
+    ].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `Laporan_QC_${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  useEffect(() => {
+    if (mainTab !== 'reports') return;
+    if (reportTab !== 'qc-report') return;
+    if (!canViewReport) return;
+    fetchQcReport();
+  }, [mainTab, reportTab, canViewReport, reportStart, reportEnd, reportSupplier]);
+
+  const rekapSupplierGroups = useMemo(() => {
+    const groups = new Map();
+    (Array.isArray(reportRows) ? reportRows : []).forEach((row) => {
+      const supplierKey = String(row?.supplier || row?.supplierName || 'UNKNOWN').trim() || 'UNKNOWN';
+      if (!groups.has(supplierKey)) {
+        const supplierName = String(row?.supplierName || '').trim();
+        groups.set(supplierKey, {
+          supplierKey,
+          supplierName,
+          supplierLabel: supplierName && supplierName !== supplierKey ? `${supplierKey} - ${supplierName}` : supplierKey,
+          rows: [],
+          poCount: 0,
+          totalRows: 0,
+          totalRequested: 0,
+          totalReceived: 0,
+          onTimeQty: 0,
+          lateQty: 0,
+          tooEarlyQty: 0,
+          onTimeCount: 0,
+          lateCount: 0,
+          lateCompletionCount: 0,
+          partialOnTimeCount: 0,
+          partialLateCount: 0,
+          tooEarlyCount: 0,
+          pendingCount: 0,
+          rnCount: 0,
+          looseCount: 0,
+          qcTotal: 0,
+          qcOpen: 0,
+          qcReject: 0,
+        });
+      }
+      const group = groups.get(supplierKey);
+      group.rows.push(row);
+      group.poCount += 1;
+      group.totalRows += Number(row?.totalRows || 0);
+      group.totalRequested += Number(row?.totalRequested || 0);
+      group.totalReceived += Number(row?.totalReceived || 0);
+      group.onTimeQty += Number(row?.onTimeQty || 0);
+      group.lateQty += Number(row?.lateQty || 0);
+      group.tooEarlyQty += Number(row?.tooEarlyQty || 0);
+      group.onTimeCount += Number(row?.onTimeCount || 0);
+      group.lateCount += Number(row?.lateCount || 0);
+      group.lateCompletionCount += Number(row?.lateCompletionCount || 0);
+      group.partialOnTimeCount += Number(row?.partialOnTimeCount || 0);
+      group.partialLateCount += Number(row?.partialLateCount || 0);
+      group.tooEarlyCount += Number(row?.tooEarlyCount || 0);
+      group.pendingCount += Number(row?.pendingCount || 0);
+      group.rnCount += Number(row?.rnCount || 0);
+      group.looseCount += Number(row?.looseCount || 0);
+      group.qcTotal += Number(row?.qcTotal || 0);
+      group.qcOpen += Number(row?.qcOpen || 0);
+      group.qcReject += Number(row?.qcReject || 0);
+    });
+    return Array.from(groups.values()).map((group) => {
+      const timingScore = group.totalRequested > 0 ? Math.min(100, (group.onTimeQty / group.totalRequested) * 100) : 0;
+      const fulfillmentScore = group.totalRequested > 0 ? Math.min(100, (group.totalReceived / group.totalRequested) * 100) : 0;
+      const packingScore = group.rnCount > 0 ? Math.max(0, ((group.rnCount - group.looseCount) / group.rnCount) * 100) : null;
+      const qcScore = group.rnCount > 0 ? Math.max(0, ((group.rnCount - group.qcOpen - group.qcReject) / group.rnCount) * 100) : null;
+      const qualityWeight = qcScore === null ? 0 : 0.15;
+      const packingWeight = packingScore === null ? 0 : 0.1;
+      const timeWeight = 0.55;
+      const fulfillWeight = 0.35;
+      const rawWeight = timeWeight + fulfillWeight + qualityWeight + packingWeight;
+      const weightedScore = rawWeight > 0
+        ? ((timingScore * timeWeight) + (fulfillmentScore * fulfillWeight) + ((qcScore ?? 100) * qualityWeight) + ((packingScore ?? 100) * packingWeight)) / rawWeight
+        : 0;
+      let rating = 1;
+      if (weightedScore >= 95) rating = 5;
+      else if (weightedScore >= 80) rating = 4;
+      else if (weightedScore >= 60) rating = 3;
+      else if (weightedScore >= 40) rating = 2;
+      return {
+        ...group,
+        timingScore: Math.round(timingScore),
+        fulfillmentScore: Math.round(fulfillmentScore),
+        packingScore: packingScore === null ? null : Math.round(packingScore),
+        qcScore: qcScore === null ? null : Math.round(qcScore),
+        weightedScore: Math.round(weightedScore * 100) / 100,
+        rating,
+        rows: group.rows.slice().sort((left, right) => String(left?.poNumber || '').localeCompare(String(right?.poNumber || ''), 'id')),
+      };
+    }).sort((left, right) => right.weightedScore - left.weightedScore || String(left.supplierLabel).localeCompare(String(right.supplierLabel), 'id'));
+  }, [reportRows]);
+
+  const monthOptionIndexMap = monthOptions.reduce((map, month, index) => ({
+    ...map,
+    [month.key]: index + 1,
+  }), {});
+  const qualitySps = qualityObjectivesData?.sps || {};
+  const qualitySpsMonths = Array.isArray(qualitySps.months) && qualitySps.months.length > 0
+    ? qualitySps.months
+    : monthOptions.map((month, index) => ({
+      month: index + 1,
+      key: month.key,
+      label: `${month.label}-${String(qualityObjectivesYear || new Date().getFullYear()).slice(-2)}`,
+      incomingQty: 0,
+      dnOrderQty: 0,
+      percent: 0,
+      status: '',
+      hasData: false,
+      inPeriod: true,
+    }));
+  const qualitySpsChartRows = qualitySpsMonths.map((month) => ({
+    label: month.label,
+    incomingQty: month.hasData ? Number(month.incomingQty || 0) : null,
+    dnOrderQty: month.hasData ? Number(month.dnOrderQty || 0) : null,
+    percent: month.hasData ? Number(month.percent || 0) : null,
+  }));
+  const qualitySpsYear = qualitySps.year || qualityObjectivesYear || new Date().getFullYear();
+  const qualitySpsSupplierLabel = (() => {
+    const supplierValue = qualitySps.supplier || qualityObjectivesSupplier || '';
+    if (!supplierValue) return 'ALL SUPPLIER';
+    const option = masterSupplierOptions.find((item) => item.value === supplierValue || item.id === supplierValue || item.name === supplierValue);
+    return option?.label || supplierValue;
+  })();
+  const qualityMonthRangeText = (() => {
+    const startIndex = monthOptionIndexMap[qualityObjectivesMonthStart] || Number(qualitySps.monthStart || 1);
+    const endIndex = monthOptionIndexMap[qualityObjectivesMonthEnd] || Number(qualitySps.monthEnd || 12);
+    const start = monthOptions[startIndex - 1]?.label || 'Jan';
+    const end = monthOptions[endIndex - 1]?.label || 'Dec';
+    return `${start}-${end} ${qualitySpsYear}`;
+  })();
+  const formatSpsQty = (value) => {
+    const num = Number(value || 0);
+    if (!Number.isFinite(num)) return '';
+    return num.toLocaleString('id-ID', { maximumFractionDigits: 0 });
+  };
+  const formatSpsPercent = (value) => {
+    const num = Number(value || 0);
+    if (!Number.isFinite(num)) return '';
+    return `${Math.round(num)}%`;
+  };
+  const renderQualitySpsValue = (month, key) => {
+    if (!month?.hasData) return '';
+    if (key === 'incomingQty' || key === 'dnOrderQty') return formatSpsQty(month[key]);
+    if (key === 'percent') return formatSpsPercent(month.percent);
+    if (key === 'status') return month.status || '';
+    return '';
+  };
+  const renderQualitySpsTable = () => (
+    <div className="quality-sps-table-wrap">
+      <table className="quality-sps-table">
+        <thead>
           <tr>
-            <th className="p-3 text-center w-12">No</th>
-            <th className="p-3 text-left">{nameLabel}</th>
-            <th className="p-3 text-center">Periode</th>
-            <th className="p-3 text-right">Plan Qty</th>
-            <th className="p-3 text-right">Actual Qty</th>
-            <th className="p-3 text-center">% Pencapaian</th>
-            <th className="p-3 text-center">Status</th>
+            <th>SPS</th>
+            {qualitySpsMonths.map((month) => (
+              <th key={`sps-head-${month.key || month.month}`}>{month.label}</th>
+            ))}
+            <th>AVG</th>
           </tr>
         </thead>
         <tbody>
-          {reportLoading && (
-            <tr><td colSpan="7" className="p-4 text-center text-gray-400">Memuat...</td></tr>
-          )}
-          {!reportLoading && (!rows || rows.length === 0) && (
-            <tr><td colSpan="7" className="p-4 text-center text-gray-400">Tidak ada data.</td></tr>
-          )}
-          {!reportLoading && (rows || []).map((row, idx) => (
-            <tr key={`${row.name}-${idx}`} className="border-t">
-              <td className="p-3 text-center">{idx + 1}</td>
-              <td className="p-3">{row.name}</td>
-              <td className="p-3 text-center">{row.period || qualityPeriodLabel}</td>
-              <td className="p-3 text-right">{Number(row.planQty || 0).toLocaleString()}</td>
-              <td className="p-3 text-right">{Number(row.actualQty || 0).toLocaleString()}</td>
-              <td className="p-3 text-center">{formatQualityPercent(row.percent)}%</td>
-              <td className="p-3 text-center">
-                <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] border ${getQualityStatusBadge(row.status)}`}>{row.status || '-'}</span>
-              </td>
-            </tr>
-          ))}
+          <tr>
+            <td>Total Incoming (Pcs)</td>
+            {qualitySpsMonths.map((month) => (
+              <td key={`sps-incoming-${month.key || month.month}`} className="quality-sps-number">{renderQualitySpsValue(month, 'incomingQty')}</td>
+            ))}
+            <td className="quality-sps-number">{qualitySps.avgIncoming ? formatSpsQty(qualitySps.avgIncoming) : ''}</td>
+          </tr>
+          <tr>
+            <td>Total DN Order (Pcs)</td>
+            {qualitySpsMonths.map((month) => (
+              <td key={`sps-dn-${month.key || month.month}`} className="quality-sps-number">{renderQualitySpsValue(month, 'dnOrderQty')}</td>
+            ))}
+            <td className="quality-sps-number">{qualitySps.avgDnOrder ? formatSpsQty(qualitySps.avgDnOrder) : ''}</td>
+          </tr>
+          <tr>
+            <td>%</td>
+            {qualitySpsMonths.map((month) => (
+              <td key={`sps-percent-${month.key || month.month}`} className="quality-sps-percent">{renderQualitySpsValue(month, 'percent')}</td>
+            ))}
+            <td className="quality-sps-percent">{qualitySps.avgStatus ? formatSpsPercent(qualitySps.avgPercent) : ''}</td>
+          </tr>
+          <tr>
+            <td>Hasil 100%<br />+-20%</td>
+            {qualitySpsMonths.map((month) => (
+              <td key={`sps-status-${month.key || month.month}`} className="quality-sps-status">{renderQualitySpsValue(month, 'status')}</td>
+            ))}
+            <td className="quality-sps-status">{qualitySps.avgStatus || ''}</td>
+          </tr>
         </tbody>
       </table>
     </div>
   );
-
+  const renderQualitySpsSignatures = () => (
+    <div className="quality-sps-signatures">
+      <table>
+        <thead>
+          <tr>
+            <th>Prepared</th>
+            <th>Checked</th>
+            <th>Approved</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr className="quality-sps-sign-space">
+            <td />
+            <td />
+            <td />
+          </tr>
+          <tr>
+            <td>WILI</td>
+            <td>Muhtadin</td>
+            <td>Beverly M</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+  const qcSummary = qcReportData?.summary || {};
+  const qcMillsheet = qcReportData?.millsheet || {};
+  const qcMonthlyChartRows = (qcReportData?.monthlyTrend || []).map((row) => ({
+    ...row,
+    label: row.month || '-',
+    releaseRate: Number(row.releaseRate || 0),
+  }));
+  const qcDispositionChartRows = (qcReportData?.dispositionBreakdown || []).map((row) => ({
+    ...row,
+    label: qcDispositionLabels[row.disposition] || row.disposition || '-',
+  }));
+  const qcSupplierLabel = (() => {
+    if (!reportSupplier) return 'ALL SUPPLIER';
+    const option = masterSupplierOptions.find((item) => item.value === reportSupplier || item.id === reportSupplier || item.name === reportSupplier);
+    return option?.label || reportSupplier;
+  })();
+  const getQcScoreClass = (value) => {
+    const score = Number(value || 0);
+    if (score >= 90) return 'text-emerald-700 bg-emerald-50';
+    if (score >= 75) return 'text-blue-700 bg-blue-50';
+    if (score >= 60) return 'text-amber-700 bg-amber-50';
+    return 'text-rose-700 bg-rose-50';
+  };
   const ScorecardSkeleton = () => (
     <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm animate-pulse">
       <div className="flex items-center gap-3 mb-3">
@@ -743,6 +1156,42 @@ const TabReports = (props) => {
             {/* Laporan */}
             {mainTab === 'reports' && (
             <div className="space-y-6 report-print-host">
+              <div className="rounded-xl border border-slate-200 bg-white p-3 shadow-sm print:hidden">
+                <div className="flex flex-wrap gap-2">
+                  {reportMenuGroups.map((group) => {
+                    const GroupIcon = group.icon;
+                    const active = activeReportGroup?.key === group.key;
+                    return (
+                      <button
+                        key={group.key}
+                        type="button"
+                        onClick={() => selectReportCategory(group)}
+                        className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold ${active ? 'bg-slate-900 text-white shadow' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+                      >
+                        <GroupIcon size={15} /> {group.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                {activeReportGroup && (
+                  <div className="mt-3 flex flex-wrap gap-2 border-t border-slate-100 pt-3">
+                    {activeReportGroup.reports.map((report) => {
+                      const ReportIcon = report.icon;
+                      const active = reportTab === report.key;
+                      return (
+                        <button
+                          key={report.key}
+                          type="button"
+                          onClick={() => selectReportTab(activeReportGroup, report.key)}
+                          className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold ${active ? 'border-indigo-200 bg-indigo-50 text-indigo-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'}`}
+                        >
+                          <ReportIcon size={14} /> {report.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
               {reportTab === 'rekap' && canViewReport && (
                 <div className="bg-white rounded-xl shadow-sm border p-4 report-print-scope">
                   {renderReportHeader('LAPORAN REKAP SUPPLIER/PO', reportStart, reportEnd)}
@@ -788,8 +1237,282 @@ const TabReports = (props) => {
                     </div>
                   </div>
 
-                  {reportSummary && (
-                  <div className="grid grid-cols-2 md:grid-cols-7 gap-3 mb-6">
+                  <div className="space-y-4">
+                    {reportLoading && (
+                      <div className="p-6 text-center text-slate-500">
+                        <Loader2 size={18} className="animate-spin inline-block mr-2" /> Memuat laporan performa supplier...
+                      </div>
+                    )}
+                    {!reportLoading && reportRows.length === 0 && (
+                      <div className="p-6 text-center text-slate-500 rounded-xl border border-slate-200">Belum ada laporan performa.</div>
+                    )}
+                    {!reportLoading && reportRows.length > 0 && (
+                      <>
+                        <div className="report-summary-kpi-grid grid grid-cols-1 gap-3 lg:grid-cols-4">
+                          {[
+                            { label: 'Total Score', value: `${Math.round(Number(reportSummary?.weightedScore || 0))}%`, icon: Trophy, tone: 'text-indigo-700 bg-indigo-50' },
+                            { label: 'Ketepatan Waktu', value: `${Math.round(Number(reportSummary?.timeScore || 0))}%`, icon: Clock3, tone: 'text-sky-700 bg-sky-50' },
+                            { label: 'Fulfillment Qty', value: `${Math.round(Number(reportSummary?.qtyScore || 0))}%`, icon: BarChart3, tone: 'text-emerald-700 bg-emerald-50' },
+                            { label: 'QC + Line Claim', value: `${Math.round(Number(reportSummary?.qcScore || 0))}%`, icon: ShieldCheck, tone: 'text-violet-700 bg-violet-50' },
+                          ].map((tile) => {
+                            const TileIcon = tile.icon;
+                            return (
+                              <div key={tile.label} className="report-summary-kpi-card rounded-xl border border-slate-200 bg-white p-4">
+                                <div className={`inline-flex h-9 w-9 items-center justify-center rounded-lg ${tile.tone}`}>
+                                  <TileIcon size={18} />
+                                </div>
+                                <div className="mt-3 text-xs font-semibold uppercase text-slate-400">{tile.label}</div>
+                                <div className="mt-1 text-2xl font-bold text-slate-900">{tile.value}</div>
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        {reportRows.map((supplierReport) => {
+                          const summary = supplierReport.summary || {};
+                          const supplierInfo = supplierReport.supplier || {};
+                          const supplierKey = supplierInfo.code || supplierInfo.name || 'UNKNOWN';
+                          const isOpen = rekapExpanded[supplierKey] ?? reportRows.length === 1;
+                          const rating = Number(summary.rating || 0);
+                          const ratingClass = rating >= 4 ? 'bg-emerald-100 text-emerald-700' : rating >= 3 ? 'bg-amber-100 text-amber-700' : 'bg-rose-100 text-rose-700';
+                          const monthly = Array.isArray(supplierReport.monthly) ? supplierReport.monthly : [];
+                          const deliveryNotes = Array.isArray(supplierReport.deliveryNotes) ? supplierReport.deliveryNotes : [];
+                          const schedules = Array.isArray(supplierReport.schedules) ? supplierReport.schedules : [];
+                          const supplierCategory = supplierInfo.category || 'Schedule';
+                          return (
+                            <div key={supplierKey} className="rounded-xl border border-slate-200 bg-white p-4">
+                              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                                <div>
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <div className="text-sm font-bold text-slate-900">{supplierInfo.name || supplierKey}</div>
+                                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-semibold uppercase text-slate-600">
+                                      {supplierCategory}
+                                    </span>
+                                  </div>
+                                  <div className="text-xs text-slate-500">
+                                    Periode {formatPrintDate(reportStart || supplierReport.period?.start)} s/d {formatPrintDate(reportEnd || supplierReport.period?.end)}
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <div className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-bold ${ratingClass}`}>
+                                    {Array.from({ length: 5 }).map((_, index) => (
+                                      <Star key={index} size={14} className={index < rating ? 'fill-current' : ''} />
+                                    ))}
+                                    {summary.ratingLabel || '-'}
+                                  </div>
+                                  <button
+                                    type="button"
+                                    className="print:hidden border px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                                    onClick={() => setRekapExpanded((prev) => ({ ...prev, [supplierKey]: !isOpen }))}
+                                  >
+                                    {isOpen ? 'Tutup' : 'Detail'}
+                                  </button>
+                                </div>
+                              </div>
+
+                              <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-6">
+                                {[
+                                  { label: 'Jadwal', value: summary.totalSchedules, tone: 'border-sky-200 bg-sky-50 text-sky-700' },
+                                  { label: 'On Time', value: summary.onTime, tone: 'border-emerald-200 bg-emerald-50 text-emerald-700' },
+                                  { label: 'Late', value: summary.late, tone: 'border-rose-200 bg-rose-50 text-rose-700' },
+                                  { label: 'Late Completion', value: summary.lateCompletion, tone: 'border-orange-200 bg-orange-50 text-orange-700' },
+                                  { label: 'Partial OK', value: summary.partialOnTime, tone: 'border-teal-200 bg-teal-50 text-teal-700' },
+                                  { label: 'Partial Late', value: summary.partialLate, tone: 'border-amber-200 bg-amber-50 text-amber-700' },
+                                  { label: 'Too Early', value: summary.tooEarly, tone: 'border-indigo-200 bg-indigo-50 text-indigo-700' },
+                                  { label: 'Pending', value: summary.pending, tone: 'border-yellow-200 bg-yellow-50 text-yellow-700' },
+                                  { label: 'QC Open', value: summary.qcOpen, tone: 'border-violet-200 bg-violet-50 text-violet-700' },
+                                ].map((tile) => (
+                                  <div key={tile.label} className={`rounded-lg border p-3 text-center ${tile.tone}`}>
+                                    <div className="text-[11px] font-bold uppercase tracking-wide opacity-80">{tile.label}</div>
+                                    <div className="mt-1 text-xl font-black text-slate-950">{formatQuantity(tile.value)}</div>
+                                  </div>
+                                ))}
+                              </div>
+
+                              {isOpen && (
+                                <div className="mt-4 space-y-4">
+                                  <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                                    <div className="rounded-xl border border-slate-200 bg-white p-4">
+                                      <div className="mb-3 flex items-center gap-2 text-sm font-bold text-slate-900">
+                                        <BarChart3 size={16} /> Trend Bulanan
+                                      </div>
+                                      {monthly.length === 0 ? (
+                                        <div className="py-6 text-center text-sm text-slate-500">Belum ada data bulanan.</div>
+                                      ) : (
+                                        <div className="space-y-4">
+                                          {monthly.map((row) => {
+                                            const requestQty = Number(row.requestQty || 0);
+                                            const receivedQty = Number(row.receivedQty || 0);
+                                            const onTimeQty = Number(row.onTimeQty || 0);
+                                            const lateQty = Number(row.lateQty || 0);
+                                            const score = Math.max(0, Math.min(100, Number(row.weightedScore || 0)));
+                                            const timeScore = Math.max(0, Math.min(100, Number(row.timeScore || (requestQty > 0 ? (onTimeQty / requestQty) * 100 : 0))));
+                                            const fulfillmentScore = Math.max(0, Math.min(100, Number(row.qtyScore || (requestQty > 0 ? (receivedQty / requestQty) * 100 : 0))));
+                                            const lateRate = Math.max(0, Math.min(100, requestQty > 0 ? (lateQty / requestQty) * 100 : 0));
+                                            const trendBars = [
+                                              { label: 'Score', value: score, color: 'bg-indigo-500', text: `${Math.round(score)}%` },
+                                              { label: 'Tepat Waktu', value: timeScore, color: 'bg-emerald-500', text: `${Math.round(timeScore)}%` },
+                                              { label: 'Fulfillment / SNP', value: fulfillmentScore, color: 'bg-sky-500', text: `${Math.round(fulfillmentScore)}%` },
+                                              { label: 'Late Qty', value: lateRate, color: 'bg-rose-500', text: `${Math.round(lateRate)}%` },
+                                            ];
+                                            return (
+                                              <div key={row.month} className="rounded-lg border border-slate-200 bg-slate-50/70 p-3">
+                                                <div className="mb-2 flex items-center justify-between text-xs">
+                                                  <span className="font-bold text-slate-900">{row.month}</span>
+                                                  <span className="rounded-full bg-white px-2 py-0.5 font-bold text-indigo-700">Score {Math.round(score)}%</span>
+                                                </div>
+                                                <div className="space-y-2">
+                                                  {trendBars.map((bar) => (
+                                                    <div key={`${row.month}-${bar.label}`}>
+                                                      <div className="mb-1 flex justify-between text-[11px] font-semibold text-slate-600">
+                                                        <span>{bar.label}</span>
+                                                        <span>{bar.text}</span>
+                                                      </div>
+                                                      <div className="h-2.5 rounded-full bg-white">
+                                                        <div
+                                                          className={`h-2.5 rounded-full ${bar.color}`}
+                                                          style={{ width: `${bar.value}%` }}
+                                                        />
+                                                      </div>
+                                                    </div>
+                                                  ))}
+                                                </div>
+                                                <div className="mt-2 grid grid-cols-3 gap-2 text-[11px]">
+                                                  <div className="rounded bg-white px-2 py-1">
+                                                    <div className="font-semibold text-slate-400">Order</div>
+                                                    <div className="font-bold text-slate-900">{formatQuantity(requestQty)}</div>
+                                                  </div>
+                                                  <div className="rounded bg-white px-2 py-1">
+                                                    <div className="font-semibold text-emerald-500">On-time</div>
+                                                    <div className="font-bold text-slate-900">{formatQuantity(onTimeQty)}</div>
+                                                  </div>
+                                                  <div className="rounded bg-white px-2 py-1">
+                                                    <div className="font-semibold text-rose-500">Late</div>
+                                                    <div className="font-bold text-slate-900">{formatQuantity(lateQty)}</div>
+                                                  </div>
+                                                </div>
+                                              </div>
+                                            );
+                                          })}
+                                        </div>
+                                      )}
+                                    </div>
+
+                                    <div className="rounded-xl border border-slate-200 bg-white p-4">
+                                      <div className="mb-3 flex items-center gap-2 text-sm font-bold text-slate-900">
+                                        <Truck size={16} /> Ringkasan DN / SJ
+                                      </div>
+                                      <div className="grid grid-cols-2 gap-3">
+                                        {[
+                                          ['Total DN', summary.dnCount],
+                                          ['Completed', summary.dnCompleted],
+                                          ['Pending', summary.dnPending],
+                                          ['Selisih/Reject', summary.dnIssue],
+                                          ['Qty DN', summary.dnDocQty],
+                                          ['Qty Diterima', summary.dnReceivedQty],
+                                        ].map(([label, value]) => {
+                                          const tone = label === 'Completed'
+                                            ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                            : label === 'Selisih/Reject'
+                                              ? 'border-rose-200 bg-rose-50 text-rose-700'
+                                              : label === 'Pending'
+                                                ? 'border-amber-200 bg-amber-50 text-amber-700'
+                                                : 'border-sky-200 bg-sky-50 text-sky-700';
+                                          return (
+                                          <div key={label} className={`rounded-lg border p-3 ${tone}`}>
+                                            <div className="text-[11px] font-bold uppercase tracking-wide opacity-80">{label}</div>
+                                            <div className="mt-1 text-xl font-black text-slate-950">{formatQuantity(value)}</div>
+                                          </div>
+                                          );
+                                        })}
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  <div className="rounded-xl border border-slate-200 bg-white p-4">
+                                    <div className="mb-3 flex items-center gap-2 text-sm font-bold text-slate-900">
+                                      <FileText size={16} /> Detail Jadwal Performa
+                                    </div>
+                                    <div className="overflow-x-auto">
+                                      <table className="min-w-full text-xs">
+                                        <thead className="bg-slate-100 text-slate-700">
+                                          <tr>
+                                            <th className="p-2 text-left">PO</th>
+                                            <th className="p-2 text-left">Item</th>
+                                            <th className="p-2 text-left">Tgl Rencana</th>
+                                            <th className="p-2 text-left">Tgl Tiba</th>
+                                            <th className="p-2 text-right">Qty Rencana</th>
+                                            <th className="p-2 text-right">Qty Tiba</th>
+                                            <th className="p-2 text-left">Status</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {schedules.slice(0, 100).map((row) => (
+                                            <tr key={`${supplierKey}-${row.id}-${row.poNumber}-${row.itemCode}`} className="border-t border-slate-100">
+                                              <td className="p-2 font-semibold text-slate-800">{row.poNumber || '-'}</td>
+                                              <td className="p-2">{row.itemCode || '-'}</td>
+                                              <td className="p-2">{formatPrintDate(row.requestDate)}</td>
+                                              <td className="p-2">{row.arrivalDate ? formatPrintDate(row.arrivalDate) : '-'}</td>
+                                              <td className="p-2 text-right">{formatQuantity(row.requestQty)}</td>
+                                              <td className="p-2 text-right">{formatQuantity(row.receivedQty)}</td>
+                                              <td className="p-2">{row.status || '-'}</td>
+                                            </tr>
+                                          ))}
+                                          {schedules.length === 0 && (
+                                            <tr><td colSpan={7} className="p-4 text-center text-slate-500">Tidak ada jadwal pada periode ini.</td></tr>
+                                          )}
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  </div>
+
+                                  <div className="rounded-xl border border-slate-200 bg-white p-4">
+                                    <div className="mb-3 flex items-center gap-2 text-sm font-bold text-slate-900">
+                                      <Truck size={16} /> Detail DN / SJ Performa
+                                    </div>
+                                    <div className="overflow-x-auto">
+                                      <table className="min-w-full text-xs">
+                                        <thead className="bg-slate-100 text-slate-700">
+                                          <tr>
+                                            <th className="p-2 text-left">DN / SJ</th>
+                                            <th className="p-2 text-left">Tanggal</th>
+                                            <th className="p-2 text-left">Sumber</th>
+                                            <th className="p-2 text-left">Tracking</th>
+                                            <th className="p-2 text-right">Qty DN</th>
+                                            <th className="p-2 text-right">Qty Terima</th>
+                                            <th className="p-2 text-right">Selisih</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {deliveryNotes.slice(0, 100).map((row) => (
+                                            <tr key={`${supplierKey}-${row.dnNumber}-${row.plannedDate}`} className="border-t border-slate-100">
+                                              <td className="p-2 font-semibold text-slate-800">{row.dnNumber || '-'}</td>
+                                              <td className="p-2">{formatPrintDate(row.plannedDate)}</td>
+                                              <td className="p-2">{row.sourceCategory || supplierCategory}</td>
+                                              <td className="p-2">{row.trackingStatus || '-'}</td>
+                                              <td className="p-2 text-right">{formatQuantity(row.docQty)}</td>
+                                              <td className="p-2 text-right">{formatQuantity(row.receivedQty)}</td>
+                                              <td className="p-2 text-right">{formatQuantity(row.diffQty)}</td>
+                                            </tr>
+                                          ))}
+                                          {deliveryNotes.length === 0 && (
+                                            <tr><td colSpan={7} className="p-4 text-center text-slate-500">Tidak ada DN/SJ pada periode ini.</td></tr>
+                                          )}
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </>
+                    )}
+                  </div>
+
+                  {false && reportSummary && (
+                  <div className="grid grid-cols-2 md:grid-cols-8 gap-3 mb-6">
                       <div className="bg-white p-3 rounded border text-center">
                         <div className="text-xs text-gray-400 uppercase">Total PO</div>
                         <div className="font-bold">{reportSummary.totalRows}</div>
@@ -803,16 +1526,20 @@ const TabReports = (props) => {
                         <div className="font-bold">{reportSummary.totalReceived}</div>
                       </div>
                       <div className="bg-white p-3 rounded border text-center">
-                        <div className="text-xs text-gray-400 uppercase">Tepat Waktu</div>
-                        <div className="font-bold text-green-600">{reportSummary.totalOnTime}</div>
+                        <div className="text-xs text-gray-400 uppercase">Qty On Time</div>
+                        <div className="font-bold text-green-600">{formatQuantity(reportSummary.totalOnTimeQty)}</div>
                       </div>
                       <div className="bg-white p-3 rounded border text-center">
-                        <div className="text-xs text-gray-400 uppercase">Terlambat</div>
-                        <div className="font-bold text-red-600">{reportSummary.totalLate}</div>
+                        <div className="text-xs text-gray-400 uppercase">Qty Late</div>
+                        <div className="font-bold text-red-600">{formatQuantity(reportSummary.totalLateQty)}</div>
                       </div>
                       <div className="bg-white p-3 rounded border text-center">
-                        <div className="text-xs text-gray-400 uppercase">Terlalu Awal</div>
-                        <div className="font-bold text-blue-600">{reportSummary.totalTooEarly}</div>
+                        <div className="text-xs text-gray-400 uppercase">Late Completion</div>
+                        <div className="font-bold text-rose-600">{reportSummary.totalLateCompletion || 0}</div>
+                      </div>
+                      <div className="bg-white p-3 rounded border text-center">
+                        <div className="text-xs text-gray-400 uppercase">Parsial OK</div>
+                        <div className="font-bold text-amber-600">{reportSummary.totalPartialOnTime || 0}</div>
                       </div>
                       <div className="bg-white p-3 rounded border text-center">
                         <div className="text-xs text-gray-400 uppercase">Menunggu</div>
@@ -821,7 +1548,110 @@ const TabReports = (props) => {
                     </div>
                   )}
 
-                  <div className="bg-white rounded-lg border overflow-x-auto">
+                  <div className="hidden">
+                    {reportLoading && (
+                      <div className="p-6 text-center text-sm text-slate-400 border rounded-lg">Memuat...</div>
+                    )}
+                    {!reportLoading && rekapSupplierGroups.length === 0 && (
+                      <div className="p-6 text-center text-sm text-slate-400 border rounded-lg">Tidak ada data.</div>
+                    )}
+                    {!reportLoading && rekapSupplierGroups.map((group) => {
+                      const isOpen = rekapExpanded[group.supplierKey] ?? rekapSupplierGroups.length === 1;
+                      return (
+                        <div key={group.supplierKey} className="border rounded-lg bg-white overflow-hidden">
+                          <div className="p-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                            <div>
+                              <div className="font-bold text-slate-900">{group.supplierLabel}</div>
+                              <div className="text-xs text-slate-500">{group.poCount} PO | {formatQuantity(group.totalRequested)} order | {formatQuantity(group.totalReceived)} incoming</div>
+                            </div>
+                            <div className="grid grid-cols-2 md:grid-cols-6 gap-2 text-center">
+                              <div className="border rounded p-2">
+                                <div className="text-[10px] uppercase text-slate-400">Performance</div>
+                                <div className="font-bold text-indigo-700">{formatPercent(group.weightedScore)}</div>
+                              </div>
+                              <div className="border rounded p-2">
+                                <div className="text-[10px] uppercase text-slate-400">Rating</div>
+                                <div className="flex justify-center gap-0.5 text-amber-500">
+                                  {Array.from({ length: 5 }).map((_, idx) => (
+                                    <Star key={idx} size={14} fill={idx < group.rating ? 'currentColor' : 'none'} />
+                                  ))}
+                                </div>
+                              </div>
+                              <div className="border rounded p-2">
+                                <div className="text-[10px] uppercase text-slate-400">Timing</div>
+                                <div className="font-semibold text-green-700">{group.timingScore}%</div>
+                              </div>
+                              <div className="border rounded p-2">
+                                <div className="text-[10px] uppercase text-slate-400">Fulfill</div>
+                                <div className="font-semibold text-blue-700">{group.fulfillmentScore}%</div>
+                              </div>
+                              <div className="border rounded p-2">
+                                <div className="text-[10px] uppercase text-slate-400">QC</div>
+                                <div className="font-semibold text-rose-700">{group.qcScore === null ? '-' : `${group.qcScore}%`}</div>
+                              </div>
+                              <div className="border rounded p-2">
+                                <div className="text-[10px] uppercase text-slate-400">Packing</div>
+                                <div className="font-semibold text-slate-700">{group.packingScore === null ? '-' : `${group.packingScore}%`}</div>
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              className="print:hidden border px-3 py-2 rounded text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                              onClick={() => setRekapExpanded((prev) => ({ ...prev, [group.supplierKey]: !isOpen }))}
+                            >
+                              {isOpen ? 'Tutup Detail' : 'Detail PO'}
+                            </button>
+                          </div>
+                          <div className="grid grid-cols-2 md:grid-cols-6 gap-2 px-4 pb-4 text-xs">
+                            <div className="bg-emerald-50 text-emerald-700 rounded p-2">On-time Qty: <b>{formatQuantity(group.onTimeQty)}</b></div>
+                            <div className="bg-rose-50 text-rose-700 rounded p-2">Late Qty: <b>{formatQuantity(group.lateQty)}</b></div>
+                            <div className="bg-amber-50 text-amber-700 rounded p-2">Partial OK: <b>{group.partialOnTimeCount}</b></div>
+                            <div className="bg-red-50 text-red-700 rounded p-2">Late Completion: <b>{group.lateCompletionCount}</b></div>
+                            <div className="bg-orange-50 text-orange-700 rounded p-2">Partial Late: <b>{group.partialLateCount}</b></div>
+                            <div className="bg-slate-50 text-slate-700 rounded p-2">QC Open/Reject: <b>{group.qcOpen}/{group.qcReject}</b></div>
+                          </div>
+                          {isOpen && (
+                            <div className="border-t overflow-x-auto">
+                              <table className="min-w-full text-xs">
+                                <thead className="bg-slate-50 text-slate-500 uppercase">
+                                  <tr>
+                                    <th className="text-left p-3">No PO</th>
+                                    <th className="text-right p-3">Qty PO</th>
+                                    <th className="text-right p-3">Incoming</th>
+                                    <th className="text-right p-3">On-time Qty</th>
+                                    <th className="text-right p-3">Late Qty</th>
+                                    <th className="text-right p-3">Partial OK</th>
+                                    <th className="text-right p-3">Late Completion</th>
+                                    <th className="text-right p-3">QC Open</th>
+                                    <th className="text-right p-3">SNP Tidak Sesuai</th>
+                                    <th className="text-center p-3">Score</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {group.rows.map((row, idx) => (
+                                    <tr key={`${group.supplierKey}-${row.poNumber}-${idx}`} className="border-t">
+                                      <td className="p-3 font-semibold text-slate-700">{row.poNumber}</td>
+                                      <td className="p-3 text-right">{formatQuantity(row.totalRequested)}</td>
+                                      <td className="p-3 text-right">{formatQuantity(row.totalReceived)}</td>
+                                      <td className="p-3 text-right text-green-700">{formatQuantity(row.onTimeQty)}</td>
+                                      <td className="p-3 text-right text-red-700">{formatQuantity(row.lateQty)}</td>
+                                      <td className="p-3 text-right text-amber-700">{row.partialOnTimeCount || 0}</td>
+                                      <td className="p-3 text-right text-rose-700">{row.lateCompletionCount || 0}</td>
+                                      <td className="p-3 text-right text-rose-700">{row.qcOpen || 0}</td>
+                                      <td className="p-3 text-right text-orange-700">{row.looseCount || 0}</td>
+                                      <td className="p-3 text-center font-bold text-indigo-700">{row.weightedScore ?? '-'}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="hidden">
                     <table className="min-w-full text-sm">
                       <thead className="bg-slate-100">
                         <tr>
@@ -852,7 +1682,7 @@ const TabReports = (props) => {
                             const packingScore = rnCount > 0 ? Math.round(((rnCount - looseCount) / rnCount) * 100) : null;
                             return (
                           <tr key={`${row.supplier}-${row.poNumber}-${idx}`} className="border-t">
-                            <td className="p-3">{row.supplier}</td>
+                            <td className="p-3">{row?.supplier?.name || row?.supplier?.code || row?.supplierName || '-'}</td>
                             <td className="p-3">{row.poNumber}</td>
                             <td className="p-3 text-right">{row.totalRequested}</td>
                             <td className="p-3 text-right">{row.totalReceived}</td>
@@ -1987,45 +2817,409 @@ const TabReports = (props) => {
               )}
 
               {reportTab === 'sasaran-mutu' && canViewReport && (
-                <div className="bg-white rounded-xl shadow-sm border p-4 report-print-scope">
-                  {(() => {
-                    const range = buildMonthInputRange(qualityObjectivesMonth);
-                    return renderReportHeader('LAPORAN SASARAN MUTU', range.start || reportStart, range.end || reportEnd);
-                  })()}
+                <div className="bg-white rounded-xl shadow-sm border p-4 report-print-scope quality-sps-report">
                   <div className="flex items-center justify-between mb-4">
                     <h3 className="font-bold text-slate-900 flex items-center gap-2"><CheckCircle size={18}/> Laporan Sasaran Mutu</h3>
                     <div className="flex gap-2 items-center print:hidden">
                       <button onClick={fetchQualityObjectivesReport} className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1 rounded text-xs">Refresh</button>
                       <button onClick={handleExportQualityObjectivesExcel} className="bg-emerald-500 hover:bg-emerald-600 text-white px-3 py-1 rounded text-xs">Excel</button>
-                      <select
-                        className="border rounded px-2 py-1 text-xs text-slate-700"
-                        value={reportPrintOrientation}
-                        onChange={(e) => setReportPrintOrientation(e.target.value)}
-                      >
-                        <option value="portrait">Portrait</option>
-                        <option value="landscape">Landscape</option>
-                      </select>
-                      <button onClick={handlePrintReport} className="bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded text-xs">PDF</button>
+                      <button onClick={() => handlePrintReport('landscape')} className="bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded text-xs">PDF Landscape</button>
                     </div>
                   </div>
-                  <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4 print:hidden">
+                  <div className="grid grid-cols-1 md:grid-cols-6 gap-3 mb-4 print:hidden">
+                    <div className="md:col-span-2">
+                      <label className="text-xs font-semibold text-gray-500">Supplier</label>
+                      <SearchableSelectDropdown
+                        value={qualityObjectivesSupplier}
+                        options={[{ value: '', label: 'ALL - Semua Supplier' }, ...masterSupplierOptions]}
+                        placeholder="ALL - Semua Supplier"
+                        onChange={(value) => setQualityObjectivesSupplier(value)}
+                      />
+                    </div>
                     <div>
-                      <label className="text-xs font-semibold text-gray-500">Periode (Bulan)</label>
+                      <label className="text-xs font-semibold text-gray-500">Bulan Awal</label>
+                      <select
+                        className="border p-2 rounded w-full text-sm bg-white"
+                        value={qualityObjectivesMonthStart}
+                        onChange={(e) => setQualityObjectivesMonthStart(e.target.value)}
+                      >
+                        {monthOptions.map((opt) => (
+                          <option key={opt.key} value={opt.key}>{opt.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Bulan Akhir</label>
+                      <select
+                        className="border p-2 rounded w-full text-sm bg-white"
+                        value={qualityObjectivesMonthEnd}
+                        onChange={(e) => setQualityObjectivesMonthEnd(e.target.value)}
+                      >
+                        {monthOptions.map((opt) => (
+                          <option key={opt.key} value={opt.key}>{opt.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Tahun</label>
                       <input
-                        type="month"
+                        type="number"
                         className="border p-2 rounded w-full text-sm"
-                        value={qualityObjectivesMonth}
-                        onChange={(e) => setQualityObjectivesMonth(e.target.value)}
+                        value={qualityObjectivesYear}
+                        onChange={(e) => {
+                          const nextYear = e.target.value;
+                          setQualityObjectivesYear(nextYear);
+                          const currentMonthPart = String(qualityObjectivesMonth || '').slice(5, 7) || '01';
+                          if (nextYear) setQualityObjectivesMonth(`${nextYear}-${currentMonthPart}`);
+                        }}
                       />
                     </div>
                     <div className="flex items-end">
                       <button onClick={fetchQualityObjectivesReport} className="bg-indigo-600 text-white px-4 py-2 rounded w-full text-sm">Terapkan</button>
                     </div>
                   </div>
-                  <div className="space-y-6">
-                    {renderQualityTable('Inbound Schedule vs Incoming', qualityObjectivesData?.inboundSchedule || [], 'Supplier')}
-                    {renderQualityTable('DN vs RN (Akurasi Surat Jalan)', qualityObjectivesData?.dnVsRn || [], 'Supplier')}
-                    {renderQualityTable('Delivery vs PRL', qualityObjectivesData?.deliveryVsPrl || [], 'Customer')}
+
+                  <div className="quality-sps-sheet">
+                    <div className="quality-sps-header">
+                      <div className="quality-sps-brand">
+                        <img src={logoPrl} alt="PT. Matra Roda Piranti" />
+                        <div>PT. Matra Roda Piranti</div>
+                      </div>
+                      <div className="quality-sps-title">
+                        SASARAN MUTU PPIC TAHUN {qualitySpsYear}
+                      </div>
+                      <div className="quality-sps-meta">
+                        <div>{qualitySpsSupplierLabel}</div>
+                        <div>{qualityMonthRangeText}</div>
+                      </div>
+                    </div>
+
+                    {reportLoading ? (
+                      <div className="py-8 text-center text-sm text-slate-500">Memuat laporan sasaran mutu...</div>
+                    ) : (
+                      <>
+                        {renderQualitySpsTable()}
+                        <div className="quality-sps-chart">
+                          <SafeResponsiveContainer>
+                            <ComposedChart data={qualitySpsChartRows} margin={{ top: 12, right: 34, bottom: 30, left: 6 }}>
+                              <CartesianGrid stroke="#d9d9d9" vertical={false} />
+                              <XAxis dataKey="label" tick={{ fontSize: 10 }} interval={0} />
+                              <YAxis yAxisId="qty" tick={{ fontSize: 10 }} tickFormatter={(value) => Number(value || 0).toLocaleString('id-ID')} />
+                              <YAxis yAxisId="percent" orientation="right" domain={[0, 120]} tick={{ fontSize: 10 }} tickFormatter={(value) => `${value}%`} />
+                              <Tooltip formatter={(value, name) => {
+                                if (name === '%') return [`${Number(value || 0).toFixed(0)}%`, name];
+                                return [Number(value || 0).toLocaleString('id-ID'), name];
+                              }} />
+                              <Legend verticalAlign="bottom" height={24} wrapperStyle={{ fontSize: 10 }} />
+                              <Bar yAxisId="qty" dataKey="incomingQty" name="Total Incoming (Pcs)" fill="#4472c4" barSize={26}>
+                                <LabelList dataKey="incomingQty" position="insideBottom" angle={-90} formatter={(value) => (value ? formatSpsQty(value) : '')} fill="#ffffff" fontSize={10} />
+                              </Bar>
+                              <Bar yAxisId="qty" dataKey="dnOrderQty" name="Total DN Order (Pcs)" fill="#ed7d31" barSize={26}>
+                                <LabelList dataKey="dnOrderQty" position="insideBottom" angle={-90} formatter={(value) => (value ? formatSpsQty(value) : '')} fill="#ffffff" fontSize={10} />
+                              </Bar>
+                              <Line yAxisId="percent" type="monotone" dataKey="percent" name="%" stroke="#8c8c8c" strokeWidth={2} dot={false} connectNulls={false}>
+                                <LabelList dataKey="percent" position="top" formatter={(value) => (value ? `${Math.round(value)}%` : '')} fill="#111827" fontSize={10} />
+                              </Line>
+                            </ComposedChart>
+                          </SafeResponsiveContainer>
+                        </div>
+                        {renderQualitySpsSignatures()}
+                      </>
+                    )}
+                  </div>
+                  <div className="report-page-footer print-only" />
+                </div>
+              )}
+
+              {reportTab === 'qc-report' && canViewReport && (
+                <div className="bg-white rounded-xl shadow-sm border p-4 report-print-scope">
+                  {renderReportHeader('LAPORAN QUALITY CONTROL', reportStart, reportEnd)}
+                  <div className="flex items-center justify-between mb-4">
+                    <div>
+                      <h3 className="font-bold text-slate-900 flex items-center gap-2"><ShieldCheck size={18}/> Laporan QC</h3>
+                      <p className="text-xs text-slate-500 mt-1">Incoming RN, Material NG Line, Production NG, Return, correction review, dan Mill Sheet.</p>
+                    </div>
+                    <div className="flex gap-2 items-center print:hidden">
+                      <button onClick={fetchQcReport} disabled={qcReportLoading} className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1 rounded text-xs">
+                        {qcReportLoading ? 'Memuat...' : 'Refresh'}
+                      </button>
+                      <button onClick={handleExportQcReportExcel} className="bg-emerald-500 hover:bg-emerald-600 text-white px-3 py-1 rounded text-xs">Excel</button>
+                      <button onClick={() => handlePrintReport('landscape')} className="bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded text-xs">PDF Landscape</button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-5 gap-3 mb-4 print:hidden">
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Tanggal Awal</label>
+                      <input
+                        type="date"
+                        className="border p-2 rounded w-full text-sm"
+                        value={reportStart}
+                        onChange={(e) => setReportStart(e.target.value)}
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Tanggal Akhir</label>
+                      <input
+                        type="date"
+                        className="border p-2 rounded w-full text-sm"
+                        value={reportEnd}
+                        onChange={(e) => setReportEnd(e.target.value)}
+                      />
+                    </div>
+                    <div className="md:col-span-2">
+                      <label className="text-xs font-semibold text-gray-500">Supplier</label>
+                      <SearchableSelectDropdown
+                        value={reportSupplier}
+                        options={[{ value: '', label: 'ALL - Semua Supplier' }, ...masterSupplierOptions]}
+                        placeholder="ALL - Semua Supplier"
+                        onChange={(value) => setReportSupplier(value)}
+                      />
+                    </div>
+                    <div className="flex items-end">
+                      <button onClick={fetchQcReport} className="bg-indigo-600 text-white px-4 py-2 rounded w-full text-sm">Terapkan</button>
+                    </div>
+                  </div>
+
+                  <div className="mb-4 rounded border bg-slate-50 p-3 text-xs text-slate-600">
+                    <b>Scope:</b> {qcSupplierLabel} | Periode {formatPrintDate(reportStart)} s/d {formatPrintDate(reportEnd)}
+                  </div>
+
+                  {qcReportError && (
+                    <div className="mb-4 rounded border border-red-200 bg-red-50 p-3 text-sm text-red-700">{qcReportError}</div>
+                  )}
+
+                  <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mb-6">
+                    <div className="bg-white p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Total Case</div>
+                      <div className="font-bold text-xl">{formatCount(qcSummary.totalCases)}</div>
+                    </div>
+                    <div className="bg-white p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Open Case</div>
+                      <div className="font-bold text-xl text-amber-600">{formatCount(qcSummary.openCases)}</div>
+                    </div>
+                    <div className="bg-white p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Release Rate</div>
+                      <div className="font-bold text-xl text-emerald-600">{formatPercent(qcSummary.releaseRate)}</div>
+                    </div>
+                    <div className="bg-white p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Reject/Return</div>
+                      <div className="font-bold text-xl text-rose-600">{formatCount((qcSummary.rejectCount || 0) + (qcSummary.returnSupplierCount || 0))}</div>
+                    </div>
+                    <div className="bg-white p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Defect PPM</div>
+                      <div className="font-bold text-xl">{formatCount(qcSummary.defectPpm)}</div>
+                    </div>
+                    <div className="bg-white p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Aging Open</div>
+                      <div className="font-bold text-xl">{Number(qcSummary.avgOpenAgingDays || 0).toFixed(1)} hari</div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mb-6">
+                    <div className="bg-slate-50 p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Incoming QC</div>
+                      <div className="font-bold">{formatCount(qcSummary.incomingCases)}</div>
+                    </div>
+                    <div className="bg-slate-50 p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Material NG Line</div>
+                      <div className="font-bold text-rose-700">{formatCount(qcSummary.materialLineNg)}</div>
+                    </div>
+                    <div className="bg-slate-50 p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Production NG</div>
+                      <div className="font-bold text-orange-700">{formatCount(qcSummary.productionNg)}</div>
+                    </div>
+                    <div className="bg-slate-50 p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Hold</div>
+                      <div className="font-bold text-amber-700">{formatCount(qcSummary.holdCount)}</div>
+                    </div>
+                    <div className="bg-slate-50 p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Correction Review</div>
+                      <div className="font-bold">{formatCount(qcSummary.correctionReviewCount)}</div>
+                    </div>
+                    <div className="bg-slate-50 p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Mill Sheet Open</div>
+                      <div className="font-bold text-purple-700">{formatCount((qcMillsheet.waitingQc || 0) + (qcMillsheet.pendingReceipts || 0))}</div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+                    <div className="rounded-lg border bg-white p-3">
+                      <div className="mb-3 text-sm font-semibold text-slate-800">Trend QC Bulanan</div>
+                      <div className="h-72">
+                        <SafeResponsiveContainer>
+                          <ComposedChart data={qcMonthlyChartRows}>
+                            <CartesianGrid strokeDasharray="3 3" />
+                            <XAxis dataKey="label" tick={{ fontSize: 11 }} />
+                            <YAxis yAxisId="count" allowDecimals={false} />
+                            <YAxis yAxisId="rate" orientation="right" domain={[0, 100]} tickFormatter={(value) => `${value}%`} />
+                            <Tooltip formatter={(value, name) => (name === 'Release Rate' ? `${Number(value || 0).toFixed(1)}%` : formatCount(value))} />
+                            <Legend wrapperStyle={{ fontSize: 11 }} />
+                            <Bar yAxisId="count" dataKey="totalCases" name="Total Case" fill="#334155" barSize={20} />
+                            <Bar yAxisId="count" dataKey="openCases" name="Open" fill="#f59e0b" barSize={20} />
+                            <Bar yAxisId="count" dataKey="rejectCount" name="Reject" fill="#e11d48" barSize={20} />
+                            <Line yAxisId="rate" type="monotone" dataKey="releaseRate" name="Release Rate" stroke="#059669" strokeWidth={2} />
+                            <ReferenceLine yAxisId="rate" y={95} stroke="#16a34a" strokeDasharray="4 4" />
+                          </ComposedChart>
+                        </SafeResponsiveContainer>
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border bg-white p-3">
+                      <div className="mb-3 text-sm font-semibold text-slate-800">Disposition QC</div>
+                      <div className="h-72">
+                        <SafeResponsiveContainer>
+                          <ComposedChart data={qcDispositionChartRows} layout="vertical" margin={{ left: 30, right: 20 }}>
+                            <CartesianGrid strokeDasharray="3 3" />
+                            <XAxis type="number" allowDecimals={false} />
+                            <YAxis type="category" dataKey="label" width={115} tick={{ fontSize: 11 }} />
+                            <Tooltip formatter={(value) => formatCount(value)} />
+                            <Bar dataKey="totalCases" name="Case" fill="#4f46e5" barSize={18}>
+                              <LabelList dataKey="totalCases" position="right" formatter={(value) => formatCount(value)} fontSize={11} />
+                            </Bar>
+                          </ComposedChart>
+                        </SafeResponsiveContainer>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 mb-6">
+                    <div className="rounded-lg border overflow-hidden">
+                      <div className="bg-slate-50 px-3 py-2 text-sm font-semibold">Performance QC Supplier</div>
+                      <div className="overflow-x-auto">
+                        <table className="min-w-full text-xs">
+                          <thead className="bg-slate-100 text-slate-600">
+                            <tr>
+                              <th className="p-2 text-left">Supplier</th>
+                              <th className="p-2 text-right">Case</th>
+                              <th className="p-2 text-right">Open</th>
+                              <th className="p-2 text-right">NG Line</th>
+                              <th className="p-2 text-right">Reject</th>
+                              <th className="p-2 text-right">Closure</th>
+                              <th className="p-2 text-center">Score</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {qcReportLoading && (
+                              <tr><td colSpan="7" className="p-4 text-center text-slate-400">Memuat...</td></tr>
+                            )}
+                            {!qcReportLoading && (qcReportData.supplierRows || []).length === 0 && (
+                              <tr><td colSpan="7" className="p-4 text-center text-slate-400">Belum ada data supplier QC.</td></tr>
+                            )}
+                            {!qcReportLoading && (qcReportData.supplierRows || []).map((row) => (
+                              <tr key={`qc-supplier-${row.supplierCode}`} className="border-t">
+                                <td className="p-2">
+                                  <div className="font-semibold">{row.supplierCode || '-'}</div>
+                                  <div className="text-[11px] text-slate-500">{row.supplierName || '-'}</div>
+                                </td>
+                                <td className="p-2 text-right">{formatCount(row.totalCases)}</td>
+                                <td className="p-2 text-right text-amber-700">{formatCount(row.openCases)}</td>
+                                <td className="p-2 text-right text-rose-700">{formatCount(row.materialLineNg)}</td>
+                                <td className="p-2 text-right text-red-700">{formatCount(row.rejectCases)}</td>
+                                <td className="p-2 text-right">{formatPercent(row.closureRate)}</td>
+                                <td className="p-2 text-center">
+                                  <span className={`inline-flex min-w-14 justify-center rounded px-2 py-1 font-bold ${getQcScoreClass(row.qualityScore)}`}>
+                                    {formatPercent(row.qualityScore)}
+                                  </span>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border overflow-hidden">
+                      <div className="bg-slate-50 px-3 py-2 text-sm font-semibold">Top Defect</div>
+                      <div className="overflow-x-auto">
+                        <table className="min-w-full text-xs">
+                          <thead className="bg-slate-100 text-slate-600">
+                            <tr>
+                              <th className="p-2 text-left">Defect</th>
+                              <th className="p-2 text-right">Case</th>
+                              <th className="p-2 text-right">Qty Defect</th>
+                              <th className="p-2 text-right">Major</th>
+                              <th className="p-2 text-right">Critical</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {qcReportLoading && (
+                              <tr><td colSpan="5" className="p-4 text-center text-slate-400">Memuat...</td></tr>
+                            )}
+                            {!qcReportLoading && (qcReportData.topDefects || []).length === 0 && (
+                              <tr><td colSpan="5" className="p-4 text-center text-slate-400">Belum ada defect tercatat.</td></tr>
+                            )}
+                            {!qcReportLoading && (qcReportData.topDefects || []).map((row) => (
+                              <tr key={`qc-defect-${row.defect}`} className="border-t">
+                                <td className="p-2 font-semibold">{row.defect}</td>
+                                <td className="p-2 text-right">{formatCount(row.totalCases)}</td>
+                                <td className="p-2 text-right">{formatQuantity(row.defectQty)}</td>
+                                <td className="p-2 text-right text-orange-700">{formatCount(row.major)}</td>
+                                <td className="p-2 text-right text-red-700">{formatCount(row.critical)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+                    <div className="rounded-lg border bg-white p-3">
+                      <div className="mb-3 text-sm font-semibold">Mill Sheet Control</div>
+                      <div className="grid grid-cols-2 gap-2 text-sm">
+                        <div className="rounded bg-slate-50 p-3"><div className="text-xs text-slate-400">Dokumen</div><b>{formatCount(qcMillsheet.totalDocuments)}</b></div>
+                        <div className="rounded bg-amber-50 p-3"><div className="text-xs text-amber-600">Waiting QC</div><b>{formatCount(qcMillsheet.waitingQc)}</b></div>
+                        <div className="rounded bg-emerald-50 p-3"><div className="text-xs text-emerald-600">Approved</div><b>{formatCount(qcMillsheet.approved)}</b></div>
+                        <div className="rounded bg-rose-50 p-3"><div className="text-xs text-rose-600">Rejected</div><b>{formatCount(qcMillsheet.rejected)}</b></div>
+                        <div className="rounded bg-purple-50 p-3"><div className="text-xs text-purple-600">RN Pending</div><b>{formatCount(qcMillsheet.pendingReceipts)}</b></div>
+                        <div className="rounded bg-red-50 p-3"><div className="text-xs text-red-600">Overdue</div><b>{formatCount(qcMillsheet.overdueReceipts)}</b></div>
+                      </div>
+                    </div>
+                    <div className="lg:col-span-2 rounded-lg border overflow-hidden">
+                      <div className="bg-slate-50 px-3 py-2 text-sm font-semibold">Open Case Aging</div>
+                      <div className="overflow-x-auto">
+                        <table className="min-w-full text-xs">
+                          <thead className="bg-slate-100 text-slate-600">
+                            <tr>
+                              <th className="p-2 text-left">Tanggal</th>
+                              <th className="p-2 text-left">Case</th>
+                              <th className="p-2 text-left">Source</th>
+                              <th className="p-2 text-left">Item</th>
+                              <th className="p-2 text-left">Supplier</th>
+                              <th className="p-2 text-right">Qty</th>
+                              <th className="p-2 text-left">Defect</th>
+                              <th className="p-2 text-left">Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {qcReportLoading && (
+                              <tr><td colSpan="8" className="p-4 text-center text-slate-400">Memuat...</td></tr>
+                            )}
+                            {!qcReportLoading && (qcReportData.openCases || []).length === 0 && (
+                              <tr><td colSpan="8" className="p-4 text-center text-slate-400">Tidak ada open case.</td></tr>
+                            )}
+                            {!qcReportLoading && (qcReportData.openCases || []).map((row) => (
+                              <tr key={`qc-open-${row.id}`} className="border-t">
+                                <td className="p-2">{formatPrintDate(row.eventAt || row.createdAt)}</td>
+                                <td className="p-2 font-semibold">{row.caseNumber || '-'}</td>
+                                <td className="p-2">{qcSourceLabels[row.sourceType] || row.sourceType || '-'}</td>
+                                <td className="p-2">
+                                  <div className="font-semibold">{row.itemCode || '-'}</div>
+                                  <div className="text-[11px] text-slate-500">{row.itemName || '-'}</div>
+                                </td>
+                                <td className="p-2">{row.supplierCode || row.supplier || '-'}</td>
+                                <td className="p-2 text-right">{formatQuantity(row.qty)}</td>
+                                <td className="p-2">{row.defectCategory || row.defectDescription || '-'}</td>
+                                <td className="p-2">
+                                  <span className="rounded bg-amber-50 px-2 py-1 text-amber-700 font-semibold">{row.status || '-'}</span>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
                   </div>
                   {renderReportSignatures()}
                   <div className="report-page-footer print-only" />

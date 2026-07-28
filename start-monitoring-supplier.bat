@@ -8,6 +8,4 @@ if %errorlevel% neq 0 (
 )
 timeout /t 6 /nobreak >nul
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\open-dev-browser.ps1"
-echo.
-echo Aplikasi selesai atau error.
-pause>nul
+exit /b %errorlevel%

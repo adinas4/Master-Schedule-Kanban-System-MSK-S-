@@ -21,6 +21,7 @@ server/.env.local
 
 # Temp files
 tmp-downloads/*
+backups/
 *.tmp
 *.bak
 *.dump

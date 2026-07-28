@@ -94,6 +94,7 @@ app.use((req, res, next) => {
 const uploadsRoot = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, "uploads"));
 const itemsUploadDir = path.join(uploadsRoot, "items");
 const itemsThumbDir = path.join(itemsUploadDir, "thumbs");
+const millsheetUploadDir = path.join(uploadsRoot, "millsheets");
 const frontendDistDir = path.resolve(__dirname, "..", "dist");
 const frontendIndexFile = path.join(frontendDistDir, "index.html");
 
@@ -365,6 +366,32 @@ const setScheduleCache = (key, data) => {
 const clearScheduleCache = () => {
   scheduleCache.clear();
 };
+const SCHEDULE_STATUS_SQL = `
+  case
+    when coalesce(nullif(rs.receipt_total, 0), coalesce(s.received_qty, 0), 0) <= 0 then 'Pending'
+    when coalesce(nullif(rs.receipt_total, 0), coalesce(s.received_qty, 0), 0) < coalesce(s.request_qty, 0)
+      and coalesce(rs.late_qty, case when s.arrival_date > s.request_date then coalesce(s.received_qty, 0) else 0 end, 0) > 0
+      then 'Partial Late'
+    when coalesce(nullif(rs.receipt_total, 0), coalesce(s.received_qty, 0), 0) < coalesce(s.request_qty, 0)
+      and coalesce(rs.on_time_qty, case when s.arrival_date between (s.request_date - interval '1 day') and s.request_date then coalesce(s.received_qty, 0) else 0 end, 0) > 0
+      then 'Partial On Time'
+    when coalesce(nullif(rs.receipt_total, 0), coalesce(s.received_qty, 0), 0) < coalesce(s.request_qty, 0)
+      and coalesce(rs.too_early_qty, case when s.arrival_date < (s.request_date - interval '1 day') then coalesce(s.received_qty, 0) else 0 end, 0) > 0
+      then 'Partial Too Early'
+    when coalesce(nullif(rs.receipt_total, 0), coalesce(s.received_qty, 0), 0) < coalesce(s.request_qty, 0)
+      then 'Partial'
+    when coalesce(rs.late_qty, case when s.arrival_date > s.request_date then coalesce(s.received_qty, 0) else 0 end, 0) > 0
+      and coalesce(rs.on_time_qty, case when s.arrival_date between (s.request_date - interval '1 day') and s.request_date then coalesce(s.received_qty, 0) else 0 end, 0) > 0
+      then 'Late Completion'
+    when coalesce(rs.late_qty, case when s.arrival_date > s.request_date then coalesce(s.received_qty, 0) else 0 end, 0) > 0
+      then 'Late'
+    when coalesce(rs.on_time_qty, case when s.arrival_date between (s.request_date - interval '1 day') and s.request_date then coalesce(s.received_qty, 0) else 0 end, 0) > 0
+      then 'On Time'
+    when coalesce(rs.too_early_qty, case when s.arrival_date < (s.request_date - interval '1 day') then coalesce(s.received_qty, 0) else 0 end, 0) > 0
+      then 'Too Early'
+    else 'Pending'
+  end
+`;
 
 const MAX_ORIGINAL_BYTES = 200 * 1024;
 const MAX_THUMB_BYTES = 30 * 1024;
@@ -374,6 +401,7 @@ const ensureUploadDirs = async () => {
   await fs.mkdir(uploadsRoot, { recursive: true });
   await fs.mkdir(itemsUploadDir, { recursive: true });
   await fs.mkdir(itemsThumbDir, { recursive: true });
+  await fs.mkdir(millsheetUploadDir, { recursive: true });
 };
 
 const upload = multer({
@@ -398,6 +426,19 @@ const deliveryUpload = multer({
       return;
     }
     cb(new Error("File DN harus berupa gambar atau PDF."));
+  },
+});
+
+const millsheetUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const mimeType = String(file.mimetype || "").toLowerCase();
+    if (mimeType.startsWith("image/") || mimeType === "application/pdf") {
+      cb(null, true);
+      return;
+    }
+    cb(new Error("File Mill Sheet harus berupa PDF/JPG/PNG."));
   },
 });
 
@@ -479,6 +520,7 @@ const permissionKeys = [
   "useAI",
   "manageUsers",
   "resetAll",
+  "quality",
   "production",
 ];
 
@@ -499,6 +541,7 @@ const defaultPermissionsByRole = {
     useAI: true,
     manageUsers: true,
     resetAll: true,
+    quality: true,
     production: true,
   },
   ppic: {
@@ -517,6 +560,7 @@ const defaultPermissionsByRole = {
     useAI: true,
     manageUsers: false,
     resetAll: false,
+    quality: false,
     production: true,
   },
   warehouse: {
@@ -535,7 +579,27 @@ const defaultPermissionsByRole = {
     useAI: false,
     manageUsers: false,
     resetAll: false,
+    quality: false,
     production: true,
+  },
+  qc: {
+    viewReport: true,
+    viewScorecard: false,
+    viewMaster: true,
+    manageMaster: false,
+    manageVendors: false,
+    manageItems: false,
+    viewPrl: false,
+    prlProcess: false,
+    prlImport: false,
+    editSchedules: false,
+    deleteRecords: false,
+    importExport: false,
+    useAI: false,
+    manageUsers: false,
+    resetAll: false,
+    quality: true,
+    production: false,
   },
   production: {
     viewReport: false,
@@ -553,6 +617,7 @@ const defaultPermissionsByRole = {
     useAI: false,
     manageUsers: false,
     resetAll: false,
+    quality: false,
     production: true,
   },
   purchasing: {
@@ -571,6 +636,7 @@ const defaultPermissionsByRole = {
     useAI: true,
     manageUsers: false,
     resetAll: false,
+    quality: false,
     production: false,
   },
   management: {
@@ -589,6 +655,7 @@ const defaultPermissionsByRole = {
     useAI: false,
     manageUsers: false,
     resetAll: false,
+    quality: false,
     production: false,
   },
   user: {
@@ -607,6 +674,7 @@ const defaultPermissionsByRole = {
     useAI: false,
     manageUsers: false,
     resetAll: false,
+    quality: false,
     production: false,
   },
   supplier: {
@@ -622,14 +690,17 @@ const defaultPermissionsByRole = {
     editSchedules: false,
     deleteRecords: false,
     importExport: false,
-    useAI: false,
+    useAI: true,
     manageUsers: false,
     resetAll: false,
+    quality: false,
     production: false,
   },
 };
 
-const allowedRoles = new Set(["admin", "ppic", "warehouse", "production", "purchasing", "management", "user", "supplier"]);
+const allowedRoles = new Set(["admin", "ppic", "warehouse", "production", "qc", "purchasing", "management", "user", "supplier"]);
+
+const isProductionRole = (role) => String(role || "").trim().toLowerCase() === "production";
 
 const normalizePermissions = (input, role) => {
   const normalizedRole = String(role || "").trim().toLowerCase();
@@ -650,6 +721,7 @@ const normalizePermissions = (input, role) => {
       useAI: false,
       manageUsers: false,
       resetAll: false,
+      quality: false,
       production: true,
     };
   }
@@ -672,6 +744,9 @@ const normalizePermissions = (input, role) => {
     normalized.importExport = true;
     normalized.useAI = true;
     normalized.production = true;
+  }
+  if (normalizedRole === "supplier") {
+    normalized.useAI = true;
   }
   return normalized;
 };
@@ -805,6 +880,15 @@ const ensureSchema = async () => {
   `);
 
   await pool.query(`
+    update users
+    set
+      permissions = jsonb_set(coalesce(permissions, '{}'::jsonb), '{useAI}', 'true'::jsonb, true),
+      updated_at = now()
+    where lower(coalesce(role, '')) = 'supplier'
+      and lower(coalesce(permissions ->> 'useAI', 'false')) <> 'true';
+  `).catch(() => {});
+
+  await pool.query(`
     create table if not exists auth_sessions (
       id serial primary key,
       user_id integer not null references users(id) on delete cascade,
@@ -905,6 +989,16 @@ const ensureSchema = async () => {
   `);
 
   await pool.query(`
+    update auth_sessions s
+    set expires_at = '9999-12-31 23:59:59+00'::timestamptz
+    from users u
+    where u.id = s.user_id
+      and lower(coalesce(u.role, '')) = 'production'
+      and s.status = 'active'
+      and s.revoked_at is null;
+  `).catch(() => {});
+
+  await pool.query(`
     alter table schedules
     add column if not exists actual_locked boolean not null default false;
   `);
@@ -918,6 +1012,12 @@ const ensureSchema = async () => {
     alter table schedules
     alter column request_qty type numeric(18,3)
     using request_qty::numeric(18,3)
+  `).catch(() => {});
+
+  await pool.query(`
+    alter table schedules
+    alter column received_qty type numeric(18,3)
+    using received_qty::numeric(18,3)
   `).catch(() => {});
 
   await pool.query(`
@@ -984,6 +1084,67 @@ const ensureSchema = async () => {
   await pool.query(`
     create index if not exists idx_schedules_po_line_id
     on schedules (po_line_id);
+  `);
+
+  await pool.query(`
+    create table if not exists receiving_labels (
+      id serial primary key,
+      token text not null unique,
+      source_type text not null default 'schedule',
+      schedule_id integer references schedules(id) on delete cascade,
+      po_line_id integer,
+      dn_id integer,
+      dn_item_id integer,
+      supplier_id text,
+      po_number text,
+      item_code text not null,
+      planned_qty numeric(18,3) not null default 0,
+      pack_seq integer not null default 1,
+      pack_total integer not null default 1,
+      pack_qty numeric(18,3) not null default 0,
+      label_status text not null default 'active',
+      payload_hash text,
+      created_by integer references users(id),
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    do $$
+    begin
+      if not exists (
+        select 1 from pg_constraint where conname = 'receiving_labels_source_type_check'
+      ) then
+        alter table receiving_labels
+        add constraint receiving_labels_source_type_check
+        check (source_type in ('schedule','dn_item'));
+      end if;
+      if not exists (
+        select 1 from pg_constraint where conname = 'receiving_labels_label_status_check'
+      ) then
+        alter table receiving_labels
+        add constraint receiving_labels_label_status_check
+        check (label_status in ('active','void','used'));
+      end if;
+    end
+    $$;
+  `);
+
+  await pool.query(`
+    create unique index if not exists idx_receiving_labels_active_schedule
+    on receiving_labels (schedule_id)
+    where source_type = 'schedule' and label_status = 'active' and schedule_id is not null;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receiving_labels_token_lower
+    on receiving_labels (lower(token));
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receiving_labels_supplier
+    on receiving_labels (supplier_id, po_number, item_code);
   `);
 
   await pool.query(`
@@ -1526,6 +1687,16 @@ const ensureSchema = async () => {
   `);
 
   await pool.query(`
+    alter table stock_movements
+    add column if not exists kanban_id text;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_stock_movements_kanban_id
+    on stock_movements (kanban_id);
+  `);
+
+  await pool.query(`
     create table if not exists inventory_ledgers (
       id serial primary key,
       date timestamptz not null default now(),
@@ -1577,6 +1748,11 @@ const ensureSchema = async () => {
   await pool.query(`
     alter table inventory_ledgers
     add column if not exists source_ref_line_id integer;
+  `);
+
+  await pool.query(`
+    alter table inventory_ledgers
+    add column if not exists location_id text;
   `);
 
   await pool.query(`
@@ -1806,6 +1982,16 @@ const ensureSchema = async () => {
   await pool.query(`
     alter table stock_batches
     add column if not exists expired_date date;
+  `);
+
+  await pool.query(`
+    alter table stock_batches
+    add column if not exists kanban_id text;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_stock_batches_kanban_id
+    on stock_batches (kanban_id);
   `);
 
   await pool.query(`
@@ -2060,6 +2246,11 @@ const ensureSchema = async () => {
 
   await pool.query(`
     alter table delivery_notes
+    drop constraint if exists delivery_notes_status_check;
+  `);
+
+  await pool.query(`
+    alter table delivery_notes
     add constraint delivery_notes_status_check
     check (status in ('draft','open','sent','in_transit','closed','cancelled','received','partial'));
   `);
@@ -2099,6 +2290,30 @@ const ensureSchema = async () => {
   await pool.query(`
     alter table delivery_notes
     add column if not exists supplier_id text;
+  `);
+
+  await pool.query(`
+    alter table delivery_notes
+    add column if not exists millsheet_status text not null default 'not_required';
+  `);
+
+  await pool.query(`
+    alter table delivery_notes
+    add column if not exists millsheet_due_at timestamptz;
+  `);
+
+  await pool.query(`
+    do $$
+    begin
+      if not exists (
+        select 1 from pg_constraint where conname = 'delivery_notes_millsheet_status_check'
+      ) then
+        alter table delivery_notes
+        add constraint delivery_notes_millsheet_status_check
+        check (millsheet_status in ('not_required','required_pending','uploaded_waiting_qc','qc_approved','qc_rejected','overdue'));
+      end if;
+    end
+    $$;
   `);
 
   await pool.query(`
@@ -2360,6 +2575,52 @@ const ensureSchema = async () => {
   `);
 
   await pool.query(`
+    alter table receive_note_headers
+    add column if not exists millsheet_required boolean not null default false;
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists millsheet_question text not null default 'unknown';
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists millsheet_status text not null default 'not_required';
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists millsheet_due_at timestamptz;
+  `);
+
+  await pool.query(`
+    alter table receive_note_headers
+    add column if not exists millsheet_notes text;
+  `);
+
+  await pool.query(`
+    do $$
+    begin
+      if not exists (
+        select 1 from pg_constraint where conname = 'receive_note_headers_millsheet_question_check'
+      ) then
+        alter table receive_note_headers
+        add constraint receive_note_headers_millsheet_question_check
+        check (millsheet_question in ('unknown','yes','no','follow_up'));
+      end if;
+      if not exists (
+        select 1 from pg_constraint where conname = 'receive_note_headers_millsheet_status_check'
+      ) then
+        alter table receive_note_headers
+        add constraint receive_note_headers_millsheet_status_check
+        check (millsheet_status in ('not_required','required_pending','uploaded_waiting_qc','qc_approved','qc_rejected','overdue'));
+      end if;
+    end
+    $$;
+  `);
+
+  await pool.query(`
     update receive_note_headers
     set
       status = 'posted',
@@ -2406,7 +2667,23 @@ const ensureSchema = async () => {
   `);
 
   await pool.query(`
-    create unique index if not exists idx_receive_note_headers_active_do
+    do $$
+    begin
+      if exists (
+        select 1
+        from pg_class c
+        join pg_index i on i.indexrelid = c.oid
+        where c.relname = 'idx_receive_note_headers_active_do'
+          and i.indisunique
+      ) then
+        drop index idx_receive_note_headers_active_do;
+      end if;
+    end
+    $$;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receive_note_headers_active_do
     on receive_note_headers (lower(trim(supplier)), lower(trim(do_number)))
     where do_number is not null and status in ('draft','validated','posted');
   `);
@@ -2430,6 +2707,55 @@ const ensureSchema = async () => {
   await pool.query(`
     create index if not exists idx_receive_note_headers_supplier_do
     on receive_note_headers (supplier, do_number);
+  `);
+
+  await pool.query(`
+    create table if not exists millsheet_documents (
+      id serial primary key,
+      supplier_id text not null,
+      dn_id integer references delivery_notes(id) on delete set null,
+      dn_number text,
+      rn_id integer references receive_note_headers(id) on delete set null,
+      rn_number text,
+      item_code text,
+      lot_supplier text,
+      certificate_no text,
+      certificate_date date,
+      file_name text not null,
+      file_type text not null,
+      file_size integer not null default 0,
+      file_url text not null,
+      file_hash text not null,
+      upload_version integer not null default 1,
+      status text not null default 'uploaded_waiting_qc' check (status in ('uploaded_waiting_qc','qc_approved','qc_rejected')),
+      qc_notes text,
+      uploaded_by integer references users(id),
+      uploaded_at timestamptz not null default now(),
+      reviewed_by integer references users(id),
+      reviewed_at timestamptz,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_millsheet_documents_supplier
+    on millsheet_documents (supplier_id, uploaded_at desc);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_millsheet_documents_dn_lower
+    on millsheet_documents (lower(coalesce(dn_number, '')));
+  `);
+
+  await pool.query(`
+    create index if not exists idx_millsheet_documents_rn
+    on millsheet_documents (rn_id);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_millsheet_documents_status
+    on millsheet_documents (status, uploaded_at desc);
   `);
 
   await pool.query(`
@@ -2467,6 +2793,142 @@ const ensureSchema = async () => {
   await pool.query(`
     alter table receive_note_items
     add column if not exists line_no integer not null default 1;
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists origin_dn_item_id integer references delivery_note_items(id);
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists kanban_id text;
+  `);
+
+  await pool.query(`
+    alter table receive_note_items
+    add column if not exists supplier_lot_no text;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_receive_note_items_origin_dn_item
+    on receive_note_items (origin_dn_item_id);
+  `);
+
+  await pool.query(`
+    with grouped_duplicates as (
+      select
+        dn_id,
+        lower(trim(item_code)) as item_code_key,
+        min(id) as keep_id,
+        array_agg(id order by id asc) as ids,
+        sum(request_qty)::numeric as total_request_qty
+      from delivery_note_items
+      group by dn_id, lower(trim(item_code))
+      having count(*) > 1
+    ),
+    duplicate_groups as (
+      select
+        dn_id,
+        item_code_key,
+        keep_id,
+        array_remove(ids, keep_id) as duplicate_ids,
+        total_request_qty
+      from grouped_duplicates
+    )
+    update receive_note_items rni
+    set origin_dn_item_id = dg.keep_id
+    from duplicate_groups dg
+    where rni.origin_dn_item_id = any(dg.duplicate_ids);
+  `);
+
+  await pool.query(`
+    with duplicate_groups as (
+      select
+        dn_id,
+        lower(trim(item_code)) as item_code_key,
+        min(id) as keep_id,
+        sum(request_qty)::numeric as total_request_qty
+      from delivery_note_items
+      group by dn_id, lower(trim(item_code))
+      having count(*) > 1
+    )
+    update delivery_note_items dni
+    set request_qty = dg.total_request_qty
+    from duplicate_groups dg
+    where dni.id = dg.keep_id
+      and dni.request_qty is distinct from dg.total_request_qty;
+  `);
+
+  await pool.query(`
+    with grouped_duplicates as (
+      select
+        dn_id,
+        lower(trim(item_code)) as item_code_key,
+        min(id) as keep_id,
+        array_agg(id order by id asc) as ids
+      from delivery_note_items
+      group by dn_id, lower(trim(item_code))
+      having count(*) > 1
+    ),
+    duplicate_groups as (
+      select
+        dn_id,
+        item_code_key,
+        keep_id,
+        array_remove(ids, keep_id) as duplicate_ids
+      from grouped_duplicates
+    )
+    delete from delivery_note_items dni
+    using duplicate_groups dg
+    where dni.id = any(dg.duplicate_ids);
+  `);
+
+  await pool.query(`
+    create unique index if not exists idx_delivery_note_items_unique_dn_item_code
+    on delivery_note_items (dn_id, lower(trim(item_code)));
+  `);
+
+  await pool.query(`
+    with ranked_receipts as (
+      select
+        rni.id,
+        row_number() over (
+          partition by rni.rn_id, rni.origin_dn_id, lower(trim(rni.item_code))
+          order by rni.line_no asc, rni.id asc
+        ) as rn_line_rank
+      from receive_note_items rni
+      where rni.origin_dn_item_id is null
+        and rni.origin_dn_id is not null
+    ),
+    ranked_dn_items as (
+      select
+        dni.id,
+        dni.dn_id,
+        lower(trim(dni.item_code)) as item_code_key,
+        row_number() over (
+          partition by dni.dn_id, lower(trim(dni.item_code))
+          order by dni.id asc
+        ) as dn_line_rank
+      from delivery_note_items dni
+    )
+    update receive_note_items rni
+    set origin_dn_item_id = dni.id
+    from ranked_receipts rr
+    join ranked_dn_items dni
+      on dni.dn_id = (
+        select origin_dn_id
+        from receive_note_items
+        where id = rr.id
+      )
+     and dni.item_code_key = lower(trim((
+        select item_code
+        from receive_note_items
+        where id = rr.id
+      )))
+     and dni.dn_line_rank = rr.rn_line_rank
+    where rni.id = rr.id
+      and rni.origin_dn_item_id is null;
   `);
 
   await pool.query(`
@@ -2996,6 +3458,26 @@ const ensureSchema = async () => {
   await pool.query(`
     alter table production_orders
     add column if not exists production_date date;
+  `);
+
+  await pool.query(`
+    alter table production_orders
+    add column if not exists line_code text;
+  `);
+
+  await pool.query(`
+    alter table production_orders
+    add column if not exists shift_label text;
+  `);
+
+  await pool.query(`
+    alter table production_orders
+    add column if not exists document_no text;
+  `);
+
+  await pool.query(`
+    alter table production_orders
+    add column if not exists notes text;
   `);
 
   await pool.query(`
@@ -3838,6 +4320,168 @@ const ensureSchema = async () => {
   `);
 
   await pool.query(`
+    create table if not exists quality_cases (
+      id serial primary key,
+      case_number text not null unique,
+      source_type text not null check (source_type in ('incoming_rn','production_ng','material_line_ng','delivery_return','manual')),
+      source_id integer,
+      source_line_id integer,
+      source_doc text,
+      batch_id integer,
+      line_name text,
+      process_name text,
+      operator_name text,
+      shift_name text,
+      discovered_at timestamptz,
+      stock_hold_qty numeric not null default 0,
+      item_code text references items(code),
+      item_name text,
+      part_no text,
+      supplier text,
+      customer text,
+      production_date date,
+      qty numeric not null default 0,
+      qty_ok numeric not null default 0,
+      qty_ng numeric not null default 0,
+      defect_category text,
+      defect_description text,
+      severity text not null default 'minor' check (severity in ('minor','major','critical')),
+      status text not null default 'open' check (status in ('open','inspecting','closed','cancelled')),
+      disposition text check (disposition in ('ok','hold','reject','rework','scrap','return_supplier','claim_customer','use_as_is','correction_review')),
+      disposition_qty numeric not null default 0,
+      disposition_notes text,
+      decided_at timestamptz,
+      decided_by integer references users(id),
+      created_by integer references users(id),
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    alter table quality_cases
+    add column if not exists batch_id integer,
+    add column if not exists line_name text,
+    add column if not exists process_name text,
+    add column if not exists operator_name text,
+    add column if not exists shift_name text,
+    add column if not exists discovered_at timestamptz,
+    add column if not exists stock_hold_qty numeric not null default 0;
+  `);
+
+  await pool.query(`
+    DO $$
+    DECLARE
+      constraint_name text;
+    BEGIN
+      SELECT c.conname INTO constraint_name
+      FROM pg_constraint c
+      JOIN pg_class t ON c.conrelid = t.oid
+      WHERE t.relname = 'quality_cases'
+        AND c.contype = 'c'
+        AND pg_get_constraintdef(c.oid) LIKE '%source_type%';
+      IF constraint_name IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE quality_cases DROP CONSTRAINT %I', constraint_name);
+      END IF;
+    END
+    $$;
+  `);
+  await pool.query(`
+    alter table quality_cases
+    add constraint quality_cases_source_type_check
+    check (source_type in ('incoming_rn','production_ng','material_line_ng','delivery_return','manual'));
+  `);
+
+  await pool.query(`
+    DO $$
+    DECLARE
+      constraint_name text;
+    BEGIN
+      SELECT c.conname INTO constraint_name
+      FROM pg_constraint c
+      JOIN pg_class t ON c.conrelid = t.oid
+      WHERE t.relname = 'quality_cases'
+        AND c.contype = 'c'
+        AND pg_get_constraintdef(c.oid) LIKE '%disposition%';
+      IF constraint_name IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE quality_cases DROP CONSTRAINT %I', constraint_name);
+      END IF;
+    END
+    $$;
+  `);
+  await pool.query(`
+    alter table quality_cases
+    add constraint quality_cases_disposition_check
+    check (disposition in ('ok','hold','sortir','reject','rework','scrap','return_supplier','claim_customer','use_as_is','correction_review'));
+  `);
+
+  await pool.query(`
+    create unique index if not exists quality_cases_source_unique
+    on quality_cases (source_type, coalesce(source_id, 0), coalesce(source_line_id, 0))
+    where source_id is not null or source_line_id is not null;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_quality_cases_status_source
+    on quality_cases (status, source_type, created_at desc);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_quality_cases_item_code
+    on quality_cases (item_code);
+  `);
+
+  await pool.query(`
+    insert into quality_cases
+      (case_number, source_type, source_id, source_line_id, source_doc, item_code, item_name, part_no, supplier,
+       production_date, qty, qty_ok, qty_ng, defect_category, defect_description, severity, status,
+       disposition, disposition_qty, disposition_notes, decided_at, decided_by, created_by, created_at, updated_at)
+    select
+      concat('QC-IN-RN-', rnh.id, '-', rni.id),
+      'incoming_rn',
+      rnh.id,
+      rni.id,
+      rnh.rn_number,
+      rni.item_code,
+      coalesce(i.name, rni.item_name),
+      rni.part_no,
+      rnh.supplier,
+      rni.production_date,
+      coalesce(rni.received_qty, 0),
+      case when lower(coalesce(rni.qc_status, 'ok')) in ('hold','reject') then 0 else coalesce(rni.received_qty, 0) end,
+      case when lower(coalesce(rni.qc_status, 'ok')) in ('hold','reject') then coalesce(rni.received_qty, 0) else 0 end,
+      upper(coalesce(rni.qc_status, 'hold')),
+      nullif(trim(coalesce(rni.notes, rnh.remarks, '')), ''),
+      case when lower(coalesce(rni.qc_status, '')) = 'reject' then 'major' else 'minor' end,
+      case when lower(coalesce(rni.qc_status, 'ok')) in ('hold','reject') then 'open' else 'closed' end,
+      case when lower(coalesce(rni.qc_status, 'ok')) in ('hold','reject') then null else 'ok' end,
+      case when lower(coalesce(rni.qc_status, 'ok')) in ('hold','reject') then 0 else coalesce(rni.received_qty, 0) end,
+      case when lower(coalesce(rni.qc_status, 'ok')) in ('hold','reject') then null else 'Passed receiving QC' end,
+      case when lower(coalesce(rni.qc_status, 'ok')) in ('hold','reject') then null else coalesce(rnh.posted_at, rnh.created_at, now()) end,
+      case when lower(coalesce(rni.qc_status, 'ok')) in ('hold','reject') then null else rnh.posted_by end,
+      rnh.posted_by,
+      coalesce(rnh.posted_at, rnh.created_at, now()),
+      coalesce(rnh.posted_at, rnh.created_at, now())
+    from receive_note_items rni
+    join receive_note_headers rnh on rnh.id = rni.rn_id
+    left join items i on i.code = rni.item_code
+    where rnh.status = 'posted'
+      and rni.line_status = 'posted'
+      and rnh.reversal_of is null
+      and coalesce(rnh.source, '') <> 'REVERSAL'
+      and coalesce(rni.received_qty, 0) > 0
+      and lower(coalesce(rni.qc_status, 'ok')) in ('hold','reject')
+      and not exists (
+        select 1
+        from quality_cases qc
+        where qc.source_type = 'incoming_rn'
+          and coalesce(qc.source_id, 0) = rnh.id
+          and coalesce(qc.source_line_id, 0) = rni.id
+      )
+    on conflict do nothing;
+  `);
+
+  await pool.query(`
     create table if not exists app_settings (
       key text primary key,
       value text,
@@ -3983,6 +4627,16 @@ const ensureSchema = async () => {
   await pool.query(`
     create index if not exists idx_audit_logs_created_at
     on audit_logs (created_at);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_audit_logs_new_data_gin
+    on audit_logs using gin (new_data jsonb_path_ops);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_audit_logs_old_data_gin
+    on audit_logs using gin (old_data jsonb_path_ops);
   `);
 
   await pool.query(`
@@ -4175,6 +4829,27 @@ const mapRowToSchedule = (row) => {
   const supplierId = row.supplier_id || row.po_supplier_id || row.supplier || null;
   const effectiveArrivalDate = row.arrival_date || row.fallback_arrival_date || null;
   const effectiveDoNumber = row.do_number || row.fallback_do_number || null;
+  const relatedReceipts = Array.isArray(row.related_receipts)
+    ? row.related_receipts
+    : (typeof row.related_receipts === "string" && row.related_receipts.trim()
+      ? (() => {
+        try { return JSON.parse(row.related_receipts); } catch { return []; }
+      })()
+      : []);
+  const normalizedRelatedReceipts = relatedReceipts
+    .map((item) => ({
+      doNumber: String(item?.doNumber || item?.do_number || "").trim(),
+      arrivalDate: formatDateOnly(item?.arrivalDate || item?.arrival_date),
+      receivedQty: Number(item?.receivedQty ?? item?.received_qty ?? 0),
+    }))
+    .filter((item) => item.doNumber || item.receivedQty > 0);
+  const deliveryMetrics = getScheduleDeliveryMetrics({
+    requestDate: row.request_date,
+    arrivalDate: effectiveArrivalDate,
+    requestQty: row.request_qty,
+    receivedQty: row.received_qty,
+    relatedReceipts: normalizedRelatedReceipts,
+  });
   return {
     id: row.id,
     poNumber: row.po_number,
@@ -4192,10 +4867,19 @@ const mapRowToSchedule = (row) => {
     arrivalDate: formatDateOnly(effectiveArrivalDate),
     receivedQty: row.received_qty,
     doNumber: effectiveDoNumber,
-    status: getScheduleStatusFromActual({
-      requestDate: row.request_date,
-      arrivalDate: effectiveArrivalDate,
-    }),
+    relatedDoNumbers: row.related_do_numbers || null,
+    relatedReceipts: normalizedRelatedReceipts,
+    status: deliveryMetrics.status,
+    timingStatus: deliveryMetrics.status,
+    firstArrivalDate: deliveryMetrics.firstArrivalDate,
+    completionDate: deliveryMetrics.completionDate,
+    completionDelayDays: deliveryMetrics.completionDelayDays,
+    onTimeQty: deliveryMetrics.onTimeQty,
+    lateQty: deliveryMetrics.lateQty,
+    tooEarlyQty: deliveryMetrics.tooEarlyQty,
+    pendingQty: deliveryMetrics.pendingQty,
+    onTimeQtyRate: deliveryMetrics.onTimeQtyRate,
+    lateQtyRate: deliveryMetrics.lateQtyRate,
     poStatus: row.po_status || null,
     notes: row.notes,
     hasSplit: row.has_split,
@@ -4281,6 +4965,27 @@ const escapeHtml = (value) => String(value ?? "")
   .replaceAll(">", "&gt;")
   .replaceAll("\"", "&quot;")
   .replaceAll("'", "&#39;");
+
+const parseEmailRecipients = (value) => {
+  const seen = new Set();
+  return String(value || "")
+    .split(/[;,\n]+/)
+    .map((email) => email.trim())
+    .filter(Boolean)
+    .filter((email) => {
+      const key = email.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+};
+
+const formatEmailRecipients = (recipients) => (Array.isArray(recipients) ? recipients : [])
+  .join(", ");
+
+const getSmtpMissingConfigMessage = () => (
+  "SMTP belum dikonfigurasi. Isi SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, dan SMTP_FROM di server/.env lalu restart API."
+);
 
 const normalizeDateOnly = (value) => {
   if (!value) return null;
@@ -4386,6 +5091,69 @@ const getTodayDateOnly = () => new Date().toISOString().slice(0, 10);
 
 const normalizePoNumber = (value) => String(value ?? "").trim();
 const normalizeItemCode = (value) => String(value ?? "").trim();
+const normalizeReceivingLabelToken = (value) => {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const tokenFromPipe = raw.match(/(?:^|\|)LBL\|([^|\s]+)/i)?.[1];
+  const tokenFromKey = raw.match(/(?:^|[|;\s])token:([^|;\s]+)/i)?.[1];
+  return String(tokenFromPipe || tokenFromKey || raw)
+    .trim()
+    .replace(/^MSKS\|LBL\|/i, "")
+    .toUpperCase();
+};
+const buildReceivingLabelQrValue = (token) => `MSKS|LBL|${String(token || "").trim().toUpperCase()}`;
+const generateReceivingLabelToken = () => crypto.randomBytes(9).toString("base64url").replace(/[^a-z0-9]/gi, "").toUpperCase();
+const mapReceivingLabelRow = (row = {}) => {
+  const token = String(row.token || "").trim().toUpperCase();
+  const requestQty = Number(row.request_qty ?? row.planned_qty ?? 0);
+  const receivedQty = Number(row.received_qty ?? 0);
+  const remainingQty = Math.max(0, requestQty - receivedQty);
+  const itemCode = normalizeItemCode(row.item_code || row.resolved_item_code);
+  return {
+    id: row.id,
+    token,
+    qrValue: buildReceivingLabelQrValue(token),
+    sourceType: row.source_type || "schedule",
+    status: row.label_status || "active",
+    supplier: {
+      id: String(row.supplier_id || row.po_supplier_id || row.supplier || "").trim(),
+      name: String(row.supplier_name || "").trim(),
+    },
+    schedule: {
+      id: parsePositiveId(row.schedule_id),
+      poNumber: normalizePoNumber(row.po_number),
+      requestDate: formatDateOnly(row.request_date),
+      deliveryTime: row.delivery_time || null,
+      requestQty,
+      receivedQty,
+      remainingQty,
+      status: row.schedule_status || row.status || null,
+      doNumber: row.do_number || null,
+    },
+    poLine: {
+      id: parsePositiveId(row.po_line_id),
+      lineNo: row.line_no ?? null,
+      qtyOrder: Number(row.qty_order ?? 0),
+      qtyReceived: Number(row.qty_received ?? 0),
+      qtyRemaining: Number(row.qty_remaining ?? 0),
+    },
+    item: {
+      code: itemCode,
+      name: String(row.item_name || "").trim(),
+      partNo: String(row.part_no || "").trim(),
+      unit: String(row.unit || "").trim(),
+      packQty: Number(row.pack_qty ?? 0),
+    },
+    label: {
+      packSeq: Number(row.pack_seq || 1),
+      packTotal: Number(row.pack_total || 1),
+      packQty: Number(row.label_pack_qty ?? row.pack_qty ?? 0),
+      plannedQty: Number(row.planned_qty ?? requestQty),
+    },
+    suggestedQty: remainingQty > 0 ? remainingQty : Number(row.planned_qty || requestQty || 0),
+    createdAt: row.created_at || null,
+  };
+};
 
 const resolvePoHeader = async (client, poNumber, { forUpdate = false } = {}) => {
   const normalized = normalizePoNumber(poNumber);
@@ -4598,10 +5366,35 @@ const reconcilePoSchedulesAndReceipts = async (client, poNumber, { lock = true }
   const scheduleIds = scheduleResult.rows.map((row) => Number(row.id)).filter(Number.isFinite);
   const noteResult = await client.query(
     `
-    select schedule_id, sum(received_qty)::numeric as total_received
-    from receive_notes
-    where schedule_id = any($1)
-    group by schedule_id
+    with allocated_receipts as (
+      select
+        ra.schedule_id,
+        sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as total_received
+      from receipt_allocations ra
+      join receive_note_items rni on rni.id = ra.rn_item_id
+      join receive_note_headers rnh on rnh.id = rni.rn_id
+      where ra.schedule_id = any($1)
+        and rnh.status = 'posted'
+        and rnh.reversal_of is null
+        and rni.line_status = 'posted'
+      group by ra.schedule_id
+    ),
+    legacy_receipts as (
+      select
+        schedule_id,
+        sum(greatest(coalesce(received_qty, 0), 0))::numeric as total_received
+      from receive_notes
+      where schedule_id = any($1)
+      group by schedule_id
+    )
+    select
+      coalesce(ar.schedule_id, lr.schedule_id) as schedule_id,
+      case
+        when coalesce(ar.total_received, 0) > 0 then ar.total_received
+        else coalesce(lr.total_received, 0)
+      end::numeric as total_received
+    from allocated_receipts ar
+    full outer join legacy_receipts lr on lr.schedule_id = ar.schedule_id
     `,
     [scheduleIds.length > 0 ? scheduleIds : [0]],
   );
@@ -4666,7 +5459,12 @@ const reconcilePoSchedulesAndReceipts = async (client, poNumber, { lock = true }
     const currentQty = Number(line.qty_received || 0);
     if (desiredQty === currentQty) continue;
     const updateResult = await client.query(
-      "update po_lines set qty_received = $1 where id = $2 and qty_received <> $1",
+      `
+      update po_lines
+      set qty_received = $1
+      where id = $2
+        and qty_received is distinct from $1::numeric
+      `,
       [desiredQty, line.id],
     );
     updatedLines += updateResult.rowCount;
@@ -4857,6 +5655,7 @@ const normalizeReceiptDraftLinePayload = (payload = {}) => {
   return {
     lineNo: Number.isFinite(lineRaw) && lineRaw > 0 ? Math.round(lineRaw) : 1,
     originDnId: parsePositiveId(payload.originDnId ?? payload.origin_dn_id ?? payload.dnId ?? payload.dn_id),
+    originDnItemId: parsePositiveId(payload.originDnItemId ?? payload.origin_dn_item_id ?? payload.dnItemId ?? payload.dn_item_id),
     itemCode: normalizeItemCode(payload.itemCode ?? payload.item_code ?? payload.item),
     itemName: payload.itemName ?? payload.item_name ?? null,
     partNo: payload.partNo ?? payload.part_no ?? null,
@@ -4870,6 +5669,8 @@ const normalizeReceiptDraftLinePayload = (payload = {}) => {
     scheduleId: parsePositiveId(payload.scheduleId ?? payload.schedule_id),
     poLineId: parsePositiveId(payload.poLineId ?? payload.po_line_id),
     qcStatus: String(payload.qcStatus ?? payload.qc_status ?? "ok").trim().toLowerCase() || "ok",
+    kanbanId: extractKanbanIdToken(payload.kanbanId ?? payload.kanban_id ?? payload.cardUid ?? payload.card_uid ?? ""),
+    supplierLotNo: String(payload.supplierLotNo ?? payload.supplier_lot_no ?? payload.lotNo ?? payload.lot_no ?? "").trim() || null,
     notes: payload.notes || null,
     dropZone: payload.dropZone ?? payload.drop_zone ?? null,
     overrideReason: payload.overrideReason ?? payload.override_reason ?? null,
@@ -4971,7 +5772,13 @@ const recomputeDeliveryNoteStatus = async (client, dnId) => {
   return nextStatus;
 };
 
-const findActiveReceiptHeaderBySupplierDoNumber = async (client, { supplier, doNumber, excludeId = null, forUpdate = false } = {}) => {
+const findActiveReceiptHeaderBySupplierDoNumber = async (client, {
+  supplier,
+  doNumber,
+  excludeId = null,
+  forUpdate = false,
+  ignoreEmpty = false,
+} = {}) => {
   const supplierValue = String(supplier || "").trim();
   const doValue = normalizeDoNumber(doNumber);
   if (!supplierValue || !doValue) return null;
@@ -4979,17 +5786,27 @@ const findActiveReceiptHeaderBySupplierDoNumber = async (client, { supplier, doN
   if (supplierAliases.length === 0) return null;
   const values = [supplierAliases, doValue, RECEIPT_HEADER_ACTIVE_STATUSES];
   let query = `
-    select *
-    from receive_note_headers
-    where lower(trim(supplier)) = any($1::text[])
-      and lower(trim(do_number)) = lower(trim($2))
-      and status = any($3::text[])
+    select h.*, coalesce(lc.line_count, 0)::int as line_count
+    from receive_note_headers h
+    left join lateral (
+      select count(*)::int as line_count
+      from receive_note_items rni
+      where rni.rn_id = h.id
+        and coalesce(rni.line_status, '') <> 'cancelled'
+    ) lc on true
+    where lower(trim(h.supplier)) = any($1::text[])
+      and lower(trim(h.do_number)) = lower(trim($2))
+      and h.status = any($3::text[])
   `;
+  if (ignoreEmpty) {
+    query += " and coalesce(lc.line_count, 0) > 0";
+  }
   if (excludeId !== null) {
     values.push(parsePositiveId(excludeId));
-    query += ` and id <> $${values.length}`;
+    query += ` and h.id <> $${values.length}`;
   }
-  if (forUpdate) query += " for update";
+  query += " order by h.created_at desc, h.id desc";
+  if (forUpdate) query += " for update of h";
   const result = await client.query(query, values);
   return result.rows[0] || null;
 };
@@ -5132,7 +5949,15 @@ const loadReceiptPoLineCandidates = async (client, { supplierId, itemCode, poNum
   }));
 };
 
-const loadActualDrivenScheduleCandidates = async (client, { supplierKeys = [], poNumber, poLineId, itemCode, arrivalDate = null, limit = 200 } = {}) => {
+const loadActualDrivenScheduleCandidates = async (client, {
+  supplierKeys = [],
+  poNumber,
+  poLineId,
+  itemCode,
+  arrivalDate = null,
+  preferredScheduleId = null,
+  limit = 200,
+} = {}) => {
   const normalizedSupplierKeys = Array.from(
     new Set(
       (Array.isArray(supplierKeys) ? supplierKeys : [])
@@ -5142,6 +5967,7 @@ const loadActualDrivenScheduleCandidates = async (client, { supplierKeys = [], p
   );
   const normalizedPo = normalizePoNumber(poNumber);
   const normalizedPoLineId = parsePositiveId(poLineId);
+  const normalizedScheduleId = parsePositiveId(preferredScheduleId);
   const normalizedItemCode = normalizeItemCode(itemCode);
   const normalizedArrivalDate = String(arrivalDate || "").trim() || null;
   if (normalizedSupplierKeys.length === 0 || !normalizedPo || !normalizedItemCode) return [];
@@ -5162,9 +5988,15 @@ const loadActualDrivenScheduleCandidates = async (client, { supplierKeys = [], p
     where lower(trim(coalesce(s.supplier_id, s.supplier))) = any($1::text[])
       and s.po_number = $2
       and lower(trim(coalesce(s.item_code, s.item))) = lower(trim($3))
+      and ($7::int is null or s.id = $7::int)
       and greatest(coalesce(s.request_qty, 0) - coalesce(s.received_qty, 0), 0) > 0
       and upper(coalesce(s.status, '')) not in ('CANCELLED', 'REJECTED', 'CLOSED')
     order by
+      case
+        when $7::int is null then 1
+        when s.id = $7::int then 0
+        else 1
+      end,
       case
         when $6::date is null then 1
         when coalesce(s.request_date, ph.po_date) = $6::date then 0
@@ -5179,7 +6011,7 @@ const loadActualDrivenScheduleCandidates = async (client, { supplierKeys = [], p
       s.id asc
     limit $5
     `,
-    [normalizedSupplierKeys, normalizedPo, normalizedItemCode, normalizedPoLineId, limit, normalizedArrivalDate],
+    [normalizedSupplierKeys, normalizedPo, normalizedItemCode, normalizedPoLineId, limit, normalizedArrivalDate, normalizedScheduleId],
   );
   return (result.rows || []).map((row) => ({
     allocationType: "schedule",
@@ -5209,6 +6041,23 @@ const loadActualDrivenPoLineCandidates = async (client, { supplierKeys = [], poN
   if (normalizedSupplierKeys.length === 0 || !normalizedPo || !normalizedItemCode) return [];
   const result = await client.query(
     `
+    with valid_receipts as (
+      select
+        coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
+        lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
+        sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
+      from receipt_allocations ra
+      join receive_note_items rni on rni.id = ra.rn_item_id
+      join receive_note_headers rnh on rnh.id = rni.rn_id
+      left join schedules s on s.id = ra.schedule_id
+      where ra.po_number = $2
+        and rnh.status = 'posted'
+        and rnh.reversal_of is null
+        and rni.line_status = 'posted'
+      group by
+        coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
+        lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+    )
     select
       pl.id as po_line_id,
       pl.po_number,
@@ -5216,7 +6065,7 @@ const loadActualDrivenPoLineCandidates = async (client, { supplierKeys = [], poN
       ph.po_date,
       pl.line_no,
       (
-        pl.qty_order - pl.qty_received - (
+        pl.qty_order - coalesce(vr.received_qty, pl.qty_received, 0) - (
           select coalesce(sum(greatest(s.request_qty - s.received_qty, 0)), 0)::numeric
           from schedules s
           where s.po_line_id = pl.id
@@ -5225,13 +6074,16 @@ const loadActualDrivenPoLineCandidates = async (client, { supplierKeys = [], poN
       )::numeric as outstanding_qty
     from po_lines pl
     join po_headers ph on ph.po_number = pl.po_number
+    left join valid_receipts vr
+      on vr.po_line_id = pl.id
+      or (vr.po_line_id is null and vr.item_code_key = lower(trim(pl.item_code)))
     where lower(trim(ph.supplier_id)) = any($1::text[])
       and pl.po_number = $2
       and lower(trim(pl.item_code)) = lower(trim($3))
       and ph.status in ('open', 'partial')
       and ($4::int is null or pl.id = $4::int)
       and (
-        pl.qty_order - pl.qty_received - (
+        pl.qty_order - coalesce(vr.received_qty, pl.qty_received, 0) - (
           select coalesce(sum(greatest(s.request_qty - s.received_qty, 0)), 0)::numeric
           from schedules s
           where s.po_line_id = pl.id
@@ -5260,7 +6112,16 @@ const loadActualDrivenPoLineCandidates = async (client, { supplierKeys = [], poN
   }));
 };
 
-const buildActualDrivenReceiptAllocations = async (client, { supplier, poNumber, poLineId, itemCode, qty, arrivalDate = null, allowOverReceive = false }) => {
+const buildActualDrivenReceiptAllocations = async (client, {
+  supplier,
+  poNumber,
+  poLineId,
+  itemCode,
+  qty,
+  arrivalDate = null,
+  allowOverReceive = false,
+  scheduleId = null,
+} = {}) => {
   const supplierValue = String(supplier || "").trim();
   const normalizedItemCode = normalizeItemCode(itemCode);
   const qtyValue = Number(qty);
@@ -5292,6 +6153,7 @@ const buildActualDrivenReceiptAllocations = async (client, { supplier, poNumber,
   const poHeader = await resolvePoHeader(client, poNumber);
   const normalizedPoNumber = normalizePoNumber(poNumber);
   const normalizedPoLineId = parsePositiveId(poLineId);
+  const normalizedScheduleId = parsePositiveId(scheduleId);
   if (!normalizedPoNumber) {
     const error = new Error("poNumber wajib diisi.");
     error.statusCode = 400;
@@ -5322,6 +6184,7 @@ const buildActualDrivenReceiptAllocations = async (client, { supplier, poNumber,
     poLineId: normalizedPoLineId,
     itemCode: normalizedItemCode,
     arrivalDate,
+    preferredScheduleId: normalizedScheduleId,
   });
   const poLineCandidates = await loadActualDrivenPoLineCandidates(client, {
     supplierKeys,
@@ -5494,6 +6357,37 @@ const rebuildActualDrivenScheduleAllocations = async (client, { poNumber, itemCo
     qty: Math.max(0, Number(row.received_qty || 0)),
   })).filter((row) => row.qty > 0 && row.arrivalDate);
 
+  const actualLineResult = await client.query(
+    `
+    select
+      rni.id as rn_item_id,
+      rni.rn_id,
+      rni.po_line_id,
+      nullif(trim(rnh.do_number), '') as do_number,
+      coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) as arrival_date,
+      greatest(coalesce(rni.received_qty, 0), 0)::numeric as received_qty
+    from receive_note_headers rnh
+    join receive_note_items rni on rni.rn_id = rnh.id
+    where rnh.po_number = $1
+      and coalesce(rnh.source, '') = 'ACTUAL_DRIVEN'
+      and lower(trim(coalesce(rni.item_code, ''))) = lower(trim($2))
+      and rnh.status = 'posted'
+      and coalesce(rni.line_status, '') = 'posted'
+      and greatest(coalesce(rni.received_qty, 0), 0) > 0
+      and coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) between $3::date and $4::date
+    order by coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) asc, rnh.id asc, rni.id asc
+    `,
+    [normalizedPo, normalizedItemCode, start, end],
+  );
+  const actualLines = (actualLineResult.rows || []).map((row) => ({
+    rnItemId: Number(row.rn_item_id),
+    rnId: Number(row.rn_id),
+    poLineId: parsePositiveId(row.po_line_id),
+    doNumber: String(row.do_number || "").trim() || null,
+    arrivalDate: formatDateOnly(row.arrival_date) || null,
+    qty: Math.max(0, Number(row.received_qty || 0)),
+  })).filter((row) => row.rnItemId && row.qty > 0 && row.arrivalDate);
+
   let allocatedQty = 0;
   let overflowQty = 0;
 
@@ -5556,6 +6450,62 @@ const rebuildActualDrivenScheduleAllocations = async (client, { poNumber, itemCo
         schedule.id,
       ],
     );
+  }
+
+  const lineSchedules = schedules.map((schedule) => ({
+    id: schedule.id,
+    poLineId: schedule.poLineId,
+    requestDate: schedule.requestDate,
+    remainingQty: schedule.requestQty,
+  }));
+  const actualLineIds = actualLines.map((line) => line.rnItemId).filter(Boolean);
+  if (actualLineIds.length > 0) {
+    await client.query(
+      "delete from receipt_allocations where rn_item_id = any($1::int[])",
+      [actualLineIds],
+    );
+  }
+  for (const line of actualLines) {
+    let remainingQty = Number(line.qty || 0);
+    if (!(remainingQty > 0)) continue;
+    const exactMatches = lineSchedules
+      .filter((schedule) => schedule.remainingQty > 0 && schedule.requestDate === line.arrivalDate)
+      .sort((left, right) => left.id - right.id);
+    const fifoMatches = lineSchedules
+      .filter((schedule) => schedule.remainingQty > 0 && schedule.requestDate !== line.arrivalDate)
+      .sort((left, right) => {
+        if (left.requestDate !== right.requestDate) return String(left.requestDate || "").localeCompare(String(right.requestDate || ""));
+        return left.id - right.id;
+      });
+    const orderedSchedules = [...exactMatches, ...fifoMatches];
+    for (const targetSchedule of orderedSchedules) {
+      if (remainingQty <= 0) break;
+      const availableBefore = Math.max(0, Number(targetSchedule.remainingQty || 0));
+      if (!(availableBefore > 0)) continue;
+      const allocQty = Math.min(remainingQty, availableBefore);
+      targetSchedule.remainingQty = Math.max(0, availableBefore - allocQty);
+      remainingQty -= allocQty;
+      await client.query(
+        `
+        insert into receipt_allocations
+          (rn_id, rn_item_id, supplier, do_number, po_number, source_type, schedule_id, po_line_id, item_code, planned_date, request_date, po_date, available_before, allocated_qty, available_after, created_by)
+        values ($1,$2,'',$3,$4,'schedule',$5,$6,$7,$8,$8,null,$9,$10,$11,null)
+        `,
+        [
+          line.rnId,
+          line.rnItemId,
+          line.doNumber || "",
+          normalizedPo,
+          targetSchedule.id,
+          targetSchedule.poLineId || line.poLineId || null,
+          normalizedItemCode,
+          targetSchedule.requestDate || null,
+          availableBefore,
+          allocQty,
+          targetSchedule.remainingQty,
+        ],
+      );
+    }
   }
 
   return {
@@ -5633,10 +6583,11 @@ const createReceiptDraft = async (client, payload = {}, user = null) => {
     error.statusCode = 400;
     throw error;
   }
-  const existing = await findReceiptHeaderBySupplierDoNumber(client, {
+  const existing = await findActiveReceiptHeaderBySupplierDoNumber(client, {
     supplier: data.supplier,
     doNumber: data.doNumber,
     forUpdate: true,
+    ignoreEmpty: true,
   });
   if (existing) {
     const error = new Error("Nomor Surat Jalan sudah pernah di-input sebelumnya!");
@@ -5705,31 +6656,35 @@ const upsertReceiptDraftLine = async (client, draftId, payload = {}) => {
       update receive_note_items
       set
         origin_dn_id = $1,
-        item_code = $2,
-        item_name = $3,
-        part_no = $4,
-        unit = $5,
-        pack_qty = $6,
-        doc_qty = $7,
-        received_qty = $8,
-        drop_zone = $9,
-        schedule_id = $10,
-        po_line_id = $11,
-        qc_status = $12,
-        arrival_date = $13,
-        notes = $14,
-        production_date = $15,
-        expired_date = $16,
+        origin_dn_item_id = $2,
+        item_code = $3,
+        item_name = $4,
+        part_no = $5,
+        unit = $6,
+        pack_qty = $7,
+        doc_qty = $8,
+        received_qty = $9,
+        drop_zone = $10,
+        schedule_id = $11,
+        po_line_id = $12,
+        qc_status = $13,
+        arrival_date = $14,
+        notes = $15,
+        production_date = $16,
+        expired_date = $17,
+        kanban_id = $18,
+        supplier_lot_no = $19,
         line_status = 'draft',
         match_status = 'matched',
-        match_basis = $17,
-        override_reason = $18,
+        match_basis = $20,
+        override_reason = $21,
         exception_code = null
-      where id = $19
+      where id = $22
       returning *
       `,
       [
         data.originDnId,
+        data.originDnItemId,
         data.itemCode,
         data.itemName,
         data.partNo,
@@ -5745,6 +6700,8 @@ const upsertReceiptDraftLine = async (client, draftId, payload = {}) => {
         data.notes,
         data.productionDate,
         data.expiredDate,
+        data.kanbanId || null,
+        data.supplierLotNo,
         data.matchBasis,
         data.overrideReason,
         existing.id,
@@ -5755,14 +6712,15 @@ const upsertReceiptDraftLine = async (client, draftId, payload = {}) => {
   const result = await client.query(
     `
     insert into receive_note_items
-      (rn_id, line_no, origin_dn_id, item_code, item_name, part_no, unit, pack_qty, doc_qty, received_qty, drop_zone, schedule_id, po_line_id, qc_status, line_status, arrival_date, notes, production_date, expired_date, posted_qty, match_status, match_basis, override_reason)
-    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'draft',$15,$16,$17,$18,0,'matched',$19,$20)
+      (rn_id, line_no, origin_dn_id, origin_dn_item_id, item_code, item_name, part_no, unit, pack_qty, doc_qty, received_qty, drop_zone, schedule_id, po_line_id, qc_status, line_status, arrival_date, notes, production_date, expired_date, kanban_id, supplier_lot_no, posted_qty, match_status, match_basis, override_reason)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'draft',$16,$17,$18,$19,$20,$21,0,'matched',$22,$23)
     returning *
     `,
     [
       draftId,
       data.lineNo,
       data.originDnId,
+      data.originDnItemId,
       data.itemCode,
       data.itemName,
       data.partNo,
@@ -5778,6 +6736,8 @@ const upsertReceiptDraftLine = async (client, draftId, payload = {}) => {
       data.notes,
       data.productionDate,
       data.expiredDate,
+      data.kanbanId || null,
+      data.supplierLotNo,
       data.matchBasis,
       data.overrideReason,
     ],
@@ -5836,7 +6796,7 @@ const validateReceiptDraft = async (client, draftId, user = null, options = {}) 
   }
 
   const supplierId = await resolveReceiptSupplierId(client, header.supplier);
-  const duplicateHeader = await findReceiptHeaderBySupplierDoNumber(client, {
+  const duplicateHeader = await findActiveReceiptHeaderBySupplierDoNumber(client, {
     supplier: header.supplier,
     doNumber: header.do_number,
     excludeId: header.id,
@@ -5960,16 +6920,21 @@ const validateReceiptDraft = async (client, draftId, user = null, options = {}) 
           dn.id as dn_id,
           dn.supplier as dn_supplier,
           dn.dn_number,
+          dni.id as dn_item_id,
           dni.request_qty,
           dni.pack_qty
         from delivery_notes dn
         join delivery_note_items dni
           on dni.dn_id = dn.id
-         and lower(trim(dni.item_code)) = lower(trim($2))
+         and (
+           ($3::int is not null and dni.id = $3::int)
+           or ($3::int is null and lower(trim(dni.item_code)) = lower(trim($2)))
+         )
         where dn.id = $1
+        order by case when dni.id = $3::int then 0 else 1 end, dni.id asc
         limit 1
         `,
-        [line.origin_dn_id, itemCode],
+        [line.origin_dn_id, itemCode, line.origin_dn_item_id || null],
       );
       const deliveryNoteItem = deliveryNoteItemResult.rows[0] || null;
       const dnSupplier = String(deliveryNoteItem?.dn_supplier || "").trim();
@@ -6128,8 +7093,6 @@ const postReceiptDraft = async (client, draftId, user = null, options = {}) => {
     }
 
     const qcStatus = String(line.qc_status || "ok").trim().toLowerCase();
-    const packQty = Number.isFinite(Number(line.pack_qty)) ? Number(line.pack_qty) : await resolveItemPackQty(client, line.item_code);
-    const isLoose = isLooseQty(qtyValue, packQty);
     const arrivalDate = line.arrival_date || header.document_date || todayDate;
     const { productionDate: productionDateValue, expiredDate: expiredDateValue } = await resolveBatchDates(
       client,
@@ -6137,7 +7100,6 @@ const postReceiptDraft = async (client, draftId, user = null, options = {}) => {
       line.production_date,
       line.expired_date,
     );
-    const referenceDoc = header.do_number || header.rn_number;
     let schedule = null;
     let poLine = null;
 
@@ -6160,73 +7122,11 @@ const postReceiptDraft = async (client, draftId, user = null, options = {}) => {
     }
 
     let batchId = null;
-    if (!RECEIPT_QC_BLOCKED_FOR_STOCK.has(qcStatus)) {
-      if (schedule?.id) {
-        await client.query(
-          `
-          insert into stock_batches (item_code, qty_in, arrival_date, do_number, batch_no, schedule_id, is_loose, production_date, expired_date)
-          values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-          on conflict (schedule_id) do update set
-            qty_in = stock_batches.qty_in + excluded.qty_in,
-            arrival_date = coalesce(stock_batches.arrival_date, excluded.arrival_date),
-            do_number = coalesce(stock_batches.do_number, excluded.do_number),
-            batch_no = coalesce(stock_batches.batch_no, excluded.batch_no),
-            is_loose = stock_batches.is_loose or excluded.is_loose,
-            production_date = coalesce(stock_batches.production_date, excluded.production_date),
-            expired_date = coalesce(stock_batches.expired_date, excluded.expired_date)
-          `,
-          [line.item_code, qtyValue, arrivalDate, header.do_number || null, `${header.do_number || header.rn_number}-${line.line_no}`, schedule.id, isLoose, productionDateValue, expiredDateValue],
-        );
-        const batchResult = await client.query("select id from stock_batches where schedule_id = $1", [schedule.id]);
-        batchId = batchResult.rows[0]?.id || null;
-      } else {
-        const batchResult = await client.query(
-          `
-          insert into stock_batches (item_code, qty_in, arrival_date, do_number, batch_no, schedule_id, is_loose, production_date, expired_date)
-          values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-          returning id
-          `,
-          [line.item_code, qtyValue, arrivalDate, header.do_number || null, `${header.do_number || header.rn_number}-${line.line_no}`, null, isLoose, productionDateValue, expiredDateValue],
-        );
-        batchId = batchResult.rows[0]?.id || null;
-      }
-      await logStockMovement(client, {
-        itemCode: line.item_code,
-        batchId,
-        qty: qtyValue,
-        direction: "in",
-        reason: "inbound_receipt",
-        sourceRefType: "inbound_receipt",
-        sourceRefId: header.id,
-        sourceRefLineId: line.id,
-      });
-      await client.query(
-        "update items set qty_on_hand = qty_on_hand + $1 where code = $2",
-        [qtyValue, line.item_code],
-      );
-      await insertInventoryLedger(client, {
-        itemCode: line.item_code,
-        transactionType: "RECEIVING",
-        referenceDoc,
-        qtyIn: qtyValue,
-        qtyOut: 0,
-        userId: user?.id || null,
-        remarks: header.remarks || null,
-        batchId,
-        sourceRefType: "inbound_receipt",
-        sourceRefId: header.id,
-        sourceRefLineId: line.id,
-      });
-    }
 
     if (schedule) {
       const nextReceived = Number(schedule.received_qty || 0) + qtyValue;
       const requestQty = Number(schedule.request_qty || 0);
-      const nextStatus = qcStatus === "ok"
-        ? (nextReceived < requestQty ? "PARTIAL" : "RECEIVED")
-        : qcStatus === "hold"
-          ? "HOLD"
-          : "REJECTED";
+      const nextStatus = qcStatus === "reject" ? "REJECTED" : "HOLD";
       await client.query(
         `
         update schedules
@@ -6249,8 +7149,15 @@ const postReceiptDraft = async (client, draftId, user = null, options = {}) => {
           arrival_date = coalesce(arrival_date, $2)
       where id = $3
       `,
-      [RECEIPT_QC_BLOCKED_FOR_STOCK.has(qcStatus) ? 0 : qtyValue, arrivalDate, line.id],
+      [0, arrivalDate, line.id],
     );
+    await ensureIncomingQualityCaseForReceiptLine(client, {
+      header,
+      line,
+      qtyValue,
+      qcStatus,
+      productionDateValue,
+    }, user);
     postedLines.push({
       lineNo: line.line_no,
       itemCode: line.item_code,
@@ -6336,6 +7243,37 @@ const reverseReceipt = async (client, receiptId, user = null, payload = {}) => {
   );
   const reversalHeader = reversalHeaderResult.rows[0];
   const lines = await getReceiptLinesByHeader(client, header.id, { forUpdate: true });
+  const actualDrivenRebuildTargets = new Map();
+  if (String(header.source || "").trim().toUpperCase() === "ACTUAL_DRIVEN") {
+    const scheduleIds = [...new Set(
+      lines
+        .map((line) => parsePositiveId(line.schedule_id))
+        .filter(Boolean),
+    )];
+    const scheduleDateById = new Map();
+    if (scheduleIds.length > 0) {
+      const scheduleDateResult = await client.query(
+        "select id, request_date from schedules where id = any($1::int[])",
+        [scheduleIds],
+      );
+      for (const scheduleRow of scheduleDateResult.rows || []) {
+        scheduleDateById.set(Number(scheduleRow.id), scheduleRow.request_date || null);
+      }
+    }
+    for (const line of lines) {
+      const itemCode = normalizeItemCode(line.item_code);
+      if (!itemCode) continue;
+      const referenceDate = scheduleDateById.get(Number(line.schedule_id))
+        || line.arrival_date
+        || header.document_date
+        || header.created_at
+        || null;
+      actualDrivenRebuildTargets.set(`${itemCode}::${formatDateOnly(referenceDate) || ""}`, {
+        itemCode,
+        referenceDate,
+      });
+    }
+  }
   const reversedLines = [];
   for (const line of lines) {
     const postedQty = Number(line.posted_qty || 0);
@@ -6372,7 +7310,7 @@ const reverseReceipt = async (client, receiptId, user = null, payload = {}) => {
       }
       const nextQtyIn = qtyIn - postedQty;
       if (nextQtyIn <= 0) {
-        await client.query("delete from stock_batches where id = $1", [batchRow.id]);
+        await client.query("update stock_batches set qty_in = 0 where id = $1", [batchRow.id]);
       } else {
         await client.query("update stock_batches set qty_in = $1 where id = $2", [nextQtyIn, batchRow.id]);
       }
@@ -6418,16 +7356,20 @@ const reverseReceipt = async (client, receiptId, user = null, payload = {}) => {
       const schedule = scheduleResult.rows[0] || null;
       if (schedule) {
         const nextReceived = Math.max(0, Number(schedule.received_qty || 0) - postedQty);
-        const nextStatus = getScheduleStatusFromActual({
-          requestDate: schedule.request_date,
-          arrivalDate: schedule.arrival_date,
-        });
+        const nextStatus = nextReceived <= 0
+          ? "Pending"
+          : getScheduleStatusFromActual({
+            requestDate: schedule.request_date,
+            arrivalDate: schedule.arrival_date,
+          });
         await client.query(
           `
           update schedules
           set received_qty = $1,
               status = $2,
-              actual_locked = case when $1 <= 0 then false else actual_locked end,
+              arrival_date = case when $1::numeric <= 0 then null else arrival_date end,
+              do_number = case when $1::numeric <= 0 then null else do_number end,
+              actual_locked = case when $1::numeric <= 0 then false else actual_locked end,
               updated_at = now()
           where id = $3
           `,
@@ -6487,12 +7429,23 @@ const reverseReceipt = async (client, receiptId, user = null, payload = {}) => {
     `,
     [user?.id || null, header.id],
   );
+  const rebuildResults = [];
+  for (const rebuildTarget of actualDrivenRebuildTargets.values()) {
+    if (rebuildTarget.itemCode) {
+      rebuildResults.push(await rebuildActualDrivenScheduleAllocations(client, {
+        poNumber: header.po_number,
+        itemCode: rebuildTarget.itemCode,
+        referenceDate: rebuildTarget.referenceDate,
+      }));
+    }
+  }
   return {
     receiptId: header.id,
     reversalId: reversalHeader.id,
     status: "reversed",
     header,
     reversedLines,
+    rebuildResults,
   };
 };
 
@@ -6905,12 +7858,63 @@ const rollbackProduction = async (client, productionId) => {
       "update stock_batches set qty_out = qty_out - $1 where id = $2",
       [row.qty, row.batch_id],
     );
+    await client.query(
+      "update items set qty_on_hand = qty_on_hand + $1 where code = $2",
+      [row.qty, row.item_code],
+    );
     const key = row.item_code;
     const prev = summary.get(key) || 0;
     summary.set(key, prev + Number(row.qty || 0));
   }
   await client.query("delete from production_consumption where production_id = $1", [productionId]);
   return Array.from(summary.entries()).map(([itemCode, qty]) => ({ itemCode, qty }));
+};
+
+const rollbackProductionOutput = async (client, productionId, userId = null, reason = "production_output_reversal") => {
+  const batchNo = `PROD-${productionId}`;
+  const result = await client.query(
+    "select id, item_code, qty_in, qty_out, batch_no from stock_batches where batch_no = $1 and do_number = $1 for update",
+    [batchNo],
+  );
+  const reversed = [];
+  for (const batch of result.rows) {
+    const qtyIn = Number(batch.qty_in || 0);
+    const qtyOut = Number(batch.qty_out || 0);
+    if (qtyOut > 0) {
+      const error = new Error(`Output produksi ${batchNo} untuk ${batch.item_code} sudah terpakai, tidak bisa diubah/dihapus.`);
+      error.statusCode = 409;
+      throw error;
+    }
+    if (!(qtyIn > 0)) continue;
+    await logStockMovement(client, {
+      itemCode: batch.item_code,
+      batchId: batch.id,
+      qty: qtyIn,
+      direction: "out",
+      reason,
+      sourceRefType: "production_order",
+      sourceRefId: productionId,
+    });
+    await client.query(
+      "update items set qty_on_hand = greatest(qty_on_hand - $1, 0) where code = $2",
+      [qtyIn, batch.item_code],
+    );
+    await insertInventoryLedger(client, {
+      itemCode: batch.item_code,
+      transactionType: "REVERSAL",
+      referenceDoc: batchNo,
+      qtyIn: 0,
+      qtyOut: qtyIn,
+      userId,
+      remarks: reason,
+      batchId: batch.id,
+      sourceRefType: "production_order",
+      sourceRefId: productionId,
+    });
+    reversed.push({ itemCode: batch.item_code, qty: qtyIn, batchId: batch.id });
+  }
+  await client.query("delete from stock_batches where batch_no = $1 and do_number = $1", [batchNo]);
+  return reversed;
 };
 
 const applyProductionConsumption = async (client, productCode, qtyNumber, productionId, supplier = "", userId = null) => {
@@ -6980,6 +7984,10 @@ const applyProductionConsumption = async (client, productCode, qtyNumber, produc
       throw new Error(`Stok ${itemCode} tidak cukup. Kurang ${remaining}.`);
     }
     if (requiredQty > 0) {
+      await client.query(
+        "update items set qty_on_hand = greatest(qty_on_hand - $1, 0) where code = $2",
+        [requiredQty, itemCode],
+      );
       await insertInventoryLedger(client, {
         itemCode,
         transactionType: "PRODUCTION",
@@ -7021,6 +8029,10 @@ const receiveProductionOutput = async (client, productCode, qtyNumber, productio
     sourceRefType: "production_order",
     sourceRefId: productionId,
   });
+  await client.query(
+    "update items set qty_on_hand = qty_on_hand + $1 where code = $2",
+    [qtyValue, productCode],
+  );
   await insertInventoryLedger(client, {
     itemCode: productCode,
     transactionType: "PRODUCTION",
@@ -7041,8 +8053,8 @@ const logStockMovement = async (client, payload) => {
   const result = await client.query(
     `
     insert into stock_movements
-      (item_code, batch_id, qty, direction, reason, source_ref_type, source_ref_id, source_ref_line_id)
-    values ($1, $2, $3, $4, $5, $6, $7, $8)
+      (item_code, batch_id, qty, direction, reason, source_ref_type, source_ref_id, source_ref_line_id, kanban_id)
+    values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
     returning id
     `,
     [
@@ -7054,6 +8066,7 @@ const logStockMovement = async (client, payload) => {
       payload.sourceRefType || null,
       payload.sourceRefId || null,
       payload.sourceRefLineId || null,
+      payload.kanbanId || payload.kanban_id || null,
     ],
   );
   return result.rows[0] || null;
@@ -7086,8 +8099,8 @@ const insertInventoryLedger = async (client, payload) => {
   await client.query(
     `
     insert into inventory_ledgers
-      (date, item_id, transaction_type, reference_doc, qty_in, qty_out, balance, user_id, remarks, batch_id, kanban_id, source_ref_type, source_ref_id, source_ref_line_id)
-    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      (date, item_id, transaction_type, reference_doc, qty_in, qty_out, balance, user_id, remarks, batch_id, kanban_id, source_ref_type, source_ref_id, source_ref_line_id, location_id)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
     `,
     [
       dateValue.toISOString(),
@@ -7104,9 +8117,857 @@ const insertInventoryLedger = async (client, payload) => {
       payload.sourceRefType || null,
       payload.sourceRefId || null,
       payload.sourceRefLineId || null,
+      payload.locationId || payload.location_id || null,
     ],
   );
   return nextBalance;
+};
+
+const normalizeQualitySourceType = (value) => {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["incoming", "incoming_rn", "rn", "receiving"].includes(normalized)) return "incoming_rn";
+  if (["production", "production_ng", "ng"].includes(normalized)) return "production_ng";
+  if (["material_line_ng", "line_ng", "material_ng", "raw_material_ng", "process_ng"].includes(normalized)) return "material_line_ng";
+  if (["delivery", "delivery_return", "return"].includes(normalized)) return "delivery_return";
+  return "manual";
+};
+
+const normalizeQualityDisposition = (value) => {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["ok", "hold", "sortir", "reject", "rework", "scrap", "return_supplier", "claim_customer", "use_as_is", "correction_review"].includes(normalized)) {
+    return normalized;
+  }
+  return "";
+};
+
+const buildQualityCaseNumber = () => {
+  const now = new Date();
+  const stamp = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, "0"),
+    String(now.getDate()).padStart(2, "0"),
+  ].join("");
+  return `QC-${stamp}-${String(now.getTime()).slice(-6)}-${Math.floor(Math.random() * 1000).toString().padStart(3, "0")}`;
+};
+
+const mapQualityCaseRow = (row = {}) => ({
+  id: row.id,
+  caseNumber: row.case_number,
+  sourceType: row.source_type,
+  sourceId: row.source_id,
+  sourceLineId: row.source_line_id,
+  sourceDoc: row.source_doc,
+  batchId: row.batch_id,
+  lineName: row.line_name,
+  processName: row.process_name,
+  operatorName: row.operator_name,
+  shiftName: row.shift_name,
+  discoveredAt: row.discovered_at,
+  stockHoldQty: Number(row.stock_hold_qty || 0),
+  itemCode: row.item_code,
+  itemName: row.item_name,
+  partNo: row.part_no,
+  supplier: row.supplier,
+  customer: row.customer,
+  productionDate: row.production_date,
+  qty: Number(row.qty || 0),
+  qtyOk: Number(row.qty_ok || 0),
+  qtyNg: Number(row.qty_ng || 0),
+  defectCategory: row.defect_category,
+  defectDescription: row.defect_description,
+  severity: row.severity || "minor",
+  status: row.status || "open",
+  disposition: row.disposition,
+  dispositionQty: Number(row.disposition_qty || 0),
+  dispositionNotes: row.disposition_notes,
+  decidedAt: row.decided_at,
+  decidedBy: row.decided_by,
+  decidedByName: row.decided_by_name,
+  createdBy: row.created_by,
+  createdByName: row.created_by_name,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+});
+
+const MILLSHEET_GRACE_HOURS = Math.max(1, Number(process.env.MILLSHEET_GRACE_HOURS || 24));
+
+const normalizeMillsheetQuestion = (value) => {
+  const key = String(value || "").trim().toLowerCase();
+  if (["yes", "ada", "available", "ready"].includes(key)) return "yes";
+  if (["no", "tidak", "none", "missing"].includes(key)) return "no";
+  if (["follow_up", "follow-up", "susulan", "pending"].includes(key)) return "follow_up";
+  return "unknown";
+};
+
+const normalizeMillsheetDocumentStatus = (value) => {
+  const key = String(value || "").trim().toLowerCase();
+  if (["approved", "approve", "ok", "qc_approved"].includes(key)) return "qc_approved";
+  if (["rejected", "reject", "ng", "qc_rejected"].includes(key)) return "qc_rejected";
+  return "uploaded_waiting_qc";
+};
+
+const getMillsheetDueAt = () => new Date(Date.now() + MILLSHEET_GRACE_HOURS * 60 * 60 * 1000);
+
+const resolveMillsheetReceiptStatus = (question) => {
+  const normalized = normalizeMillsheetQuestion(question);
+  if (normalized === "yes") return "uploaded_waiting_qc";
+  if (normalized === "no" || normalized === "follow_up") return "required_pending";
+  return "required_pending";
+};
+
+const getEffectiveMillsheetStatus = (status, dueAt) => {
+  const key = String(status || "not_required").trim().toLowerCase();
+  if (key === "required_pending" && dueAt && new Date(dueAt).getTime() < Date.now()) return "overdue";
+  return key || "not_required";
+};
+
+const mapMillsheetDocumentRow = (row = {}) => ({
+  id: row.id,
+  supplierId: row.supplier_id,
+  supplierName: row.supplier_name || null,
+  dnId: row.dn_id,
+  dnNumber: row.dn_number,
+  rnId: row.rn_id,
+  rnNumber: row.rn_number,
+  itemCode: row.item_code,
+  itemName: row.item_name || null,
+  lotSupplier: row.lot_supplier,
+  certificateNo: row.certificate_no,
+  certificateDate: row.certificate_date,
+  fileName: row.file_name,
+  fileType: row.file_type,
+  fileSize: Number(row.file_size || 0),
+  fileUrl: row.file_url,
+  fileHash: row.file_hash,
+  uploadVersion: Number(row.upload_version || 1),
+  status: row.status || "uploaded_waiting_qc",
+  effectiveStatus: getEffectiveMillsheetStatus(row.status, row.due_at),
+  dueAt: row.due_at || null,
+  qcNotes: row.qc_notes,
+  uploadedBy: row.uploaded_by,
+  uploadedByName: row.uploaded_by_name || null,
+  uploadedAt: row.uploaded_at,
+  reviewedBy: row.reviewed_by,
+  reviewedByName: row.reviewed_by_name || null,
+  reviewedAt: row.reviewed_at,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+});
+
+const refreshMillsheetStatusForDn = async (client, dnId) => {
+  const idValue = parsePositiveId(dnId);
+  if (!idValue) return null;
+  const result = await client.query(
+    `
+    with doc_summary as (
+      select
+        count(*)::int as doc_count,
+        count(*) filter (where status = 'qc_approved')::int as approved_count,
+        count(*) filter (where status = 'qc_rejected')::int as rejected_count,
+        count(*) filter (where status = 'uploaded_waiting_qc')::int as waiting_count
+      from millsheet_documents
+      where dn_id = $1
+    ),
+    rn_summary as (
+      select
+        bool_or(h.millsheet_required) as required,
+        min(h.millsheet_due_at) as due_at
+      from receive_note_items rni
+      join receive_note_headers h on h.id = rni.rn_id
+      where rni.origin_dn_id = $1
+        and h.status = 'posted'
+        and h.reversal_of is null
+    )
+    update delivery_notes dn
+    set
+      millsheet_status = case
+        when coalesce(ds.doc_count, 0) > 0 and coalesce(ds.rejected_count, 0) > 0 then 'qc_rejected'
+        when coalesce(ds.doc_count, 0) > 0 and coalesce(ds.waiting_count, 0) > 0 then 'uploaded_waiting_qc'
+        when coalesce(ds.doc_count, 0) > 0 and coalesce(ds.approved_count, 0) = coalesce(ds.doc_count, 0) then 'qc_approved'
+        when coalesce(rs.required, false) and rs.due_at is not null and rs.due_at < now() then 'overdue'
+        when coalesce(rs.required, false) then 'required_pending'
+        else coalesce(nullif(dn.millsheet_status, ''), 'not_required')
+      end,
+      millsheet_due_at = coalesce(rs.due_at, dn.millsheet_due_at)
+    from doc_summary ds, rn_summary rs
+    where dn.id = $1
+    returning *
+    `,
+    [idValue],
+  );
+  return result.rows[0] || null;
+};
+
+const refreshMillsheetStatusForReceipt = async (client, rnId) => {
+  const idValue = parsePositiveId(rnId);
+  if (!idValue) return null;
+  const result = await client.query(
+    `
+    with doc_summary as (
+      select
+        count(*)::int as doc_count,
+        count(*) filter (where status = 'qc_approved')::int as approved_count,
+        count(*) filter (where status = 'qc_rejected')::int as rejected_count,
+        count(*) filter (where status = 'uploaded_waiting_qc')::int as waiting_count
+      from millsheet_documents
+      where rn_id = $1
+         or dn_id in (select distinct origin_dn_id from receive_note_items where rn_id = $1 and origin_dn_id is not null)
+    )
+    update receive_note_headers h
+    set millsheet_status = case
+      when coalesce(ds.doc_count, 0) > 0 and coalesce(ds.rejected_count, 0) > 0 then 'qc_rejected'
+      when coalesce(ds.doc_count, 0) > 0 and coalesce(ds.waiting_count, 0) > 0 then 'uploaded_waiting_qc'
+      when coalesce(ds.doc_count, 0) > 0 and coalesce(ds.approved_count, 0) = coalesce(ds.doc_count, 0) then 'qc_approved'
+      when h.millsheet_required and h.millsheet_due_at is not null and h.millsheet_due_at < now() then 'overdue'
+      when h.millsheet_required then 'required_pending'
+      else coalesce(nullif(h.millsheet_status, ''), 'not_required')
+    end
+    from doc_summary ds
+    where h.id = $1
+    returning *
+    `,
+    [idValue],
+  );
+  return result.rows[0] || null;
+};
+
+const findQualityCaseForSource = async (client, sourceType, sourceId, sourceLineId) => {
+  const normalizedSource = normalizeQualitySourceType(sourceType);
+  if (!sourceId && !sourceLineId) return null;
+  const result = await client.query(
+    `
+    select qc.*, uc.username as created_by_name, ud.username as decided_by_name
+    from quality_cases qc
+    left join users uc on uc.id = qc.created_by
+    left join users ud on ud.id = qc.decided_by
+    where qc.source_type = $1
+      and coalesce(qc.source_id, 0) = coalesce($2::int, 0)
+      and coalesce(qc.source_line_id, 0) = coalesce($3::int, 0)
+    limit 1
+    `,
+    [normalizedSource, sourceId || null, sourceLineId || null],
+  );
+  return result.rows[0] || null;
+};
+
+const ensureQualityCase = async (client, payload, user = null) => {
+  const sourceType = normalizeQualitySourceType(payload.sourceType || payload.source_type);
+  const sourceId = Number(payload.sourceId ?? payload.source_id);
+  const sourceLineId = Number(payload.sourceLineId ?? payload.source_line_id);
+  const normalizedSourceId = Number.isFinite(sourceId) && sourceId > 0 ? sourceId : null;
+  const normalizedSourceLineId = Number.isFinite(sourceLineId) && sourceLineId > 0 ? sourceLineId : null;
+  const existing = await findQualityCaseForSource(client, sourceType, normalizedSourceId, normalizedSourceLineId);
+  if (existing) return existing;
+
+  const qty = Number(payload.qty || 0);
+  const qtyOk = Number(payload.qtyOk ?? payload.qty_ok ?? 0);
+  const qtyNg = Number(payload.qtyNg ?? payload.qty_ng ?? Math.max(qty - qtyOk, 0));
+  const result = await client.query(
+    `
+    insert into quality_cases
+      (case_number, source_type, source_id, source_line_id, source_doc, batch_id, line_name, process_name, operator_name, shift_name, discovered_at, stock_hold_qty,
+       item_code, item_name, part_no, supplier, customer,
+       production_date, qty, qty_ok, qty_ng, defect_category, defect_description, severity, status, created_by)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,'open',$25)
+    returning *
+    `,
+    [
+      buildQualityCaseNumber(),
+      sourceType,
+      normalizedSourceId,
+      normalizedSourceLineId,
+      payload.sourceDoc ?? payload.source_doc ?? null,
+      Number.isFinite(Number(payload.batchId ?? payload.batch_id)) ? Number(payload.batchId ?? payload.batch_id) : null,
+      payload.lineName ?? payload.line_name ?? null,
+      payload.processName ?? payload.process_name ?? null,
+      payload.operatorName ?? payload.operator_name ?? null,
+      payload.shiftName ?? payload.shift_name ?? null,
+      payload.discoveredAt ?? payload.discovered_at ?? null,
+      Number.isFinite(Number(payload.stockHoldQty ?? payload.stock_hold_qty)) ? Number(payload.stockHoldQty ?? payload.stock_hold_qty) : 0,
+      normalizeItemCode(payload.itemCode ?? payload.item_code) || null,
+      payload.itemName ?? payload.item_name ?? null,
+      payload.partNo ?? payload.part_no ?? null,
+      payload.supplier || null,
+      payload.customer || null,
+      normalizeDateOnly(payload.productionDate ?? payload.production_date) || null,
+      Number.isFinite(qty) ? qty : 0,
+      Number.isFinite(qtyOk) ? qtyOk : 0,
+      Number.isFinite(qtyNg) ? qtyNg : 0,
+      payload.defectCategory ?? payload.defect_category ?? null,
+      payload.defectDescription ?? payload.defect_description ?? null,
+      ["minor", "major", "critical"].includes(String(payload.severity || "").trim().toLowerCase())
+        ? String(payload.severity).trim().toLowerCase()
+        : "minor",
+      user?.id || null,
+    ],
+  );
+  return result.rows[0] || null;
+};
+
+const ensureIncomingQualityCaseForReceiptLine = async (client, { header, line, qtyValue, qcStatus, productionDateValue }, user = null) => {
+  if (!header || !line?.id || !(Number(qtyValue) > 0)) return null;
+  const normalizedQc = String(qcStatus || line.qc_status || "ok").trim().toLowerCase() || "ok";
+  const blockedForStock = RECEIPT_QC_BLOCKED_FOR_STOCK.has(normalizedQc);
+  return ensureQualityCase(client, {
+    sourceType: "incoming_rn",
+    sourceId: header.id,
+    sourceLineId: line.id,
+    sourceDoc: header.rn_number,
+    itemCode: line.item_code,
+    itemName: line.item_name,
+    partNo: line.part_no,
+    supplier: header.supplier,
+    productionDate: productionDateValue || line.production_date || null,
+    qty: Number(qtyValue || 0),
+    qtyOk: blockedForStock ? 0 : Number(qtyValue || 0),
+    qtyNg: blockedForStock ? Number(qtyValue || 0) : 0,
+    defectCategory: normalizedQc.toUpperCase(),
+    defectDescription: line.notes || header.remarks || null,
+    severity: normalizedQc === "reject" ? "major" : "minor",
+  }, user);
+};
+
+const isIncomingReceiptCorrectionSource = async (client, qualityCase, lock = false) => {
+  if (normalizeQualitySourceType(qualityCase?.source_type) !== "incoming_rn") return false;
+  const lineId = parsePositiveId(qualityCase?.source_line_id);
+  if (lineId) {
+    const result = await client.query(
+      `
+      select
+        rni.line_status,
+        rni.exception_code,
+        rni.reversal_of_item_id,
+        rnh.status as header_status,
+        rnh.source as header_source,
+        rnh.reversal_of
+      from receive_note_items rni
+      join receive_note_headers rnh on rnh.id = rni.rn_id
+      where rni.id = $1
+      ${lock ? "for update of rni, rnh" : ""}
+      `,
+      [lineId],
+    );
+    const row = result.rows[0] || null;
+    if (!row) return false;
+    return Boolean(
+      row.reversal_of
+        || row.reversal_of_item_id
+        || String(row.exception_code || "").trim().toLowerCase() === "receipt_reversal"
+        || String(row.header_source || "").trim().toUpperCase() === "REVERSAL"
+        || String(row.header_status || "").trim().toLowerCase() === "reversed"
+        || String(row.line_status || "").trim().toLowerCase() === "reversed",
+    );
+  }
+  const sourceId = parsePositiveId(qualityCase?.source_id);
+  if (!sourceId) return false;
+  const result = await client.query(
+    `
+    select status, source
+    from receive_notes
+    where id = $1
+    ${lock ? "for update" : ""}
+    `,
+    [sourceId],
+  );
+  const row = result.rows[0] || null;
+  if (!row) return false;
+  return Boolean(
+    String(row.status || "").trim().toLowerCase() === "reversed"
+      || String(row.status || "").trim().toLowerCase() === "cancelled"
+      || String(row.source || "").trim().toUpperCase() === "REVERSAL",
+  );
+};
+
+const loadQualityStockBatch = async (client, batchId, itemCode, lock = false) => {
+  const id = Number(batchId || 0);
+  const code = normalizeItemCode(itemCode);
+  if (!Number.isFinite(id) || id <= 0 || !code) return null;
+  const result = await client.query(
+    `
+    select
+      b.*,
+      (b.qty_in - b.qty_out)::numeric as available_qty,
+      i.name as item_name,
+      i.part_no,
+      coalesce(ph.supplier_id, nullif(trim(s.supplier), ''), nullif(trim(i.vendor_id), ''), primary_supplier.vendor_id, nullif(trim(i.supplier_name), '')) as supplier_code,
+      coalesce(mv.name, nullif(trim(i.supplier_name), ''), ph.supplier_id, nullif(trim(s.supplier), ''), primary_supplier.vendor_id, nullif(trim(i.vendor_id), '')) as supplier_name
+    from stock_batches b
+    join items i on i.code = b.item_code
+    left join schedules s on s.id = b.schedule_id
+    left join po_headers ph on ph.po_number = s.po_number
+    left join lateral (
+      select vendor_id
+      from item_suppliers
+      where item_code = i.code
+      order by coalesce(share_percent, 0) desc, vendor_id asc
+      limit 1
+    ) primary_supplier on true
+    left join master_vendors mv on mv.id = coalesce(ph.supplier_id, nullif(trim(s.supplier), ''), nullif(trim(i.vendor_id), ''), primary_supplier.vendor_id)
+    where b.id = $1 and b.item_code = $2
+    ${lock ? "for update of b" : ""}
+    `,
+    [id, code],
+  );
+  return result.rows[0] || null;
+};
+
+const holdMaterialLineNgStock = async (client, qualityCase, user = null, notes = "") => {
+  const sourceType = normalizeQualitySourceType(qualityCase?.source_type);
+  if (sourceType !== "material_line_ng") return null;
+  const itemCode = normalizeItemCode(qualityCase.item_code);
+  const batchId = Number(qualityCase.batch_id || 0);
+  const holdQtyExisting = Number(qualityCase.stock_hold_qty || 0);
+  const qtyValue = Number(qualityCase.qty_ng || qualityCase.qty || 0);
+  if (holdQtyExisting > 0) return { held: false, reason: "already_held", batchId };
+  if (!itemCode || !(batchId > 0) || !(qtyValue > 0)) {
+    const error = new Error("Material NG Line wajib memilih batch FIFO dan qty valid.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const batch = await loadQualityStockBatch(client, batchId, itemCode, true);
+  if (!batch) {
+    const error = new Error("Batch FIFO tidak ditemukan untuk item ini.");
+    error.statusCode = 404;
+    throw error;
+  }
+  const availableQty = Number(batch.available_qty || 0);
+  if (qtyValue > availableQty) {
+    const error = new Error(`Qty NG melebihi stok batch. Available ${availableQty}.`);
+    error.statusCode = 409;
+    throw error;
+  }
+  await client.query("update stock_batches set qty_out = qty_out + $1 where id = $2", [qtyValue, batchId]);
+  await logStockMovement(client, {
+    itemCode,
+    batchId,
+    qty: qtyValue,
+    direction: "out",
+    reason: "material_line_ng_hold",
+    sourceRefType: "quality_case",
+    sourceRefId: qualityCase.id,
+  });
+  await client.query("update items set qty_on_hand = greatest(qty_on_hand - $1, 0) where code = $2", [qtyValue, itemCode]);
+  await insertInventoryLedger(client, {
+    itemCode,
+    transactionType: "ADJUSTMENT_SO",
+    referenceDoc: qualityCase.source_doc || qualityCase.case_number,
+    qtyIn: 0,
+    qtyOut: qtyValue,
+    userId: user?.id || null,
+    remarks: notes || "material_line_ng_hold",
+    batchId,
+    sourceRefType: "quality_case",
+    sourceRefId: qualityCase.id,
+  });
+  const updated = await client.query(
+    "update quality_cases set stock_hold_qty = $1, updated_at = now() where id = $2 returning *",
+    [qtyValue, qualityCase.id],
+  );
+  return { held: true, batchId, qty: qtyValue, caseRow: updated.rows[0] || null };
+};
+
+const restoreMaterialLineNgStock = async (client, qualityCase, user = null, notes = "") => {
+  const sourceType = normalizeQualitySourceType(qualityCase?.source_type);
+  if (sourceType !== "material_line_ng") return null;
+  const itemCode = normalizeItemCode(qualityCase.item_code);
+  const batchId = Number(qualityCase.batch_id || 0);
+  const holdQty = Number(qualityCase.stock_hold_qty || 0);
+  if (!itemCode || !(batchId > 0) || !(holdQty > 0)) return { restored: false, reason: "nothing_held", batchId };
+  const batch = await loadQualityStockBatch(client, batchId, itemCode, true);
+  if (!batch) {
+    const error = new Error("Batch FIFO tidak ditemukan untuk restore QC.");
+    error.statusCode = 404;
+    throw error;
+  }
+  await client.query("update stock_batches set qty_out = greatest(qty_out - $1, 0) where id = $2", [holdQty, batchId]);
+  await logStockMovement(client, {
+    itemCode,
+    batchId,
+    qty: holdQty,
+    direction: "in",
+    reason: "material_line_ng_use_as_is",
+    sourceRefType: "quality_case",
+    sourceRefId: qualityCase.id,
+  });
+  await client.query("update items set qty_on_hand = qty_on_hand + $1 where code = $2", [holdQty, itemCode]);
+  await insertInventoryLedger(client, {
+    itemCode,
+    transactionType: "ADJUSTMENT_SO",
+    referenceDoc: qualityCase.source_doc || qualityCase.case_number,
+    qtyIn: holdQty,
+    qtyOut: 0,
+    userId: user?.id || null,
+    remarks: notes || "material_line_ng_use_as_is",
+    batchId,
+    sourceRefType: "quality_case",
+    sourceRefId: qualityCase.id,
+  });
+  return { restored: true, batchId, qty: holdQty };
+};
+
+const releaseIncomingReceiptLineToStock = async (client, lineId, user = null, notes = "") => {
+  const lineResult = await client.query(
+    `
+    select
+      rni.*,
+      rnh.rn_number,
+      rnh.do_number,
+      rnh.document_date,
+      rnh.remarks as header_remarks,
+      rnh.supplier as header_supplier,
+      rnh.status as header_status,
+      rnh.source as header_source,
+      rnh.reversal_of as header_reversal_of,
+      s.request_qty as schedule_request_qty,
+      s.received_qty as schedule_received_qty
+    from receive_note_items rni
+    join receive_note_headers rnh on rnh.id = rni.rn_id
+    left join schedules s on s.id = rni.schedule_id
+    where rni.id = $1
+    for update of rni
+    `,
+    [lineId],
+  );
+  const line = lineResult.rows[0] || null;
+  if (!line) {
+    const error = new Error("Line RN tidak ditemukan.");
+    error.statusCode = 404;
+    throw error;
+  }
+  if (
+    line.header_reversal_of
+      || line.reversal_of_item_id
+      || String(line.exception_code || "").trim().toLowerCase() === "receipt_reversal"
+      || String(line.header_source || "").trim().toUpperCase() === "REVERSAL"
+      || String(line.header_status || "").trim().toLowerCase() === "reversed"
+      || String(line.line_status || "").trim().toLowerCase() === "reversed"
+  ) {
+    const error = new Error("RN batal/reversal tidak boleh direlease ke stok. Gunakan Close Review QC.");
+    error.statusCode = 409;
+    throw error;
+  }
+  const qtyValue = Number(line.received_qty || 0);
+  if (!(qtyValue > 0)) {
+    const error = new Error("Qty RN tidak valid.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const alreadyPostedQty = Number(line.posted_qty || 0);
+  if (alreadyPostedQty > 0 && String(line.qc_status || "").trim().toLowerCase() === "ok") {
+    return { released: false, reason: "already_released" };
+  }
+
+  const packQty = Number.isFinite(Number(line.pack_qty)) ? Number(line.pack_qty) : await resolveItemPackQty(client, line.item_code);
+  const isLoose = isLooseQty(qtyValue, packQty);
+  const arrivalDate = line.arrival_date || line.document_date || getTodayDateOnly();
+  const { productionDate: productionDateValue, expiredDate: expiredDateValue } = await resolveBatchDates(
+    client,
+    line.item_code,
+    line.production_date,
+    line.expired_date,
+  );
+  const lineBatchNo = String(line.supplier_lot_no || line.batch_no || "").trim()
+    || `${line.do_number || line.rn_number}-${line.line_no}`;
+  const lineKanbanId = extractKanbanIdToken(line.kanban_id || "");
+  let batchId = null;
+
+  if (line.schedule_id) {
+    await client.query(
+      `
+      insert into stock_batches (item_code, qty_in, arrival_date, do_number, batch_no, schedule_id, is_loose, production_date, expired_date, kanban_id)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      on conflict (schedule_id) do update set
+        qty_in = stock_batches.qty_in + excluded.qty_in,
+        arrival_date = coalesce(stock_batches.arrival_date, excluded.arrival_date),
+        do_number = coalesce(stock_batches.do_number, excluded.do_number),
+        batch_no = coalesce(stock_batches.batch_no, excluded.batch_no),
+        is_loose = stock_batches.is_loose or excluded.is_loose,
+        production_date = coalesce(stock_batches.production_date, excluded.production_date),
+        expired_date = coalesce(stock_batches.expired_date, excluded.expired_date),
+        kanban_id = coalesce(stock_batches.kanban_id, excluded.kanban_id)
+      `,
+      [line.item_code, qtyValue, arrivalDate, line.do_number || null, lineBatchNo, line.schedule_id, isLoose, productionDateValue, expiredDateValue, lineKanbanId || null],
+    );
+    const batchResult = await client.query("select id from stock_batches where schedule_id = $1", [line.schedule_id]);
+    batchId = batchResult.rows[0]?.id || null;
+  } else {
+    const batchResult = await client.query(
+      `
+      insert into stock_batches (item_code, qty_in, arrival_date, do_number, batch_no, schedule_id, is_loose, production_date, expired_date, kanban_id)
+      values ($1,$2,$3,$4,$5,null,$6,$7,$8,$9)
+      returning id
+      `,
+      [line.item_code, qtyValue, arrivalDate, line.do_number || null, lineBatchNo, isLoose, productionDateValue, expiredDateValue, lineKanbanId || null],
+    );
+    batchId = batchResult.rows[0]?.id || null;
+  }
+
+  await logStockMovement(client, {
+    itemCode: line.item_code,
+    batchId,
+    qty: qtyValue,
+    direction: "in",
+    reason: "qc_release",
+    sourceRefType: "quality_release",
+    sourceRefId: line.rn_id,
+    sourceRefLineId: line.id,
+    kanbanId: lineKanbanId || null,
+  });
+  await client.query("update items set qty_on_hand = qty_on_hand + $1 where code = $2", [qtyValue, line.item_code]);
+  await insertInventoryLedger(client, {
+    itemCode: line.item_code,
+    transactionType: "RECEIVING",
+    referenceDoc: line.do_number || line.rn_number,
+    qtyIn: qtyValue,
+    qtyOut: 0,
+    userId: user?.id || null,
+    remarks: notes || "qc_release",
+    batchId,
+    kanbanId: lineKanbanId || null,
+    sourceRefType: "quality_release",
+    sourceRefId: line.rn_id,
+    sourceRefLineId: line.id,
+  });
+  await client.query(
+    `
+    update receive_note_items
+    set qc_status = 'ok',
+        posted_qty = received_qty,
+        notes = coalesce(nullif($2, ''), notes)
+    where id = $1
+    `,
+    [line.id, notes || null],
+  );
+  if (line.schedule_id) {
+    const requestQty = Number(line.schedule_request_qty || 0);
+    const receivedQty = Number(line.schedule_received_qty || 0);
+    const nextStatus = receivedQty < requestQty ? "PARTIAL" : "RECEIVED";
+    await client.query(
+      "update schedules set status = $1, updated_at = now() where id = $2",
+      [nextStatus, line.schedule_id],
+    );
+  }
+  return { released: true, batchId };
+};
+
+const releaseLegacyReceiveNoteToStock = async (client, rnId, user = null, notes = "") => {
+  const rnResult = await client.query(
+    `
+    select
+      rn.*,
+      s.request_qty as schedule_request_qty,
+      s.received_qty as schedule_received_qty,
+      s.do_number as schedule_do_number,
+      s.arrival_date as schedule_arrival_date
+    from receive_notes rn
+    left join schedules s on s.id = rn.schedule_id
+    where rn.id = $1
+    for update of rn
+    `,
+    [rnId],
+  );
+  const rn = rnResult.rows[0] || null;
+  if (!rn) {
+    const error = new Error("RN tidak ditemukan.");
+    error.statusCode = 404;
+    throw error;
+  }
+  if (
+    String(rn.status || "").trim().toLowerCase() === "reversed"
+      || String(rn.status || "").trim().toLowerCase() === "cancelled"
+      || String(rn.source || "").trim().toUpperCase() === "REVERSAL"
+  ) {
+    const error = new Error("RN batal/reversal tidak boleh direlease ke stok. Gunakan Close Review QC.");
+    error.statusCode = 409;
+    throw error;
+  }
+  const existingRelease = await client.query(
+    "select id from stock_movements where source_ref_type = 'quality_release' and source_ref_id = $1 limit 1",
+    [rn.id],
+  );
+  if (existingRelease.rows.length > 0) {
+    return { released: false, reason: "already_released" };
+  }
+  const qtyValue = Number(rn.received_qty || 0);
+  if (!(qtyValue > 0)) {
+    const error = new Error("Qty RN tidak valid.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const itemCode = normalizeItemCode(rn.item_code);
+  if (!itemCode) {
+    const error = new Error("Item RN tidak valid.");
+    error.statusCode = 409;
+    throw error;
+  }
+  const packQty = await resolveItemPackQty(client, itemCode);
+  const isLoose = isLooseQty(qtyValue, packQty);
+  const arrivalDate = rn.schedule_arrival_date || rn.received_at || getTodayDateOnly();
+  const batchNo = rn.schedule_do_number || rn.rn_number || String(rn.id);
+  let batchId = null;
+  if (rn.schedule_id) {
+    const batchResult = await client.query(
+      `
+      insert into stock_batches (item_code, qty_in, arrival_date, do_number, batch_no, schedule_id, is_loose)
+      values ($1,$2,$3,$4,$5,$6,$7)
+      on conflict (schedule_id) do nothing
+      returning id
+      `,
+      [itemCode, qtyValue, arrivalDate, rn.schedule_do_number || null, batchNo, rn.schedule_id, isLoose],
+    );
+    if (batchResult.rows[0]?.id) {
+      batchId = batchResult.rows[0].id;
+    } else {
+      const existingBatch = await client.query("select id from stock_batches where schedule_id = $1", [rn.schedule_id]);
+      batchId = existingBatch.rows[0]?.id || null;
+    }
+  } else {
+    const batchResult = await client.query(
+      `
+      insert into stock_batches (item_code, qty_in, qty_out, arrival_date, do_number, batch_no, is_loose)
+      values ($1,$2,0,$3,$4,$5,$6)
+      returning id
+      `,
+      [itemCode, qtyValue, arrivalDate, rn.rn_number || null, batchNo, isLoose],
+    );
+    batchId = batchResult.rows[0]?.id || null;
+  }
+  await logStockMovement(client, {
+    itemCode,
+    batchId,
+    qty: qtyValue,
+    direction: "in",
+    reason: "qc_release",
+    sourceRefType: "quality_release",
+    sourceRefId: rn.id,
+  });
+  await client.query("update items set qty_on_hand = qty_on_hand + $1 where code = $2", [qtyValue, itemCode]);
+  await insertInventoryLedger(client, {
+    itemCode,
+    transactionType: "RECEIVING",
+    referenceDoc: rn.rn_number,
+    qtyIn: qtyValue,
+    qtyOut: 0,
+    userId: user?.id || null,
+    remarks: notes || "qc_release",
+    batchId,
+    sourceRefType: "quality_release",
+    sourceRefId: rn.id,
+  });
+  await client.query(
+    "update receive_notes set qc_status = 'ok', status = 'closed', notes = coalesce(nullif($2, ''), notes) where id = $1",
+    [rn.id, notes || null],
+  );
+  if (rn.schedule_id) {
+    const requestQty = Number(rn.schedule_request_qty || 0);
+    const receivedQty = Number(rn.schedule_received_qty || rn.received_qty || 0);
+    const nextStatus = receivedQty < requestQty ? "PARTIAL" : "RECEIVED";
+    await client.query("update schedules set status = $1, updated_at = now() where id = $2", [nextStatus, rn.schedule_id]);
+  }
+  return { released: true, batchId };
+};
+
+const reverseScheduleStockReceipt = async (client, scheduleId, user = null, reason = "schedule_unlock") => {
+  const batches = await client.query(
+    "select id, item_code, qty_in, qty_out, do_number, batch_no from stock_batches where schedule_id = $1 for update",
+    [scheduleId],
+  );
+  for (const batch of batches.rows) {
+    const qtyIn = Number(batch.qty_in || 0);
+    const qtyOut = Number(batch.qty_out || 0);
+    if (qtyOut > 0) {
+      const error = new Error(`Stok schedule untuk ${batch.item_code} sudah terpakai, tidak bisa dibatalkan.`);
+      error.statusCode = 409;
+      throw error;
+    }
+    if (!(qtyIn > 0)) continue;
+    const hasOriginalMovement = await client.query(
+      "select id from stock_movements where batch_id = $1 and direction = 'in' limit 1",
+      [batch.id],
+    );
+    await client.query(
+      "update items set qty_on_hand = greatest(qty_on_hand - $1, 0) where code = $2",
+      [qtyIn, batch.item_code],
+    );
+    if (hasOriginalMovement.rows.length > 0) {
+      await logStockMovement(client, {
+        itemCode: batch.item_code,
+        batchId: batch.id,
+        qty: qtyIn,
+        direction: "out",
+        reason,
+        sourceRefType: "schedule",
+        sourceRefId: scheduleId,
+      });
+      await insertInventoryLedger(client, {
+        itemCode: batch.item_code,
+        transactionType: "REVERSAL",
+        referenceDoc: batch.do_number || batch.batch_no || `SCH-${scheduleId}`,
+        qtyIn: 0,
+        qtyOut: qtyIn,
+        userId: user?.id || null,
+        remarks: reason,
+        batchId: batch.id,
+        sourceRefType: "schedule",
+        sourceRefId: scheduleId,
+      });
+    }
+  }
+  await client.query("delete from stock_batches where schedule_id = $1", [scheduleId]);
+};
+
+const updateIncomingReceiptLineQcStatus = async (client, lineId, qcStatus, notes = "") => {
+  const normalizedQc = ["ok", "hold", "reject"].includes(qcStatus) ? qcStatus : "hold";
+  const currentResult = await client.query(
+    `
+    select
+      rni.id,
+      rni.schedule_id,
+      rni.line_status,
+      rni.exception_code,
+      rni.reversal_of_item_id,
+      rnh.status as header_status,
+      rnh.source as header_source,
+      rnh.reversal_of as header_reversal_of
+    from receive_note_items rni
+    join receive_note_headers rnh on rnh.id = rni.rn_id
+    where rni.id = $1
+    for update of rni, rnh
+    `,
+    [lineId],
+  );
+  const current = currentResult.rows[0] || null;
+  if (!current) {
+    const error = new Error("Line RN tidak ditemukan.");
+    error.statusCode = 404;
+    throw error;
+  }
+  if (
+    current.header_reversal_of
+      || current.reversal_of_item_id
+      || String(current.exception_code || "").trim().toLowerCase() === "receipt_reversal"
+      || String(current.header_source || "").trim().toUpperCase() === "REVERSAL"
+      || String(current.header_status || "").trim().toLowerCase() === "reversed"
+      || String(current.line_status || "").trim().toLowerCase() === "reversed"
+  ) {
+    const error = new Error("RN batal/reversal tidak boleh diproses Hold/Reject. Gunakan Close Review QC.");
+    error.statusCode = 409;
+    throw error;
+  }
+  await client.query(
+    `
+    update receive_note_items
+    set qc_status = $1,
+        notes = coalesce(nullif($2, ''), notes)
+    where id = $3
+    `,
+    [normalizedQc, notes || null, lineId],
+  );
+  const scheduleId = current.schedule_id || null;
+  if (scheduleId) {
+    const status = normalizedQc === "ok" ? "RECEIVED" : normalizedQc === "hold" ? "HOLD" : "REJECTED";
+    await client.query("update schedules set status = $1, updated_at = now() where id = $2", [status, scheduleId]);
+  }
 };
 
 const normalizeStockOpnameMode = (value) => {
@@ -7318,25 +9179,33 @@ const getOldestAvailableBatch = async (client, itemCode) => {
   return result.rows[0] || null;
 };
 
-const consumeStockFifo = async (client, itemCode, qtyNumber, reason = "consume") => {
+const consumeStockFifo = async (client, itemCode, qtyNumber, reason = "consume", movementMeta = {}) => {
   let remaining = qtyNumber;
   const consumed = [];
   const warnings = [];
   const warningSet = new Set();
+  const kanbanId = extractKanbanIdToken(movementMeta.kanbanId || movementMeta.kanban_id || "");
   const orderClause = await getFifoOrderClause(client, itemCode);
+  const prioritizedOrderClause = kanbanId
+    ? orderClause.replace(/^order by/i, "order by case when lower(coalesce(kanban_id, '')) = lower($2) then 0 else 1 end,")
+    : orderClause;
   const batches = await client.query(
-    `select id, qty_in, qty_out, batch_no, expired_date
+    `select id, qty_in, qty_out, batch_no, expired_date, kanban_id
      from stock_batches
      where item_code = $1 and qty_in > qty_out
-     ${orderClause}`,
-    [itemCode],
+     ${prioritizedOrderClause}`,
+    kanbanId ? [itemCode, kanbanId] : [itemCode],
   );
   for (const batch of batches.rows) {
     if (remaining <= 0) break;
     const available = Number(batch.qty_in) - Number(batch.qty_out);
     if (available <= 0) continue;
     assertBatchNotExpired(batch, itemCode, warnings, warningSet);
-    const oldest = await getOldestAvailableBatch(client, itemCode);
+    const batchKanbanId = extractKanbanIdToken(batch.kanban_id || "");
+    const isMatchedKanbanBatch = kanbanId && batchKanbanId && batchKanbanId.toLowerCase() === kanbanId.toLowerCase();
+    const oldest = isMatchedKanbanBatch
+      ? null
+      : await getOldestAvailableBatch(client, itemCode);
     if (oldest && oldest.id !== batch.id) {
       await logFifoViolation(client, {
         itemCode,
@@ -7358,6 +9227,10 @@ const consumeStockFifo = async (client, itemCode, qtyNumber, reason = "consume")
       qty: consumeQty,
       direction: "out",
       reason,
+      kanbanId: movementMeta.kanbanId || movementMeta.kanban_id || null,
+      sourceRefType: movementMeta.sourceRefType || null,
+      sourceRefId: movementMeta.sourceRefId || null,
+      sourceRefLineId: movementMeta.sourceRefLineId || null,
     });
     remaining -= consumeQty;
   }
@@ -7386,7 +9259,7 @@ const resolveVendorRow = async (client, vendorValue) => {
   const key = String(vendorValue || "").trim();
   if (!key) return null;
   const result = await client.query(
-    "select * from master_vendors where id = $1 or name = $1 limit 1",
+    "select * from master_vendors where id::text = $1::text or name::text = $1::text limit 1",
     [key],
   );
   return result.rows[0] || null;
@@ -7408,7 +9281,7 @@ const resolveItemRow = async (client, itemValue) => {
   const key = String(itemValue || "").trim();
   if (!key) return null;
   const result = await client.query(
-    "select * from items where code = $1 or name = $1 limit 1",
+    "select * from items where code::text = $1::text or name::text = $1::text limit 1",
     [key],
   );
   return result.rows[0] || null;
@@ -7700,7 +9573,7 @@ const resolveInboundItemInfo = async (client, itemValue) => {
     select i.code, i.name, i.unit, i.pack_qty, ks.lot_qty
     from items i
     left join kanban_settings ks on ks.item_code = i.code
-    where i.code = $1 or i.name = $1
+    where i.code::text = $1::text or i.name::text = $1::text
     limit 1
     `,
     [itemKey],
@@ -7787,7 +9660,7 @@ const resolveItemDeliveryLimits = async (client, itemValue) => {
     return { orderLotSize: 0, maxDeliveryPerRit: 0 };
   }
   const result = await client.query(
-    "select order_lot_size, max_delivery_per_rit from items where code = $1 or name = $1 limit 1",
+    "select order_lot_size, max_delivery_per_rit from items where code::text = $1::text or name::text = $1::text limit 1",
     [itemKey],
   );
   const row = result.rows[0] || {};
@@ -7857,17 +9730,87 @@ const normalizeDeliveryDocumentDate = (value) => {
 const parseDeliveryNumericValue = (value) => {
   if (value === null || value === undefined) return 0;
   if (typeof value === "number") return Number.isFinite(value) ? value : 0;
-  const normalized = String(value)
-    .replace(/,/g, ".")
+  const raw = String(value).trim();
+  if (!raw) return 0;
+  const hasComma = raw.includes(",");
+  const hasDot = raw.includes(".");
+  const numericText = raw.replace(/[^0-9,.-]/g, "").replace(/(?!^)-/g, "");
+  let normalized = numericText;
+  if (hasComma && hasDot) {
+    normalized = numericText.replace(/,/g, "");
+  } else if (hasComma) {
+    normalized = /^-?\d{1,3}(,\d{3})+$/.test(numericText)
+      ? numericText.replace(/,/g, "")
+      : numericText.replace(/,/g, ".");
+  } else if (hasDot && /^-?\d{1,3}(\.\d{3})+$/.test(numericText)) {
+    normalized = numericText.replace(/\./g, "");
+  }
+  normalized = normalized
     .replace(/[^0-9.-]/g, "")
     .replace(/(?!^)-/g, "");
   const parsed = Number(normalized);
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
-const resolveDeliveryItemRow = async (client, partNo) => {
-  const key = String(partNo || "").trim();
-  if (!key) return null;
+const normalizeDeliveryLookupKey = (value) => String(value || "").trim();
+
+const normalizeDeliveryLookupAlnum = (value) => normalizeDeliveryLookupKey(value)
+  .toLowerCase()
+  .replace(/[^a-z0-9]/g, "");
+
+const buildDeliveryItemLookupKeys = (input) => {
+  const rawValues = [];
+  if (input && typeof input === "object" && !Array.isArray(input)) {
+    rawValues.push(
+      input.itemCode,
+      input.item_code,
+      input.uniq,
+      input.uniqueCode,
+      input.unique_code,
+      input.partNo,
+      input.part_no,
+      input.partNumber,
+      input.part_number,
+      input.partName,
+      input.part_name,
+    );
+  } else {
+    rawValues.push(input);
+  }
+
+  const keys = [];
+  const addKey = (value) => {
+    const key = normalizeDeliveryLookupKey(value);
+    if (!key) return;
+    if (!keys.some((existing) => existing.toLowerCase() === key.toLowerCase())) {
+      keys.push(key);
+    }
+  };
+
+  rawValues.forEach((value) => {
+    const key = normalizeDeliveryLookupKey(value);
+    if (!key) return;
+    addKey(key);
+    if (key.includes("/")) {
+      addKey(key.split("/")[0]);
+    }
+    const trailingZeroVariant = key.replace(/-0{2,}$/i, "");
+    if (trailingZeroVariant !== key) {
+      addKey(trailingZeroVariant);
+    }
+  });
+
+  return keys;
+};
+
+const resolveDeliveryItemRow = async (client, itemRef) => {
+  const keys = buildDeliveryItemLookupKeys(itemRef);
+  if (keys.length === 0) return null;
+  const loweredKeys = keys.map((key) => key.toLowerCase());
+  const normalizedKeys = keys.map(normalizeDeliveryLookupAlnum).filter(Boolean);
+  const likeKeys = keys
+    .filter((key) => key.length >= 4)
+    .map((key) => `%${key.replace(/[%_\\]/g, "\\$&")}%`);
   const result = await client.query(
     `
     select
@@ -7876,12 +9819,26 @@ const resolveDeliveryItemRow = async (client, partNo) => {
       ks.max_delivery_per_rit
     from items i
     left join kanban_settings ks on ks.item_code = i.code
-    where i.code = $1
-       or i.part_no = $1
-       or i.name = $1
+    where lower(trim(coalesce(i.code, ''))) = any($1::text[])
+       or lower(trim(coalesce(i.part_no, ''))) = any($1::text[])
+       or lower(trim(coalesce(i.name, ''))) = any($1::text[])
+       or regexp_replace(lower(coalesce(i.code, '')), '[^a-z0-9]', '', 'g') = any($2::text[])
+       or regexp_replace(lower(coalesce(i.part_no, '')), '[^a-z0-9]', '', 'g') = any($2::text[])
+       or regexp_replace(lower(coalesce(i.name, '')), '[^a-z0-9]', '', 'g') = any($2::text[])
+       or coalesce(i.part_no, '') ilike any($3::text[])
+       or coalesce(i.name, '') ilike any($3::text[])
+    order by
+      case
+        when lower(trim(coalesce(i.code, ''))) = any($1::text[]) then 0
+        when regexp_replace(lower(coalesce(i.code, '')), '[^a-z0-9]', '', 'g') = any($2::text[]) then 1
+        when lower(trim(coalesce(i.part_no, ''))) = any($1::text[]) then 2
+        when regexp_replace(lower(coalesce(i.part_no, '')), '[^a-z0-9]', '', 'g') = any($2::text[]) then 3
+        else 4
+      end,
+      i.code asc
     limit 1
     `,
-    [key],
+    [loweredKeys, normalizedKeys, likeKeys.length ? likeKeys : ["__NO_LIKE_MATCH__"]],
   );
   return result.rows[0] || null;
 };
@@ -7933,8 +9890,12 @@ Kembalikan HANYA JSON valid dengan struktur:
   "items": [
     {
       "lineNo": 1,
+      "uniq": "kode pada kolom UNIQ, contoh SP0/025",
+      "itemCode": "kode item internal jika terlihat; untuk format UNIQ seperti SP0/025 isi SP0",
       "partNo": "part number atau kode parent",
       "partName": "nama part",
+      "qtyPerKanban": 0,
+      "orderKanban": 0,
       "qtyOrder": 0,
       "uom": "PCS/PC/UNIT atau null",
       "packing": "opsional"
@@ -7943,6 +9904,9 @@ Kembalikan HANYA JSON valid dengan struktur:
 }
 Aturan:
 - Ambil seluruh baris item yang terlihat pada tabel.
+- Untuk tabel dengan kolom UNIQ, isi uniq sesuai teks lengkap dan itemCode dengan bagian sebelum "/" (contoh "PF2/010" menjadi "PF2").
+- Untuk format Bonecom Tricom, qtyOrder WAJIB memakai kolom "ORDER UNIT", bukan "QTY/KBN" dan bukan "ORDER KBN".
+- Jika hanya ada QTY/KBN dan ORDER KBN, hitung qtyOrder = qtyPerKanban * orderKanban.
 - Jika ada beberapa halaman, gabungkan semua baris.
 - Abaikan tanda tangan, catatan kaki, dan stamp.
 - Jika ada nilai yang tidak pasti, gunakan tebakan terbaik dan sisakan null jika benar-benar tidak terbaca.
@@ -8018,16 +9982,49 @@ const normalizeDeliveryDocumentPayload = (rawPayload = {}) => {
   const normalizedItems = items
     .map((item, index) => {
       const lineNo = Number(item?.lineNo ?? item?.line_no ?? index + 1) || index + 1;
+      const uniq = String(item?.uniq || item?.uniqueCode || item?.unique_code || "").trim();
+      const itemCodeRaw = String(item?.itemCode || item?.item_code || item?.code || "").trim();
+      const itemCode = itemCodeRaw || (uniq.includes("/") ? uniq.split("/")[0].trim() : uniq);
       const partNo = String(item?.partNo || item?.part_no || item?.partNumber || item?.part_number || "").trim();
       const partName = String(item?.partName || item?.part_name || "").trim();
-      const qtyOrder = parseDeliveryNumericValue(item?.qtyOrder ?? item?.qty_order);
+      const qtyPerKanban = parseDeliveryNumericValue(
+        item?.qtyPerKanban
+        ?? item?.qty_per_kanban
+        ?? item?.qtyKbn
+        ?? item?.qty_kbn
+        ?? item?.qtyPerKbn
+        ?? item?.qty_per_kbn,
+      );
+      const orderKanban = parseDeliveryNumericValue(
+        item?.orderKanban
+        ?? item?.order_kanban
+        ?? item?.orderKbn
+        ?? item?.order_kbn,
+      );
+      let qtyOrder = parseDeliveryNumericValue(
+        item?.qtyOrder
+        ?? item?.qty_order
+        ?? item?.orderUnit
+        ?? item?.order_unit
+        ?? item?.qtyUnit
+        ?? item?.qty_unit
+        ?? item?.quantity
+        ?? item?.qty,
+      );
+      if (!(qtyOrder > 0) && qtyPerKanban > 0 && orderKanban > 0) {
+        qtyOrder = qtyPerKanban * orderKanban;
+      }
       const uom = String(item?.uom || item?.unit || "").trim() || null;
       const packing = String(item?.packing || item?.pack || "").trim() || null;
-      if (!partNo && !partName && qtyOrder <= 0) return null;
+      if (!itemCode && !uniq && !partNo && !partName && qtyOrder <= 0) return null;
       return {
         lineNo,
-        partNo: partNo || partName || `LINE-${lineNo}`,
+        uniq: uniq || null,
+        itemCode: itemCode || null,
+        partNo: partNo || itemCode || partName || `LINE-${lineNo}`,
         partName: partName || null,
+        qtyPerKanban: qtyPerKanban || null,
+        orderKanban: orderKanban || null,
         qtyOrder,
         uom,
         packing,
@@ -8151,7 +10148,7 @@ const createDeliveryBackorderRequests = async (client, parentItem, shortageQty, 
 
 const insertDeliveryNoteItems = async (client, dnId, requestIds) => {
   if (!Number.isFinite(Number(dnId))) return [];
-  const idList = (requestIds || []).map((val) => Number(val)).filter((val) => Number.isFinite(val));
+  const idList = Array.from(new Set((requestIds || []).map((val) => Number(val)).filter((val) => Number.isFinite(val))));
   if (idList.length === 0) return [];
   const result = await client.query(
     `
@@ -8173,6 +10170,43 @@ const insertDeliveryNoteItems = async (client, dnId, requestIds) => {
     [idList],
   );
   if (result.rows.length === 0) return [];
+  const incomingByItem = new Map();
+  for (const row of result.rows) {
+    const itemKey = String(row.item_code || "").trim().toLowerCase();
+    if (!itemKey) continue;
+    const list = incomingByItem.get(itemKey) || [];
+    list.push(row);
+    incomingByItem.set(itemKey, list);
+  }
+  const duplicateIncoming = Array.from(incomingByItem.entries())
+    .find(([, rows]) => rows.length > 1);
+  if (duplicateIncoming) {
+    const [itemCodeKey, rows] = duplicateIncoming;
+    const requestLabels = rows.map((row) => row.request_id).join(", ");
+    const error = new Error(`Item ${itemCodeKey.toUpperCase()} muncul lebih dari satu kali untuk DN yang sama. Gabungkan qty request atau buat DN terpisah. Request: ${requestLabels}.`);
+    error.statusCode = 409;
+    throw error;
+  }
+  const itemKeys = Array.from(incomingByItem.keys());
+  const existingResult = itemKeys.length > 0
+    ? await client.query(
+      `
+      select item_code, request_id
+      from delivery_note_items
+      where dn_id = $1
+        and lower(trim(item_code)) = any($2::text[])
+        and request_id <> all($3::int[])
+      order by item_code asc
+      `,
+      [dnId, itemKeys, idList],
+    )
+    : { rows: [] };
+  if (existingResult.rows.length > 0) {
+    const itemCode = existingResult.rows[0].item_code;
+    const error = new Error(`Item ${itemCode} sudah ada di DN ini. Satu nomor DN tidak boleh berisi kode item yang sama lebih dari satu baris.`);
+    error.statusCode = 409;
+    throw error;
+  }
   const inserted = [];
   for (const row of result.rows) {
     const payload = [
@@ -8245,14 +10279,106 @@ const createInboundCardsForSchedule = async (client, scheduleRow) => {
   return created;
 };
 
-const getScheduleStatusFromActual = ({ requestDate, arrivalDate }) => {
+const getScheduleDeliveryMetrics = ({ requestDate, arrivalDate, requestQty, receivedQty, relatedReceipts } = {}) => {
+  const reqKey = formatDateOnly(requestDate);
+  const reqDate = reqKey ? new Date(`${reqKey}T00:00:00`) : null;
+  const requested = Math.max(0, Number(requestQty || 0));
+  const fallbackReceived = Math.max(0, Number(receivedQty || 0));
+  const receipts = (Array.isArray(relatedReceipts) ? relatedReceipts : [])
+    .map((receipt) => ({
+      arrivalDate: formatDateOnly(receipt?.arrivalDate || receipt?.arrival_date),
+      receivedQty: Math.max(0, Number(receipt?.receivedQty ?? receipt?.received_qty ?? 0)),
+      doNumber: String(receipt?.doNumber || receipt?.do_number || "").trim(),
+    }))
+    .filter((receipt) => receipt.arrivalDate || receipt.receivedQty > 0);
+  if (receipts.length === 0 && (arrivalDate || fallbackReceived > 0)) {
+    receipts.push({
+      arrivalDate: formatDateOnly(arrivalDate),
+      receivedQty: fallbackReceived,
+      doNumber: "",
+    });
+  }
+
+  let onTimeQty = 0;
+  let lateQty = 0;
+  let tooEarlyQty = 0;
+  let datedReceivedQty = 0;
+  let firstArrivalDate = "";
+  let completionDate = "";
+  let cumulativeQty = 0;
+  const orderedReceipts = receipts
+    .filter((receipt) => receipt.arrivalDate)
+    .sort((left, right) => String(left.arrivalDate).localeCompare(String(right.arrivalDate)));
+
+  orderedReceipts.forEach((receipt) => {
+    const qty = Number(receipt.receivedQty || 0);
+    datedReceivedQty += qty;
+    if (!firstArrivalDate) firstArrivalDate = receipt.arrivalDate;
+    cumulativeQty += qty;
+    if (!completionDate && requested > 0 && cumulativeQty >= requested) completionDate = receipt.arrivalDate;
+    if (!reqDate || !reqKey) return;
+    const arrDate = new Date(`${receipt.arrivalDate}T00:00:00`);
+    if (Number.isNaN(arrDate.getTime())) return;
+    const diffDays = Math.round((arrDate - reqDate) / 86400000);
+    if (diffDays >= -1 && diffDays <= 0) onTimeQty += qty;
+    else if (diffDays > 0) lateQty += qty;
+    else tooEarlyQty += qty;
+  });
+
+  const totalReceived = receipts.length > 0 ? Math.max(datedReceivedQty, fallbackReceived) : fallbackReceived;
+  const pendingQty = Math.max(0, requested - totalReceived);
+  let completionDelayDays = 0;
+  if (completionDate && reqKey) {
+    completionDelayDays = Math.max(0, Math.round((new Date(`${completionDate}T00:00:00`) - new Date(`${reqKey}T00:00:00`)) / 86400000));
+  }
+
+  let status = "Pending";
+  if (totalReceived > 0) {
+    if (requested > 0 && totalReceived < requested) {
+      if (onTimeQty > 0 && lateQty <= 0) status = "Partial On Time";
+      else if (lateQty > 0) status = "Partial Late";
+      else if (tooEarlyQty > 0) status = "Partial Too Early";
+      else status = "Partial";
+    } else if (lateQty > 0 && onTimeQty > 0) {
+      status = "Late Completion";
+    } else if (lateQty > 0) {
+      status = "Late";
+    } else if (onTimeQty > 0) {
+      status = "On Time";
+    } else if (tooEarlyQty > 0) {
+      status = "Too Early";
+    } else {
+      status = getScheduleStatusFromActual({ requestDate, arrivalDate: firstArrivalDate || arrivalDate });
+    }
+  }
+
+  return {
+    status,
+    firstArrivalDate: firstArrivalDate || formatDateOnly(arrivalDate),
+    completionDate,
+    completionDelayDays,
+    totalReceived,
+    onTimeQty,
+    lateQty,
+    tooEarlyQty,
+    pendingQty,
+    onTimeQtyRate: requested > 0 ? (onTimeQty / requested) * 100 : 0,
+    lateQtyRate: requested > 0 ? (lateQty / requested) * 100 : 0,
+  };
+};
+
+const getScheduleStatusFromActual = ({ requestDate, arrivalDate, requestQty, receivedQty, relatedReceipts } = {}) => {
+  if (Array.isArray(relatedReceipts) && relatedReceipts.length > 0) {
+    return getScheduleDeliveryMetrics({ requestDate, arrivalDate, requestQty, receivedQty, relatedReceipts }).status;
+  }
   if (!arrivalDate) return "Pending";
   const reqDate = new Date(requestDate);
   const arrDate = new Date(arrivalDate);
   if (Number.isNaN(reqDate.getTime()) || Number.isNaN(arrDate.getTime())) return "Pending";
   const reqKey = formatDateOnly(reqDate);
   const arrKey = formatDateOnly(arrDate);
-  if (arrKey === reqKey) return "On Time";
+  const diffDays = Math.round((new Date(`${arrKey}T00:00:00`) - new Date(`${reqKey}T00:00:00`)) / 86400000);
+  if (diffDays >= -1 && diffDays <= 0) return "On Time";
   return arrKey > reqKey ? "Late" : "Too Early";
 };
 
@@ -8298,7 +10424,25 @@ const buildKanbanIdRegex = (format) => {
 };
 
 const extractKanbanIdToken = (value) => {
-  return String(value || "").trim();
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return "";
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    try {
+      const payload = JSON.parse(trimmed);
+      const nested = payload?.kanbanId || payload?.kanban_id || payload?.cardUid || payload?.card_uid || payload?.itemCode || payload?.item_code || payload?.uniq || "";
+      if (nested) return extractKanbanIdToken(nested);
+    } catch (_error) {
+      return trimmed;
+    }
+  }
+  for (let len = 1; len <= Math.floor(trimmed.length / 2); len += 1) {
+    if (trimmed.length % len !== 0) continue;
+    const prefix = trimmed.slice(0, len);
+    if (prefix.repeat(trimmed.length / len) === trimmed) {
+      return prefix;
+    }
+  }
+  return trimmed;
 };
 
 const extractKanbanItemCodeCandidates = (value) => {
@@ -8314,7 +10458,7 @@ const extractKanbanItemCodeCandidates = (value) => {
   };
 
   pushCandidate(trimmed);
-  const directMatch = trimmed.match(/^KB-([A-Za-z0-9_-]+)-(.+)$/i);
+  const directMatch = trimmed.match(/^KB-([A-Za-z0-9_]+)-(.+)$/i);
   if (directMatch) {
     const parts = String(directMatch[2] || "")
       .split("-")
@@ -8322,6 +10466,9 @@ const extractKanbanItemCodeCandidates = (value) => {
       .filter(Boolean);
     for (let endIndex = parts.length; endIndex >= 1; endIndex -= 1) {
       pushCandidate(parts.slice(0, endIndex).join("-"));
+    }
+    for (let startIndex = 0; startIndex < parts.length; startIndex += 1) {
+      pushCandidate(parts.slice(startIndex).join("-"));
     }
   }
 
@@ -8332,6 +10479,9 @@ const extractKanbanItemCodeCandidates = (value) => {
   if (genericParts.length >= 2) {
     for (let endIndex = genericParts.length - 1; endIndex >= 1; endIndex -= 1) {
       pushCandidate(genericParts.slice(0, endIndex).join("-"));
+    }
+    for (let startIndex = 1; startIndex < genericParts.length; startIndex += 1) {
+      pushCandidate(genericParts.slice(startIndex).join("-"));
     }
   }
 
@@ -9304,7 +11454,7 @@ const resolveSupplierCode = async (client, supplierValue, options = {}) => {
   if (!trimmed) return "";
   const strict = Boolean(options?.strict);
   const result = await client.query(
-    "select id from master_vendors where id = $1 or name = $1 limit 1",
+    "select id from master_vendors where id::text = $1::text or name::text = $1::text limit 1",
     [trimmed],
   );
   const resolved = result.rows[0]?.id || "";
@@ -9316,6 +11466,28 @@ const extractKanbanIdFromNotes = (notes) => {
   const text = String(notes || "");
   const match = text.match(/(?:^|\s|\|)kanban:([^|]+)/i);
   return match ? String(match[1] || "").trim() : "";
+};
+
+const parseDelimitedQrPayload = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return {};
+  if (raw.startsWith("{") && raw.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (_error) {
+      return {};
+    }
+  }
+  return raw.split(/[|;]/).reduce((acc, token) => {
+    const trimmed = String(token || "").trim();
+    const splitIndex = trimmed.includes(":") ? trimmed.indexOf(":") : trimmed.indexOf("=");
+    if (splitIndex <= 0) return acc;
+    const key = trimmed.slice(0, splitIndex).trim().toLowerCase();
+    const parsedValue = trimmed.slice(splitIndex + 1).trim();
+    if (key) acc[key] = parsedValue;
+    return acc;
+  }, {});
 };
 
 const normalizeDeliverySchedule = (input) => {
@@ -9367,7 +11539,7 @@ const resolveVendorSchedule = async (client, supplierValue) => {
   const trimmed = String(supplierValue || "").trim();
   if (!trimmed) return [];
   const result = await client.query(
-    "select delivery_schedule, cycle, rit, delivery_time from master_vendors where id = $1 or name = $1 limit 1",
+    "select delivery_schedule, cycle, rit, delivery_time from master_vendors where id::text = $1::text or name::text = $1::text limit 1",
     [trimmed],
   );
   if (result.rows.length === 0) return [];
@@ -10843,7 +13015,10 @@ const authenticate = async (req, res, next) => {
         and s.status = 'active'
         and s.revoked_at is null
         and s.expires_at > now()
-        and coalesce(s.last_activity_at, s.last_seen_at, s.created_at) > now() - make_interval(mins => $2)
+        and (
+          lower(coalesce(u.role, '')) = 'production'
+          or coalesce(s.last_activity_at, s.last_seen_at, s.created_at) > now() - make_interval(mins => $2)
+        )
       limit 1
       `,
       [sessionId, SESSION_INACTIVITY_TIMEOUT_MINUTES],
@@ -10925,6 +13100,18 @@ const requireSupplier = (req, res, next) => {
   next();
 };
 
+const requirePrlForecastPreviewAccess = (req, res, next) => {
+  if (req.user?.role === "admin" || req.user?.permissions?.viewPrl) {
+    next();
+    return;
+  }
+  if (req.user?.role === "supplier" && req.user?.supplierId) {
+    next();
+    return;
+  }
+  res.status(403).json({ error: "forbidden" });
+};
+
 const requireNotSupplier = (req, res, next) => {
   if (req.user?.role === "supplier" || req.user?.role === "production") {
     res.status(403).json({ error: "forbidden" });
@@ -10965,6 +13152,12 @@ const revokeExpiredSessions = async (client) => {
           end
         )
     where status = 'active'
+      and not exists (
+        select 1
+        from users u
+        where u.id = auth_sessions.user_id
+          and lower(coalesce(u.role, '')) = 'production'
+      )
       and (
         expires_at <= now()
         or coalesce(last_activity_at, last_seen_at, created_at) <= now() - make_interval(mins => $1)
@@ -11193,6 +13386,7 @@ const syncOperationalNotificationsForUser = async (client, userRow) => {
 };
 
 const requireMasterRead = requireAnyPermission("viewMaster", "manageMaster", "manageVendors", "manageItems", "importExport");
+const requireMasterItemRead = requireAnyPermission("viewMaster", "manageMaster", "manageVendors", "manageItems", "importExport", "production");
 const requireManageMaster = requirePermission("manageMaster");
 const requireManageVendors = requireAnyPermission("manageVendors", "manageMaster");
 const requireManageItems = requireAnyPermission("manageItems", "manageMaster");
@@ -11240,31 +13434,36 @@ app.post("/api/auth/login", async (req, res) => {
       return;
     }
     const permissions = normalizePermissions(user.permissions, user.role);
+    const productionSession = isProductionRole(user.role);
     const now = new Date();
     await revokeExpiredSessions(pool);
-    const activeSessionResult = await pool.query(
-      `
-      select id, session_jti, device_label, created_at, last_seen_at, last_activity_at, expires_at
-      from auth_sessions
-      where user_id = $1
-        and status = 'active'
-        and revoked_at is null
-        and expires_at > now()
-      order by last_seen_at desc, created_at desc
-      limit 1
-      `,
-      [user.id],
-    );
-    if (activeSessionResult.rows.length > 0) {
-      const activeSession = activeSessionResult.rows[0];
-      res.status(409).json({
-        error: `Akun ${user.username} masih aktif di perangkat lain (${activeSession.device_label || "unknown device"}) dalam 15 menit terakhir. Logout dulu atau tunggu sesi pasif timeout.`,
-      });
-      return;
+    if (!productionSession) {
+      const activeSessionResult = await pool.query(
+        `
+        select id, session_jti, device_label, created_at, last_seen_at, last_activity_at, expires_at
+        from auth_sessions
+        where user_id = $1
+          and status = 'active'
+          and revoked_at is null
+          and expires_at > now()
+        order by last_seen_at desc, created_at desc
+        limit 1
+        `,
+        [user.id],
+      );
+      if (activeSessionResult.rows.length > 0) {
+        const activeSession = activeSessionResult.rows[0];
+        res.status(409).json({
+          error: `Akun ${user.username} masih aktif di perangkat lain (${activeSession.device_label || "unknown device"}) dalam 15 menit terakhir. Logout dulu atau tunggu sesi pasif timeout.`,
+        });
+        return;
+      }
     }
     const sessionJti = crypto.randomUUID();
-    const expiresIn = "12h";
-    const expiresAt = new Date(now.getTime() + 12 * 60 * 60 * 1000);
+    const expiresIn = productionSession ? null : "12h";
+    const expiresAt = productionSession
+      ? new Date(Date.UTC(9999, 11, 31, 23, 59, 59))
+      : new Date(now.getTime() + 12 * 60 * 60 * 1000);
     const deviceLabel = buildDeviceLabel(req);
     const userAgent = String(req.headers["user-agent"] || "").trim();
     const ipAddress = getClientIp(req);
@@ -11295,18 +13494,17 @@ app.post("/api/auth/login", async (req, res) => {
         role: user.role,
       }),
     ]);
-    const token = jwt.sign(
-      {
-        id: user.id,
-        username: user.username,
-        role: user.role,
-        permissions,
-        supplierId: user.supplier_id || null,
-        sid: sessionJti,
-      },
-      jwtSecret,
-      { expiresIn },
-    );
+    const tokenPayload = {
+      id: user.id,
+      username: user.username,
+      role: user.role,
+      permissions,
+      supplierId: user.supplier_id || null,
+      sid: sessionJti,
+    };
+    const token = expiresIn
+      ? jwt.sign(tokenPayload, jwtSecret, { expiresIn })
+      : jwt.sign(tokenPayload, jwtSecret);
     res.json({
       token,
       user: {
@@ -11583,6 +13781,8 @@ app.get("/api/audit-logs", authenticate, requireRole("admin"), async (req, res) 
     const rawOffset = Number(req.query.offset);
     const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 1000) : 200;
     const offset = Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : 0;
+    let documentSearchActive = false;
+    const documentSearchParts = [];
 
     if (start) {
       values.push(start);
@@ -11597,21 +13797,88 @@ app.get("/api/audit-logs", authenticate, requireRole("admin"), async (req, res) 
       whereClauses.push(`l.user_id = $${values.length}`);
     }
     if (q) {
+      const isDocumentLikeSearch = /^[a-z0-9][a-z0-9/_-]{2,}$/i.test(q);
       const likeValue = `%${q}%`;
-      values.push(likeValue);
-      whereClauses.push(`(
-        lower(coalesce(u.username, '')) like $${values.length}
-        or lower(coalesce(l.table_name, '')) like $${values.length}
-        or lower(coalesce(l.action, '')) like $${values.length}
-        or l.record_id::text ilike $${values.length}
-        or l.old_data::text ilike $${values.length}
-        or l.new_data::text ilike $${values.length}
-      )`);
+      const searchParts = [];
+      if (isDocumentLikeSearch) {
+        documentSearchActive = true;
+        const documentFields = [
+          "do_number",
+          "rn_number",
+          "dn_number",
+          "sj_number",
+        ];
+        const variants = [...new Set([q, q.toUpperCase()])];
+        for (const variant of variants) {
+          for (const field of documentFields) {
+            values.push(JSON.stringify({ [field]: variant }));
+            documentSearchParts.push(`l.old_data @> $${values.length}::jsonb`);
+            values.push(JSON.stringify({ [field]: variant }));
+            documentSearchParts.push(`l.new_data @> $${values.length}::jsonb`);
+          }
+        }
+        if (/^\d+$/.test(q)) {
+          values.push(q);
+          documentSearchParts.push(`l.record_id = $${values.length}`);
+        }
+      } else if (start || end) {
+        values.push(likeValue);
+        searchParts.push(`(
+          lower(coalesce(u.username, '')) like $${values.length}
+          or lower(coalesce(l.table_name, '')) like $${values.length}
+          or lower(coalesce(l.action, '')) like $${values.length}
+          or l.record_id::text ilike $${values.length}
+        )`);
+        values.push(likeValue);
+        searchParts.push(`(
+          l.old_data::text ilike $${values.length}
+          or l.new_data::text ilike $${values.length}
+        )`);
+      } else {
+        values.push(likeValue);
+        searchParts.push(`(
+          lower(coalesce(u.username, '')) like $${values.length}
+          or lower(coalesce(l.table_name, '')) like $${values.length}
+          or lower(coalesce(l.action, '')) like $${values.length}
+          or l.record_id::text ilike $${values.length}
+        )`);
+      }
+      if (!documentSearchActive) {
+        whereClauses.push(`(${searchParts.join(" or ")})`);
+      }
     }
 
+    const documentWhereClauses = documentSearchActive
+      ? [...whereClauses, `(${documentSearchParts.join(" or ")})`]
+      : [];
     const whereSql = whereClauses.length ? `where ${whereClauses.join(" and ")}` : "";
+    const documentWhereSql = documentWhereClauses.length ? `where ${documentWhereClauses.join(" and ")}` : "";
     const dataValues = [...values, limit, offset];
-    const dataSql = `
+    const dataSql = documentSearchActive
+      ? `
+      with candidate as materialized (
+        select l.id
+        from audit_logs l
+        ${documentWhereSql}
+      )
+      select
+        l.id,
+        l.user_id,
+        u.username,
+        l.action,
+        l.table_name,
+        l.record_id,
+        l.old_data,
+        l.new_data,
+        l.created_at
+      from candidate c
+      join audit_logs l on l.id = c.id
+      left join users u on u.id = l.user_id
+      order by l.created_at desc, l.id desc
+      limit $${values.length + 1}
+      offset $${values.length + 2}
+    `
+      : `
       select
         l.id,
         l.user_id,
@@ -11633,7 +13900,17 @@ app.get("/api/audit-logs", authenticate, requireRole("admin"), async (req, res) 
     let total = result.rows.length;
     if (includeTotal) {
       const countResult = await pool.query(
+        documentSearchActive
+          ? `
+        with candidate as materialized (
+          select l.id
+          from audit_logs l
+          ${documentWhereSql}
+        )
+        select count(*)::int as total
+        from candidate
         `
+          : `
         select count(*)::int as total
         from audit_logs l
         left join users u on u.id = l.user_id
@@ -11820,18 +14097,8 @@ app.get("/api/schedules", authenticate, requireNotSupplier, async (req, res) => 
     }
     if (status) {
       const normalizedStatus = status.toLowerCase();
-      if (normalizedStatus === "pending") {
-        whereClauses.push("s.arrival_date is null");
-      } else if (normalizedStatus === "on time") {
-        whereClauses.push("s.arrival_date = s.request_date");
-      } else if (normalizedStatus === "late") {
-        whereClauses.push("s.arrival_date > s.request_date");
-      } else if (normalizedStatus === "too early") {
-        whereClauses.push("s.arrival_date < s.request_date");
-      } else {
-        filterValues.push(status);
-        whereClauses.push(`s.status = $${filterValues.length}`);
-      }
+      filterValues.push(normalizedStatus);
+      whereClauses.push(`lower(${SCHEDULE_STATUS_SQL}) = $${filterValues.length}`);
     }
     if (supplier) {
       filterValues.push(supplier);
@@ -11879,12 +14146,26 @@ app.get("/api/schedules", authenticate, requireNotSupplier, async (req, res) => 
         ) mv on true
         left join lateral (
           select
-            string_agg(distinct nullif(trim(rnh.do_number), ''), ' ') as related_do_numbers
-          from receive_note_items rni
+            string_agg(distinct nullif(trim(ra.do_number), ''), ' ') as related_do_numbers,
+            coalesce(sum(greatest(coalesce(ra.allocated_qty, 0), 0)), 0)::numeric as receipt_total,
+            coalesce(sum(greatest(coalesce(ra.allocated_qty, 0), 0)) filter (
+              where coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date)
+                between (s.request_date - interval '1 day') and s.request_date
+            ), 0)::numeric as on_time_qty,
+            coalesce(sum(greatest(coalesce(ra.allocated_qty, 0), 0)) filter (
+              where coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) > s.request_date
+            ), 0)::numeric as late_qty,
+            coalesce(sum(greatest(coalesce(ra.allocated_qty, 0), 0)) filter (
+              where coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) < (s.request_date - interval '1 day')
+            ), 0)::numeric as too_early_qty
+          from receipt_allocations ra
+          join receive_note_items rni on rni.id = ra.rn_item_id
           join receive_note_headers rnh on rnh.id = rni.rn_id
-          where rni.schedule_id = s.id
+          where ra.schedule_id = s.id
+            and greatest(coalesce(ra.allocated_qty, 0), 0) > 0
             and rni.line_status = 'posted'
-            and nullif(trim(rnh.do_number), '') is not null
+            and rnh.status = 'posted'
+            and nullif(trim(ra.do_number), '') is not null
         ) rs on true
         left join items i on lower(i.code) = lower(coalesce(pl.item_code, s.item_code, s.item))
         ${whereSql}
@@ -11903,6 +14184,7 @@ app.get("/api/schedules", authenticate, requireNotSupplier, async (req, res) => 
         i.unit as item_unit,
         coalesce(pl.item_code, s.item_code, s.item) as resolved_item_code,
         rs.related_do_numbers,
+        rs.related_receipts,
         rl.fallback_do_number,
         rl.fallback_arrival_date
       from schedules s
@@ -11924,12 +14206,41 @@ app.get("/api/schedules", authenticate, requireNotSupplier, async (req, res) => 
       ) mv on true
       left join lateral (
         select
-          string_agg(distinct nullif(trim(rnh.do_number), ''), ' ') as related_do_numbers
-        from receive_note_items rni
-        join receive_note_headers rnh on rnh.id = rni.rn_id
-        where rni.schedule_id = s.id
-          and rni.line_status = 'posted'
-          and nullif(trim(rnh.do_number), '') is not null
+          string_agg(distinct receipt_rows.do_number, ' ') as related_do_numbers,
+          coalesce(sum(receipt_rows.received_qty), 0)::numeric as receipt_total,
+          coalesce(sum(receipt_rows.received_qty) filter (
+            where receipt_rows.arrival_date between (s.request_date - interval '1 day') and s.request_date
+          ), 0)::numeric as on_time_qty,
+          coalesce(sum(receipt_rows.received_qty) filter (
+            where receipt_rows.arrival_date > s.request_date
+          ), 0)::numeric as late_qty,
+          coalesce(sum(receipt_rows.received_qty) filter (
+            where receipt_rows.arrival_date < (s.request_date - interval '1 day')
+          ), 0)::numeric as too_early_qty,
+          jsonb_agg(
+            jsonb_build_object(
+              'doNumber', receipt_rows.do_number,
+              'arrivalDate', receipt_rows.arrival_date,
+              'receivedQty', receipt_rows.received_qty
+            )
+            order by receipt_rows.arrival_date asc nulls last, receipt_rows.do_number asc
+          ) as related_receipts
+        from (
+          select
+            nullif(trim(ra.do_number), '') as do_number,
+            coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) as arrival_date,
+            sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
+          from receipt_allocations ra
+          join receive_note_items rni on rni.id = ra.rn_item_id
+          join receive_note_headers rnh on rnh.id = rni.rn_id
+          where ra.schedule_id = s.id
+            and greatest(coalesce(ra.allocated_qty, 0), 0) > 0
+            and rni.line_status = 'posted'
+            and rnh.status = 'posted'
+            and nullif(trim(ra.do_number), '') is not null
+          group by nullif(trim(ra.do_number), ''), coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date)
+        ) receipt_rows
+        where receipt_rows.do_number is not null
       ) rs on true
       left join lateral (
         select
@@ -12023,8 +14334,8 @@ app.get("/api/schedules/stats", authenticate, requireNotSupplier, async (req, re
         count(distinct request_date)::int as total_schedule_dates,
         sum(case when arrival_date is null then 1 else 0 end)::int as pending,
         sum(case when arrival_date > request_date then 1 else 0 end)::int as late,
-        sum(case when arrival_date < request_date then 1 else 0 end)::int as too_early,
-        sum(case when arrival_date = request_date then 1 else 0 end)::int as on_time
+        sum(case when arrival_date < (request_date - interval '1 day') then 1 else 0 end)::int as too_early,
+        sum(case when arrival_date between (request_date - interval '1 day') and request_date then 1 else 0 end)::int as on_time
       from schedules${whereSql}
       `,
       values,
@@ -12601,12 +14912,6 @@ app.post("/api/schedules/bulk", authenticate, requireAnyPermission("editSchedule
 
       const packQty = await resolveItemPackQty(client, resolvedItemCode);
       const isLoose = isLooseQty(data.receivedQty, packQty);
-      const { productionDate, expiredDate } = await resolveBatchDates(
-        client,
-        resolvedItemCode,
-        req.body?.productionDate,
-        req.body?.expiredDate,
-      );
       const { remaining } = await resolvePoLineScheduleRemaining(client, poLine, { excludeScheduleId: id });
       if (!Number.isFinite(data.requestQty) || data.requestQty <= 0) {
         data.requestQty = Math.max(0, remaining);
@@ -12634,12 +14939,17 @@ app.post("/api/schedules/bulk", authenticate, requireAnyPermission("editSchedule
         await assertArrivalDateAllowed(client, data.arrivalDate, req.user);
       }
       if (Number(data.receivedQty || 0) > 0) {
+        const nextReceivedQty = Number(data.receivedQty || 0);
+        const existingReceivedQty = Number(existing.received_qty || 0);
+        const receiveDeltaQty = Math.max(0, nextReceivedQty - existingReceivedQty);
         assertScheduleReceiveQty(
           { request_qty: data.requestQty ?? existing.request_qty },
-          Number(data.receivedQty || 0),
+          nextReceivedQty,
           { allowOver: allowOverReceive },
         );
-        assertPoLineRemaining(poLine, Number(data.receivedQty || 0), { allowOver: allowOverReceive });
+        if (receiveDeltaQty > 0) {
+          assertPoLineRemaining(poLine, receiveDeltaQty, { allowOver: allowOverReceive });
+        }
       }
 
       await ensureUniqueDoNumber(client, data, id);
@@ -12706,7 +15016,7 @@ app.post("/api/schedules/bulk", authenticate, requireAnyPermission("editSchedule
           );
           await refreshPoHeaderStatus(client, data.poNumber);
         }
-        await client.query("delete from stock_batches where schedule_id = $1", [id]);
+        await reverseScheduleStockReceipt(client, id, req.user, "schedule_unlock");
         await client.query("commit");
         clearScheduleCache();
         res.json(mapRowToSchedule(updatedRow));
@@ -12741,6 +15051,13 @@ app.post("/api/schedules/bulk", authenticate, requireAnyPermission("editSchedule
           data.receivedQty,
           { allowOverReceive },
         );
+        let legacyRnId = null;
+        let legacyRnNumber = null;
+        const legacyItemCode = normalizeItemCode(data.item || existing.item || existing.item_code);
+        const legacyItemResult = legacyItemCode
+          ? await client.query("select name, part_no from items where code = $1", [legacyItemCode])
+          : { rows: [] };
+        const legacyItem = legacyItemResult.rows[0] || {};
         if (rnExists.rows.length === 0) {
           const numbering = await getDocumentNumberingConfig(client);
           const supplierValue = data.supplier || existing.supplier || "SUPPLIER";
@@ -12753,11 +15070,13 @@ app.post("/api/schedules/bulk", authenticate, requireAnyPermission("editSchedule
             supplier: supplierValue,
             supplierCode,
           });
+          legacyRnNumber = resolvedRnNumber;
           const resolvedDocQty = Number.isFinite(docQtyValue) ? docQtyValue : data.receivedQty;
-          await client.query(
+          const legacyRnResult = await client.query(
             `insert into receive_notes
               (rn_number, dn_id, schedule_id, item_code, received_qty, doc_qty, qc_status, status, notes, is_loose, received_by, source, po_line_id)
-             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+             returning id`,
             [
               resolvedRnNumber,
               data.dnId || existing.dn_id || null,
@@ -12774,13 +15093,27 @@ app.post("/api/schedules/bulk", authenticate, requireAnyPermission("editSchedule
               poLineForReceive?.id || data.poLineId,
             ],
           );
+          legacyRnId = legacyRnResult.rows[0]?.id || null;
         }
-        await client.query(
-          `insert into stock_batches (item_code, qty_in, arrival_date, do_number, batch_no, schedule_id, is_loose, production_date, expired_date)
-           values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-           on conflict (schedule_id) do nothing`,
-          [data.item, data.receivedQty, data.arrivalDate || null, data.doNumber || null, data.doNumber || String(id), id, isLoose, productionDate, expiredDate],
-        );
+        if (legacyRnId) {
+          await ensureQualityCase(client, {
+            sourceType: "incoming_rn",
+            sourceId: legacyRnId,
+            sourceLineId: null,
+            sourceDoc: legacyRnNumber,
+            itemCode: legacyItemCode,
+            itemName: legacyItem.name || null,
+            partNo: legacyItem.part_no || null,
+            supplier: data.supplier || existing.supplier || null,
+            qty: data.receivedQty,
+            qtyOk: data.receivedQty,
+            qtyNg: 0,
+            defectCategory: "OK",
+            defectDescription: data.notes || null,
+            severity: "minor",
+          }, req.user);
+        }
+        await client.query("update schedules set status = 'HOLD', updated_at = now() where id = $1", [id]);
         shouldTriggerKanban = true;
       }
 
@@ -12825,7 +15158,7 @@ app.post("/api/schedules/:id/unlock", authenticate, requireRole("admin"), async 
       );
       await refreshPoHeaderStatus(client, existing.po_number);
     }
-    await client.query("delete from stock_batches where schedule_id = $1", [id]);
+    await reverseScheduleStockReceipt(client, id, req.user, "schedule_unlock");
     await client.query("commit");
     await autoTriggerKanbanRequests(pool, { note: "auto-trigger (schedule unlock)" });
     clearScheduleCache();
@@ -13164,6 +15497,7 @@ app.put("/api/po/:poNumber/lines/:lineId", authenticate, requireAnyPermission("m
       res.status(400).json({ error: "Qty order tidak valid." });
       return;
     }
+    const requestedItemCode = normalizeItemCode(req.body?.itemCode ?? req.body?.item_code ?? req.body?.item);
 
     await client.query("begin");
     const header = await resolvePoHeader(client, poNumber, { forUpdate: true });
@@ -13186,6 +15520,23 @@ app.put("/api/po/:poNumber/lines/:lineId", authenticate, requireAnyPermission("m
     }
 
     const line = lineResult.rows[0];
+    const oldItemCode = normalizeItemCode(line.item_code);
+    const nextItemCode = requestedItemCode || oldItemCode;
+    if (!nextItemCode) {
+      await client.query("rollback");
+      res.status(400).json({ error: "Kode item wajib diisi." });
+      return;
+    }
+    const itemResult = await client.query(
+      "select code, name from items where code = $1",
+      [nextItemCode],
+    );
+    if (itemResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(409).json({ error: `Item ${nextItemCode} tidak ditemukan di master item.` });
+      return;
+    }
+    const item = itemResult.rows[0];
     const qtyReceived = Number(line.qty_received || 0);
     const scheduledOutstanding = await getScheduledOutstandingByPoLine(client, line);
     const minimumQtyOrder = qtyReceived + scheduledOutstanding;
@@ -13205,16 +15556,38 @@ app.put("/api/po/:poNumber/lines/:lineId", authenticate, requireAnyPermission("m
     const updatedLineResult = await client.query(
       `
       update po_lines
-      set qty_order = $1
-      where id = $2
+      set
+        item_code = $1,
+        qty_order = $2
+      where id = $3
       returning *
       `,
-      [qtyOrder, lineId],
+      [nextItemCode, qtyOrder, lineId],
+    );
+    const scheduleUpdateResult = await client.query(
+      `
+      update schedules
+      set
+        item_code = $1,
+        item = $1,
+        updated_at = now()
+      where po_line_id = $2
+        and (coalesce(item_code, '') is distinct from $1 or coalesce(item, '') is distinct from $1)
+      `,
+      [nextItemCode, lineId],
     );
     await refreshPoHeaderStatus(client, poNumber);
     const latestHeader = await resolvePoHeader(client, poNumber);
     await client.query("commit");
-    res.json({ header: latestHeader || header, line: updatedLineResult.rows[0] });
+    res.json({
+      header: latestHeader || header,
+      line: {
+        ...updatedLineResult.rows[0],
+        item_name: item.name || null,
+      },
+      updatedSchedules: Number(scheduleUpdateResult.rowCount || 0),
+      itemChanged: oldItemCode !== nextItemCode,
+    });
   } catch (error) {
     await client.query("rollback");
     res.status(error.statusCode || 500).json({ error: error.message });
@@ -13611,8 +15984,31 @@ app.get("/api/po/:poNumber", authenticate, requireAnyPermission("manageVendors",
     }
     const linesResult = await pool.query(
       `
+      with valid_receipts as (
+        select
+          coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
+          lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
+          sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
+        from receipt_allocations ra
+        join receive_note_items rni on rni.id = ra.rn_item_id
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        left join schedules s on s.id = ra.schedule_id
+        where ra.po_number = $1
+          and rnh.status = 'posted'
+          and rnh.reversal_of is null
+          and rni.line_status = 'posted'
+        group by
+          coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
+          lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+      )
       select
-        pl.*,
+        pl.id,
+        pl.po_number,
+        pl.line_no,
+        pl.item_code,
+        pl.qty_order,
+        coalesce(vr.received_qty, pl.qty_received, 0)::numeric as qty_received,
+        greatest(coalesce(pl.qty_order, 0) - coalesce(vr.received_qty, pl.qty_received, 0), 0)::numeric as qty_remaining,
         i.name as item_name,
         i.unit,
         i.part_no,
@@ -13631,7 +16027,7 @@ app.get("/api/po/:poNumber", authenticate, requireAnyPermission("manageVendors",
              or (s.po_line_id is null and s.po_number = pl.po_number and coalesce(s.item_code, s.item) = pl.item_code)
         ) as scheduled_outstanding,
         (
-          pl.qty_order - pl.qty_received - (
+          pl.qty_order - coalesce(vr.received_qty, pl.qty_received, 0) - (
             select coalesce(sum(greatest(request_qty - received_qty, 0)), 0)::numeric
             from schedules s2
             where s2.po_line_id = pl.id
@@ -13639,6 +16035,9 @@ app.get("/api/po/:poNumber", authenticate, requireAnyPermission("manageVendors",
           )
         )::numeric as remaining_after_schedule
       from po_lines pl
+      left join valid_receipts vr
+        on vr.po_line_id = pl.id
+        or (vr.po_line_id is null and vr.item_code_key = lower(trim(pl.item_code)))
       left join items i on i.code = pl.item_code
       where pl.po_number = $1
       order by pl.line_no asc
@@ -13829,6 +16228,167 @@ app.get("/api/supplier/po", authenticate, requireSupplier, async (req, res) => {
   }
 });
 
+app.get("/api/supplier/prl", authenticate, requireSupplier, async (req, res) => {
+  try {
+    const supplierId = String(req.user?.supplierId || "").trim();
+    if (!supplierId) {
+      res.status(403).json({ error: "Akun supplier belum terhubung ke Supplier ID." });
+      return;
+    }
+
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const start = String(req.query.start || "").trim();
+    const end = String(req.query.end || "").trim();
+    const requestedYear = Number(req.query.year);
+    const rawLimit = Number(req.query.limit);
+    const rawOffset = Number(req.query.offset);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 5000) : null;
+    const offset = Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : null;
+    const includeTotal = String(req.query.includeTotal || "") === "1";
+    const wantsMeta = includeTotal || limit !== null || offset !== null;
+
+    const values = [supplierId];
+    const whereClauses = [
+      "lower(coalesce(status_value, '')) = 'active'",
+      "qty_released > 0",
+    ];
+
+    if (Number.isFinite(requestedYear) && requestedYear > 2000) {
+      values.push(Math.floor(requestedYear));
+      whereClauses.push(`year = $${values.length}`);
+    }
+    if (start) {
+      values.push(start);
+      whereClauses.push(`period_date >= $${values.length}::date`);
+    }
+    if (end) {
+      values.push(end);
+      whereClauses.push(`period_date <= $${values.length}::date`);
+    }
+    if (q) {
+      values.push(`%${q}%`);
+      whereClauses.push(`(
+        lower(item_code) like $${values.length}
+        or lower(coalesce(item_name, '')) like $${values.length}
+        or lower(coalesce(part_no, '')) like $${values.length}
+        or lower(coalesce(model, '')) like $${values.length}
+        or lower(coalesce(type_pack, '')) like $${values.length}
+      )`);
+    }
+
+    const releasedCte = `
+      with released as (
+        select
+          pr.id,
+          pr.item_code,
+          coalesce(nullif(trim(i.name), ''), nullif(trim(pr.description), ''), pr.item_code) as item_name,
+          coalesce(nullif(trim(i.part_no), ''), nullif(trim(pr.part_no), '')) as part_no,
+          coalesce(nullif(trim(i.model), ''), nullif(trim(pr.model), '')) as model,
+          coalesce(nullif(trim(i.unit), ''), nullif(trim(pr.uom), '')) as uom,
+          coalesce(nullif(trim(pr.type_pack), ''), nullif(trim(i.packing_name), '')) as type_pack,
+          coalesce(pr.qty_per_kanban, i.pack_qty, 0)::numeric as qty_per_kanban,
+          pr.volume,
+          pr.year,
+          st.month_key,
+          st.status_value,
+          case st.month_key
+            when 'jan' then 1 when 'feb' then 2 when 'mar' then 3 when 'apr' then 4
+            when 'may' then 5 when 'jun' then 6 when 'jul' then 7 when 'aug' then 8
+            when 'sep' then 9 when 'oct' then 10 when 'nov' then 11 when 'dec' then 12
+            else 1
+          end as month_no,
+          make_date(
+            pr.year,
+            case st.month_key
+              when 'jan' then 1 when 'feb' then 2 when 'mar' then 3 when 'apr' then 4
+              when 'may' then 5 when 'jun' then 6 when 'jul' then 7 when 'aug' then 8
+              when 'sep' then 9 when 'oct' then 10 when 'nov' then 11 when 'dec' then 12
+              else 1
+            end,
+            1
+          ) as period_date,
+          case
+            when (pr.months ->> st.month_key) ~ '^-?[0-9]+(\\.[0-9]+)?$'
+              then (pr.months ->> st.month_key)::numeric
+            else 0
+          end as qty_released,
+          pr.approved_qty,
+          pr.approved_at,
+          pr.source_type,
+          pr.source_ref,
+          pr.updated_at,
+          coalesce(supplier_link.vendor_id, nullif(trim(i.vendor_id), ''), mv_by_name.id, $1) as supplier_code,
+          coalesce(mv_link.name, mv_item.name, mv_by_name.name, nullif(trim(i.supplier_name), ''), supplier_link.vendor_id, nullif(trim(i.vendor_id), ''), $1) as supplier_name
+        from prl_records pr
+        join items i on i.code = pr.item_code
+        cross join lateral jsonb_each_text(coalesce(pr.status, '{}'::jsonb)) as st(month_key, status_value)
+        left join lateral (
+          select rel.vendor_id
+          from item_suppliers rel
+          where rel.item_code = pr.item_code
+            and lower(trim(rel.vendor_id)) = lower(trim($1))
+          order by coalesce(rel.share_percent, 0) desc, rel.vendor_id asc
+          limit 1
+        ) supplier_link on true
+        left join master_vendors mv_link on mv_link.id = supplier_link.vendor_id
+        left join master_vendors mv_item on mv_item.id = nullif(trim(i.vendor_id), '')
+        left join master_vendors mv_by_name on lower(mv_by_name.name) = lower(nullif(trim(i.supplier_name), ''))
+        where (
+          supplier_link.vendor_id is not null
+          or lower(trim(coalesce(i.vendor_id, ''))) = lower(trim($1))
+          or lower(trim(coalesce(i.supplier_name, ''))) = lower(trim($1))
+          or lower(trim(coalesce(mv_by_name.id, ''))) = lower(trim($1))
+        )
+      )
+    `;
+    const whereSql = `where ${whereClauses.join(" and ")}`;
+
+    let total = null;
+    if (wantsMeta) {
+      const countResult = await pool.query(
+        `${releasedCte}
+        select count(*)::int as total
+        from released
+        ${whereSql}`,
+        values,
+      );
+      total = Number(countResult.rows[0]?.total || 0);
+    }
+
+    const queryValues = [...values];
+    let sql = `${releasedCte}
+      select *
+      from released
+      ${whereSql}
+      order by year desc, month_no desc, item_code asc
+    `;
+    if (limit) {
+      queryValues.push(limit);
+      sql += ` limit $${queryValues.length}`;
+    }
+    if (offset !== null) {
+      queryValues.push(offset);
+      sql += ` offset $${queryValues.length}`;
+    }
+
+    const result = await pool.query(sql, queryValues);
+    const rows = (result.rows || []).map((row) => ({
+      ...row,
+      document_type: "PRL",
+      prl_number: buildPrlForecastDocumentNumber(row.supplier_code || supplierId, row.month_key, row.year, 1),
+      month_label: formatPrlShortMonthLabel(Number(row.month_no || 1) - 1, row.year),
+      status: "active",
+    }));
+    if (wantsMeta) {
+      res.json({ rows, total: total ?? rows.length });
+      return;
+    }
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/api/supplier/po/:poNumber/lines", authenticate, requireSupplier, async (req, res) => {
   try {
     const supplierId = req.user?.supplierId;
@@ -13896,11 +16456,11 @@ app.get("/api/supplier/schedules", authenticate, requireSupplier, async (req, re
       if (normalizedStatus === "pending") {
         whereClauses.push("s.arrival_date is null");
       } else if (normalizedStatus === "on time") {
-        whereClauses.push("s.arrival_date = s.request_date");
+        whereClauses.push("s.arrival_date between (s.request_date - interval '1 day') and s.request_date");
       } else if (normalizedStatus === "late") {
         whereClauses.push("s.arrival_date > s.request_date");
       } else if (normalizedStatus === "too early") {
-        whereClauses.push("s.arrival_date < s.request_date");
+        whereClauses.push("s.arrival_date < (s.request_date - interval '1 day')");
       } else {
         filterValues.push(status);
         whereClauses.push(`s.status = $${filterValues.length}`);
@@ -13961,6 +16521,1185 @@ app.get("/api/supplier/schedules", authenticate, requireSupplier, async (req, re
     res.json(rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/receiving-labels/schedule/:scheduleId", authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const scheduleId = parsePositiveId(req.params.scheduleId);
+    if (!scheduleId) {
+      res.status(400).json({ error: "scheduleId tidak valid." });
+      return;
+    }
+    const scheduleResult = await client.query(
+      `
+      select
+        s.id as schedule_id,
+        s.po_number,
+        s.supplier,
+        coalesce(s.supplier_id, ph.supplier_id, s.supplier) as supplier_id,
+        mv.name as supplier_name,
+        coalesce(s.item_code, s.item) as item_code,
+        s.request_date,
+        s.delivery_time,
+        s.request_qty,
+        s.received_qty,
+        s.status as schedule_status,
+        s.do_number,
+        pl.id as po_line_id,
+        pl.line_no,
+        pl.qty_order,
+        pl.qty_received,
+        greatest(coalesce(pl.qty_order, 0) - coalesce(pl.qty_received, 0), 0)::numeric as qty_remaining,
+        i.name as item_name,
+        i.part_no,
+        i.unit,
+        coalesce(i.pack_qty, 0)::numeric as pack_qty
+      from schedules s
+      left join po_headers ph on ph.po_number = s.po_number
+      left join master_vendors mv on mv.id = coalesce(s.supplier_id, ph.supplier_id, s.supplier)
+      left join lateral (
+        select pl.*
+        from po_lines pl
+        where pl.po_number = s.po_number
+          and (
+            (s.po_line_id is not null and pl.id = s.po_line_id)
+            or (s.po_line_id is null and lower(trim(pl.item_code)) = lower(trim(coalesce(s.item_code, s.item))))
+          )
+        order by case when s.po_line_id is not null and pl.id = s.po_line_id then 0 else 1 end, pl.line_no asc, pl.id asc
+        limit 1
+      ) pl on true
+      left join items i on lower(trim(i.code)) = lower(trim(coalesce(s.item_code, s.item)))
+      where s.id = $1
+      limit 1
+      `,
+      [scheduleId],
+    );
+    const schedule = scheduleResult.rows[0];
+    if (!schedule) {
+      res.status(404).json({ error: "Schedule tidak ditemukan." });
+      return;
+    }
+
+    const userRole = String(req.user?.role || "").toLowerCase();
+    const canManageInbound = userRole === "admin" || Boolean(req.user?.permissions?.editSchedules);
+    const scheduleSupplierId = String(schedule.supplier_id || schedule.supplier || "").trim().toLowerCase();
+    if (userRole === "supplier") {
+      const userSupplierId = String(req.user?.supplierId || "").trim().toLowerCase();
+      if (!userSupplierId || userSupplierId !== scheduleSupplierId) {
+        res.status(403).json({ error: "Schedule bukan milik supplier ini." });
+        return;
+      }
+    } else if (!canManageInbound) {
+      res.status(403).json({ error: "forbidden" });
+      return;
+    }
+
+    const existingResult = await client.query(
+      `
+      select
+        rl.*,
+        s.request_date,
+        s.delivery_time,
+        s.request_qty,
+        s.received_qty,
+        s.status as schedule_status,
+        s.do_number,
+        $2::text as supplier_name,
+        $3::int as line_no,
+        $4::numeric as qty_order,
+        $5::numeric as qty_received,
+        $6::numeric as qty_remaining,
+        $7::text as item_name,
+        $8::text as part_no,
+        $9::text as unit,
+        $10::numeric as pack_qty
+      from receiving_labels rl
+      left join schedules s on s.id = rl.schedule_id
+      where rl.source_type = 'schedule'
+        and rl.schedule_id = $1
+        and rl.label_status = 'active'
+      limit 1
+      `,
+      [
+        scheduleId,
+        schedule.supplier_name || "",
+        schedule.line_no || null,
+        schedule.qty_order || 0,
+        schedule.qty_received || 0,
+        schedule.qty_remaining || 0,
+        schedule.item_name || "",
+        schedule.part_no || "",
+        schedule.unit || "",
+        schedule.pack_qty || 0,
+      ],
+    );
+    if (existingResult.rows[0]) {
+      res.json(mapReceivingLabelRow(existingResult.rows[0]));
+      return;
+    }
+
+    const payloadHash = crypto
+      .createHash("sha256")
+      .update(JSON.stringify({
+        sourceType: "schedule",
+        scheduleId,
+        poNumber: schedule.po_number,
+        itemCode: schedule.item_code,
+        requestQty: schedule.request_qty,
+      }))
+      .digest("hex");
+
+    let inserted = null;
+    for (let attempt = 0; attempt < 5 && !inserted; attempt += 1) {
+      const token = generateReceivingLabelToken();
+      const insertResult = await client.query(
+        `
+        insert into receiving_labels (
+          token, source_type, schedule_id, po_line_id, supplier_id, po_number, item_code,
+          planned_qty, pack_seq, pack_total, pack_qty, payload_hash, created_by
+        )
+        values ($1, 'schedule', $2, $3, $4, $5, $6, $7, 1, 1, $8, $9, $10)
+        on conflict (token) do nothing
+        returning *
+        `,
+        [
+          token,
+          scheduleId,
+          schedule.po_line_id || null,
+          schedule.supplier_id || schedule.supplier || null,
+          schedule.po_number,
+          schedule.item_code,
+          schedule.request_qty || 0,
+          schedule.pack_qty || 0,
+          payloadHash,
+          req.user?.id || null,
+        ],
+      );
+      inserted = insertResult.rows[0] || null;
+    }
+    if (!inserted) {
+      res.status(500).json({ error: "Gagal membuat token label." });
+      return;
+    }
+
+    res.json(mapReceivingLabelRow({
+      ...inserted,
+      request_date: schedule.request_date,
+      delivery_time: schedule.delivery_time,
+      request_qty: schedule.request_qty,
+      received_qty: schedule.received_qty,
+      schedule_status: schedule.schedule_status,
+      do_number: schedule.do_number,
+      supplier_name: schedule.supplier_name,
+      line_no: schedule.line_no,
+      qty_order: schedule.qty_order,
+      qty_received: schedule.qty_received,
+      qty_remaining: schedule.qty_remaining,
+      item_name: schedule.item_name,
+      part_no: schedule.part_no,
+      unit: schedule.unit,
+      pack_qty: schedule.pack_qty,
+    }));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/receiving-labels/resolve", authenticate, requirePermission("editSchedules"), async (req, res) => {
+  try {
+    const token = normalizeReceivingLabelToken(req.query.token || req.query.q || req.query.value);
+    if (!token) {
+      res.status(400).json({ error: "Token label wajib diisi." });
+      return;
+    }
+    const result = await pool.query(
+      `
+      select
+        rl.*,
+        s.request_date,
+        s.delivery_time,
+        s.request_qty,
+        s.received_qty,
+        s.status as schedule_status,
+        s.do_number,
+        ph.supplier_id as po_supplier_id,
+        mv.name as supplier_name,
+        pl.id as po_line_id,
+        pl.line_no,
+        pl.qty_order,
+        pl.qty_received,
+        greatest(coalesce(pl.qty_order, 0) - coalesce(pl.qty_received, 0), 0)::numeric as qty_remaining,
+        i.name as item_name,
+        i.part_no,
+        i.unit,
+        coalesce(i.pack_qty, rl.pack_qty, 0)::numeric as pack_qty,
+        rl.pack_qty as label_pack_qty
+      from receiving_labels rl
+      left join schedules s on s.id = rl.schedule_id
+      left join po_headers ph on ph.po_number = coalesce(rl.po_number, s.po_number)
+      left join master_vendors mv on mv.id = coalesce(rl.supplier_id, s.supplier_id, ph.supplier_id, s.supplier)
+      left join lateral (
+        select pl.*
+        from po_lines pl
+        where pl.po_number = coalesce(rl.po_number, s.po_number)
+          and (
+            (coalesce(rl.po_line_id, s.po_line_id) is not null and pl.id = coalesce(rl.po_line_id, s.po_line_id))
+            or (
+              coalesce(rl.po_line_id, s.po_line_id) is null
+              and lower(trim(pl.item_code)) = lower(trim(coalesce(rl.item_code, s.item_code, s.item)))
+            )
+          )
+        order by case when coalesce(rl.po_line_id, s.po_line_id) is not null and pl.id = coalesce(rl.po_line_id, s.po_line_id) then 0 else 1 end, pl.line_no asc, pl.id asc
+        limit 1
+      ) pl on true
+      left join items i on lower(trim(i.code)) = lower(trim(coalesce(rl.item_code, s.item_code, s.item)))
+      where lower(rl.token) = lower($1)
+        and rl.label_status = 'active'
+      limit 1
+      `,
+      [token],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      res.status(404).json({ error: "Label tidak ditemukan atau sudah tidak aktif." });
+      return;
+    }
+    res.json(mapReceivingLabelRow(row));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/supplier/performance", authenticate, requireSupplier, async (req, res) => {
+  try {
+    const supplierId = String(req.user?.supplierId || "").trim();
+    if (!supplierId) {
+      res.status(403).json({ error: "Supplier tidak terhubung ke user ini." });
+      return;
+    }
+
+    const today = new Date();
+    const defaultStart = formatDateOnly(new Date(today.getFullYear(), today.getMonth(), 1));
+    const defaultEnd = formatDateOnly(today);
+    const start = formatDateOnly(req.query.start) || defaultStart;
+    const end = formatDateOnly(req.query.end) || defaultEnd;
+    const rangeStart = start <= end ? start : end;
+    const rangeEnd = start <= end ? end : start;
+
+    const supplierResult = await pool.query(
+      "select id, name from master_vendors where id = $1 limit 1",
+      [supplierId],
+    );
+    const supplierRow = supplierResult.rows[0] || { id: supplierId, name: supplierId };
+
+    const scheduleResult = await pool.query(
+      `
+      with supplier_schedules as (
+        select
+          s.id,
+          s.po_number,
+          coalesce(s.item_code, s.item) as item_code,
+          coalesce(i.name, '') as item_name,
+          s.request_date,
+          s.arrival_date,
+          coalesce(s.request_qty, 0)::numeric as request_qty,
+          coalesce(s.received_qty, 0)::numeric as received_qty,
+          s.do_number
+        from schedules s
+        join po_headers ph on ph.po_number = s.po_number
+        left join items i on lower(i.code) = lower(coalesce(s.item_code, s.item))
+        where ph.supplier_id = $1
+          and s.request_date between $2::date and $3::date
+          and coalesce(s.item_code, s.item) not ilike 'TEST-%'
+      ),
+      receipt_rows as (
+        select
+          ra.schedule_id,
+          coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) as arrival_date,
+          sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
+        from receipt_allocations ra
+        join receive_note_items rni on rni.id = ra.rn_item_id
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        where ra.schedule_id in (select id from supplier_schedules)
+          and greatest(coalesce(ra.allocated_qty, 0), 0) > 0
+          and rni.line_status = 'posted'
+          and rnh.status = 'posted'
+        group by ra.schedule_id, coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date)
+      ),
+      receipt_eval as (
+        select
+          ss.id as schedule_id,
+          coalesce(sum(rr.received_qty), 0)::numeric as receipt_total,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date between (ss.request_date - interval '1 day') and ss.request_date), 0)::numeric as on_time_qty,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date > ss.request_date), 0)::numeric as late_qty,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date < (ss.request_date - interval '1 day')), 0)::numeric as too_early_qty,
+          min(rr.arrival_date) as first_arrival_date
+        from supplier_schedules ss
+        left join receipt_rows rr on rr.schedule_id = ss.id
+        group by ss.id
+      ),
+      receipt_ordered as (
+        select
+          rr.schedule_id,
+          rr.arrival_date,
+          sum(rr.received_qty) over (partition by rr.schedule_id order by rr.arrival_date asc rows between unbounded preceding and current row) as cumulative_qty
+        from receipt_rows rr
+      ),
+      completion as (
+        select
+          ss.id as schedule_id,
+          min(ro.arrival_date) filter (where ro.cumulative_qty >= ss.request_qty) as completion_date
+        from supplier_schedules ss
+        left join receipt_ordered ro on ro.schedule_id = ss.id
+        group by ss.id
+      ),
+      schedule_base as (
+        select
+          ss.*,
+          coalesce(nullif(re.receipt_total, 0), ss.received_qty, 0)::numeric as actual_received_qty,
+          coalesce(nullif(re.on_time_qty, 0),
+            case when re.receipt_total = 0 and ss.arrival_date between (ss.request_date - interval '1 day') and ss.request_date then ss.received_qty else 0 end,
+            0
+          )::numeric as on_time_qty,
+          coalesce(nullif(re.late_qty, 0),
+            case when re.receipt_total = 0 and ss.arrival_date > ss.request_date then ss.received_qty else 0 end,
+            0
+          )::numeric as late_qty,
+          coalesce(nullif(re.too_early_qty, 0),
+            case when re.receipt_total = 0 and ss.arrival_date < (ss.request_date - interval '1 day') then ss.received_qty else 0 end,
+            0
+          )::numeric as too_early_qty,
+          coalesce(re.first_arrival_date, ss.arrival_date) as first_arrival_date,
+          coalesce(c.completion_date, case when ss.received_qty >= ss.request_qty then ss.arrival_date end) as completion_date,
+          case
+            when coalesce(nullif(re.receipt_total, 0), ss.received_qty, 0) <= 0 then 'Pending'
+            when coalesce(nullif(re.receipt_total, 0), ss.received_qty, 0) < ss.request_qty
+              and coalesce(re.on_time_qty, 0) > 0
+              and coalesce(re.late_qty, 0) <= 0 then 'Partial On Time'
+            when coalesce(nullif(re.receipt_total, 0), ss.received_qty, 0) < ss.request_qty
+              and coalesce(re.late_qty, 0) > 0 then 'Partial Late'
+            when coalesce(nullif(re.receipt_total, 0), ss.received_qty, 0) < ss.request_qty
+              and coalesce(re.too_early_qty, 0) > 0 then 'Partial Too Early'
+            when coalesce(re.late_qty, 0) > 0 and coalesce(re.on_time_qty, 0) > 0 then 'Late Completion'
+            when coalesce(re.late_qty, 0) > 0 or ss.arrival_date > ss.request_date then 'Late'
+            when coalesce(re.on_time_qty, 0) > 0 or ss.arrival_date between (ss.request_date - interval '1 day') and ss.request_date then 'On Time'
+            when coalesce(re.too_early_qty, 0) > 0 or ss.arrival_date < (ss.request_date - interval '1 day') then 'Too Early'
+            else 'Pending'
+          end as kpi_status,
+          case
+            when coalesce(c.completion_date, case when ss.received_qty >= ss.request_qty then ss.arrival_date end) > ss.request_date
+              then (coalesce(c.completion_date, case when ss.received_qty >= ss.request_qty then ss.arrival_date end) - ss.request_date)
+            else 0
+          end::int as completion_delay_days,
+          to_char(ss.request_date, 'YYYY-MM') as month_key
+        from supplier_schedules ss
+        left join receipt_eval re on re.schedule_id = ss.id
+        left join completion c on c.schedule_id = ss.id
+      )
+      select
+        coalesce(
+          jsonb_agg(
+            jsonb_build_object(
+              'id', id,
+              'poNumber', po_number,
+              'itemCode', item_code,
+              'itemName', item_name,
+              'requestDate', to_char(request_date, 'YYYY-MM-DD'),
+              'arrivalDate', to_char(first_arrival_date, 'YYYY-MM-DD'),
+              'completionDate', to_char(completion_date, 'YYYY-MM-DD'),
+              'completionDelayDays', completion_delay_days,
+              'requestQty', request_qty,
+              'receivedQty', actual_received_qty,
+              'onTimeQty', on_time_qty,
+              'lateQty', late_qty,
+              'tooEarlyQty', too_early_qty,
+              'doNumber', do_number,
+              'status', kpi_status
+            )
+            order by request_date desc, id desc
+          ),
+          '[]'::jsonb
+        ) as rows,
+        count(*)::int as total_schedules,
+        count(*) filter (where kpi_status = 'On Time')::int as on_time,
+        count(*) filter (where kpi_status = 'Late')::int as late,
+        count(*) filter (where kpi_status = 'Late Completion')::int as late_completion,
+        count(*) filter (where kpi_status = 'Partial On Time')::int as partial_on_time,
+        count(*) filter (where kpi_status = 'Partial Late')::int as partial_late,
+        count(*) filter (where kpi_status = 'Too Early')::int as too_early,
+        count(*) filter (where kpi_status = 'Pending')::int as pending,
+        coalesce(sum(request_qty), 0)::numeric as request_qty,
+        coalesce(sum(actual_received_qty), 0)::numeric as received_qty,
+        coalesce(sum(on_time_qty), 0)::numeric as on_time_qty,
+        coalesce(sum(late_qty), 0)::numeric as late_qty,
+        coalesce(sum(too_early_qty), 0)::numeric as too_early_qty
+      from schedule_base
+      `,
+      [supplierId, rangeStart, rangeEnd],
+    );
+    const scheduleSummary = scheduleResult.rows[0] || {};
+
+    const monthlyResult = await pool.query(
+      `
+      with supplier_schedules as (
+        select
+          s.id,
+          s.request_date,
+          coalesce(s.request_qty, 0)::numeric as request_qty,
+          coalesce(s.received_qty, 0)::numeric as received_qty,
+          s.arrival_date
+        from schedules s
+        join po_headers ph on ph.po_number = s.po_number
+        where ph.supplier_id = $1
+          and s.request_date between $2::date and $3::date
+          and coalesce(s.item_code, s.item) not ilike 'TEST-%'
+      ),
+      receipt_rows as (
+        select
+          ra.schedule_id,
+          coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) as arrival_date,
+          sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
+        from receipt_allocations ra
+        join receive_note_items rni on rni.id = ra.rn_item_id
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        where ra.schedule_id in (select id from supplier_schedules)
+          and greatest(coalesce(ra.allocated_qty, 0), 0) > 0
+          and rni.line_status = 'posted'
+          and rnh.status = 'posted'
+        group by ra.schedule_id, coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date)
+      ),
+      receipt_eval as (
+        select
+          ss.id as schedule_id,
+          coalesce(sum(rr.received_qty), 0)::numeric as receipt_total,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date between (ss.request_date - interval '1 day') and ss.request_date), 0)::numeric as on_time_qty,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date > ss.request_date), 0)::numeric as late_qty,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date < (ss.request_date - interval '1 day')), 0)::numeric as too_early_qty
+        from supplier_schedules ss
+        left join receipt_rows rr on rr.schedule_id = ss.id
+        group by ss.id
+      ),
+      schedule_base as (
+        select
+          to_char(ss.request_date, 'YYYY-MM') as month_key,
+          ss.request_qty,
+          coalesce(nullif(re.receipt_total, 0), ss.received_qty, 0)::numeric as actual_received_qty,
+          coalesce(nullif(re.on_time_qty, 0),
+            case when re.receipt_total = 0 and ss.arrival_date between (ss.request_date - interval '1 day') and ss.request_date then ss.received_qty else 0 end,
+            0
+          )::numeric as on_time_qty,
+          coalesce(nullif(re.late_qty, 0),
+            case when re.receipt_total = 0 and ss.arrival_date > ss.request_date then ss.received_qty else 0 end,
+            0
+          )::numeric as late_qty,
+          coalesce(nullif(re.too_early_qty, 0),
+            case when re.receipt_total = 0 and ss.arrival_date < (ss.request_date - interval '1 day') then ss.received_qty else 0 end,
+            0
+          )::numeric as too_early_qty,
+          case
+            when coalesce(nullif(re.receipt_total, 0), ss.received_qty, 0) <= 0 then 'Pending'
+            when coalesce(nullif(re.receipt_total, 0), ss.received_qty, 0) < ss.request_qty
+              and coalesce(re.on_time_qty, 0) > 0
+              and coalesce(re.late_qty, 0) <= 0 then 'Partial On Time'
+            when coalesce(nullif(re.receipt_total, 0), ss.received_qty, 0) < ss.request_qty
+              and coalesce(re.late_qty, 0) > 0 then 'Partial Late'
+            when coalesce(re.late_qty, 0) > 0 and coalesce(re.on_time_qty, 0) > 0 then 'Late Completion'
+            when coalesce(re.late_qty, 0) > 0 or ss.arrival_date > ss.request_date then 'Late'
+            when coalesce(re.on_time_qty, 0) > 0 or ss.arrival_date between (ss.request_date - interval '1 day') and ss.request_date then 'On Time'
+            when coalesce(re.too_early_qty, 0) > 0 or ss.arrival_date < (ss.request_date - interval '1 day') then 'Too Early'
+            else 'Pending'
+          end as kpi_status
+        from supplier_schedules ss
+        left join receipt_eval re on re.schedule_id = ss.id
+      )
+      select
+        month_key,
+        count(*)::int as total_schedules,
+        count(*) filter (where kpi_status = 'On Time')::int as on_time,
+        count(*) filter (where kpi_status = 'Late')::int as late,
+        count(*) filter (where kpi_status = 'Late Completion')::int as late_completion,
+        count(*) filter (where kpi_status = 'Partial On Time')::int as partial_on_time,
+        count(*) filter (where kpi_status = 'Partial Late')::int as partial_late,
+        count(*) filter (where kpi_status = 'Too Early')::int as too_early,
+        count(*) filter (where kpi_status = 'Pending')::int as pending,
+        coalesce(sum(request_qty), 0)::numeric as request_qty,
+        coalesce(sum(actual_received_qty), 0)::numeric as received_qty,
+        coalesce(sum(on_time_qty), 0)::numeric as on_time_qty,
+        coalesce(sum(late_qty), 0)::numeric as late_qty,
+        coalesce(sum(too_early_qty), 0)::numeric as too_early_qty
+      from schedule_base
+      group by month_key
+      order by month_key asc
+      `,
+      [supplierId, rangeStart, rangeEnd],
+    );
+
+    const dnResult = await pool.query(
+      `
+      with supplier_dn as (
+        select dn.*
+        from delivery_notes dn
+        where (dn.supplier_id = $1 or lower(trim(coalesce(dn.supplier, ''))) = lower(trim($1)))
+          and dn.planned_date between $2::date and $3::date
+      ),
+      rn_union as (
+        select
+          rn.dn_id,
+          coalesce(rn.doc_qty, s.request_qty, rn.received_qty) as doc_qty,
+          rn.received_qty,
+          rn.qc_status,
+          rn.received_at
+        from receive_notes rn
+        left join schedules s on s.id = rn.schedule_id
+        where rn.dn_id in (select id from supplier_dn)
+        union all
+        select
+          rni.origin_dn_id as dn_id,
+          rni.doc_qty,
+          rni.received_qty,
+          coalesce(rni.qc_status, 'ok') as qc_status,
+          coalesce(rnh.posted_at, rnh.created_at) as received_at
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        where rni.origin_dn_id in (select id from supplier_dn)
+          and rnh.status = 'posted'
+          and rni.line_status = 'posted'
+          and rnh.reversal_of is null
+          and coalesce(rnh.source, '') <> 'REVERSAL'
+      ),
+      rn_group as (
+        select
+          dn_id,
+          count(*)::int as rn_count,
+          coalesce(sum(doc_qty), 0)::numeric as doc_qty,
+          coalesce(sum(received_qty), 0)::numeric as received_qty,
+          coalesce(sum(case when qc_status <> 'ok' then 1 else 0 end), 0)::int as qc_issue_count,
+          max(received_at) as last_received_at
+        from rn_union
+        group by dn_id
+      ),
+      dn_items as (
+        select dn_id, coalesce(sum(request_qty), 0)::numeric as request_qty
+        from delivery_note_items
+        where dn_id in (select id from supplier_dn)
+        group by dn_id
+      ),
+      dn_enriched as (
+        select
+          dn.id,
+          dn.dn_number,
+          dn.planned_date,
+          dn.status,
+          coalesce(rg.rn_count, 0)::int as rn_count,
+          coalesce(rg.doc_qty, di.request_qty, 0)::numeric as doc_qty_total,
+          coalesce(rg.received_qty, 0)::numeric as received_qty_total,
+          (coalesce(rg.doc_qty, di.request_qty, 0) - coalesce(rg.received_qty, 0))::numeric as diff_qty,
+          coalesce(rg.qc_issue_count, 0)::int as qc_issue_count,
+          rg.last_received_at,
+          case
+            when coalesce(rg.rn_count, 0) = 0 then 'Pending'
+            when coalesce(rg.qc_issue_count, 0) > 0
+              or coalesce(rg.doc_qty, di.request_qty, 0) <> coalesce(rg.received_qty, 0)
+              then 'Selisih/Reject'
+            when dn.status in ('closed','received') then 'Completed'
+            else 'Received'
+          end as tracking_status
+        from supplier_dn dn
+        left join dn_items di on di.dn_id = dn.id
+        left join rn_group rg on rg.dn_id = dn.id
+      )
+      select
+        count(*)::int as dn_count,
+        count(*) filter (where tracking_status = 'Completed')::int as dn_completed,
+        count(*) filter (where tracking_status = 'Pending')::int as dn_pending,
+        count(*) filter (where tracking_status = 'Selisih/Reject')::int as dn_issue,
+        coalesce(sum(doc_qty_total), 0)::numeric as dn_doc_qty,
+        coalesce(sum(received_qty_total), 0)::numeric as dn_received_qty,
+        coalesce(sum(diff_qty), 0)::numeric as dn_diff_qty,
+        coalesce(
+          jsonb_agg(
+            jsonb_build_object(
+              'dnNumber', dn_number,
+              'plannedDate', to_char(planned_date, 'YYYY-MM-DD'),
+              'status', status,
+              'trackingStatus', tracking_status,
+              'docQty', doc_qty_total,
+              'receivedQty', received_qty_total,
+              'diffQty', diff_qty,
+              'rnCount', rn_count,
+              'lastReceivedAt', last_received_at
+            )
+            order by planned_date desc nulls last, dn_number desc
+          ),
+          '[]'::jsonb
+        ) as rows
+      from dn_enriched
+      `,
+      [supplierId, rangeStart, rangeEnd],
+    );
+    const dnSummary = dnResult.rows[0] || {};
+
+    const qcResult = await pool.query(
+      `
+      with incoming_qc as (
+        select
+          coalesce(dn.supplier_id, nullif(trim(rnh.supplier), ''), 'UNKNOWN') as supplier_key,
+          qc.id,
+          qc.status,
+          qc.disposition,
+          lower(coalesce(rni.qc_status, 'ok')) = 'reject'
+            or lower(coalesce(qc.disposition, '')) in ('reject', 'return_supplier') as is_reject
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        left join delivery_notes dn on dn.id = rni.origin_dn_id
+        left join quality_cases qc
+          on qc.source_type = 'incoming_rn'
+          and qc.source_id = rnh.id
+          and qc.source_line_id = rni.id
+        where (dn.supplier_id = $1 or rnh.supplier = $1 or lower(trim(coalesce(dn.supplier, ''))) = lower(trim($1)))
+          and coalesce(rnh.posted_at, rnh.created_at)::date between $2::date and $3::date
+          and rnh.status = 'posted'
+          and rni.line_status = 'posted'
+          and rnh.reversal_of is null
+          and coalesce(rnh.source, '') <> 'REVERSAL'
+      ),
+      line_qc as (
+        select
+          coalesce(nullif(trim(qc.supplier), ''), 'UNKNOWN') as supplier_key,
+          qc.id,
+          qc.status,
+          qc.disposition,
+          lower(coalesce(qc.disposition, '')) in ('reject', 'return_supplier', 'scrap', 'rework') as is_reject
+        from quality_cases qc
+        where qc.source_type = 'material_line_ng'
+          and (qc.supplier = $1 or lower(trim(coalesce(qc.supplier, ''))) = lower(trim($1)))
+          and coalesce(qc.discovered_at, qc.created_at)::date between $2::date and $3::date
+      ),
+      all_qc as (
+        select * from incoming_qc
+        union all
+        select * from line_qc
+      )
+      select
+        count(id)::int as qc_total,
+        count(id) filter (where coalesce(status, 'open') <> 'closed')::int as qc_open,
+        count(id) filter (where is_reject)::int as qc_reject,
+        count(id) filter (where status = 'closed')::int as qc_closed,
+        count(id) filter (where supplier_key = $1 and id in (select id from line_qc))::int as line_claim_total
+      from all_qc
+      `,
+      [supplierId, rangeStart, rangeEnd],
+    );
+    const qcSummary = qcResult.rows[0] || {};
+
+    const totalSchedules = Number(scheduleSummary.total_schedules || 0);
+    const onTime = Number(scheduleSummary.on_time || 0);
+    const requestQty = Number(scheduleSummary.request_qty || 0);
+    const receivedQty = Number(scheduleSummary.received_qty || 0);
+    const onTimeQty = Number(scheduleSummary.on_time_qty || 0);
+    const lateQty = Number(scheduleSummary.late_qty || 0);
+    const tooEarlyQty = Number(scheduleSummary.too_early_qty || 0);
+    const qcTotal = Number(qcSummary.qc_total || 0);
+    const qcOpen = Number(qcSummary.qc_open || 0);
+    const qcReject = Number(qcSummary.qc_reject || 0);
+    const timeScore = requestQty > 0 ? (onTimeQty / requestQty) * 100 : 0;
+    const qtyScoreRaw = requestQty > 0 ? (receivedQty / requestQty) * 100 : 0;
+    const qtyScore = Math.min(100, qtyScoreRaw);
+    const qcScore = qcTotal > 0 ? Math.max(0, ((qcTotal - qcOpen - qcReject) / qcTotal) * 100) : 100;
+    const weightedScore = (timeScore * 0.6) + (qtyScore * 0.3) + (qcScore * 0.1);
+    let rating = 1;
+    if (weightedScore >= 95) rating = 5;
+    else if (weightedScore >= 80) rating = 4;
+    else if (weightedScore >= 60) rating = 3;
+    else if (weightedScore >= 40) rating = 2;
+
+    const decorateMonth = (row) => {
+      const monthRequestQty = Number(row.request_qty || 0);
+      const monthReceivedQty = Number(row.received_qty || 0);
+      const monthOnTimeQty = Number(row.on_time_qty || 0);
+      const monthLateQty = Number(row.late_qty || 0);
+      const monthTotal = Number(row.total_schedules || 0);
+      const monthOnTime = Number(row.on_time || 0);
+      const monthTimeScore = monthRequestQty > 0 ? (monthOnTimeQty / monthRequestQty) * 100 : 0;
+      const monthQtyScoreRaw = monthRequestQty > 0 ? (monthReceivedQty / monthRequestQty) * 100 : 0;
+      const monthQtyScore = Math.min(100, monthQtyScoreRaw);
+      const monthScore = (monthTimeScore * 0.7) + (monthQtyScore * 0.3);
+      return {
+        month: row.month_key,
+        totalSchedules: monthTotal,
+        onTime: monthOnTime,
+        late: Number(row.late || 0),
+        tooEarly: Number(row.too_early || 0),
+        pending: Number(row.pending || 0),
+        lateCompletion: Number(row.late_completion || 0),
+        partialOnTime: Number(row.partial_on_time || 0),
+        partialLate: Number(row.partial_late || 0),
+        requestQty: monthRequestQty,
+        receivedQty: monthReceivedQty,
+        onTimeQty: monthOnTimeQty,
+        lateQty: monthLateQty,
+        timeScore: Math.round(monthTimeScore),
+        qtyScore: Math.round(monthQtyScore),
+        weightedScore: Math.round(monthScore * 100) / 100,
+      };
+    };
+
+    res.json({
+      supplier: {
+        code: supplierRow.id || supplierId,
+        name: supplierRow.name || supplierId,
+      },
+      period: { start: rangeStart, end: rangeEnd },
+      summary: {
+        totalSchedules,
+        onTime,
+        late: Number(scheduleSummary.late || 0),
+        lateCompletion: Number(scheduleSummary.late_completion || 0),
+        partialOnTime: Number(scheduleSummary.partial_on_time || 0),
+        partialLate: Number(scheduleSummary.partial_late || 0),
+        tooEarly: Number(scheduleSummary.too_early || 0),
+        pending: Number(scheduleSummary.pending || 0),
+        requestQty,
+        receivedQty,
+        onTimeQty,
+        lateQty,
+        tooEarlyQty,
+        timeScore: Math.round(timeScore),
+        qtyScore: Math.round(qtyScore),
+        qtyScoreRaw: Math.round(qtyScoreRaw * 100) / 100,
+        qcScore: Math.round(qcScore),
+        qcTotal,
+        qcOpen,
+        qcReject,
+        qcClosed: Number(qcSummary.qc_closed || 0),
+        lineClaimTotal: Number(qcSummary.line_claim_total || 0),
+        dnCount: Number(dnSummary.dn_count || 0),
+        dnCompleted: Number(dnSummary.dn_completed || 0),
+        dnPending: Number(dnSummary.dn_pending || 0),
+        dnIssue: Number(dnSummary.dn_issue || 0),
+        dnDocQty: Number(dnSummary.dn_doc_qty || 0),
+        dnReceivedQty: Number(dnSummary.dn_received_qty || 0),
+        dnDiffQty: Number(dnSummary.dn_diff_qty || 0),
+        weightedScore: Math.round(weightedScore * 100) / 100,
+        rating,
+        ratingLabel: rating === 5 ? "Excellent" : rating >= 4 ? "Good" : rating >= 3 ? "Fair" : "Poor",
+      },
+      monthly: (monthlyResult.rows || []).map(decorateMonth),
+      schedules: Array.isArray(scheduleSummary.rows) ? scheduleSummary.rows : [],
+      deliveryNotes: Array.isArray(dnSummary.rows) ? dnSummary.rows : [],
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/supplier/millsheets", authenticate, requireSupplier, async (req, res) => {
+  try {
+    const supplierId = String(req.user?.supplierId || "").trim();
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const values = [supplierId];
+    const docFilters = ["m.supplier_id = $1"];
+    const pendingFilters = ["(dn.supplier_id = $1 or mv.id = $1)"];
+    if (q) {
+      values.push(`%${q}%`);
+      const idx = values.length;
+      docFilters.push(`(
+        lower(coalesce(m.dn_number, '')) like $${idx}
+        or lower(coalesce(m.rn_number, '')) like $${idx}
+        or lower(coalesce(m.item_code, '')) like $${idx}
+        or lower(coalesce(m.certificate_no, '')) like $${idx}
+        or lower(coalesce(m.lot_supplier, '')) like $${idx}
+        or lower(coalesce(m.file_name, '')) like $${idx}
+        or lower(coalesce(schedule_doc_meta.po_numbers, '')) like $${idx}
+        or lower(coalesce(schedule_doc_meta.schedule_ids, '')) like $${idx}
+      )`);
+      pendingFilters.push(`(
+        lower(coalesce(dn.dn_number, '')) like $${idx}
+        or lower(coalesce(schedule_meta.po_numbers, '')) like $${idx}
+        or lower(coalesce(schedule_meta.schedule_ids, '')) like $${idx}
+        or lower(coalesce(rn_meta.rn_numbers, '')) like $${idx}
+        or lower(coalesce(items_meta.item_codes, '')) like $${idx}
+        or lower(coalesce(items_meta.item_summary, '')) like $${idx}
+        or exists (
+          select 1 from delivery_note_items dni
+          where dni.dn_id = dn.id
+            and lower(coalesce(dni.item_code, '')) like $${idx}
+        )
+      )`);
+    }
+    const documents = await pool.query(
+      `
+      select
+        m.*,
+        coalesce(dn.millsheet_due_at, rnh.millsheet_due_at) as due_at,
+        mv.name as supplier_name,
+        i.name as item_name,
+        uu.username as uploaded_by_name,
+        ur.username as reviewed_by_name
+      from millsheet_documents m
+      left join delivery_notes dn on dn.id = m.dn_id
+      left join receive_note_headers rnh on rnh.id = m.rn_id
+      left join master_vendors mv on mv.id = m.supplier_id
+      left join items i on i.code = m.item_code
+      left join users uu on uu.id = m.uploaded_by
+      left join users ur on ur.id = m.reviewed_by
+      left join lateral (
+        select
+          string_agg(distinct s.po_number, ', ' order by s.po_number) as po_numbers,
+          string_agg(distinct s.id::text, ', ' order by s.id::text) as schedule_ids
+        from schedules s
+        where s.dn_id = dn.id
+          or s.request_id in (
+            select dni.request_id
+            from delivery_note_items dni
+            where dni.dn_id = dn.id
+          )
+      ) schedule_doc_meta on true
+      where ${docFilters.join(" and ")}
+      order by m.uploaded_at desc, m.id desc
+      limit 300
+      `,
+      values,
+    );
+    const pending = await pool.query(
+      `
+      select
+        dn.id,
+        dn.dn_number,
+        dn.planned_date,
+        dn.status,
+        dn.millsheet_status,
+        dn.millsheet_due_at,
+        coalesce(schedule_meta.po_numbers, '') as po_numbers,
+        coalesce(schedule_meta.schedule_ids, '') as schedule_ids,
+        coalesce(rn_meta.rn_numbers, '') as rn_numbers,
+        coalesce(items_meta.item_codes, '') as item_codes,
+        coalesce(items_meta.item_summary, '') as item_summary,
+        coalesce(count(m.id), 0)::int as document_count,
+        coalesce(count(m.id) filter (where m.status = 'qc_approved'), 0)::int as approved_count,
+        coalesce(count(m.id) filter (where m.status = 'qc_rejected'), 0)::int as rejected_count
+      from delivery_notes dn
+      left join master_vendors mv on mv.id = dn.supplier or mv.name = dn.supplier
+      left join millsheet_documents m on m.dn_id = dn.id
+      left join lateral (
+        select
+          string_agg(distinct dni.item_code, ', ' order by dni.item_code) as item_codes,
+          string_agg(distinct concat_ws(' - ', nullif(trim(dni.item_code), ''), nullif(trim(dni.item_name), '')), ' | ' order by concat_ws(' - ', nullif(trim(dni.item_code), ''), nullif(trim(dni.item_name), ''))) as item_summary
+        from delivery_note_items dni
+        where dni.dn_id = dn.id
+      ) items_meta on true
+      left join lateral (
+        select
+          string_agg(distinct rnh.rn_number, ', ' order by rnh.rn_number) as rn_numbers
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        where rni.origin_dn_id = dn.id
+          and rnh.reversal_of is null
+      ) rn_meta on true
+      left join lateral (
+        select
+          string_agg(distinct s.po_number, ', ' order by s.po_number) as po_numbers,
+          string_agg(distinct s.id::text, ', ' order by s.id::text) as schedule_ids
+        from schedules s
+        where s.dn_id = dn.id
+          or s.request_id in (
+            select dni.request_id
+            from delivery_note_items dni
+            where dni.dn_id = dn.id
+          )
+      ) schedule_meta on true
+      where ${pendingFilters.join(" and ")}
+        and coalesce(dn.status, '') not in ('draft', 'cancelled')
+      group by dn.id, schedule_meta.po_numbers, schedule_meta.schedule_ids, rn_meta.rn_numbers, items_meta.item_codes, items_meta.item_summary
+      having coalesce(count(m.id) filter (where m.status = 'qc_approved'), 0) = 0
+      order by dn.millsheet_due_at asc nulls last, dn.planned_date desc nulls last
+      limit 300
+      `,
+      values,
+    );
+    const rnFilters = [
+      "lower(trim(coalesce(rnh.supplier, ''))) = lower(trim($1))",
+      "rnh.status = 'posted'",
+      "rnh.reversal_of is null",
+      "coalesce(rnh.source, '') <> 'REVERSAL'",
+    ];
+    if (q) {
+      const idx = values.length;
+      rnFilters.push(`(
+        lower(coalesce(rnh.rn_number, '')) like $${idx}
+        or lower(coalesce(rnh.do_number, '')) like $${idx}
+        or lower(coalesce(rnh.po_number, '')) like $${idx}
+        or lower(coalesce(items_rn_meta.item_codes, '')) like $${idx}
+        or lower(coalesce(items_rn_meta.item_summary, '')) like $${idx}
+      )`);
+    }
+    const pendingRns = await pool.query(
+      `
+      select
+        rnh.id,
+        rnh.rn_number,
+        rnh.do_number,
+        rnh.po_number,
+        rnh.status,
+        rnh.created_at,
+        rnh.millsheet_status,
+        rnh.millsheet_due_at,
+        coalesce(items_rn_meta.item_codes, '') as item_codes,
+        coalesce(items_rn_meta.item_summary, '') as item_summary,
+        coalesce(count(m.id), 0)::int as document_count,
+        coalesce(count(m.id) filter (where m.status = 'qc_approved'), 0)::int as approved_count,
+        coalesce(count(m.id) filter (where m.status = 'qc_rejected'), 0)::int as rejected_count
+      from receive_note_headers rnh
+      left join millsheet_documents m on m.rn_id = rnh.id
+      left join lateral (
+        select
+          string_agg(distinct rni.item_code, ', ' order by rni.item_code) as item_codes,
+          string_agg(distinct concat_ws(' - ', nullif(trim(rni.item_code), ''), nullif(trim(rni.item_name), '')), ' | ' order by concat_ws(' - ', nullif(trim(rni.item_code), ''), nullif(trim(rni.item_name), ''))) as item_summary
+        from receive_note_items rni
+        where rni.rn_id = rnh.id
+      ) items_rn_meta on true
+      where ${rnFilters.join(" and ")}
+      group by rnh.id, items_rn_meta.item_codes, items_rn_meta.item_summary
+      having coalesce(count(m.id) filter (where m.status = 'qc_approved'), 0) = 0
+      order by rnh.millsheet_due_at asc nulls last, rnh.created_at desc nulls last
+      limit 300
+      `,
+      values,
+    );
+    res.json({
+      documents: documents.rows.map(mapMillsheetDocumentRow),
+      pendingDns: pending.rows.map((row) => ({
+        id: row.id,
+        dnNumber: row.dn_number,
+        plannedDate: row.planned_date,
+        status: row.status,
+        poNumbers: row.po_numbers,
+        scheduleIds: row.schedule_ids,
+        rnNumbers: row.rn_numbers,
+        itemCodes: row.item_codes,
+        itemSummary: row.item_summary,
+        millsheetStatus: getEffectiveMillsheetStatus(
+          row.millsheet_status === "not_required" ? "required_pending" : row.millsheet_status,
+          row.millsheet_due_at,
+        ),
+        millsheetDueAt: row.millsheet_due_at,
+        documentCount: Number(row.document_count || 0),
+        approvedCount: Number(row.approved_count || 0),
+        rejectedCount: Number(row.rejected_count || 0),
+      })),
+      pendingRns: pendingRns.rows.map((row) => ({
+        id: row.id,
+        rnNumber: row.rn_number,
+        doNumber: row.do_number,
+        poNumber: row.po_number,
+        createdAt: row.created_at,
+        status: row.status,
+        itemCodes: row.item_codes,
+        itemSummary: row.item_summary,
+        millsheetStatus: getEffectiveMillsheetStatus(
+          row.millsheet_status === "not_required" ? "required_pending" : row.millsheet_status,
+          row.millsheet_due_at,
+        ),
+        millsheetDueAt: row.millsheet_due_at,
+        documentCount: Number(row.document_count || 0),
+        approvedCount: Number(row.approved_count || 0),
+        rejectedCount: Number(row.rejected_count || 0),
+      })),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/supplier/millsheets", authenticate, requireSupplier, millsheetUpload.single("file"), async (req, res) => {
+  const client = await pool.connect();
+  let savedUrl = "";
+  try {
+    const supplierId = String(req.user?.supplierId || "").trim();
+    const referenceType = String(req.body?.referenceType || req.body?.reference_type || "").trim().toLowerCase();
+    const dnNumber = String(req.body?.dnNumber || req.body?.dn_number || "").trim();
+    const rnNumber = String(req.body?.rnNumber || req.body?.rn_number || "").trim();
+    const itemCode = normalizeItemCode(req.body?.itemCode || req.body?.item_code);
+    const lotSupplier = String(req.body?.lotSupplier || req.body?.lot_supplier || "").trim();
+    const certificateNo = String(req.body?.certificateNo || req.body?.certificate_no || "").trim();
+    const certificateDate = String(req.body?.certificateDate || req.body?.certificate_date || "").trim() || null;
+    if (!req.file) {
+      res.status(400).json({ error: "File Mill Sheet wajib diupload." });
+      return;
+    }
+    const useRnReference = referenceType === "rn" || (!dnNumber && rnNumber);
+    if (!dnNumber && !rnNumber) {
+      res.status(400).json({ error: "Nomor DN/RN wajib dipilih untuk upload Mill Sheet." });
+      return;
+    }
+    await client.query("begin");
+    let dn = null;
+    let rn = {};
+    if (useRnReference) {
+      const rnResult = await client.query(
+        `
+        select *
+        from receive_note_headers
+        where lower(rn_number) = lower($1)
+          and lower(trim(coalesce(supplier, ''))) = lower(trim($2))
+          and status = 'posted'
+          and reversal_of is null
+        limit 1
+        for update
+        `,
+        [rnNumber, supplierId],
+      );
+      rn = rnResult.rows[0] || {};
+      if (!rn.id) {
+        await client.query("rollback");
+        res.status(404).json({ error: "RN tidak ditemukan untuk supplier ini." });
+        return;
+      }
+      if (itemCode) {
+        const itemResult = await client.query(
+          "select 1 from receive_note_items where rn_id = $1 and item_code = $2 limit 1",
+          [rn.id, itemCode],
+        );
+        if (itemResult.rows.length === 0) {
+          await client.query("rollback");
+          res.status(409).json({ error: `Item ${itemCode} tidak ada di RN ${rn.rn_number}.` });
+          return;
+        }
+      }
+    } else {
+      const dnResult = await client.query(
+        `
+        select dn.*
+        from delivery_notes dn
+        left join master_vendors mv on mv.id = dn.supplier or mv.name = dn.supplier
+        where lower(dn.dn_number) = lower($1)
+          and (dn.supplier_id = $2 or dn.supplier = $2 or mv.id = $2)
+        limit 1
+        for update of dn
+        `,
+        [dnNumber, supplierId],
+      );
+      dn = dnResult.rows[0];
+      if (!dn) {
+        await client.query("rollback");
+        res.status(404).json({ error: "DN tidak ditemukan untuk supplier ini." });
+        return;
+      }
+      if (itemCode) {
+        const itemResult = await client.query(
+          "select 1 from delivery_note_items where dn_id = $1 and item_code = $2 limit 1",
+          [dn.id, itemCode],
+        );
+        if (itemResult.rows.length === 0) {
+          await client.query("rollback");
+          res.status(409).json({ error: `Item ${itemCode} tidak ada di DN ${dn.dn_number}.` });
+          return;
+        }
+      }
+      const rnResult = await client.query(
+        `
+        select distinct h.id, h.rn_number
+        from receive_note_headers h
+        join receive_note_items rni on rni.rn_id = h.id
+        where rni.origin_dn_id = $1
+          and h.status = 'posted'
+          and h.reversal_of is null
+        order by h.id desc
+        limit 1
+        `,
+        [dn.id],
+      );
+      rn = rnResult.rows[0] || {};
+    }
+    const hash = crypto.createHash("sha256").update(req.file.buffer).digest("hex");
+    const resolvedDnNumber = dn?.dn_number || "";
+    const resolvedRnNumber = rn?.rn_number || "";
+    const versionResult = await client.query(
+      `
+      select coalesce(max(upload_version), 0) + 1 as next_version
+      from millsheet_documents
+      where supplier_id = $1
+        and lower(coalesce(dn_number, '')) = lower($2)
+        and lower(coalesce(rn_number, '')) = lower($3)
+        and lower(coalesce(item_code, '')) = lower($4)
+        and lower(coalesce(lot_supplier, '')) = lower($5)
+      `,
+      [supplierId, resolvedDnNumber, resolvedRnNumber, itemCode || "", lotSupplier || ""],
+    );
+    const uploadVersion = Number(versionResult.rows[0]?.next_version || 1);
+    const originalName = req.file.originalname || "millsheet";
+    const ext = path.extname(originalName) || (req.file.mimetype === "application/pdf" ? ".pdf" : ".jpg");
+    const fileBase = [
+      sanitizeFileToken(supplierId || "supplier"),
+      sanitizeFileToken(resolvedDnNumber || resolvedRnNumber || "doc"),
+      itemCode ? sanitizeFileToken(itemCode) : "all",
+      String(Date.now()),
+      `v${uploadVersion}`,
+    ].filter(Boolean).join("_");
+    const fileName = `${fileBase}${ext.toLowerCase()}`;
+    const targetPath = path.join(millsheetUploadDir, fileName);
+    savedUrl = `/uploads/millsheets/${fileName}`;
+    await fs.mkdir(millsheetUploadDir, { recursive: true });
+    await fs.writeFile(targetPath, req.file.buffer);
+    const insertResult = await client.query(
+      `
+      insert into millsheet_documents (
+        supplier_id, dn_id, dn_number, rn_id, rn_number, item_code, lot_supplier,
+        certificate_no, certificate_date, file_name, file_type, file_size, file_url,
+        file_hash, upload_version, status, uploaded_by
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'uploaded_waiting_qc',$16)
+      returning *
+      `,
+      [
+        supplierId,
+        dn?.id || null,
+        resolvedDnNumber || null,
+        rn.id || null,
+        resolvedRnNumber || null,
+        itemCode || null,
+        lotSupplier || null,
+        certificateNo || null,
+        certificateDate,
+        originalName,
+        req.file.mimetype || "application/octet-stream",
+        req.file.size || req.file.buffer.length,
+        savedUrl,
+        hash,
+        uploadVersion,
+        req.user?.id || null,
+      ],
+    );
+    if (dn?.id) {
+      await refreshMillsheetStatusForDn(client, dn.id);
+      const relatedRnIds = await client.query(
+        `
+        select distinct rn_id
+        from receive_note_items
+        where origin_dn_id = $1
+          and rn_id is not null
+        `,
+        [dn.id],
+      );
+      for (const row of relatedRnIds.rows || []) {
+        await refreshMillsheetStatusForReceipt(client, row.rn_id);
+      }
+    }
+    if (rn?.id) {
+      await refreshMillsheetStatusForReceipt(client, rn.id);
+    }
+    await client.query("commit");
+    res.status(201).json(mapMillsheetDocumentRow(insertResult.rows[0]));
+  } catch (error) {
+    await client.query("rollback").catch(() => undefined);
+    if (savedUrl) await removeLocalUploadFile(savedUrl);
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -14039,10 +17778,15 @@ app.get("/api/supplier/dn", authenticate, requireSupplier, async (req, res) => {
           rni.item_code,
           rni.doc_qty,
           rni.received_qty,
-          'ok'::text as qc_status,
-          rnh.created_at as received_at
+          coalesce(rni.qc_status, 'ok') as qc_status,
+          coalesce(rnh.posted_at, rnh.created_at) as received_at
         from receive_note_items rni
         join receive_note_headers rnh on rnh.id = rni.rn_id
+        where rni.origin_dn_id is not null
+          and rnh.status = 'posted'
+          and rni.line_status = 'posted'
+          and rnh.reversal_of is null
+          and coalesce(rnh.source, '') <> 'REVERSAL'
       ),
       rn_group as (
         select
@@ -14055,12 +17799,52 @@ app.get("/api/supplier/dn", authenticate, requireSupplier, async (req, res) => {
         from rn_union
         group by dn_id
       ),
+      qc_group as (
+        select
+          rni.origin_dn_id as dn_id,
+          count(qc.id)::int as qc_total_count,
+          count(qc.id) filter (where coalesce(qc.status, 'open') <> 'closed')::int as qc_open_count,
+          count(qc.id) filter (where qc.status = 'closed')::int as qc_closed_count,
+          count(qc.id) filter (
+            where lower(coalesce(rni.qc_status, 'ok')) = 'hold'
+              or lower(coalesce(qc.status, '')) = 'inspecting'
+              or lower(coalesce(qc.disposition, '')) = 'hold'
+          )::int as qc_hold_count,
+          count(qc.id) filter (
+            where lower(coalesce(rni.qc_status, 'ok')) = 'reject'
+              or lower(coalesce(qc.disposition, '')) in ('reject', 'return_supplier')
+          )::int as qc_reject_count,
+          max(coalesce(qc.decided_at, qc.updated_at, qc.created_at)) as last_qc_at
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        left join quality_cases qc
+          on qc.source_type = 'incoming_rn'
+          and qc.source_id = rnh.id
+          and qc.source_line_id = rni.id
+        where rni.origin_dn_id is not null
+          and rnh.status = 'posted'
+          and rni.line_status = 'posted'
+          and rnh.reversal_of is null
+          and coalesce(rnh.source, '') <> 'REVERSAL'
+        group by rni.origin_dn_id
+      ),
       dn_items as (
         select
           dn_id,
           coalesce(sum(request_qty), 0)::numeric as request_qty,
           count(*)::int as item_count
         from delivery_note_items
+        group by dn_id
+      ),
+      millsheet_group as (
+        select
+          dn_id,
+          count(*)::int as millsheet_document_count,
+          count(*) filter (where status = 'qc_approved')::int as millsheet_approved_count,
+          count(*) filter (where status = 'qc_rejected')::int as millsheet_rejected_count,
+          max(uploaded_at) as millsheet_last_uploaded_at
+        from millsheet_documents
+        where dn_id is not null
         group by dn_id
       ),
       dn_base as (
@@ -14075,17 +17859,34 @@ app.get("/api/supplier/dn", authenticate, requireSupplier, async (req, res) => {
           dn.cycle,
           dn.rit,
           dn.delivery_time,
+          case
+            when dn.millsheet_status = 'required_pending' and dn.millsheet_due_at is not null and dn.millsheet_due_at < now() then 'overdue'
+            else coalesce(dn.millsheet_status, 'not_required')
+          end as millsheet_status,
+          dn.millsheet_due_at,
           dn.created_at,
           coalesce(di.request_qty, 0)::numeric as request_qty,
           coalesce(di.item_count, 0)::int as item_count,
+          coalesce(mg.millsheet_document_count, 0)::int as millsheet_document_count,
+          coalesce(mg.millsheet_approved_count, 0)::int as millsheet_approved_count,
+          coalesce(mg.millsheet_rejected_count, 0)::int as millsheet_rejected_count,
+          mg.millsheet_last_uploaded_at,
           rg.doc_qty,
           rg.received_qty,
           rg.rn_count,
           rg.qc_issue_count,
-          rg.last_received_at
+          rg.last_received_at,
+          coalesce(qg.qc_total_count, 0)::int as qc_total_count,
+          coalesce(qg.qc_open_count, 0)::int as qc_open_count,
+          coalesce(qg.qc_closed_count, 0)::int as qc_closed_count,
+          coalesce(qg.qc_hold_count, 0)::int as qc_hold_count,
+          coalesce(qg.qc_reject_count, 0)::int as qc_reject_count,
+          qg.last_qc_at
         from delivery_notes dn
         left join dn_items di on di.dn_id = dn.id
         left join rn_group rg on rg.dn_id = dn.id
+        left join qc_group qg on qg.dn_id = dn.id
+        left join millsheet_group mg on mg.dn_id = dn.id
         left join master_vendors mv on mv.id = dn.supplier or mv.name = dn.supplier
         ${whereSql}
       ),
@@ -14097,7 +17898,8 @@ app.get("/api/supplier/dn", authenticate, requireSupplier, async (req, res) => {
           (coalesce(dn_base.doc_qty, dn_base.request_qty, 0) - coalesce(dn_base.received_qty, 0))::numeric as diff_qty,
           case
             when coalesce(dn_base.rn_count, 0) = 0 then 'Pending'
-            when coalesce(dn_base.qc_issue_count, 0) > 0
+            when coalesce(dn_base.qc_open_count, 0) > 0
+              or coalesce(dn_base.qc_issue_count, 0) > 0
               or coalesce(dn_base.doc_qty, dn_base.request_qty, 0) <> coalesce(dn_base.received_qty, 0)
               then 'Selisih/Reject'
             when dn_base.status in ('closed','received') then 'Completed'
@@ -14170,10 +17972,15 @@ app.get("/api/supplier/dn/:dnNumber", authenticate, requireSupplier, async (req,
           rni.item_code,
           rni.doc_qty,
           rni.received_qty,
-          'ok'::text as qc_status,
-          rnh.created_at as received_at
+          coalesce(rni.qc_status, 'ok') as qc_status,
+          coalesce(rnh.posted_at, rnh.created_at) as received_at
         from receive_note_items rni
         join receive_note_headers rnh on rnh.id = rni.rn_id
+        where rni.origin_dn_id is not null
+          and rnh.status = 'posted'
+          and rni.line_status = 'posted'
+          and rnh.reversal_of is null
+          and coalesce(rnh.source, '') <> 'REVERSAL'
       ),
       rn_group as (
         select
@@ -14185,6 +17992,35 @@ app.get("/api/supplier/dn/:dnNumber", authenticate, requireSupplier, async (req,
           max(received_at) as last_received_at
         from rn_union
         group by dn_id
+      ),
+      qc_group as (
+        select
+          rni.origin_dn_id as dn_id,
+          count(qc.id)::int as qc_total_count,
+          count(qc.id) filter (where coalesce(qc.status, 'open') <> 'closed')::int as qc_open_count,
+          count(qc.id) filter (where qc.status = 'closed')::int as qc_closed_count,
+          count(qc.id) filter (
+            where lower(coalesce(rni.qc_status, 'ok')) = 'hold'
+              or lower(coalesce(qc.status, '')) = 'inspecting'
+              or lower(coalesce(qc.disposition, '')) = 'hold'
+          )::int as qc_hold_count,
+          count(qc.id) filter (
+            where lower(coalesce(rni.qc_status, 'ok')) = 'reject'
+              or lower(coalesce(qc.disposition, '')) in ('reject', 'return_supplier')
+          )::int as qc_reject_count,
+          max(coalesce(qc.decided_at, qc.updated_at, qc.created_at)) as last_qc_at
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        left join quality_cases qc
+          on qc.source_type = 'incoming_rn'
+          and qc.source_id = rnh.id
+          and qc.source_line_id = rni.id
+        where rni.origin_dn_id is not null
+          and rnh.status = 'posted'
+          and rni.line_status = 'posted'
+          and rnh.reversal_of is null
+          and coalesce(rnh.source, '') <> 'REVERSAL'
+        group by rni.origin_dn_id
       ),
       dn_items as (
         select
@@ -14203,12 +18039,19 @@ app.get("/api/supplier/dn/:dnNumber", authenticate, requireSupplier, async (req,
         rg.rn_count,
         rg.qc_issue_count,
         rg.last_received_at,
+        coalesce(qg.qc_total_count, 0)::int as qc_total_count,
+        coalesce(qg.qc_open_count, 0)::int as qc_open_count,
+        coalesce(qg.qc_closed_count, 0)::int as qc_closed_count,
+        coalesce(qg.qc_hold_count, 0)::int as qc_hold_count,
+        coalesce(qg.qc_reject_count, 0)::int as qc_reject_count,
+        qg.last_qc_at,
         coalesce(rg.doc_qty, di.request_qty, 0)::numeric as doc_qty_total,
         coalesce(rg.received_qty, 0)::numeric as received_qty_total,
         (coalesce(rg.doc_qty, di.request_qty, 0) - coalesce(rg.received_qty, 0))::numeric as diff_qty,
         case
           when coalesce(rg.rn_count, 0) = 0 then 'Pending'
-          when coalesce(rg.qc_issue_count, 0) > 0
+          when coalesce(qg.qc_open_count, 0) > 0
+            or coalesce(rg.qc_issue_count, 0) > 0
             or coalesce(rg.doc_qty, di.request_qty, 0) <> coalesce(rg.received_qty, 0)
             then 'Selisih/Reject'
           when dn.status in ('closed','received') then 'Completed'
@@ -14217,6 +18060,7 @@ app.get("/api/supplier/dn/:dnNumber", authenticate, requireSupplier, async (req,
       from delivery_notes dn
       left join dn_items di on di.dn_id = dn.id
       left join rn_group rg on rg.dn_id = dn.id
+      left join qc_group qg on qg.dn_id = dn.id
       left join master_vendors mv on mv.id = dn.supplier or mv.name = dn.supplier
       where lower(dn.dn_number) = lower($1)
         and (dn.supplier_id = $2 or mv.id = $2)
@@ -14248,9 +18092,14 @@ app.get("/api/supplier/dn/:dnNumber", authenticate, requireSupplier, async (req,
           rni.item_code,
           rni.doc_qty,
           rni.received_qty,
-          'ok'::text as qc_status
+          coalesce(rni.qc_status, 'ok') as qc_status
         from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
         where rni.origin_dn_id = $1
+          and rnh.status = 'posted'
+          and rni.line_status = 'posted'
+          and rnh.reversal_of is null
+          and coalesce(rnh.source, '') <> 'REVERSAL'
       ),
       rn_group as (
         select
@@ -14261,6 +18110,36 @@ app.get("/api/supplier/dn/:dnNumber", authenticate, requireSupplier, async (req,
           coalesce(sum(case when qc_status <> 'ok' then 1 else 0 end), 0)::int as qc_issue_count
         from rn_union
         group by dn_id, item_code
+      ),
+      qc_group as (
+        select
+          rni.origin_dn_id as dn_id,
+          rni.item_code,
+          count(qc.id)::int as qc_total_count,
+          count(qc.id) filter (where coalesce(qc.status, 'open') <> 'closed')::int as qc_open_count,
+          count(qc.id) filter (where qc.status = 'closed')::int as qc_closed_count,
+          count(qc.id) filter (
+            where lower(coalesce(rni.qc_status, 'ok')) = 'hold'
+              or lower(coalesce(qc.status, '')) = 'inspecting'
+              or lower(coalesce(qc.disposition, '')) = 'hold'
+          )::int as qc_hold_count,
+          count(qc.id) filter (
+            where lower(coalesce(rni.qc_status, 'ok')) = 'reject'
+              or lower(coalesce(qc.disposition, '')) in ('reject', 'return_supplier')
+          )::int as qc_reject_count,
+          max(coalesce(qc.decided_at, qc.updated_at, qc.created_at)) as last_qc_at
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        left join quality_cases qc
+          on qc.source_type = 'incoming_rn'
+          and qc.source_id = rnh.id
+          and qc.source_line_id = rni.id
+        where rni.origin_dn_id = $1
+          and rnh.status = 'posted'
+          and rni.line_status = 'posted'
+          and rnh.reversal_of is null
+          and coalesce(rnh.source, '') <> 'REVERSAL'
+        group by rni.origin_dn_id, rni.item_code
       )
       select
         dni.item_code,
@@ -14269,6 +18148,9 @@ app.get("/api/supplier/dn/:dnNumber", authenticate, requireSupplier, async (req,
         dni.unit,
         dni.pack_qty,
         dni.drop_zone,
+        dni.request_id,
+        coalesce(kr.request_code, '') as request_code,
+        nullif(substring(kr.notes from 'kanban:\\s*([^|]+)'), '') as kanban_id,
         coalesce(nullif(dni.drop_zone, ''), nullif(ks.drop_zone, ''), nullif(i.location_id, ''), nullif(i.location_name, '')) as location_code,
         coalesce(nullif(ml.line_description, ''), nullif(i.location_name, ''), nullif(i.location_id, '')) as location_name,
         i.line_production,
@@ -14279,15 +18161,24 @@ app.get("/api/supplier/dn/:dnNumber", authenticate, requireSupplier, async (req,
         coalesce(rg.doc_qty, dni.request_qty, 0)::numeric as doc_qty,
         coalesce(rg.received_qty, 0)::numeric as received_qty,
         coalesce(rg.qc_issue_count, 0)::int as qc_issue_count,
+        coalesce(qg.qc_total_count, 0)::int as qc_total_count,
+        coalesce(qg.qc_open_count, 0)::int as qc_open_count,
+        coalesce(qg.qc_closed_count, 0)::int as qc_closed_count,
+        coalesce(qg.qc_hold_count, 0)::int as qc_hold_count,
+        coalesce(qg.qc_reject_count, 0)::int as qc_reject_count,
+        qg.last_qc_at,
         case
           when coalesce(rg.received_qty, 0) = 0 then 'Pending'
-          when coalesce(rg.qc_issue_count, 0) > 0
+          when coalesce(qg.qc_open_count, 0) > 0
+            or coalesce(rg.qc_issue_count, 0) > 0
             or coalesce(rg.doc_qty, dni.request_qty, 0) <> coalesce(rg.received_qty, 0)
             then 'Selisih/Reject'
           else 'Received'
         end as item_status
       from delivery_note_items dni
       left join rn_group rg on rg.dn_id = dni.dn_id and rg.item_code = dni.item_code
+      left join qc_group qg on qg.dn_id = dni.dn_id and qg.item_code = dni.item_code
+      left join kanban_requests kr on kr.id = dni.request_id
       left join items i on i.code = dni.item_code
       left join kanban_settings ks on ks.item_code = dni.item_code
       left join master_locations ml on ml.id = coalesce(nullif(dni.drop_zone, ''), nullif(ks.drop_zone, ''), nullif(i.location_id, ''))
@@ -14298,7 +18189,29 @@ app.get("/api/supplier/dn/:dnNumber", authenticate, requireSupplier, async (req,
       [header.id],
     );
 
-    res.json({ header, items: itemsResult.rows || [] });
+    const documentsResult = await pool.query(
+      `
+      select
+        m.*,
+        coalesce(dn.millsheet_due_at, rnh.millsheet_due_at) as due_at,
+        mv.name as supplier_name,
+        i.name as item_name,
+        uu.username as uploaded_by_name,
+        ur.username as reviewed_by_name
+      from millsheet_documents m
+      left join delivery_notes dn on dn.id = m.dn_id
+      left join receive_note_headers rnh on rnh.id = m.rn_id
+      left join master_vendors mv on mv.id = m.supplier_id
+      left join items i on i.code = m.item_code
+      left join users uu on uu.id = m.uploaded_by
+      left join users ur on ur.id = m.reviewed_by
+      where m.dn_id = $1
+      order by m.uploaded_at desc, m.id desc
+      `,
+      [header.id],
+    );
+
+    res.json({ header, items: itemsResult.rows || [], millsheets: documentsResult.rows.map(mapMillsheetDocumentRow) });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -14366,11 +18279,12 @@ app.post("/api/schedules/check-sj", authenticate, requirePermission("editSchedul
     const headerResult = await pool.query(headerQuery, headerParams);
     const headerMatches = headerResult.rows || [];
     if (headerMatches.length > 0) {
+      const hasLineItems = headerMatches.some((row) => Number(row.line_count || 0) > 0);
       res.json({
-        status: "block",
+        status: hasLineItems ? "block" : "warn",
         matches: headerMatches.map((row) => ({
           id: row.id,
-          receiptType: "receipt_header",
+          receiptType: Number(row.line_count || 0) > 0 ? "receipt_header" : "empty_receipt_header",
           poNumber: row.po_number,
           itemCode: null,
           itemName: null,
@@ -14381,6 +18295,9 @@ app.post("/api/schedules/check-sj", authenticate, requirePermission("editSchedul
           supplier: row.supplier,
           lineCount: Number(row.line_count || 0),
           receiptStatus: row.status,
+          message: Number(row.line_count || 0) > 0
+            ? "Nomor SJ sudah ada di RN aktif."
+            : "Nomor SJ ada di RN kosong tanpa item; tidak memblok input baru.",
         })),
       });
       return;
@@ -14456,7 +18373,89 @@ app.get("/api/search", authenticate, requireNotSupplier, async (req, res) => {
     const query = rawQuery.toLowerCase();
     const like = `%${query}%`;
 
-    const [poResult, vendorResult, itemResult, scheduleResult] = await Promise.all([
+    const [rnResult, dnResult, poResult, vendorResult, itemResult, scheduleResult] = await Promise.all([
+      pool.query(
+        `
+        with raw_rn as (
+          select
+            rn.id,
+            rn.rn_number,
+            dn.dn_number,
+            coalesce(dn.supplier, s.supplier) as supplier,
+            s.po_number,
+            s.do_number,
+            rn.status,
+            rn.received_at,
+            rn.received_qty
+          from receive_notes rn
+          left join delivery_notes dn on dn.id = rn.dn_id
+          left join schedules s on s.id = rn.schedule_id
+          union all
+          select
+            rnh.id,
+            rnh.rn_number,
+            dn.dn_number,
+            coalesce(dn.supplier, rnh.supplier, s.supplier) as supplier,
+            coalesce(rnh.po_number, s.po_number, pl.po_number) as po_number,
+            rnh.do_number,
+            rnh.status,
+            coalesce(rnh.posted_at, rnh.created_at) as received_at,
+            coalesce(sum(rni.received_qty), 0)::numeric as received_qty
+          from receive_note_headers rnh
+          left join receive_note_items rni on rni.rn_id = rnh.id and rni.line_status = 'posted'
+          left join delivery_notes dn on dn.id = rni.origin_dn_id
+          left join schedules s on s.id = rni.schedule_id
+          left join po_lines pl on pl.id = rni.po_line_id
+          where coalesce(rnh.status, '') <> 'void'
+          group by rnh.id, rnh.rn_number, dn.dn_number, coalesce(dn.supplier, rnh.supplier, s.supplier), coalesce(rnh.po_number, s.po_number, pl.po_number), rnh.do_number, rnh.status, coalesce(rnh.posted_at, rnh.created_at)
+        ),
+        matched_rn as (
+          select *
+          from raw_rn
+          where lower(coalesce(rn_number, '')) like $1
+             or lower(coalesce(dn_number, '')) like $1
+             or lower(coalesce(do_number, '')) like $1
+             or lower(coalesce(po_number, '')) like $1
+             or lower(coalesce(supplier, '')) like $1
+        ),
+        deduped_rn as (
+          select distinct on (rn_number)
+            id, rn_number, dn_number, supplier, po_number, do_number, status, received_at, received_qty
+          from matched_rn
+          order by rn_number, received_at desc nulls last, id desc
+        )
+        select *
+        from deduped_rn
+        order by received_at desc nulls last, id desc
+        limit $2
+        `,
+        [like, limit],
+      ),
+      pool.query(
+        `
+        select
+          dn.id,
+          dn.dn_number,
+          dn.supplier,
+          coalesce(mv.name, dn.supplier) as supplier_name,
+          dn.status,
+          dn.delivery_type,
+          to_char(dn.created_at, 'YYYY-MM-DD') as created_date,
+          to_char(dn.planned_date, 'YYYY-MM-DD') as planned_date,
+          coalesce(sum(dni.request_qty), 0)::numeric as total_qty
+        from delivery_notes dn
+        left join delivery_note_items dni on dni.dn_id = dn.id
+        left join master_vendors mv on mv.id = dn.supplier or mv.name = dn.supplier
+        where lower(coalesce(dn.dn_number, '')) like $1
+           or lower(coalesce(dn.supplier, '')) like $1
+           or lower(coalesce(mv.name, '')) like $1
+           or lower(coalesce(dn.status, '')) like $1
+        group by dn.id, dn.dn_number, dn.supplier, coalesce(mv.name, dn.supplier), dn.status, dn.delivery_type, dn.created_at, dn.planned_date
+        order by dn.created_at desc nulls last, dn.id desc
+        limit $2
+        `,
+        [like, limit],
+      ),
       pool.query(
         `
         select
@@ -14518,6 +18517,8 @@ app.get("/api/search", authenticate, requireNotSupplier, async (req, res) => {
     ]);
 
     const groups = [
+      { key: "rn", label: "Receiving Notes", items: rnResult.rows || [] },
+      { key: "dn", label: "Delivery Notes", items: dnResult.rows || [] },
       { key: "po", label: "Master PO", items: poResult.rows || [] },
       { key: "vendors", label: "Master Vendor", items: vendorResult.rows || [] },
       { key: "items", label: "Master Item", items: itemResult.rows || [] },
@@ -15007,6 +19008,94 @@ app.get("/api/kanban/requests", authenticate, async (req, res) => {
   }
 });
 
+app.get("/api/kanban/empty-log", authenticate, requireAnyPermission("editSchedules", "production"), async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(Number(req.query.limit || 1000), 1000));
+    const result = await pool.query(
+      `
+      select
+        il.id,
+        il.date as created_at,
+        il.item_id as item_code,
+        i.name as item_name,
+        i.type as item_type,
+        coalesce(
+          nullif(il.location_id, ''),
+          nullif(substring(kr.notes from 'area:\\s*([^|]+)'), ''),
+          nullif(i.location_id, '')
+        ) as location_id,
+        coalesce(
+          nullif(ml.line_description, ''),
+          case
+            when ma.id is not null then concat(ma.id, case when nullif(ma.name, '') is not null then concat(' - ', ma.name) else '' end)
+            else null
+          end,
+          nullif(i.location_name, ''),
+          nullif(il.location_id, ''),
+          nullif(substring(kr.notes from 'area:\\s*([^|]+)'), ''),
+          nullif(i.location_id, ''),
+          '-'
+        ) as location_label,
+        il.kanban_id,
+        il.qty_out as consumed_qty,
+        il.reference_doc,
+        il.remarks,
+        coalesce(kr.status, 'consumed') as status,
+        kr.id as request_id,
+        kr.request_code,
+        kr.request_group,
+        kr.dn_id,
+        coalesce(lots.lot_count, 0)::int as lot_count,
+        coalesce(lots.lot_summary, '') as lot_summary
+      from inventory_ledgers il
+      join items i on i.code = il.item_id
+      left join master_locations ml on ml.id = coalesce(nullif(il.location_id, ''), nullif(i.location_id, ''))
+      left join master_areas ma on ma.id = coalesce(nullif(il.location_id, ''), nullif(i.location_id, ''))
+      left join lateral (
+        select kr.*
+        from kanban_requests kr
+        where kr.item_code = il.item_id
+          and (
+            (il.kanban_id is not null and kr.notes ilike ('%' || 'kanban:' || il.kanban_id || '%'))
+            or kr.created_at between il.date - interval '10 seconds' and il.date + interval '10 seconds'
+          )
+        order by kr.created_at desc, kr.id desc
+        limit 1
+      ) kr on true
+      left join lateral (
+        select
+          count(distinct sm.batch_id) as lot_count,
+          string_agg(
+            distinct concat(coalesce(sb.batch_no, concat('BATCH-', sm.batch_id::text)), ': ', trim(to_char(sm.qty, 'FM999999999990.##'))),
+            ', '
+          ) as lot_summary
+        from stock_movements sm
+        left join stock_batches sb on sb.id = sm.batch_id
+        where sm.item_code = il.item_id
+          and sm.reason = 'kanban_empty'
+          and sm.direction = 'out'
+          and (
+            (il.kanban_id is not null and sm.kanban_id = il.kanban_id)
+            or sm.created_at between il.date - interval '10 seconds' and il.date + interval '10 seconds'
+          )
+      ) lots on true
+      where il.transaction_type = 'PRODUCTION'
+        and il.qty_out > 0
+        and il.remarks in ('kanban_scan', 'kanban_empty')
+      order by il.date desc, il.id desc
+      limit $1
+      `,
+      [limit],
+    );
+    res.json(result.rows.map((row) => ({
+      ...row,
+      kanban_id: extractKanbanIdToken(row.kanban_id),
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/api/delivery-notes", authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -15040,7 +19129,7 @@ app.get("/api/delivery-notes/open", authenticate, async (req, res) => {
       return;
     }
     const vendorResult = await pool.query(
-      "select id, name from master_vendors where id = $1 or name = $1 limit 1",
+      "select id, name from master_vendors where id::text = $1::text or name::text = $1::text limit 1",
       [supplierRaw],
     );
     const matchValues = new Set([supplierRaw]);
@@ -15082,20 +19171,54 @@ app.get("/api/delivery-notes/items", authenticate, async (req, res) => {
     }
     const result = await pool.query(
       `
+      with dn_item_counts as (
+        select
+          dn_id,
+          lower(trim(item_code)) as item_code_key,
+          count(*)::int as line_count
+        from delivery_note_items
+        where dn_id = any($1::int[])
+        group by dn_id, lower(trim(item_code))
+      ),
+      precise_receipts as (
+        select
+          origin_dn_item_id,
+          sum(received_qty) as received_total
+        from receive_note_items
+        where origin_dn_item_id is not null
+        group by origin_dn_item_id
+      ),
+      legacy_receipts as (
+        select
+          origin_dn_id,
+          lower(trim(item_code)) as item_code_key,
+          sum(received_qty) as received_total
+        from receive_note_items
+        where origin_dn_item_id is null
+        group by origin_dn_id, lower(trim(item_code))
+      )
       select
         dni.*,
         dn.dn_number,
         dn.supplier,
         mp.name as packing_name,
-        coalesce(rn.received_total, 0) as received_total
+        (
+          coalesce(pr.received_total, 0)
+          + case
+              when coalesce(dic.line_count, 1) = 1 then coalesce(lr.received_total, 0)
+              else 0
+            end
+        ) as received_total
       from delivery_note_items dni
       join delivery_notes dn on dn.id = dni.dn_id
       left join master_packings mp on mp.code = dni.type_pack
-      left join (
-        select origin_dn_id, item_code, sum(received_qty) as received_total
-        from receive_note_items
-        group by origin_dn_id, item_code
-      ) rn on rn.origin_dn_id = dni.dn_id and rn.item_code = dni.item_code
+      left join dn_item_counts dic
+        on dic.dn_id = dni.dn_id
+       and dic.item_code_key = lower(trim(dni.item_code))
+      left join precise_receipts pr on pr.origin_dn_item_id = dni.id
+      left join legacy_receipts lr
+        on lr.origin_dn_id = dni.dn_id
+       and lr.item_code_key = lower(trim(dni.item_code))
       where dni.dn_id = any($1::int[])
       order by dn.id asc, dni.id asc
       `,
@@ -15628,6 +19751,33 @@ app.post("/api/delivery-notes/:id/receive", authenticate, requirePermission("edi
     const today = new Date().toISOString().slice(0, 10);
     const supplierValue = dn.supplier || "SUPPLIER";
     const payloadCodes = new Set();
+    const receiveMetaByItem = new Map();
+    const setReceiveItemMeta = (itemCode, meta = {}) => {
+      const code = String(itemCode || "").trim();
+      if (!code) return;
+      const current = receiveMetaByItem.get(code) || { kanbanId: "", supplierLotNo: "" };
+      const kanbanId = extractKanbanIdToken(meta.kanbanId || meta.kanban_id || meta.kanban || "");
+      const supplierLotNo = String(meta.supplierLotNo || meta.supplier_lot_no || meta.lotNo || meta.lot_no || meta.lot || meta.batchNo || meta.batch_no || "").trim();
+      receiveMetaByItem.set(code, {
+        kanbanId: current.kanbanId || kanbanId,
+        supplierLotNo: current.supplierLotNo || supplierLotNo,
+      });
+    };
+    for (const item of items) {
+      const itemCode = String(item?.itemCode || item?.item_code || "").trim();
+      setReceiveItemMeta(itemCode, item);
+    }
+    if (Array.isArray(scans)) {
+      for (const scan of scans) {
+        const qrValue = String(scan?.qrValue || scan?.qr_value || "").trim();
+        const parsedQr = parseDelimitedQrPayload(qrValue);
+        const itemCode = String(scan?.itemCode || scan?.item_code || parsedQr.item || parsedQr.item_code || "").trim();
+        setReceiveItemMeta(itemCode, {
+          kanbanId: scan?.kanbanId || scan?.kanban_id || parsedQr.kanban || parsedQr.kanban_id,
+          supplierLotNo: scan?.lotNo || scan?.lot_no || scan?.supplierLotNo || scan?.supplier_lot_no || parsedQr.lot || parsedQr.lot_no || parsedQr.batch || parsedQr.batch_no,
+        });
+      }
+    }
     const effectiveDoNumber = providedDoNumber || normalizeDoNumber(dn.dn_number) || `DN:${id}`;
     const header = await createReceiptDraft(client, {
       supplier: supplierValue,
@@ -15668,6 +19818,7 @@ app.post("/api/delivery-notes/:id/receive", authenticate, requirePermission("edi
       if (receivedQty > docQty) hasOver = true;
       if (receivedQty <= 0) continue;
       totalReceivedQty += receivedQty;
+      const lineMeta = receiveMetaByItem.get(itemCode) || {};
       await upsertReceiptDraftLine(client, header.id, {
         lineNo: nextLineNo,
         originDnId: id,
@@ -15677,7 +19828,12 @@ app.post("/api/delivery-notes/:id/receive", authenticate, requirePermission("edi
         receivedQty,
         qcStatus: "ok",
         arrivalDate: documentDate || today,
-        notes: null,
+        kanbanId: lineMeta.kanbanId || null,
+        supplierLotNo: lineMeta.supplierLotNo || null,
+        notes: [
+          lineMeta.kanbanId ? `kanban:${lineMeta.kanbanId}` : "",
+          lineMeta.supplierLotNo ? `lot:${lineMeta.supplierLotNo}` : "",
+        ].filter(Boolean).join(" | ") || null,
         matchBasis: "delivery_note",
         overrideReason: receivedQty > docQty ? "dn_receive_over_receipt" : null,
       }, req.user);
@@ -15933,20 +20089,6 @@ app.post("/api/inbound/receipts/:id/reverse", authenticate, requireRole("admin")
     }
     await client.query("begin");
     const result = await reverseReceipt(client, id, req.user, req.body || {});
-    if (String(result?.header?.source || "").trim().toUpperCase() === "ACTUAL_DRIVEN") {
-      const itemCodes = [...new Set(
-        (Array.isArray(result?.reversedLines) ? result.reversedLines : [])
-          .map((line) => normalizeItemCode(line?.item_code))
-          .filter(Boolean),
-      )];
-      for (const rebuildItemCode of itemCodes) {
-        await rebuildActualDrivenScheduleAllocations(client, {
-          poNumber: result?.header?.po_number,
-          itemCode: rebuildItemCode,
-          referenceDate: result?.header?.document_date || result?.header?.created_at || null,
-        });
-      }
-    }
     await client.query("commit");
     clearScheduleCache();
     void recordActivityNotification(pool, {
@@ -16083,7 +20225,7 @@ app.get("/api/receive-notes", authenticate, async (req, res) => {
           rn.received_qty,
           rn.qc_status,
           rn.status,
-          rn.received_at,
+          coalesce(s.arrival_date::timestamptz, rn.received_at) as received_at,
           rn.notes,
           rn.source,
           null::text as truck_no,
@@ -16119,7 +20261,7 @@ app.get("/api/receive-notes", authenticate, async (req, res) => {
           rni.received_qty,
           coalesce(rni.qc_status, 'ok') as qc_status,
           case when rni.line_status = 'posted' then 'open' else rni.line_status end as status,
-          coalesce(rnh.posted_at, rnh.created_at) as received_at,
+          coalesce(rni.arrival_date::timestamptz, rnh.document_date::timestamptz, rnh.posted_at, rnh.created_at) as received_at,
           coalesce(rni.notes, rnh.remarks) as notes,
           coalesce(rnh.source, 'DN_MERGE') as source,
           rnh.truck_no,
@@ -16153,6 +20295,755 @@ app.get("/api/receive-notes", authenticate, async (req, res) => {
   }
 });
 
+app.get("/api/quality/queue", authenticate, requirePermission("quality"), async (req, res) => {
+  try {
+    const [incomingResult, productionResult, caseResult] = await Promise.all([
+      pool.query(
+        `
+        select *
+        from (
+        select
+          qc.id as case_id,
+          qc.case_number,
+          qc.status as case_status,
+          qc.disposition,
+          qc.disposition_notes,
+          'incoming_rn'::text as source_type,
+          rnh.id as source_id,
+          rni.id as source_line_id,
+          rnh.rn_number as source_doc,
+          rni.item_code,
+          coalesce(i.name, rni.item_name) as item_name,
+          rni.part_no,
+          rnh.supplier,
+          null::text as customer,
+          rni.production_date,
+          rni.received_qty::numeric as qty,
+          case when lower(coalesce(rni.qc_status, 'ok')) = 'ok' then rni.received_qty else 0 end::numeric as qty_ok,
+          case when lower(coalesce(rni.qc_status, 'ok')) = 'ok' then 0 else rni.received_qty end::numeric as qty_ng,
+          coalesce(qc.defect_category, upper(rni.qc_status)) as defect_category,
+          coalesce(qc.defect_description, rni.notes) as defect_description,
+          coalesce(qc.severity, case when lower(rni.qc_status) = 'reject' then 'major' else 'minor' end) as severity,
+          rni.qc_status,
+          (
+            rnh.reversal_of is not null
+            or rni.reversal_of_item_id is not null
+            or lower(coalesce(rni.exception_code, '')) = 'receipt_reversal'
+            or upper(coalesce(rnh.source, '')) = 'REVERSAL'
+            or lower(coalesce(rnh.status, '')) = 'reversed'
+            or lower(coalesce(rni.line_status, '')) = 'reversed'
+          ) as correction_review,
+          rnh.status as rn_status,
+          rni.line_status,
+          rnh.reversal_of,
+          rni.reversal_of_item_id,
+          coalesce(rni.arrival_date::timestamptz, rnh.document_date::timestamptz, rnh.posted_at, rnh.created_at) as event_at
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        left join items i on i.code = rni.item_code
+        left join quality_cases qc
+          on qc.source_type = 'incoming_rn'
+         and coalesce(qc.source_id, 0) = rnh.id
+         and coalesce(qc.source_line_id, 0) = rni.id
+        where rni.line_status = 'posted'
+          and coalesce(rni.posted_qty, 0) < coalesce(rni.received_qty, 0)
+          and coalesce(qc.status, 'open') <> 'closed'
+        union all
+        select
+          qc.id as case_id,
+          qc.case_number,
+          qc.status as case_status,
+          qc.disposition,
+          qc.disposition_notes,
+          'incoming_rn'::text as source_type,
+          rn.id as source_id,
+          null::int as source_line_id,
+          rn.rn_number as source_doc,
+          coalesce(rn.item_code, s.item_code, s.item) as item_code,
+          i.name as item_name,
+          i.part_no,
+          coalesce(dn.supplier, s.supplier) as supplier,
+          null::text as customer,
+          null::date as production_date,
+          rn.received_qty::numeric as qty,
+          case when lower(coalesce(rn.qc_status, 'ok')) = 'ok' then rn.received_qty else 0 end::numeric as qty_ok,
+          case when lower(coalesce(rn.qc_status, 'ok')) = 'ok' then 0 else rn.received_qty end::numeric as qty_ng,
+          coalesce(qc.defect_category, upper(rn.qc_status)) as defect_category,
+          coalesce(qc.defect_description, rn.notes) as defect_description,
+          coalesce(qc.severity, case when lower(rn.qc_status) = 'reject' then 'major' else 'minor' end) as severity,
+          rn.qc_status,
+          (
+            lower(coalesce(rn.status, '')) in ('reversed','cancelled')
+            or upper(coalesce(rn.source, '')) = 'REVERSAL'
+          ) as correction_review,
+          rn.status as rn_status,
+          null::text as line_status,
+          null::int as reversal_of,
+          null::int as reversal_of_item_id,
+          coalesce(s.arrival_date::timestamptz, rn.received_at) as event_at
+        from receive_notes rn
+        left join schedules s on s.id = rn.schedule_id
+        left join delivery_notes dn on dn.id = rn.dn_id
+        left join items i on i.code = coalesce(rn.item_code, s.item_code, s.item)
+        left join quality_cases qc
+          on qc.source_type = 'incoming_rn'
+         and coalesce(qc.source_id, 0) = rn.id
+         and coalesce(qc.source_line_id, 0) = 0
+        where rn.status = 'open'
+          and coalesce(rn.received_qty, 0) > 0
+          and coalesce(qc.status, 'open') <> 'closed'
+          and not exists (
+            select 1
+            from stock_batches sb
+            where sb.schedule_id = rn.schedule_id
+              and sb.qty_in > 0
+          )
+        ) incoming_qc
+        order by event_at desc, source_id desc, coalesce(source_line_id, 0) desc
+        limit 300
+        `,
+      ),
+      pool.query(
+        `
+        select *
+        from (
+        select
+          qc.id as case_id,
+          qc.case_number,
+          qc.status as case_status,
+          qc.disposition,
+          qc.disposition_notes,
+          'production_ng'::text as source_type,
+          w.id as source_id,
+          null::int as source_line_id,
+          coalesce(nullif(w.document_no, ''), 'WIP-' || w.id::text) as source_doc,
+          w.item_code,
+          i.name as item_name,
+          i.part_no,
+          null::text as supplier,
+          null::text as customer,
+          w.production_date,
+          (coalesce(w.qty_good, 0) + coalesce(w.qty_reject, 0))::numeric as qty,
+          coalesce(w.qty_good, 0)::numeric as qty_ok,
+          coalesce(w.qty_reject, 0)::numeric as qty_ng,
+          coalesce(qc.defect_category, 'PRODUCTION_NG') as defect_category,
+          coalesce(qc.defect_description, concat('From ', w.from_location, ' to ', w.to_location)) as defect_description,
+          coalesce(qc.severity, 'major') as severity,
+          'reject'::text as qc_status,
+          w.created_at as event_at,
+          qc.batch_id,
+          qc.line_name,
+          qc.process_name,
+          qc.operator_name,
+          qc.shift_name,
+          qc.discovered_at,
+          qc.stock_hold_qty
+        from wip_stock_movements w
+        left join items i on i.code = w.item_code
+        left join quality_cases qc
+          on qc.source_type = 'production_ng'
+         and coalesce(qc.source_id, 0) = w.id
+         and coalesce(qc.source_line_id, 0) = 0
+        where coalesce(w.qty_reject, 0) > 0
+          and coalesce(qc.status, 'open') <> 'closed'
+        union all
+        select
+          qc.id as case_id,
+          qc.case_number,
+          qc.status as case_status,
+          qc.disposition,
+          qc.disposition_notes,
+          'material_line_ng'::text as source_type,
+          qc.id as source_id,
+          qc.batch_id as source_line_id,
+          coalesce(nullif(qc.source_doc, ''), sb.batch_no, qc.case_number) as source_doc,
+          qc.item_code,
+          coalesce(i.name, qc.item_name) as item_name,
+          coalesce(i.part_no, qc.part_no) as part_no,
+          qc.supplier,
+          qc.customer,
+          qc.production_date,
+          qc.qty::numeric as qty,
+          qc.qty_ok::numeric as qty_ok,
+          qc.qty_ng::numeric as qty_ng,
+          coalesce(qc.defect_category, 'MATERIAL_LINE_NG') as defect_category,
+          qc.defect_description,
+          coalesce(qc.severity, 'major') as severity,
+          'reject'::text as qc_status,
+          coalesce(qc.discovered_at, qc.created_at) as event_at,
+          qc.batch_id,
+          qc.line_name,
+          qc.process_name,
+          qc.operator_name,
+          qc.shift_name,
+          qc.discovered_at,
+          qc.stock_hold_qty
+        from quality_cases qc
+        left join items i on i.code = qc.item_code
+        left join stock_batches sb on sb.id = qc.batch_id
+        where qc.source_type = 'material_line_ng'
+          and coalesce(qc.status, 'open') <> 'closed'
+        ) production_qc
+        order by event_at desc, source_id desc
+        limit 300
+        `,
+      ),
+      pool.query(
+        `
+        select qc.*, uc.username as created_by_name, ud.username as decided_by_name
+        from quality_cases qc
+        left join users uc on uc.id = qc.created_by
+        left join users ud on ud.id = qc.decided_by
+        where ($1::text is null or qc.source_type = $1)
+          and ($2::text is null or qc.status = $2)
+          and not (
+            qc.source_type = 'incoming_rn'
+            and qc.status = 'closed'
+            and qc.disposition = 'ok'
+            and qc.disposition_notes = 'Passed receiving QC'
+          )
+        order by qc.updated_at desc, qc.created_at desc
+        limit 500
+        `,
+        [
+          req.query.sourceType ? normalizeQualitySourceType(req.query.sourceType) : null,
+          req.query.status ? String(req.query.status).trim().toLowerCase() : null,
+        ],
+      ),
+    ]);
+
+    const mapQueueRow = (row) => ({
+      caseId: row.case_id || null,
+      caseNumber: row.case_number || null,
+      caseStatus: row.case_status || "open",
+      disposition: row.disposition || null,
+      dispositionNotes: row.disposition_notes || null,
+      sourceType: row.source_type,
+      sourceId: row.source_id,
+      sourceLineId: row.source_line_id,
+      sourceDoc: row.source_doc,
+      itemCode: row.item_code,
+      itemName: row.item_name,
+      partNo: row.part_no,
+      supplier: row.supplier,
+      customer: row.customer,
+      productionDate: row.production_date,
+      qty: Number(row.qty || 0),
+      qtyOk: Number(row.qty_ok || 0),
+      qtyNg: Number(row.qty_ng || 0),
+      defectCategory: row.defect_category,
+      defectDescription: row.defect_description,
+      severity: row.severity || "minor",
+      qcStatus: row.qc_status,
+      correctionReview: Boolean(row.correction_review),
+      rnStatus: row.rn_status || null,
+      lineStatus: row.line_status || null,
+      reversalOf: row.reversal_of || null,
+      reversalOfItemId: row.reversal_of_item_id || null,
+      eventAt: row.event_at,
+      batchId: row.batch_id || null,
+      lineName: row.line_name || null,
+      processName: row.process_name || null,
+      operatorName: row.operator_name || null,
+      shiftName: row.shift_name || null,
+      discoveredAt: row.discovered_at || null,
+      stockHoldQty: Number(row.stock_hold_qty || 0),
+    });
+
+    res.json({
+      incoming: incomingResult.rows.map(mapQueueRow),
+      production: productionResult.rows.map(mapQueueRow),
+      cases: caseResult.rows.map(mapQualityCaseRow),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/quality/millsheets", authenticate, requirePermission("quality"), async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const status = String(req.query.status || "").trim().toLowerCase();
+    const values = [];
+    const filters = [];
+    if (q) {
+      values.push(`%${q}%`);
+      filters.push(`(
+        lower(coalesce(m.dn_number, '')) like $${values.length}
+        or lower(coalesce(m.rn_number, '')) like $${values.length}
+        or lower(coalesce(m.item_code, '')) like $${values.length}
+        or lower(coalesce(m.supplier_id, '')) like $${values.length}
+        or lower(coalesce(m.certificate_no, '')) like $${values.length}
+        or lower(coalesce(m.lot_supplier, '')) like $${values.length}
+      )`);
+    }
+    if (["uploaded_waiting_qc", "qc_approved", "qc_rejected"].includes(status)) {
+      values.push(status);
+      filters.push(`m.status = $${values.length}`);
+    }
+    const whereSql = filters.length ? `where ${filters.join(" and ")}` : "";
+    const documents = await pool.query(
+      `
+      select
+        m.*,
+        coalesce(dn.millsheet_due_at, rnh.millsheet_due_at) as due_at,
+        mv.name as supplier_name,
+        i.name as item_name,
+        uu.username as uploaded_by_name,
+        ur.username as reviewed_by_name
+      from millsheet_documents m
+      left join delivery_notes dn on dn.id = m.dn_id
+      left join receive_note_headers rnh on rnh.id = m.rn_id
+      left join master_vendors mv on mv.id = m.supplier_id
+      left join items i on i.code = m.item_code
+      left join users uu on uu.id = m.uploaded_by
+      left join users ur on ur.id = m.reviewed_by
+      ${whereSql}
+      order by
+        case when m.status = 'uploaded_waiting_qc' then 0 when m.status = 'qc_rejected' then 1 else 2 end,
+        m.uploaded_at desc,
+        m.id desc
+      limit 500
+      `,
+      values,
+    );
+    const pending = await pool.query(
+      `
+      select
+        h.id,
+        h.rn_number,
+        h.supplier,
+        h.do_number,
+        h.document_date,
+        h.millsheet_question,
+        h.millsheet_status,
+        h.millsheet_due_at,
+        h.millsheet_notes,
+        array_remove(array_agg(distinct dn.dn_number), null) as dn_numbers,
+        count(distinct m.id)::int as document_count
+      from receive_note_headers h
+      left join receive_note_items rni on rni.rn_id = h.id
+      left join delivery_notes dn on dn.id = rni.origin_dn_id
+      left join millsheet_documents m on m.rn_id = h.id or m.dn_id = dn.id
+      where h.millsheet_required
+        and h.status = 'posted'
+        and h.reversal_of is null
+        and (
+          coalesce(h.millsheet_status, 'required_pending') in ('required_pending','uploaded_waiting_qc','overdue','qc_rejected')
+          or (
+            h.millsheet_due_at is not null
+            and h.millsheet_due_at < now()
+            and coalesce(h.millsheet_status, 'required_pending') = 'required_pending'
+          )
+        )
+      group by h.id
+      order by h.millsheet_due_at asc nulls last, h.created_at desc
+      limit 500
+      `,
+    );
+    res.json({
+      documents: documents.rows.map(mapMillsheetDocumentRow),
+      pendingReceipts: pending.rows.map((row) => ({
+        id: row.id,
+        rnNumber: row.rn_number,
+        supplier: row.supplier,
+        doNumber: row.do_number,
+        documentDate: row.document_date,
+        millsheetQuestion: row.millsheet_question,
+        millsheetStatus: getEffectiveMillsheetStatus(row.millsheet_status, row.millsheet_due_at),
+        millsheetDueAt: row.millsheet_due_at,
+        millsheetNotes: row.millsheet_notes,
+        dnNumbers: row.dn_numbers || [],
+        documentCount: Number(row.document_count || 0),
+      })),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/quality/millsheets/:id/review", authenticate, requirePermission("quality"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = parsePositiveId(req.params.id);
+    const status = normalizeMillsheetDocumentStatus(req.body?.status);
+    const notes = String(req.body?.notes || req.body?.qcNotes || req.body?.qc_notes || "").trim();
+    if (!id) {
+      res.status(400).json({ error: "id tidak valid." });
+      return;
+    }
+    if (!["qc_approved", "qc_rejected"].includes(status)) {
+      res.status(400).json({ error: "Status review harus approve atau reject." });
+      return;
+    }
+    await client.query("begin");
+    const currentResult = await client.query(
+      "select * from millsheet_documents where id = $1 for update",
+      [id],
+    );
+    const current = currentResult.rows[0];
+    if (!current) {
+      await client.query("rollback");
+      res.status(404).json({ error: "Mill Sheet tidak ditemukan." });
+      return;
+    }
+    const updateResult = await client.query(
+      `
+      update millsheet_documents
+      set
+        status = $1,
+        qc_notes = $2,
+        reviewed_by = $3,
+        reviewed_at = now(),
+        updated_at = now()
+      where id = $4
+      returning *
+      `,
+      [status, notes || null, req.user?.id || null, id],
+    );
+    if (current.dn_id) {
+      await refreshMillsheetStatusForDn(client, current.dn_id);
+      const relatedRnIds = await client.query(
+        `
+        select distinct rn_id
+        from receive_note_items
+        where origin_dn_id = $1
+          and rn_id is not null
+        `,
+        [current.dn_id],
+      );
+      for (const row of relatedRnIds.rows || []) {
+        await refreshMillsheetStatusForReceipt(client, row.rn_id);
+      }
+    }
+    if (current.rn_id) await refreshMillsheetStatusForReceipt(client, current.rn_id);
+    await client.query("commit");
+    res.json(mapMillsheetDocumentRow(updateResult.rows[0]));
+  } catch (error) {
+    await client.query("rollback").catch(() => undefined);
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/quality/stock-batches", authenticate, requirePermission("quality"), async (req, res) => {
+  try {
+    const itemCode = normalizeItemCode(req.query.itemCode || req.query.item_code);
+    const search = String(req.query.q || "").trim().toLowerCase();
+    const values = [];
+    const filters = ["b.qty_in > b.qty_out"];
+    if (itemCode) {
+      values.push(itemCode);
+      filters.push(`b.item_code = $${values.length}`);
+    }
+    if (search) {
+      values.push(`%${search}%`);
+      filters.push(`(
+        lower(b.item_code) like $${values.length}
+        or lower(coalesce(b.batch_no, '')) like $${values.length}
+        or lower(coalesce(b.do_number, '')) like $${values.length}
+        or lower(coalesce(i.name, '')) like $${values.length}
+      )`);
+    }
+    const result = await pool.query(
+      `
+      select
+        b.id,
+        b.item_code,
+        i.name as item_name,
+        i.part_no,
+        b.batch_no,
+        b.do_number,
+        b.arrival_date,
+        b.production_date,
+        b.expired_date,
+        b.qty_in::numeric,
+        b.qty_out::numeric,
+        (b.qty_in - b.qty_out)::numeric as available_qty,
+        coalesce(ph.supplier_id, nullif(trim(s.supplier), ''), nullif(trim(i.vendor_id), ''), primary_supplier.vendor_id, nullif(trim(i.supplier_name), '')) as supplier_code,
+        coalesce(mv.name, nullif(trim(i.supplier_name), ''), ph.supplier_id, nullif(trim(s.supplier), ''), primary_supplier.vendor_id, nullif(trim(i.vendor_id), '')) as supplier_name
+      from stock_batches b
+      join items i on i.code = b.item_code
+      left join schedules s on s.id = b.schedule_id
+      left join po_headers ph on ph.po_number = s.po_number
+      left join lateral (
+        select vendor_id
+        from item_suppliers
+        where item_code = i.code
+        order by coalesce(share_percent, 0) desc, vendor_id asc
+        limit 1
+      ) primary_supplier on true
+      left join master_vendors mv on mv.id = coalesce(ph.supplier_id, nullif(trim(s.supplier), ''), nullif(trim(i.vendor_id), ''), primary_supplier.vendor_id)
+      where ${filters.join(" and ")}
+      order by b.arrival_date asc nulls last, b.id asc
+      limit 100
+      `,
+      values,
+    );
+    res.json(result.rows.map((row) => ({
+      id: row.id,
+      itemCode: row.item_code,
+      itemName: row.item_name,
+      partNo: row.part_no,
+      batchNo: row.batch_no,
+      doNumber: row.do_number,
+      arrivalDate: row.arrival_date,
+      productionDate: row.production_date,
+      expiredDate: row.expired_date,
+      qtyIn: Number(row.qty_in || 0),
+      qtyOut: Number(row.qty_out || 0),
+      availableQty: Number(row.available_qty || 0),
+      supplierCode: row.supplier_code || "",
+      supplierName: row.supplier_name || "",
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/quality/cases", authenticate, requirePermission("quality"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const payload = req.body || {};
+    const sourceType = normalizeQualitySourceType(payload.sourceType || payload.source_type);
+    const itemCode = normalizeItemCode(payload.itemCode || payload.item_code);
+    const qtyValue = Number(payload.qty || payload.qtyNg || payload.qty_ng || 0);
+    if (!itemCode || !(qtyValue > 0)) {
+      res.status(400).json({ error: "itemCode dan qty wajib diisi." });
+      return;
+    }
+    const itemResult = await client.query("select code, name, part_no from items where code = $1", [itemCode]);
+    const item = itemResult.rows[0] || null;
+    if (!item) {
+      res.status(400).json({ error: "Item harus ada di Master Item." });
+      return;
+    }
+    await client.query("begin");
+    let batchRow = null;
+    if (sourceType === "material_line_ng") {
+      const batchId = Number(payload.batchId || payload.batch_id);
+      if (!Number.isFinite(batchId) || batchId <= 0) {
+        res.status(400).json({ error: "Material NG Line wajib memilih batch FIFO/RN." });
+        await client.query("rollback");
+        return;
+      }
+      batchRow = await loadQualityStockBatch(client, batchId, itemCode, true);
+      if (!batchRow) {
+        res.status(404).json({ error: "Batch FIFO/RN tidak ditemukan untuk item ini." });
+        await client.query("rollback");
+        return;
+      }
+      const availableQty = Number(batchRow.available_qty || 0);
+      if (qtyValue > availableQty) {
+        res.status(409).json({ error: `Qty NG melebihi stok batch. Available ${availableQty}.` });
+        await client.query("rollback");
+        return;
+      }
+    }
+    const qualityCase = await ensureQualityCase(client, {
+      ...payload,
+      sourceType,
+      batchId: batchRow?.id || payload.batchId || payload.batch_id || null,
+      itemCode,
+      itemName: payload.itemName || payload.item_name || item.name,
+      partNo: payload.partNo || payload.part_no || item.part_no,
+      qty: qtyValue,
+      qtyNg: payload.qtyNg ?? payload.qty_ng ?? qtyValue,
+      supplier: payload.supplier || payload.supplier_code || batchRow?.supplier_code || null,
+      sourceDoc: payload.sourceDoc || payload.source_doc || batchRow?.do_number || batchRow?.batch_no || null,
+      stockHoldQty: 0,
+    }, req.user);
+    let finalCase = qualityCase;
+    let stockAction = null;
+    if (sourceType === "material_line_ng") {
+      stockAction = await holdMaterialLineNgStock(client, qualityCase, req.user, payload.notes || payload.defectDescription || payload.defect_description || "");
+      finalCase = stockAction?.caseRow || qualityCase;
+    }
+    await client.query("commit");
+    res.status(201).json({ case: mapQualityCaseRow(finalCase), stockAction });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/quality/disposition", authenticate, requirePermission("quality"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const payload = req.body || {};
+    const disposition = normalizeQualityDisposition(payload.disposition);
+    if (!disposition) {
+      res.status(400).json({ error: "Disposition QC tidak valid." });
+      return;
+    }
+
+    await client.query("begin");
+    let qualityCase = null;
+    const caseId = Number(payload.caseId || payload.case_id);
+    if (Number.isFinite(caseId) && caseId > 0) {
+      const caseResult = await client.query("select * from quality_cases where id = $1 for update", [caseId]);
+      qualityCase = caseResult.rows[0] || null;
+      if (!qualityCase) {
+        res.status(404).json({ error: "Kasus QC tidak ditemukan." });
+        await client.query("rollback");
+        return;
+      }
+    } else {
+      qualityCase = await ensureQualityCase(client, payload, req.user);
+    }
+
+    if (String(qualityCase.status || "").toLowerCase() === "closed") {
+      res.status(409).json({ error: "Kasus QC sudah closed." });
+      await client.query("rollback");
+      return;
+    }
+
+    const dispositionQtyRaw = Number(payload.dispositionQty ?? payload.disposition_qty ?? qualityCase.qty_ng ?? qualityCase.qty ?? 0);
+    const dispositionQty = Number.isFinite(dispositionQtyRaw) && dispositionQtyRaw > 0 ? dispositionQtyRaw : Number(qualityCase.qty_ng || qualityCase.qty || 0);
+    const notes = String(payload.notes || payload.dispositionNotes || payload.disposition_notes || "").trim();
+    const defectCategory = String(payload.defectCategory || payload.defect_category || qualityCase.defect_category || "").trim() || null;
+    const defectDescription = String(payload.defectDescription || payload.defect_description || qualityCase.defect_description || "").trim() || null;
+    const nextStatus = ["hold", "sortir"].includes(disposition) ? "inspecting" : "closed";
+    const sourceType = normalizeQualitySourceType(qualityCase.source_type);
+    let stockAction = null;
+    const correctionReviewSource = sourceType === "incoming_rn"
+      ? await isIncomingReceiptCorrectionSource(client, qualityCase, true)
+      : false;
+
+    if (correctionReviewSource && disposition !== "correction_review") {
+      res.status(409).json({
+        error: "RN batal/koreksi tidak boleh diproses Release/Hold/Reject/Return. Gunakan Close Review QC.",
+      });
+      await client.query("rollback");
+      return;
+    }
+    if (!correctionReviewSource && disposition === "correction_review") {
+      res.status(409).json({ error: "Close Review hanya untuk RN batal/reversal/koreksi." });
+      await client.query("rollback");
+      return;
+    }
+
+    if (sourceType === "incoming_rn" && correctionReviewSource) {
+      stockAction = { reviewed: true, reason: "receipt_correction_review" };
+    } else if (sourceType === "incoming_rn" && qualityCase.source_line_id) {
+      if (disposition === "ok" || disposition === "use_as_is") {
+        stockAction = await releaseIncomingReceiptLineToStock(client, qualityCase.source_line_id, req.user, notes);
+      } else if (disposition === "hold") {
+        await updateIncomingReceiptLineQcStatus(client, qualityCase.source_line_id, "hold", notes);
+      } else {
+        await updateIncomingReceiptLineQcStatus(client, qualityCase.source_line_id, "reject", notes);
+      }
+    } else if (sourceType === "incoming_rn" && qualityCase.source_id) {
+      if (disposition === "ok" || disposition === "use_as_is") {
+        stockAction = await releaseLegacyReceiveNoteToStock(client, qualityCase.source_id, req.user, notes);
+      } else {
+        const nextQcStatus = disposition === "hold" ? "hold" : "reject";
+        await client.query(
+          "update receive_notes set qc_status = $1, notes = coalesce(nullif($2, ''), notes) where id = $3",
+          [nextQcStatus, notes || null, qualityCase.source_id],
+        );
+      }
+    }
+
+    if (sourceType === "material_line_ng") {
+      if (disposition === "ok" || disposition === "use_as_is") {
+        stockAction = await restoreMaterialLineNgStock(client, qualityCase, req.user, notes);
+      } else if (Number(qualityCase.stock_hold_qty || 0) <= 0) {
+        stockAction = await holdMaterialLineNgStock(client, qualityCase, req.user, notes);
+        qualityCase = stockAction?.caseRow || qualityCase;
+      } else {
+        stockAction = { held: false, reason: "already_held", batchId: qualityCase.batch_id, qty: Number(qualityCase.stock_hold_qty || 0) };
+      }
+    }
+
+    if (sourceType === "delivery_return" && (disposition === "ok" || disposition === "use_as_is")) {
+      const itemCode = normalizeItemCode(qualityCase.item_code);
+      if (!itemCode || !(dispositionQty > 0)) {
+        res.status(400).json({ error: "Return delivery butuh itemCode dan qty valid untuk restock." });
+        await client.query("rollback");
+        return;
+      }
+      const batchNo = `${qualityCase.source_doc || qualityCase.case_number}-QC`;
+      const batchResult = await client.query(
+        `
+        insert into stock_batches (item_code, qty_in, qty_out, arrival_date, do_number, batch_no, schedule_id)
+        values ($1, $2, 0, $3, $4, $5, null)
+        returning id
+        `,
+        [itemCode, dispositionQty, getTodayDateOnly(), qualityCase.source_doc || qualityCase.case_number, batchNo],
+      );
+      const batchId = batchResult.rows[0]?.id || null;
+      await logStockMovement(client, {
+        itemCode,
+        batchId,
+        qty: dispositionQty,
+        direction: "in",
+        reason: "delivery_return_qc_release",
+        sourceRefType: "quality_case",
+        sourceRefId: qualityCase.id,
+      });
+      await client.query("update items set qty_on_hand = qty_on_hand + $1 where code = $2", [dispositionQty, itemCode]);
+      await insertInventoryLedger(client, {
+        itemCode,
+        transactionType: "RETURN",
+        referenceDoc: qualityCase.source_doc || qualityCase.case_number,
+        qtyIn: dispositionQty,
+        qtyOut: 0,
+        userId: req.user?.id || null,
+        remarks: notes || "delivery_return_qc_release",
+        batchId,
+        sourceRefType: "quality_case",
+        sourceRefId: qualityCase.id,
+      });
+      stockAction = { released: true, batchId };
+    }
+
+    const updatedResult = await client.query(
+      `
+      update quality_cases
+      set status = $1,
+          disposition = $2,
+          disposition_qty = $3,
+          disposition_notes = $4,
+          defect_category = coalesce($5, defect_category),
+          defect_description = coalesce($6, defect_description),
+          qty_ok = case when $2 in ('ok','use_as_is') then greatest(qty_ok, $3) else qty_ok end,
+          qty_ng = case when $2 in ('ok','use_as_is') then greatest(qty - $3, 0) else qty_ng end,
+          stock_hold_qty = case when $2 in ('ok','use_as_is') then 0 else stock_hold_qty end,
+          decided_at = case when $1 = 'closed' then now() else decided_at end,
+          decided_by = case when $1 = 'closed' then $7 else decided_by end,
+          updated_at = now()
+      where id = $8
+      returning *
+      `,
+      [
+        nextStatus,
+        disposition,
+        correctionReviewSource && disposition === "correction_review" ? 0 : dispositionQty,
+        notes || null,
+        defectCategory,
+        defectDescription,
+        req.user?.id || null,
+        qualityCase.id,
+      ],
+    );
+
+    await client.query("commit");
+    res.json({
+      case: mapQualityCaseRow(updatedResult.rows[0]),
+      stockAction,
+    });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/api/receive-notes/check-do", authenticate, requirePermission("editSchedules"), async (req, res) => {
   const client = await pool.connect();
   try {
@@ -16162,7 +21053,7 @@ app.post("/api/receive-notes/check-do", authenticate, requirePermission("editSch
       res.json({ status: "idle", duplicate: false, message: "" });
       return;
     }
-    const duplicateHeader = await findReceiptHeaderBySupplierDoNumber(client, {
+    const duplicateHeader = await findActiveReceiptHeaderBySupplierDoNumber(client, {
       supplier,
       doNumber,
     });
@@ -16237,10 +21128,12 @@ app.post("/api/receive-notes/actual", authenticate, requirePermission("editSched
         res.status(400).json({ error: `Qty aktual tidak valid untuk ${itemCode || poLineId}.` });
         return;
       }
-      const groupKey = poLineId || itemCode;
+      const scheduleId = parsePositiveId(row.scheduleId ?? row.schedule_id);
+      const groupKey = scheduleId ? `schedule:${scheduleId}` : (poLineId || itemCode);
       const current = groupedItems.get(groupKey) || {
         groupKey,
         poLineId: poLineId || null,
+        scheduleId,
         itemCode: itemCode || null,
         qty: 0,
         itemName: String(row.itemName || row.item_name || "").trim() || null,
@@ -16251,6 +21144,9 @@ app.post("/api/receive-notes/actual", authenticate, requirePermission("editSched
       current.qty += qtyValue;
       if (!current.poLineId && poLineId) {
         current.poLineId = poLineId;
+      }
+      if (!current.scheduleId && scheduleId) {
+        current.scheduleId = scheduleId;
       }
       if (!current.itemName && String(row.itemName || row.item_name || "").trim()) {
         current.itemName = String(row.itemName || row.item_name || "").trim();
@@ -16266,10 +21162,11 @@ app.post("/api/receive-notes/actual", authenticate, requirePermission("editSched
 
     await client.query("begin");
 
-    const duplicateHeader = await findReceiptHeaderBySupplierDoNumber(client, {
+    const duplicateHeader = await findActiveReceiptHeaderBySupplierDoNumber(client, {
       supplier,
       doNumber,
       forUpdate: true,
+      ignoreEmpty: true,
     });
     if (duplicateHeader) {
       await client.query("rollback");
@@ -16311,6 +21208,7 @@ app.post("/api/receive-notes/actual", authenticate, requirePermission("editSched
         supplier,
         poNumber,
         poLineId: item.poLineId,
+        scheduleId: item.scheduleId,
         itemCode: item.itemCode,
         qty: item.qty,
         arrivalDate,
@@ -17401,6 +22299,8 @@ app.post("/api/receive-notes/merge", authenticate, requirePermission("editSchedu
     const driverName = String(body.driverName || body.driver_name || "").trim();
     const providedDoNumber = normalizeDoNumber(body.doNumber || body.do_number);
     const documentDate = String(body.documentDate || body.document_date || body.arrivalDate || body.arrival_date || "").trim();
+    const millsheetQuestion = normalizeMillsheetQuestion(body.millsheetQuestion ?? body.millsheet_question);
+    const millsheetNotes = String(body.millsheetNotes || body.millsheet_notes || "").trim();
     const allowOverReceive = Boolean(body.allowOverReceive) && req.user?.role === "admin";
 
     if (!supplier) {
@@ -17415,6 +22315,10 @@ app.post("/api/receive-notes/merge", authenticate, requirePermission("editSchedu
       res.status(400).json({ error: "truck_no wajib diisi" });
       return;
     }
+    if (!providedDoNumber) {
+      res.status(400).json({ error: "Nomor SJ / DO wajib diisi sebelum confirm receiving." });
+      return;
+    }
 
     await client.query("begin");
     const dnResult = await client.query(
@@ -17427,7 +22331,7 @@ app.post("/api/receive-notes/merge", authenticate, requirePermission("editSchedu
       return;
     }
     const vendorResult = await client.query(
-      "select id, name from master_vendors where id = $1 or name = $1 limit 1",
+      "select id, name from master_vendors where id::text = $1::text or name::text = $1::text limit 1",
       [supplier],
     );
     const supplierMatch = new Set([supplier]);
@@ -17460,33 +22364,78 @@ app.post("/api/receive-notes/merge", authenticate, requirePermission("editSchedu
       res.status(409).json({ error: "Item DN tidak ditemukan." });
       return;
     }
-    const validKeys = new Set(dnItems.map((row) => `${row.dn_id}:${row.item_code}`));
-    const receivedMap = new Map();
-    itemsPayload.forEach((row) => {
-      const dnId = Number(row.originDnId || row.origin_dn_id || row.dnId || row.dn_id);
-      const itemCode = String(row.itemCode || row.item_code || "").trim();
-      if (!Number.isFinite(dnId) || !itemCode) return;
-      receivedMap.set(`${dnId}:${itemCode}`, Number(row.receivedQty || row.received_qty || 0));
+    const dnItemById = new Map(dnItems.map((row) => [Number(row.id), row]));
+    const dnItemsByLegacyKey = new Map();
+    dnItems.forEach((row) => {
+      const key = `${row.dn_id}:${row.item_code}`;
+      const list = dnItemsByLegacyKey.get(key) || [];
+      list.push(row);
+      dnItemsByLegacyKey.set(key, list);
     });
-    for (const key of receivedMap.keys()) {
-      if (!validKeys.has(key)) {
+    const receivedMap = new Map();
+    const receiveMetaMap = new Map();
+    const setReceiveLineMeta = (dnItemId, meta = {}) => {
+      const idValue = Number(dnItemId);
+      if (!Number.isFinite(idValue) || idValue <= 0) return;
+      const current = receiveMetaMap.get(idValue) || { kanbanId: "", supplierLotNo: "" };
+      const kanbanId = extractKanbanIdToken(meta.kanbanId || meta.kanban_id || meta.kanban || "");
+      const supplierLotNo = String(meta.supplierLotNo || meta.supplier_lot_no || meta.lotNo || meta.lot_no || meta.lot || meta.batchNo || meta.batch_no || "").trim();
+      receiveMetaMap.set(idValue, {
+        kanbanId: current.kanbanId || kanbanId,
+        supplierLotNo: current.supplierLotNo || supplierLotNo,
+      });
+    };
+    for (const row of itemsPayload) {
+      const dnId = Number(row.originDnId || row.origin_dn_id || row.dnId || row.dn_id);
+      const dnItemId = Number(row.originDnItemId || row.origin_dn_item_id || row.dnItemId || row.dn_item_id);
+      const itemCode = String(row.itemCode || row.item_code || "").trim();
+      if (!Number.isFinite(dnId) || !itemCode) continue;
+      let targetDnItem = null;
+      if (Number.isFinite(dnItemId) && dnItemId > 0) {
+        targetDnItem = dnItemById.get(dnItemId);
+        if (!targetDnItem || Number(targetDnItem.dn_id) !== dnId || String(targetDnItem.item_code || "").trim() !== itemCode) {
+          await client.query("rollback");
+          res.status(409).json({ error: `Baris DN ${dnItemId} / Item ${itemCode} tidak valid.` });
+          return;
+        }
+      } else {
+        const matches = dnItemsByLegacyKey.get(`${dnId}:${itemCode}`) || [];
+        if (matches.length !== 1) {
+          await client.query("rollback");
+          res.status(409).json({ error: `Item ${itemCode} muncul lebih dari satu baris di DN. Load ulang form receiving sebelum confirm.` });
+          return;
+        }
+        targetDnItem = matches[0];
+      }
+      if (!targetDnItem) {
         await client.query("rollback");
-        res.status(409).json({ error: `Item ${key} tidak ada di DN.` });
+        res.status(409).json({ error: `Item ${dnId}:${itemCode} tidak ada di DN.` });
         return;
       }
+      receivedMap.set(Number(targetDnItem.id), Number(row.receivedQty || row.received_qty || 0));
+      setReceiveLineMeta(targetDnItem.id, row);
+    }
+    for (const scan of scans) {
+      const qrValue = String(scan?.qrValue || scan?.qr_value || "").trim();
+      const parsedQr = parseDelimitedQrPayload(qrValue);
+      const itemCode = String(scan?.itemCode || scan?.item_code || parsedQr.item || parsedQr.item_code || "").trim();
+      const dnId = Number(scan?.originDnId || scan?.origin_dn_id || scan?.dnId || scan?.dn_id)
+        || Number(dnResult.rows.find((dn) => String(dn.dn_number || "").trim().toLowerCase() === String(scan?.dnNumber || scan?.dn_number || parsedQr.dn || parsedQr.dn_number || "").trim().toLowerCase())?.id);
+      const dnItemId = Number(scan?.originDnItemId || scan?.origin_dn_item_id || scan?.dnItemId || scan?.dn_item_id);
+      if (!itemCode || !Number.isFinite(dnId)) continue;
+      const targetDnItem = Number.isFinite(dnItemId) && dnItemId > 0
+        ? dnItemById.get(dnItemId)
+        : (dnItemsByLegacyKey.get(`${dnId}:${itemCode}`) || [])[0];
+      if (!targetDnItem || Number(targetDnItem.dn_id) !== dnId || String(targetDnItem.item_code || "").trim() !== itemCode) continue;
+      setReceiveLineMeta(targetDnItem.id, {
+        kanbanId: scan?.kanbanId || scan?.kanban_id || parsedQr.kanban || parsedQr.kanban_id,
+        supplierLotNo: scan?.lotNo || scan?.lot_no || scan?.supplierLotNo || scan?.supplier_lot_no || parsedQr.lot || parsedQr.lot_no || parsedQr.batch || parsedQr.batch_no,
+      });
     }
 
     const headerSupplier = dnResult.rows[0]?.supplier || supplier || "SUPPLIER";
     const today = new Date().toISOString().slice(0, 10);
-    const fallbackDoNumber = (() => {
-      const dnNumbers = dnResult.rows
-        .map((row) => String(row.dn_number || "").trim())
-        .filter(Boolean);
-      if (dnNumbers.length === 0) return `MERGE:${ids.join("+")}`;
-      const merged = dnNumbers.join("+");
-      return merged.length > 120 ? `MERGE:${ids.join("+")}` : merged;
-    })();
-    const effectiveDoNumber = providedDoNumber || fallbackDoNumber;
+    const effectiveDoNumber = providedDoNumber;
     const header = await createReceiptDraft(client, {
       supplier: headerSupplier,
       doNumber: effectiveDoNumber,
@@ -17496,6 +22445,21 @@ app.post("/api/receive-notes/merge", authenticate, requirePermission("editSchedu
       driverName: driverName || null,
       source: "LEGACY_DN_MERGE",
     }, req.user);
+    const millsheetStatus = resolveMillsheetReceiptStatus(millsheetQuestion);
+    const millsheetDueAt = getMillsheetDueAt();
+    await client.query(
+      `
+      update receive_note_headers
+      set
+        millsheet_required = true,
+        millsheet_question = $1,
+        millsheet_status = $2,
+        millsheet_due_at = $3,
+        millsheet_notes = $4
+      where id = $5
+      `,
+      [millsheetQuestion, millsheetStatus, millsheetDueAt, millsheetNotes || null, header.id],
+    );
     let nextLineNo = Number(
       (
         await client.query(
@@ -17506,7 +22470,7 @@ app.post("/api/receive-notes/merge", authenticate, requirePermission("editSchedu
     );
     let totalReceivedQty = 0;
     for (const row of dnItems) {
-      const key = `${row.dn_id}:${row.item_code}`;
+      const key = Number(row.id);
       const receivedValue = Number.isFinite(receivedMap.get(key)) ? receivedMap.get(key) : 0;
       if (!Number.isFinite(receivedValue) || receivedValue < 0) {
         await client.query("rollback");
@@ -17514,12 +22478,14 @@ app.post("/api/receive-notes/merge", authenticate, requirePermission("editSchedu
         return;
       }
       const receivedQty = receivedValue;
+      const lineMeta = receiveMetaMap.get(Number(row.id)) || {};
       const docQty = Number(row.request_qty || 0);
       if (!(receivedQty > 0)) continue;
       totalReceivedQty += receivedQty;
       await upsertReceiptDraftLine(client, header.id, {
         lineNo: nextLineNo,
         originDnId: row.dn_id,
+        originDnItemId: row.id,
         itemCode: row.item_code,
         itemName: row.item_name || null,
         partNo: row.part_no || null,
@@ -17530,7 +22496,13 @@ app.post("/api/receive-notes/merge", authenticate, requirePermission("editSchedu
         dropZone: row.drop_zone || null,
         qcStatus: "ok",
         arrivalDate: documentDate || today,
-        notes: remarks || null,
+        kanbanId: lineMeta.kanbanId || null,
+        supplierLotNo: lineMeta.supplierLotNo || null,
+        notes: [
+          remarks || "",
+          lineMeta.kanbanId ? `kanban:${lineMeta.kanbanId}` : "",
+          lineMeta.supplierLotNo ? `lot:${lineMeta.supplierLotNo}` : "",
+        ].filter(Boolean).join(" | ") || null,
         matchBasis: "delivery_note",
         overrideReason: receivedQty > docQty ? "legacy_dn_merge_over_receipt" : null,
       }, req.user);
@@ -17543,7 +22515,7 @@ app.post("/api/receive-notes/merge", authenticate, requirePermission("editSchedu
     }
     const postResult = await postReceiptDraft(client, header.id, req.user, {
       allowOverReceive,
-      allowPartial: false,
+      allowPartial: true,
     });
 
     if (scans.length > 0) {
@@ -17553,9 +22525,13 @@ app.post("/api/receive-notes/merge", authenticate, requirePermission("editSchedu
         const itemCode = String(scan?.itemCode || scan?.item_code || "").trim();
         const dnId = Number(scan?.originDnId || scan?.origin_dn_id || scan?.dnId || scan?.dn_id)
           || dnNumberMap.get(String(scan?.dnNumber || scan?.dn_number || "").trim());
+        const dnItemId = Number(scan?.originDnItemId || scan?.origin_dn_item_id || scan?.dnItemId || scan?.dn_item_id);
         const qtyValue = Number(scan?.qty || 0);
         if (!qrValue || !itemCode || !Number.isFinite(dnId)) continue;
-        if (!validKeys.has(`${dnId}:${itemCode}`)) continue;
+        const scanDnItem = Number.isFinite(dnItemId) && dnItemId > 0
+          ? dnItemById.get(dnItemId)
+          : (dnItemsByLegacyKey.get(`${dnId}:${itemCode}`) || [])[0];
+        if (!scanDnItem || Number(scanDnItem.dn_id) !== dnId || String(scanDnItem.item_code || "").trim() !== itemCode) continue;
         await client.query(
           `
           insert into dn_receive_scans (dn_id, item_code, qr_value, qty, scanned_by)
@@ -17569,9 +22545,27 @@ app.post("/api/receive-notes/merge", authenticate, requirePermission("editSchedu
 
     for (const dn of dnResult.rows) {
       await recomputeDeliveryNoteStatus(client, dn.id);
+      await refreshMillsheetStatusForDn(client, dn.id);
     }
 
     await client.query("commit");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Kanban",
+      severity: "success",
+      title: `RN ${header.rn_number} berhasil dibuat.`,
+      detail: `Receiving ${effectiveDoNumber} tersimpan untuk DN ${dnResult.rows.map((dn) => dn.dn_number).filter(Boolean).join(", ") || ids.join(", ")}.`,
+      entityType: "receive_note_header",
+      entityId: String(header.id),
+      payload: {
+        rnId: header.id,
+        rnNumber: header.rn_number,
+        doNumber: effectiveDoNumber,
+        dnIds: ids,
+        dnNumbers: dnResult.rows.map((dn) => dn.dn_number).filter(Boolean),
+        totalReceivedQty,
+      },
+    }).catch((error) => console.warn("Kanban notification failed:", error.message));
     res.json({
       ok: true,
       rnNumber: header.rn_number,
@@ -17649,7 +22643,7 @@ app.delete("/api/receive-note-headers/:id", authenticate, requireRole("admin"), 
           return;
         }
         if (nextQtyIn <= 0) {
-          await client.query("delete from stock_batches where id = $1", [batch.id]);
+          await client.query("update stock_batches set qty_in = 0 where id = $1", [batch.id]);
         } else {
           await client.query("update stock_batches set qty_in = $1 where id = $2", [nextQtyIn, batch.id]);
         }
@@ -17789,7 +22783,7 @@ app.delete("/api/receive-notes/:id", authenticate, requireRole("admin"), async (
         return;
       }
       if (nextQtyIn <= 0) {
-        await client.query("delete from stock_batches where id = $1", [batchRow.id]);
+        await client.query("update stock_batches set qty_in = 0 where id = $1", [batchRow.id]);
       } else {
         await client.query("update stock_batches set qty_in = $1 where id = $2", [nextQtyIn, batchRow.id]);
       }
@@ -17893,10 +22887,11 @@ app.post("/api/schedules/reminder-email", authenticate, requirePermission("editS
       return;
     }
     const vendorResult = await client.query(
-      "select email from master_vendors where id = $1 or name = $1 limit 1",
+      "select email from master_vendors where id::text = $1::text or name::text = $1::text limit 1",
       [supplier],
     );
-    const toEmail = String(vendorResult.rows[0]?.email || "").trim();
+    const toEmails = parseEmailRecipients(vendorResult.rows[0]?.email);
+    const recipientLabel = formatEmailRecipients(toEmails);
     const subject = `[URGENT] Inbound Schedule Reminder - ${supplier} - ${formatDateId(requestDate)}`;
     const rowsHtml = schedulesResult.rows.map((row) => {
       const planQty = Number(row.request_qty || 0);
@@ -17945,20 +22940,20 @@ app.post("/api/schedules/reminder-email", authenticate, requirePermission("editS
       <p>Terima kasih,<br><strong>Procurement Team</strong></p>
     `;
 
-    if (!toEmail) {
+    if (toEmails.length === 0) {
       res.json({
         sent: false,
         to: null,
         subject,
         html,
-        notice: "Email supplier belum diisi di Master Vendor. Reminder ditampilkan sebagai preview, belum bisa dikirim otomatis.",
+        notice: "Email penerima dokumen supplier belum diisi di Master Vendor. Reminder ditampilkan sebagai preview, belum bisa dikirim otomatis.",
       });
       return;
     }
 
     const smtpHost = String(process.env.SMTP_HOST || "").trim();
     if (!smtpHost) {
-      res.json({ sent: false, to: toEmail, subject, html, notice: "SMTP belum dikonfigurasi." });
+      res.json({ sent: false, to: recipientLabel, subject, html, notice: getSmtpMissingConfigMessage() });
       return;
     }
     let nodemailer;
@@ -17981,11 +22976,11 @@ app.post("/api/schedules/reminder-email", authenticate, requirePermission("editS
     });
     await transporter.sendMail({
       from: fromAddress,
-      to: toEmail,
+      to: toEmails,
       subject,
       html,
     });
-    res.json({ sent: true, to: toEmail, subject });
+    res.json({ sent: true, to: recipientLabel, recipientCount: toEmails.length, subject });
   } catch (error) {
     res.status(500).json({ error: error.message });
   } finally {
@@ -18033,19 +23028,20 @@ app.post("/api/schedules/send-pdf-email", authenticate, requirePermission("editS
     }
 
     const vendorResult = await client.query(
-      "select email, name from master_vendors where id = $1 or name = $1 limit 1",
+      "select email, name from master_vendors where id::text = $1::text or name::text = $1::text limit 1",
       [supplier],
     );
-    const toEmail = String(vendorResult.rows[0]?.email || "").trim();
+    const toEmails = parseEmailRecipients(vendorResult.rows[0]?.email);
+    const recipientLabel = formatEmailRecipients(toEmails);
     const supplierLabel = String(vendorResult.rows[0]?.name || supplier).trim();
-    if (!toEmail) {
-      res.status(409).json({ error: "Email supplier belum diisi di Master Vendor." });
+    if (toEmails.length === 0) {
+      res.status(409).json({ error: "Email penerima dokumen supplier belum diisi di Master Vendor." });
       return;
     }
 
     const smtpHost = String(process.env.SMTP_HOST || "").trim();
     if (!smtpHost) {
-      res.status(409).json({ error: "SMTP belum dikonfigurasi." });
+      res.status(409).json({ error: getSmtpMissingConfigMessage() });
       return;
     }
 
@@ -18118,7 +23114,7 @@ app.post("/api/schedules/send-pdf-email", authenticate, requirePermission("editS
 
     await transporter.sendMail({
       from: fromAddress,
-      to: toEmail,
+      to: toEmails,
       subject,
       html,
       attachments: [
@@ -18130,7 +23126,7 @@ app.post("/api/schedules/send-pdf-email", authenticate, requirePermission("editS
       ],
     });
 
-    res.json({ sent: true, to: toEmail, subject, rows: schedulesResult.rows.length });
+    res.json({ sent: true, to: recipientLabel, recipientCount: toEmails.length, subject, rows: schedulesResult.rows.length });
   } catch (error) {
     res.status(500).json({ error: error.message });
   } finally {
@@ -18325,7 +23321,7 @@ app.post("/api/inbound-cards/scan", authenticate, requirePermission("editSchedul
     await assertArrivalDateAllowed(client, arrivalValue, req.user);
     const scheduleSupplier = schedule.supplier || "SUPPLIER";
     const effectiveDoNumber = normalizeDoNumber(doNumber || schedule.do_number || card.batch_no || card.card_uid || "") || `INB:${schedule.id}`;
-    const duplicateHeader = await findReceiptHeaderBySupplierDoNumber(client, {
+    const duplicateHeader = await findActiveReceiptHeaderBySupplierDoNumber(client, {
       supplier: scheduleSupplier,
       doNumber: effectiveDoNumber,
       forUpdate: true,
@@ -18648,7 +23644,7 @@ app.post("/api/kanban/requests/batch-dn", authenticate, requirePermission("editS
     }
     const supplierKeys = Array.from(supplierGroups.keys());
     const roleResult = await client.query(
-      "select id, name, role from master_vendors where id = any($1::text[]) or name = any($1::text[])",
+      "select id, name, role from master_vendors where id::text = any($1::text[]) or name::text = any($1::text[])",
       [supplierKeys],
     );
     const roleMap = new Map();
@@ -18757,7 +23753,8 @@ const handleKanbanEmptyScan = async (req, res) => {
   const client = await pool.connect();
   try {
     const body = req.body || {};
-    const rawKanbanId = body.kanbanId || body.kanban_uuid || body.kanban_id || null;
+    const rawKanbanId = extractKanbanIdToken(body.kanbanId || body.kanban_uuid || body.kanban_id || "");
+    const locationId = String(body.area || body.locationId || body.location_id || "").trim() || null;
     let itemCode = body.itemCode || "";
     if (!itemCode && rawKanbanId) {
       itemCode = await resolveKanbanItemCode(client, rawKanbanId);
@@ -18799,10 +23796,13 @@ const handleKanbanEmptyScan = async (req, res) => {
     if (isScan && rawKanbanId) {
       const dupResult = await client.query(
         `
-        select id from production_orders
+        select id
+        from inventory_ledgers
         where kanban_id = $1
-          and source = 'SCAN_APP'
-          and coalesce(scanned_at, created_at) >= (now() - interval '5 minutes')
+          and transaction_type = 'PRODUCTION'
+          and qty_out > 0
+          and remarks in ('kanban_scan', 'kanban_empty')
+          and date >= (now() - interval '5 minutes')
         limit 1
         `,
         [rawKanbanId],
@@ -18813,17 +23813,6 @@ const handleKanbanEmptyScan = async (req, res) => {
         return;
       }
     }
-
-    let consumed = [];
-    let warnings = [];
-    try {
-      ({ consumed, warnings } = await consumeStockFifo(client, itemCode, qtyValue, "kanban_empty"));
-    } catch (error) {
-      error.statusCode = error.statusCode || 409;
-      throw error;
-    }
-    const consumedQty = consumed.reduce((sum, row) => sum + Number(row.qty || 0), 0);
-    const consumedBatches = consumed.length;
 
     const vendorInfo = await getVendorRoleForItem(client, itemCode);
     const supplierRaw = vendorInfo.supplier || supplierHint;
@@ -18844,6 +23833,21 @@ const handleKanbanEmptyScan = async (req, res) => {
       productionId = prodResult.rows[0]?.id || null;
     }
 
+    let consumed = [];
+    let warnings = [];
+    try {
+      ({ consumed, warnings } = await consumeStockFifo(client, itemCode, qtyValue, "kanban_empty", {
+        kanbanId: rawKanbanId || null,
+        sourceRefType: productionId ? "production_order" : null,
+        sourceRefId: productionId,
+      }));
+    } catch (error) {
+      error.statusCode = error.statusCode || 409;
+      throw error;
+    }
+    const consumedQty = consumed.reduce((sum, row) => sum + Number(row.qty || 0), 0);
+    const consumedBatches = consumed.length;
+
     await insertInventoryLedger(client, {
       itemCode,
       transactionType: "PRODUCTION",
@@ -18853,6 +23857,9 @@ const handleKanbanEmptyScan = async (req, res) => {
       userId: operatorId,
       remarks: isScan ? "kanban_scan" : "kanban_empty",
       kanbanId: rawKanbanId || null,
+      locationId,
+      sourceRefType: productionId ? "production_order" : null,
+      sourceRefId: productionId,
     });
 
     if (isScheduleVendor(vendorInfo.role)) {
@@ -18937,7 +23944,7 @@ const handleKanbanEmptyScan = async (req, res) => {
     const requestIdFormat = requireFormat(config?.request_id_format, "Request ID format");
     const requestCode = await buildRequestNumber(client, requestIdFormat, itemCode);
     const noteParts = [];
-    if (body.area) noteParts.push(`area:${body.area}`);
+    if (locationId) noteParts.push(`area:${locationId}`);
     if (rawKanbanId) noteParts.push(`kanban:${rawKanbanId}`);
     if (prlPlan.prlId) noteParts.push(`prl:${prlPlan.year}:${prlPlan.monthKey}:${prlPlan.prlId}`);
     if (prlPlan.overPrl || cardMeta.overPrl) noteParts.push("over_prl");
@@ -19379,7 +24386,7 @@ app.post("/api/kanban/requests/:id/approve-dn", authenticate, requirePermission(
       return;
     }
     const roleResult = await client.query(
-      "select role from master_vendors where id = $1 or name = $1 limit 1",
+      "select role from master_vendors where id::text = $1::text or name::text = $1::text limit 1",
       [supplierValue],
     );
     if (roleResult.rows.length && roleResult.rows[0].role !== "Delivery Note") {
@@ -19975,7 +24982,7 @@ app.post("/api/kanban/requests/:id/create-dn", authenticate, requirePermission("
       return;
     }
     const roleResult = await client.query(
-      "select role from master_vendors where id = $1 or name = $1 limit 1",
+      "select role from master_vendors where id::text = $1::text or name::text = $1::text limit 1",
       [supplier],
     );
     if (roleResult.rows.length && roleResult.rows[0].role !== "Delivery Note") {
@@ -20228,13 +25235,13 @@ app.get("/api/prl", authenticate, requirePermission("viewPrl"), async (req, res)
   }
 });
 
-app.get("/api/prl/forecast-preview", authenticate, requirePermission("viewPrl"), async (req, res) => {
+app.get("/api/prl/forecast-preview", authenticate, requirePrlForecastPreviewAccess, async (req, res) => {
   try {
     const now = new Date();
     const year = Number(req.query.year) || now.getFullYear();
     const requestedMonthKey = String(req.query.month || PRL_MONTH_KEYS[now.getMonth()] || "jul").trim().toLowerCase();
     const monthKey = PRL_MONTH_KEYS.includes(requestedMonthKey) ? requestedMonthKey : PRL_MONTH_KEYS[now.getMonth()];
-    const supplierRaw = String(req.query.supplier || "").trim();
+    const supplierRaw = String(req.user?.role === "supplier" ? req.user?.supplierId : req.query.supplier || "").trim();
     const supplierKey = supplierRaw.toLowerCase();
     const traceStep = async (label, fn) => {
       const started = Date.now();
@@ -20251,7 +25258,7 @@ app.get("/api/prl/forecast-preview", authenticate, requirePermission("viewPrl"),
         `
         select id, name, email
         from master_vendors
-        where lower(id) = $1 or lower(name) = $1
+        where lower(id::text) = $1::text or lower(name::text) = $1::text
         order by case when lower(id) = $1 then 0 else 1 end, id asc
         limit 1
         `,
@@ -20264,6 +25271,80 @@ app.get("/api/prl/forecast-preview", authenticate, requirePermission("viewPrl"),
       name: String(supplierInfoRow?.name || supplierRaw || "All Supplier").trim() || "All Supplier",
       email: String(supplierInfoRow?.email || "").trim() || "-",
     };
+    const supplierMatchKeys = new Set(
+      [supplierRaw, supplierInfo.code, supplierInfo.name]
+        .map((value) => String(value || "").trim().toLowerCase())
+        .filter(Boolean),
+    );
+    const normalizeSharePercent = (value) => {
+      const numeric = Number(value || 0);
+      return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+    };
+    const supplierShareRatioByItemCode = new Map();
+    const computeSupplierShareRatio = (itemRow) => {
+      if (!supplierKey) return 1;
+      const itemCode = String(itemRow?.code || itemRow?.item_code || "").trim();
+      if (itemCode && supplierShareRatioByItemCode.has(itemCode)) {
+        return supplierShareRatioByItemCode.get(itemCode);
+      }
+      const supplierRows = Array.isArray(itemRow?.suppliers) ? itemRow.suppliers : [];
+      if (supplierRows.length > 0) {
+        const matchedRows = supplierRows.filter((supplierRow) => (
+          supplierMatchKeys.has(String(supplierRow?.vendorId || "").trim().toLowerCase())
+          || supplierMatchKeys.has(String(supplierRow?.vendorName || "").trim().toLowerCase())
+        ));
+        if (matchedRows.length === 0) return 0;
+        const matchedShare = matchedRows.reduce((sum, supplierRow) => (
+          sum + normalizeSharePercent(supplierRow?.sharePercent)
+        ), 0);
+        if (matchedShare > 0) return matchedShare / 100;
+        return matchedRows.length / Math.max(supplierRows.length, 1);
+      }
+      const defaultSupplierMatches = (
+        supplierMatchKeys.has(String(itemRow?.vendor_id || "").trim().toLowerCase())
+        || supplierMatchKeys.has(String(itemRow?.supplier_name || "").trim().toLowerCase())
+      );
+      return defaultSupplierMatches ? 1 : 0;
+    };
+    if (supplierKey && supplierMatchKeys.size > 0) {
+      const supplierShareResult = await traceStep("supplier-share-map", () => pool.query(
+        `
+        with supplier_rows as (
+          select
+            isup.item_code,
+            isup.vendor_id,
+            coalesce(mv.name, isup.vendor_id) as vendor_name,
+            coalesce(isup.share_percent, 0)::numeric as share_percent,
+            (
+              lower(coalesce(isup.vendor_id, '')) = any($1::text[])
+              or lower(coalesce(mv.name, '')) = any($1::text[])
+            ) as is_match
+          from item_suppliers isup
+          left join master_vendors mv on mv.id = isup.vendor_id
+        )
+        select
+          item_code,
+          coalesce(sum(share_percent) filter (where is_match), 0)::numeric as matched_share,
+          count(*) filter (where is_match)::int as matched_count,
+          count(*)::int as supplier_count
+        from supplier_rows
+        group by item_code
+        having count(*) filter (where is_match) > 0
+        `,
+        [Array.from(supplierMatchKeys)],
+      ));
+      for (const row of supplierShareResult.rows || []) {
+        const itemCode = String(row.item_code || "").trim();
+        if (!itemCode) continue;
+        const matchedShare = normalizeSharePercent(row.matched_share);
+        const matchedCount = Number(row.matched_count || 0);
+        const supplierCount = Number(row.supplier_count || 0);
+        const ratio = matchedShare > 0
+          ? matchedShare / 100
+          : matchedCount / Math.max(supplierCount, 1);
+        supplierShareRatioByItemCode.set(itemCode, Math.max(0, Math.min(1, ratio)));
+      }
+    }
     let supplierScopedRootCodes = null;
     if (supplierKey) {
       const scopedRootsResult = await traceStep("supplier-root-scope", () => pool.query(
@@ -20596,7 +25677,12 @@ app.get("/api/prl/forecast-preview", authenticate, requirePermission("viewPrl"),
       .filter((itemRow) => isPrlForecastLeafType(itemRow.type, itemRow.name, itemRow.code))
       .map((itemRow) => {
         const itemCode = String(itemRow.code || "").trim();
-        const monthValues = monthSlots.map((slot) => roundQuantity(monthlyTotalsBySlot.get(slot.monthKey)?.get(itemCode) || 0, 2));
+        const supplierShareRatio = computeSupplierShareRatio(itemRow);
+        const fullMonthValues = monthSlots.map((slot) => roundQuantity(
+          monthlyTotalsBySlot.get(slot.monthKey)?.get(itemCode) || 0,
+          2,
+        ));
+        const monthValues = fullMonthValues.map((value) => roundQuantity(value * supplierShareRatio, 2));
         const modelLabel = String(itemRow.model || "-").split(" - ")[0] || "-";
         const nMinusQty = monthValues[0];
         const nQty = monthValues[1];
@@ -20610,6 +25696,8 @@ app.get("/api/prl/forecast-preview", authenticate, requirePermission("viewPrl"),
           snp: Number(itemRow.pack_qty || 0) || 0,
           uom: String(itemRow.unit || "-").trim() || "-",
           typePack: String(itemRow.type_pack_name || itemRow.type_pack || "-").trim() || "-",
+          supplierSharePercent: supplierKey ? roundQuantity(supplierShareRatio * 100, 2) : 100,
+          supplierShareRatio,
           qtyDayMinusOne: roundQuantity(monthSlots[0].workingDays > 0 ? nMinusQty / monthSlots[0].workingDays : 0, 2),
           qtyDayCurrent: roundQuantity(monthSlots[1].workingDays > 0 ? nQty / monthSlots[1].workingDays : 0, 2),
           weekI: weekAllocation[0] || 0,
@@ -20622,6 +25710,13 @@ app.get("/api/prl/forecast-preview", authenticate, requirePermission("viewPrl"),
             nPlus1: monthValues[2],
             nPlus2: monthValues[3],
             nPlus3: monthValues[4],
+          },
+          fullDemandMonths: {
+            nMinus1: fullMonthValues[0],
+            n: fullMonthValues[1],
+            nPlus1: fullMonthValues[2],
+            nPlus2: fullMonthValues[3],
+            nPlus3: fullMonthValues[4],
           },
           fluctuation,
           suppliers: itemRow.suppliers || [],
@@ -21645,7 +26740,7 @@ app.delete("/api/master/vendors/:id", authenticate, requireManageVendors, async 
   }
 });
 
-app.get("/api/master/items", authenticate, requireMasterRead, async (req, res) => {
+app.get("/api/master/items", authenticate, requireMasterItemRead, async (req, res) => {
   try {
     const bucket = String(req.query.bucket || req.query.category || '').trim().toLowerCase();
     const search = String(req.query.q || req.query.search || '').trim().toLowerCase();
@@ -21781,7 +26876,7 @@ const resolveMasterOrgLocation = async (client, value) => {
   const result = await client.query(
     `
     select id, name, 'warehouse' as source from master_warehouses
-    where lower(id) = lower($1) or lower(name) = lower($1)
+    where lower(id::text) = lower($1::text) or lower(name::text) = lower($1::text)
     union all
     select id, coalesce(line_description, id) as name, 'location' as source from master_locations
     where lower(id) = lower($1) or lower(coalesce(line_description, '')) = lower($1)
@@ -21821,7 +26916,11 @@ const normalizeMasterProcessRefs = async (client, processFlow, processRouting, l
     const lookupKey = String(rawCode || "").trim().toLowerCase();
     if (!lookupKey) continue;
     const process = processMap.get(lookupKey);
-    if (!process) throw createHttpError(400, `Process harus dari Master Referensi: ${rawCode}`);
+    if (!process) {
+      const locationResult = await client.query("select id from master_locations where lower(id) = lower($1) limit 1", [rawCode]);
+      if (locationResult.rows.length > 0) continue;
+      throw createHttpError(400, `Process harus dari Master Referensi: ${rawCode}`);
+    }
     const standardTime = Number(step?.standardTime ?? step?.standard_time ?? process.standard_time ?? 0);
     normalizedRouting.push({
       code: process.code,
@@ -23859,7 +28958,7 @@ app.post("/api/schedules/:id/receive", authenticate, requirePermission("editSche
       await client.query("rollback");
       return;
     }
-    const duplicateHeader = await findReceiptHeaderBySupplierDoNumber(client, {
+    const duplicateHeader = await findActiveReceiptHeaderBySupplierDoNumber(client, {
       supplier: scheduleSupplier,
       doNumber: normalizedDoNumber,
       forUpdate: true,
@@ -24117,6 +29216,7 @@ app.get("/api/stock-card", authenticate, requireNotSupplier, async (req, res) =>
         l.transaction_type,
         l.batch_id,
         b.batch_no,
+        coalesce(l.kanban_id, b.kanban_id) as kanban_id,
         l.qty_in,
         l.qty_out,
         l.balance,
@@ -24154,6 +29254,7 @@ app.get("/api/stock-card/lot", authenticate, requireNotSupplier, async (req, res
         i.unit,
         b.arrival_date,
         b.do_number,
+        b.kanban_id,
         b.production_date,
         b.expired_date,
         b.qty_in,
@@ -25315,9 +30416,14 @@ app.get("/api/production/orders", authenticate, requirePermission("production"),
         po.qty,
         po.created_at,
         po.production_date,
+        po.line_code,
+        po.shift_label,
+        po.document_no,
+        po.notes,
         po.source,
         po.created_by,
         u.username as created_by_name,
+        i.part_no,
         i.name as product_name,
         i.unit as product_unit
       from production_orders po
@@ -25351,6 +30457,7 @@ app.get("/api/stock/batches", authenticate, requirePermission("production"), asy
         b.item_code,
         b.arrival_date,
         b.do_number,
+        b.kanban_id,
         b.schedule_id,
         (b.qty_in - b.qty_out)::numeric as available_qty,
         s.supplier,
@@ -25389,6 +30496,7 @@ app.get("/api/stock/batches/list", authenticate, async (req, res) => {
         b.id,
         b.batch_no,
         b.do_number,
+        b.kanban_id,
         b.arrival_date,
         b.production_date,
         b.expired_date,
@@ -25534,6 +30642,14 @@ app.post("/api/production/import", authenticate, requirePermission("production")
         "",
         req.user?.id || null,
       );
+      const outputBatch = await receiveProductionOutput(
+        client,
+        row.itemCode,
+        row.qtyValue,
+        productionId,
+        row.productionDate,
+        req.user?.id || null,
+      );
       if (Array.isArray(warnings) && warnings.length > 0) {
         allWarnings.push(...warnings);
       }
@@ -25542,6 +30658,7 @@ app.post("/api/production/import", authenticate, requirePermission("production")
         itemCode: row.itemCode,
         qty: row.qtyValue,
         productionDate: row.productionDate,
+        outputBatchId: outputBatch?.id || null,
         requirements,
       });
     }
@@ -25853,7 +30970,7 @@ app.get("/api/production/compare", authenticate, requirePermission("production")
           coalesce(po.production_date, po.created_at::date) as prod_date,
           sum(po.qty)::numeric as production_qty
         from production_orders po
-        where po.source = 'IMPORT'
+        where po.source in ('IMPORT', 'MANUAL_REPORT')
         group by po.product_code, coalesce(po.production_date, po.created_at::date)
       ),
       kanban_out as (
@@ -25891,10 +31008,19 @@ app.get("/api/production/compare", authenticate, requirePermission("production")
 app.post("/api/production/consume", authenticate, requirePermission("production"), async (req, res) => {
   const client = await pool.connect();
   try {
-    const { productCode, qty, supplier, productionDate, source } = req.body || {};
+    const { productCode, qty, supplier, productionDate, source, lineCode, shiftLabel, documentNo, notes } = req.body || {};
     const qtyNumber = Number(qty);
     if (!productCode || !Number.isFinite(qtyNumber) || qtyNumber <= 0) {
       res.status(400).json({ error: "productCode dan qty wajib diisi" });
+      return;
+    }
+    const itemResult = await pool.query("select type from items where code = $1", [productCode]);
+    if (itemResult.rows.length === 0) {
+      res.status(404).json({ error: "Item produksi tidak ditemukan." });
+      return;
+    }
+    if (!isAllowedProductionOutputType(itemResult.rows[0]?.type)) {
+      res.status(409).json({ error: "Hanya FG, Subassy, atau Child Part yang bisa diinput sebagai hasil produksi." });
       return;
     }
     const productionDateValue = productionDate ? normalizeDateOnly(productionDate) : null;
@@ -25902,14 +31028,30 @@ app.post("/api/production/consume", authenticate, requirePermission("production"
       res.status(400).json({ error: "productionDate tidak valid" });
       return;
     }
+    const lineCodeValue = String(lineCode || "").trim() || null;
+    const shiftLabelValue = String(shiftLabel || "").trim() || null;
+    const documentNoValue = String(documentNo || "").trim() || null;
+    const notesValue = String(notes || "").trim() || null;
     await client.query("begin");
     const orderResult = await client.query(
       `
-      insert into production_orders (product_code, supplier, qty, source, created_by, production_date)
-      values ($1, $2, $3, $4, $5, $6)
+      insert into production_orders
+        (product_code, supplier, qty, source, created_by, production_date, line_code, shift_label, document_no, notes)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       returning *
       `,
-      [productCode, supplier || null, qtyNumber, source || "MANUAL", req.user?.id || null, productionDateValue],
+      [
+        productCode,
+        supplier || null,
+        qtyNumber,
+        source || "MANUAL",
+        req.user?.id || null,
+        productionDateValue,
+        lineCodeValue,
+        shiftLabelValue,
+        documentNoValue,
+        notesValue,
+      ],
     );
     const orderId = orderResult.rows[0].id;
     const { requirements, warnings } = await applyProductionConsumption(
@@ -25920,10 +31062,18 @@ app.post("/api/production/consume", authenticate, requirePermission("production"
       supplier || "",
       req.user?.id || null,
     );
+    const outputBatch = await receiveProductionOutput(
+      client,
+      productCode,
+      qtyNumber,
+      orderId,
+      productionDateValue,
+      req.user?.id || null,
+    );
 
     const autoCreated = await autoTriggerKanbanRequests(client, { note: "auto-trigger (production)", userId: req.user?.id || null });
     await client.query("commit");
-    res.json({ ok: true, productionId: orderId, requirements, warnings, autoTriggered: autoCreated.length });
+    res.json({ ok: true, productionId: orderId, outputBatch, requirements, warnings, autoTriggered: autoCreated.length });
   } catch (error) {
     await client.query("rollback");
     res.status(500).json({ error: error.message });
@@ -25953,6 +31103,7 @@ app.put("/api/production/orders/:id", authenticate, requirePermission("productio
       return;
     }
     const order = orderResult.rows[0];
+    await rollbackProductionOutput(client, id, req.user?.id || null);
     const reversedItems = await rollbackProduction(client, id);
     const userLabel = getUserLabel(req.user);
     for (const row of reversedItems) {
@@ -25976,9 +31127,17 @@ app.put("/api/production/orders/:id", authenticate, requirePermission("productio
       order.supplier || "",
       req.user?.id || null,
     );
+    const outputBatch = await receiveProductionOutput(
+      client,
+      order.product_code,
+      qtyNumber,
+      id,
+      order.production_date,
+      req.user?.id || null,
+    );
     const autoCreated = await autoTriggerKanbanRequests(client, { note: "auto-trigger (production update)", userId: req.user?.id || null });
     await client.query("commit");
-    res.json({ ok: true, productionId: id, requirements, warnings, autoTriggered: autoCreated.length });
+    res.json({ ok: true, productionId: id, outputBatch, requirements, warnings, autoTriggered: autoCreated.length });
   } catch (error) {
     await client.query("rollback");
     res.status(500).json({ error: error.message });
@@ -26002,6 +31161,7 @@ app.delete("/api/production/orders/:id", authenticate, requirePermission("produc
       await client.query("rollback");
       return;
     }
+    await rollbackProductionOutput(client, id, req.user?.id || null);
     const reversedItems = await rollbackProduction(client, id);
     const userLabel = getUserLabel(req.user);
     for (const row of reversedItems) {
@@ -26794,23 +31954,86 @@ app.get("/api/reports/summary", authenticate, requirePermission("viewReport"), a
     const { start, end, supplier } = req.query;
     const filters = [];
     const values = [];
-    filters.push("item not ilike 'TEST-%'");
-    if (start) { values.push(start); filters.push(`request_date >= $${values.length}`); }
-    if (end) { values.push(end); filters.push(`request_date <= $${values.length}`); }
-    if (supplier) { values.push(supplier); filters.push(`supplier = $${values.length}`); }
+    filters.push("coalesce(s.item_code, s.item) not ilike 'TEST-%'");
+    if (start) { values.push(start); filters.push(`s.request_date >= $${values.length}`); }
+    if (end) { values.push(end); filters.push(`s.request_date <= $${values.length}`); }
+    if (supplier) {
+      values.push(supplier);
+      filters.push(`(coalesce(s.supplier_id, ph.supplier_id, s.supplier) = $${values.length} or s.supplier = $${values.length})`);
+    }
     const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
     const result = await pool.query(
       `
+      with base as (
+        select s.*
+        from schedules s
+        left join po_headers ph on ph.po_number = s.po_number
+        ${whereClause}
+      ),
+      receipt_rows as (
+        select
+          ra.schedule_id,
+          coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) as arrival_date,
+          sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
+        from receipt_allocations ra
+        join receive_note_items rni on rni.id = ra.rn_item_id
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        where ra.schedule_id in (select id from base)
+          and greatest(coalesce(ra.allocated_qty, 0), 0) > 0
+          and rni.line_status = 'posted'
+          and rnh.status = 'posted'
+        group by ra.schedule_id, coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date)
+      ),
+      receipt_eval as (
+        select
+          b.id as schedule_id,
+          coalesce(sum(rr.received_qty), 0)::numeric as receipt_total,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date between (b.request_date - interval '1 day') and b.request_date), 0)::numeric as on_time_qty,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date > b.request_date), 0)::numeric as late_qty,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date < (b.request_date - interval '1 day')), 0)::numeric as too_early_qty
+        from base b
+        left join receipt_rows rr on rr.schedule_id = b.id
+        group by b.id
+      ),
+      schedule_eval as (
+        select
+          b.*,
+          coalesce(nullif(re.receipt_total, 0), b.received_qty, 0)::numeric as actual_received_qty,
+          coalesce(nullif(re.on_time_qty, 0), case when re.receipt_total = 0 and b.arrival_date between (b.request_date - interval '1 day') and b.request_date then b.received_qty else 0 end, 0)::numeric as on_time_qty,
+          coalesce(nullif(re.late_qty, 0), case when re.receipt_total = 0 and b.arrival_date > b.request_date then b.received_qty else 0 end, 0)::numeric as late_qty,
+          coalesce(nullif(re.too_early_qty, 0), case when re.receipt_total = 0 and b.arrival_date < (b.request_date - interval '1 day') then b.received_qty else 0 end, 0)::numeric as too_early_qty
+        from base b
+        left join receipt_eval re on re.schedule_id = b.id
+      ),
+      status_eval as (
+        select *,
+          case
+            when actual_received_qty <= 0 then 'Pending'
+            when actual_received_qty < request_qty and on_time_qty > 0 and late_qty <= 0 then 'Partial On Time'
+            when actual_received_qty < request_qty and late_qty > 0 then 'Partial Late'
+            when late_qty > 0 and on_time_qty > 0 then 'Late Completion'
+            when late_qty > 0 then 'Late'
+            when on_time_qty > 0 then 'On Time'
+            when too_early_qty > 0 then 'Too Early'
+            else 'Pending'
+          end as kpi_status
+        from schedule_eval
+      )
       select
         count(*)::int as total_rows,
         coalesce(sum(request_qty), 0)::int as total_requested,
-        coalesce(sum(received_qty), 0)::int as total_received,
-        sum(case when arrival_date = request_date then 1 else 0 end)::int as total_on_time,
-        sum(case when arrival_date > request_date then 1 else 0 end)::int as total_late,
-        sum(case when arrival_date < request_date then 1 else 0 end)::int as total_too_early,
-        sum(case when arrival_date is null then 1 else 0 end)::int as total_pending
-      from schedules
-      ${whereClause}
+        coalesce(sum(actual_received_qty), 0)::int as total_received,
+        coalesce(sum(on_time_qty), 0)::numeric as total_on_time_qty,
+        coalesce(sum(late_qty), 0)::numeric as total_late_qty,
+        coalesce(sum(too_early_qty), 0)::numeric as total_too_early_qty,
+        count(*) filter (where kpi_status = 'On Time')::int as total_on_time,
+        count(*) filter (where kpi_status = 'Late')::int as total_late,
+        count(*) filter (where kpi_status = 'Late Completion')::int as total_late_completion,
+        count(*) filter (where kpi_status = 'Partial On Time')::int as total_partial_on_time,
+        count(*) filter (where kpi_status = 'Partial Late')::int as total_partial_late,
+        count(*) filter (where kpi_status = 'Too Early')::int as total_too_early,
+        count(*) filter (where kpi_status = 'Pending')::int as total_pending
+      from status_eval
       `,
       values,
     );
@@ -26819,8 +32042,14 @@ app.get("/api/reports/summary", authenticate, requirePermission("viewReport"), a
       totalRows: row.total_rows,
       totalRequested: row.total_requested,
       totalReceived: row.total_received,
+      totalOnTimeQty: Number(row.total_on_time_qty || 0),
+      totalLateQty: Number(row.total_late_qty || 0),
+      totalTooEarlyQty: Number(row.total_too_early_qty || 0),
       totalOnTime: row.total_on_time,
       totalLate: row.total_late,
+      totalLateCompletion: row.total_late_completion,
+      totalPartialOnTime: row.total_partial_on_time,
+      totalPartialLate: row.total_partial_late,
       totalTooEarly: row.total_too_early,
       totalPending: row.total_pending,
     });
@@ -26866,74 +32095,723 @@ app.get("/api/reports/by-supplier-po", authenticate, requirePermission("viewRepo
     filters.push("coalesce(s.item_code, s.item) not ilike 'TEST-%'");
     if (start) { values.push(start); filters.push(`s.request_date >= $${values.length}`); }
     if (end) { values.push(end); filters.push(`s.request_date <= $${values.length}`); }
-    if (supplier) { values.push(supplier); filters.push(`s.supplier = $${values.length}`); }
+    if (supplier) {
+      values.push(supplier);
+      filters.push(`(coalesce(s.supplier_id, ph.supplier_id, s.supplier) = $${values.length} or s.supplier = $${values.length})`);
+    }
     const whereClause = filters.length ? `where ${filters.join(" and ")}` : "";
     const result = await pool.query(
       `
-      with schedule_group as (
+      with base as (
         select
-          s.supplier,
-          s.po_number,
-          coalesce(sum(s.request_qty), 0)::int as total_requested,
-          coalesce(sum(s.received_qty), 0)::int as total_received,
-          sum(case when s.arrival_date = s.request_date then 1 else 0 end)::int as on_time_count,
-          sum(case when s.arrival_date > s.request_date then 1 else 0 end)::int as late_count,
-          sum(case when s.arrival_date < s.request_date then 1 else 0 end)::int as too_early_count,
-          sum(case when s.arrival_date is null then 1 else 0 end)::int as pending_count
+          s.*,
+          coalesce(s.supplier_id, ph.supplier_id, s.supplier) as supplier_key,
+          coalesce(mv.name, s.supplier, coalesce(s.supplier_id, ph.supplier_id)) as supplier_name
         from schedules s
+        left join po_headers ph on ph.po_number = s.po_number
+        left join master_vendors mv on mv.id = coalesce(s.supplier_id, ph.supplier_id, s.supplier)
         ${whereClause}
-        group by s.supplier, s.po_number
+      ),
+      receipt_rows as (
+        select
+          ra.schedule_id,
+          coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) as arrival_date,
+          sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
+        from receipt_allocations ra
+        join receive_note_items rni on rni.id = ra.rn_item_id
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        where ra.schedule_id in (select id from base)
+          and greatest(coalesce(ra.allocated_qty, 0), 0) > 0
+          and rni.line_status = 'posted'
+          and rnh.status = 'posted'
+        group by ra.schedule_id, coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date)
+      ),
+      receipt_eval as (
+        select
+          b.id as schedule_id,
+          coalesce(sum(rr.received_qty), 0)::numeric as receipt_total,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date between (b.request_date - interval '1 day') and b.request_date), 0)::numeric as on_time_qty,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date > b.request_date), 0)::numeric as late_qty,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date < (b.request_date - interval '1 day')), 0)::numeric as too_early_qty
+        from base b
+        left join receipt_rows rr on rr.schedule_id = b.id
+        group by b.id
+      ),
+      schedule_eval as (
+        select
+          b.*,
+          coalesce(nullif(re.receipt_total, 0), b.received_qty, 0)::numeric as actual_received_qty,
+          coalesce(nullif(re.on_time_qty, 0), case when re.receipt_total = 0 and b.arrival_date between (b.request_date - interval '1 day') and b.request_date then b.received_qty else 0 end, 0)::numeric as on_time_qty,
+          coalesce(nullif(re.late_qty, 0), case when re.receipt_total = 0 and b.arrival_date > b.request_date then b.received_qty else 0 end, 0)::numeric as late_qty,
+          coalesce(nullif(re.too_early_qty, 0), case when re.receipt_total = 0 and b.arrival_date < (b.request_date - interval '1 day') then b.received_qty else 0 end, 0)::numeric as too_early_qty
+        from base b
+        left join receipt_eval re on re.schedule_id = b.id
+      ),
+      status_eval as (
+        select *,
+          case
+            when actual_received_qty <= 0 then 'Pending'
+            when actual_received_qty < request_qty and on_time_qty > 0 and late_qty <= 0 then 'Partial On Time'
+            when actual_received_qty < request_qty and late_qty > 0 then 'Partial Late'
+            when late_qty > 0 and on_time_qty > 0 then 'Late Completion'
+            when late_qty > 0 then 'Late'
+            when on_time_qty > 0 then 'On Time'
+            when too_early_qty > 0 then 'Too Early'
+            else 'Pending'
+          end as kpi_status
+        from schedule_eval
+      ),
+      schedule_group as (
+        select
+          supplier_key,
+          max(supplier_name) as supplier_name,
+          po_number,
+          count(*)::int as total_rows,
+          coalesce(sum(request_qty), 0)::numeric as total_requested,
+          coalesce(sum(actual_received_qty), 0)::numeric as total_received,
+          coalesce(sum(on_time_qty), 0)::numeric as on_time_qty,
+          coalesce(sum(late_qty), 0)::numeric as late_qty,
+          coalesce(sum(too_early_qty), 0)::numeric as too_early_qty,
+          count(*) filter (where kpi_status = 'On Time')::int as on_time_count,
+          count(*) filter (where kpi_status = 'Late')::int as late_count,
+          count(*) filter (where kpi_status = 'Late Completion')::int as late_completion_count,
+          count(*) filter (where kpi_status = 'Partial On Time')::int as partial_on_time_count,
+          count(*) filter (where kpi_status = 'Partial Late')::int as partial_late_count,
+          count(*) filter (where kpi_status = 'Too Early')::int as too_early_count,
+          count(*) filter (where kpi_status = 'Pending')::int as pending_count
+        from status_eval
+        group by supplier_key, po_number
       ),
       rn_group as (
         select
-          s.supplier,
-          s.po_number,
-          count(rn.id)::int as rn_count,
+          b.supplier_key,
+          b.po_number,
+          count(distinct rni.id)::int as rn_count,
           coalesce(sum(
             case
-              when rn.id is null then 0
-              when rn.is_loose is true then 1
-              when lower(trim(coalesce(i.unit, ''))) in ('kg', 'kgs', 'kilogram', 'kilograms', 'berat')
-                and coalesce(i.pack_qty, 0) > 0
+              when rni.id is null then 0
+              when lower(coalesce(rni.qc_status, 'ok')) in ('hold', 'reject') then 1
+              when coalesce(i.pack_qty, 0) <= 0 then 0
+              when lower(trim(coalesce(i.unit, rni.unit, ''))) in ('kg', 'kgs', 'kilogram', 'kilograms', 'berat')
                 and not (
-                  rn.received_qty >= (coalesce(i.pack_qty, 0) * 0.75)
-                  and rn.received_qty <= (coalesce(i.pack_qty, 0) * 1.25)
+                  coalesce(rni.posted_qty, rni.received_qty, 0) >= (coalesce(i.pack_qty, 0) * 0.75)
+                  and coalesce(rni.posted_qty, rni.received_qty, 0) <= (coalesce(i.pack_qty, 0) * 1.25)
                 ) then 1
-              when coalesce(i.pack_qty, 0) > 0 and mod(rn.received_qty, i.pack_qty) <> 0 then 1
+              when mod(coalesce(rni.posted_qty, rni.received_qty, 0), i.pack_qty) <> 0 then 1
               else 0
             end
-          ), 0)::int as loose_count
-        from schedules s
-        left join receive_notes rn on rn.schedule_id = s.id
-        left join items i on i.code = coalesce(s.item_code, s.item)
-        ${whereClause}
-        group by s.supplier, s.po_number
+          ), 0)::int as loose_count,
+          count(distinct rni.id) filter (where lower(coalesce(rni.qc_status, 'ok')) <> 'ok' or qc.id is not null)::int as qc_total,
+          count(distinct rni.id) filter (where lower(coalesce(rni.qc_status, 'ok')) = 'reject' or qc.disposition = 'reject')::int as qc_reject,
+          count(distinct rni.id) filter (
+            where lower(coalesce(rni.qc_status, 'ok')) in ('hold', 'reject')
+              and coalesce(qc.status, 'open') <> 'closed'
+          )::int as qc_open
+        from base b
+        left join receipt_allocations ra on ra.schedule_id = b.id
+        left join receive_note_items rni on rni.id = ra.rn_item_id and rni.line_status = 'posted'
+        left join receive_note_headers rnh on rnh.id = rni.rn_id and rnh.status = 'posted'
+        left join items i on i.code = coalesce(b.item_code, b.item)
+        left join quality_cases qc
+          on qc.source_type = 'incoming_rn'
+         and coalesce(qc.source_id, 0) = coalesce(rnh.id, 0)
+         and coalesce(qc.source_line_id, 0) = coalesce(rni.id, 0)
+        group by b.supplier_key, b.po_number
       )
       select
         sg.*,
         coalesce(rg.rn_count, 0)::int as rn_count,
-        coalesce(rg.loose_count, 0)::int as loose_count
+        coalesce(rg.loose_count, 0)::int as loose_count,
+        coalesce(rg.qc_total, 0)::int as qc_total,
+        coalesce(rg.qc_reject, 0)::int as qc_reject,
+        coalesce(rg.qc_open, 0)::int as qc_open
       from schedule_group sg
       left join rn_group rg
-        on rg.supplier = sg.supplier
+        on rg.supplier_key = sg.supplier_key
         and rg.po_number = sg.po_number
-      order by sg.supplier asc, sg.po_number asc
+      order by sg.supplier_key asc, sg.po_number asc
       `,
       values,
     );
     const mapped = result.rows.map((row) => ({
-      supplier: row.supplier,
+      supplier: row.supplier_key,
+      supplierName: row.supplier_name || row.supplier_key,
       poNumber: row.po_number,
-      totalRequested: row.total_requested,
-      totalReceived: row.total_received,
+      totalRows: row.total_rows,
+      totalRequested: Number(row.total_requested || 0),
+      totalReceived: Number(row.total_received || 0),
+      onTimeQty: Number(row.on_time_qty || 0),
+      lateQty: Number(row.late_qty || 0),
+      tooEarlyQty: Number(row.too_early_qty || 0),
       onTimeCount: row.on_time_count,
       lateCount: row.late_count,
+      lateCompletionCount: row.late_completion_count,
+      partialOnTimeCount: row.partial_on_time_count,
+      partialLateCount: row.partial_late_count,
       tooEarlyCount: row.too_early_count,
       pendingCount: row.pending_count,
       rnCount: row.rn_count,
       looseCount: row.loose_count,
+      qcTotal: row.qc_total,
+      qcReject: row.qc_reject,
+      qcOpen: row.qc_open,
     }));
-    res.json(mapped);
+    res.json(mapped.map((row) => {
+      const timingScore = row.totalRequested > 0 ? Math.min(100, (row.onTimeQty / row.totalRequested) * 100) : 0;
+      const fulfillmentScore = row.totalRequested > 0 ? Math.min(100, (row.totalReceived / row.totalRequested) * 100) : 0;
+      const packingScore = row.rnCount > 0 ? Math.max(0, ((row.rnCount - row.looseCount) / row.rnCount) * 100) : null;
+      const qcScore = row.rnCount > 0 ? Math.max(0, ((row.rnCount - row.qcOpen - row.qcReject) / row.rnCount) * 100) : null;
+      const qualityWeight = qcScore === null ? 0 : 0.15;
+      const packingWeight = packingScore === null ? 0 : 0.1;
+      const timeWeight = 0.55;
+      const fulfillWeight = 0.35;
+      const rawWeight = timeWeight + fulfillWeight + qualityWeight + packingWeight;
+      const weightedScore = rawWeight > 0
+        ? ((timingScore * timeWeight) + (fulfillmentScore * fulfillWeight) + ((qcScore ?? 100) * qualityWeight) + ((packingScore ?? 100) * packingWeight)) / rawWeight
+        : 0;
+      let rating = 1;
+      if (weightedScore >= 95) rating = 5;
+      else if (weightedScore >= 80) rating = 4;
+      else if (weightedScore >= 60) rating = 3;
+      else if (weightedScore >= 40) rating = 2;
+      return {
+        ...row,
+        timingScore: Math.round(timingScore),
+        fulfillmentScore: Math.round(fulfillmentScore),
+        packingScore: packingScore === null ? null : Math.round(packingScore),
+        qcScore: qcScore === null ? null : Math.round(qcScore),
+        weightedScore: Math.round(weightedScore * 100) / 100,
+        rating,
+        ratingLabel: `${rating}/5`,
+      };
+    }));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/reports/supplier-performance", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const { start, end, supplier } = req.query;
+    const values = [];
+    const scheduleFilters = ["coalesce(s.item_code, s.item) not ilike 'TEST-%'"];
+    if (start) { values.push(start); scheduleFilters.push(`s.request_date >= $${values.length}`); }
+    if (end) { values.push(end); scheduleFilters.push(`s.request_date <= $${values.length}`); }
+    if (supplier) {
+      values.push(supplier);
+      scheduleFilters.push(`(coalesce(s.supplier_id, ph.supplier_id, s.supplier) = $${values.length} or s.supplier = $${values.length})`);
+    }
+    const scheduleWhere = scheduleFilters.length ? `where ${scheduleFilters.join(" and ")}` : "";
+    const scheduleResult = await pool.query(
+      `
+      with base as (
+        select
+          s.*,
+          coalesce(s.supplier_id, ph.supplier_id, nullif(trim(s.supplier), ''), 'UNKNOWN') as supplier_key,
+          coalesce(mv.name, nullif(trim(s.supplier), ''), coalesce(s.supplier_id, ph.supplier_id), 'UNKNOWN') as supplier_name,
+          coalesce(nullif(trim(mv.role), ''), 'Schedule') as supplier_role
+        from schedules s
+        left join po_headers ph on ph.po_number = s.po_number
+        left join master_vendors mv on mv.id = coalesce(s.supplier_id, ph.supplier_id, s.supplier)
+        ${scheduleWhere}
+      ),
+      receipt_rows as (
+        select
+          ra.schedule_id,
+          coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) as arrival_date,
+          sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty
+        from receipt_allocations ra
+        join receive_note_items rni on rni.id = ra.rn_item_id
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        where ra.schedule_id in (select id from base)
+          and greatest(coalesce(ra.allocated_qty, 0), 0) > 0
+          and rni.line_status = 'posted'
+          and rnh.status = 'posted'
+        group by ra.schedule_id, coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date)
+      ),
+      receipt_eval as (
+        select
+          b.id as schedule_id,
+          coalesce(sum(rr.received_qty), 0)::numeric as receipt_total,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date between (b.request_date - interval '1 day') and b.request_date), 0)::numeric as on_time_qty,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date > b.request_date), 0)::numeric as late_qty,
+          coalesce(sum(rr.received_qty) filter (where rr.arrival_date < (b.request_date - interval '1 day')), 0)::numeric as too_early_qty,
+          min(rr.arrival_date) as first_arrival_date
+        from base b
+        left join receipt_rows rr on rr.schedule_id = b.id
+        group by b.id
+      ),
+      schedule_eval as (
+        select
+          b.*,
+          coalesce(nullif(re.receipt_total, 0), b.received_qty, 0)::numeric as actual_received_qty,
+          coalesce(nullif(re.on_time_qty, 0), case when re.receipt_total = 0 and b.arrival_date between (b.request_date - interval '1 day') and b.request_date then b.received_qty else 0 end, 0)::numeric as on_time_qty,
+          coalesce(nullif(re.late_qty, 0), case when re.receipt_total = 0 and b.arrival_date > b.request_date then b.received_qty else 0 end, 0)::numeric as late_qty,
+          coalesce(nullif(re.too_early_qty, 0), case when re.receipt_total = 0 and b.arrival_date < (b.request_date - interval '1 day') then b.received_qty else 0 end, 0)::numeric as too_early_qty,
+          coalesce(re.first_arrival_date, b.arrival_date) as first_arrival_date
+        from base b
+        left join receipt_eval re on re.schedule_id = b.id
+      ),
+      status_eval as (
+        select *,
+          case
+            when actual_received_qty <= 0 then 'Pending'
+            when actual_received_qty < request_qty and on_time_qty > 0 and late_qty <= 0 then 'Partial On Time'
+            when actual_received_qty < request_qty and late_qty > 0 then 'Partial Late'
+            when late_qty > 0 and on_time_qty > 0 then 'Late Completion'
+            when late_qty > 0 then 'Late'
+            when on_time_qty > 0 then 'On Time'
+            when too_early_qty > 0 then 'Too Early'
+            else 'Pending'
+          end as kpi_status,
+          to_char(request_date, 'YYYY-MM') as month_key
+        from schedule_eval
+      ),
+      monthly as (
+        select
+          supplier_key,
+          month_key,
+          count(*)::int as total_schedules,
+          count(*) filter (where kpi_status = 'On Time')::int as on_time,
+          count(*) filter (where kpi_status = 'Late')::int as late,
+          count(*) filter (where kpi_status = 'Late Completion')::int as late_completion,
+          count(*) filter (where kpi_status = 'Partial On Time')::int as partial_on_time,
+          count(*) filter (where kpi_status = 'Partial Late')::int as partial_late,
+          count(*) filter (where kpi_status = 'Too Early')::int as too_early,
+          count(*) filter (where kpi_status = 'Pending')::int as pending,
+          coalesce(sum(request_qty), 0)::numeric as request_qty,
+          coalesce(sum(actual_received_qty), 0)::numeric as received_qty,
+          coalesce(sum(on_time_qty), 0)::numeric as on_time_qty,
+          coalesce(sum(late_qty), 0)::numeric as late_qty
+        from status_eval
+        group by supplier_key, month_key
+      )
+      select
+        supplier_key,
+        max(supplier_name) as supplier_name,
+        max(supplier_role) as supplier_role,
+        count(*)::int as total_schedules,
+        count(distinct po_number)::int as po_count,
+        count(*) filter (where kpi_status = 'On Time')::int as on_time,
+        count(*) filter (where kpi_status = 'Late')::int as late,
+        count(*) filter (where kpi_status = 'Late Completion')::int as late_completion,
+        count(*) filter (where kpi_status = 'Partial On Time')::int as partial_on_time,
+        count(*) filter (where kpi_status = 'Partial Late')::int as partial_late,
+        count(*) filter (where kpi_status = 'Too Early')::int as too_early,
+        count(*) filter (where kpi_status = 'Pending')::int as pending,
+        coalesce(sum(request_qty), 0)::numeric as request_qty,
+        coalesce(sum(actual_received_qty), 0)::numeric as received_qty,
+        coalesce(sum(on_time_qty), 0)::numeric as on_time_qty,
+        coalesce(sum(late_qty), 0)::numeric as late_qty,
+        coalesce(sum(too_early_qty), 0)::numeric as too_early_qty,
+        coalesce(
+          jsonb_agg(
+            jsonb_build_object(
+              'id', id,
+              'poNumber', po_number,
+              'itemCode', coalesce(item_code, item),
+              'requestDate', to_char(request_date, 'YYYY-MM-DD'),
+              'arrivalDate', to_char(first_arrival_date, 'YYYY-MM-DD'),
+              'requestQty', request_qty,
+              'receivedQty', actual_received_qty,
+              'onTimeQty', on_time_qty,
+              'lateQty', late_qty,
+              'status', kpi_status
+            )
+            order by request_date desc nulls last, id desc
+          ),
+          '[]'::jsonb
+        ) as schedules,
+        coalesce((
+          select jsonb_agg(
+            jsonb_build_object(
+              'month', m.month_key,
+              'totalSchedules', m.total_schedules,
+              'onTime', m.on_time,
+              'late', m.late,
+              'lateCompletion', m.late_completion,
+              'partialOnTime', m.partial_on_time,
+              'partialLate', m.partial_late,
+              'tooEarly', m.too_early,
+              'pending', m.pending,
+              'requestQty', m.request_qty,
+              'receivedQty', m.received_qty,
+              'onTimeQty', m.on_time_qty,
+              'lateQty', m.late_qty
+            )
+            order by m.month_key asc
+          )
+          from monthly m
+          where m.supplier_key = status_eval.supplier_key
+        ), '[]'::jsonb) as monthly
+      from status_eval
+      group by supplier_key
+      order by supplier_key asc
+      `,
+      values,
+    );
+
+    const dnResult = await pool.query(
+      `
+      with dn_request_scope as (
+        select
+          dn.*,
+          coalesce(dn.supplier_id, mvd.id, nullif(trim(dn.supplier), ''), 'UNKNOWN') as supplier_key,
+          coalesce(nullif(trim(mvd.role), ''), 'Delivery Note') as supplier_role
+        from delivery_notes dn
+        left join lateral (
+          select id, name, role
+          from master_vendors mv
+          where lower(trim(mv.id)) = lower(trim(coalesce(dn.supplier_id, dn.supplier, '')))
+             or lower(trim(mv.name)) = lower(trim(coalesce(dn.supplier_id, dn.supplier, '')))
+          order by case when lower(trim(mv.id)) = lower(trim(coalesce(dn.supplier_id, dn.supplier, ''))) then 0 else 1 end
+          limit 1
+        ) mvd on true
+        where ($1::date is null or dn.planned_date >= $1::date)
+          and ($2::date is null or dn.planned_date <= $2::date)
+          and (
+            $3::text is null
+            or lower(trim(coalesce(dn.supplier_id, dn.supplier, ''))) = lower(trim($3::text))
+            or lower(trim(coalesce(mvd.id, ''))) = lower(trim($3::text))
+            or lower(trim(coalesce(mvd.name, ''))) = lower(trim($3::text))
+          )
+      ),
+      dn_request_rn as (
+        select
+          rni.origin_dn_id as dn_id,
+          rni.doc_qty,
+          rni.received_qty,
+          coalesce(rni.qc_status, 'ok') as qc_status,
+          coalesce(rnh.posted_at, rnh.created_at) as received_at
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        where rni.origin_dn_id in (select id from dn_request_scope)
+          and rnh.status = 'posted'
+          and rni.line_status = 'posted'
+          and rnh.reversal_of is null
+          and coalesce(rnh.source, '') <> 'REVERSAL'
+      ),
+      dn_request_rn_group as (
+        select
+          dn_id,
+          count(*)::int as rn_count,
+          coalesce(sum(doc_qty), 0)::numeric as doc_qty,
+          coalesce(sum(received_qty), 0)::numeric as received_qty,
+          coalesce(sum(case when qc_status <> 'ok' then 1 else 0 end), 0)::int as qc_issue_count,
+          max(received_at) as last_received_at
+        from dn_request_rn
+        group by dn_id
+      ),
+      dn_request_items as (
+        select dn_id, coalesce(sum(request_qty), 0)::numeric as request_qty
+        from delivery_note_items
+        where dn_id in (select id from dn_request_scope)
+        group by dn_id
+      ),
+      dn_request_rows as (
+        select
+          dn.supplier_key,
+          dn.supplier_role,
+          'DN Request'::text as source_category,
+          dn.id::text as source_key,
+          dn.dn_number,
+          dn.planned_date,
+          dn.status,
+          coalesce(rg.rn_count, 0)::int as rn_count,
+          coalesce(rg.doc_qty, di.request_qty, 0)::numeric as doc_qty_total,
+          coalesce(rg.received_qty, 0)::numeric as received_qty_total,
+          (coalesce(rg.doc_qty, di.request_qty, 0) - coalesce(rg.received_qty, 0))::numeric as diff_qty,
+          coalesce(rg.qc_issue_count, 0)::int as qc_issue_count,
+          rg.last_received_at,
+          case
+            when coalesce(rg.rn_count, 0) = 0 then 'Pending'
+            when coalesce(rg.qc_issue_count, 0) > 0
+              or coalesce(rg.doc_qty, di.request_qty, 0) <> coalesce(rg.received_qty, 0)
+              then 'Selisih/Reject'
+            when dn.status in ('closed','received') then 'Completed'
+            else 'Received'
+          end as tracking_status
+        from dn_request_scope dn
+        left join dn_request_items di on di.dn_id = dn.id
+        left join dn_request_rn_group rg on rg.dn_id = dn.id
+      ),
+      schedule_receipt_lines as (
+        select
+          coalesce(s.supplier_id, ph.supplier_id, mvs.id, nullif(trim(rnh.supplier), ''), 'UNKNOWN') as supplier_key,
+          coalesce(nullif(trim(mvs.role), ''), 'Schedule') as supplier_role,
+          coalesce(nullif(trim(rnh.do_number), ''), rnh.rn_number) as dn_number,
+          coalesce(rni.arrival_date, rnh.document_date, rnh.posted_at::date, rnh.created_at::date) as planned_date,
+          rnh.status,
+          rnh.id as rn_id,
+          rni.id as rn_item_id,
+          coalesce(rni.doc_qty, rni.received_qty, 0)::numeric as doc_qty,
+          coalesce(rni.received_qty, 0)::numeric as received_qty,
+          case when lower(coalesce(rni.qc_status, 'ok')) <> 'ok' then 1 else 0 end as qc_issue_count,
+          coalesce(rnh.posted_at, rnh.created_at) as last_received_at
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        left join schedules s on s.id = rni.schedule_id
+        left join po_headers ph on ph.po_number = coalesce(s.po_number, rnh.po_number)
+        left join lateral (
+          select id, name, role
+          from master_vendors mv
+          where lower(trim(mv.id)) = lower(trim(coalesce(s.supplier_id, ph.supplier_id, rnh.supplier, '')))
+             or lower(trim(mv.name)) = lower(trim(coalesce(s.supplier_id, ph.supplier_id, rnh.supplier, '')))
+          order by case when lower(trim(mv.id)) = lower(trim(coalesce(s.supplier_id, ph.supplier_id, rnh.supplier, ''))) then 0 else 1 end
+          limit 1
+        ) mvs on true
+        where rnh.status = 'posted'
+          and rni.line_status = 'posted'
+          and rnh.reversal_of is null
+          and coalesce(rnh.source, '') <> 'REVERSAL'
+          and rni.schedule_id is not null
+          and rni.origin_dn_id is null
+          and ($1::date is null or coalesce(rni.arrival_date, rnh.document_date, rnh.posted_at::date, rnh.created_at::date) >= $1::date)
+          and ($2::date is null or coalesce(rni.arrival_date, rnh.document_date, rnh.posted_at::date, rnh.created_at::date) <= $2::date)
+          and (
+            $3::text is null
+            or lower(trim(coalesce(s.supplier_id, ph.supplier_id, rnh.supplier, ''))) = lower(trim($3::text))
+            or lower(trim(coalesce(mvs.id, ''))) = lower(trim($3::text))
+            or lower(trim(coalesce(mvs.name, ''))) = lower(trim($3::text))
+          )
+      ),
+      schedule_receipt_rows as (
+        select
+          supplier_key,
+          supplier_role,
+          'Schedule SJ'::text as source_category,
+          concat('schedule-sj:', supplier_key, ':', lower(trim(dn_number)), ':', planned_date::text) as source_key,
+          dn_number,
+          planned_date,
+          max(status) as status,
+          count(distinct rn_id)::int as rn_count,
+          coalesce(sum(doc_qty), 0)::numeric as doc_qty_total,
+          coalesce(sum(received_qty), 0)::numeric as received_qty_total,
+          (coalesce(sum(doc_qty), 0) - coalesce(sum(received_qty), 0))::numeric as diff_qty,
+          coalesce(sum(qc_issue_count), 0)::int as qc_issue_count,
+          max(last_received_at) as last_received_at,
+          case
+            when coalesce(sum(received_qty), 0) <= 0 then 'Pending'
+            when coalesce(sum(qc_issue_count), 0) > 0
+              or coalesce(sum(doc_qty), 0) <> coalesce(sum(received_qty), 0)
+              then 'Selisih/Reject'
+            else 'Completed'
+          end as tracking_status
+        from schedule_receipt_lines
+        group by supplier_key, supplier_role, dn_number, planned_date
+      ),
+      all_dn_rows as (
+        select * from dn_request_rows
+        union all
+        select * from schedule_receipt_rows
+      )
+      select
+        supplier_key,
+        max(supplier_role) as supplier_role,
+        count(*)::int as dn_count,
+        count(*) filter (where tracking_status = 'Completed')::int as dn_completed,
+        count(*) filter (where tracking_status = 'Pending')::int as dn_pending,
+        count(*) filter (where tracking_status = 'Selisih/Reject')::int as dn_issue,
+        coalesce(sum(doc_qty_total), 0)::numeric as dn_doc_qty,
+        coalesce(sum(received_qty_total), 0)::numeric as dn_received_qty,
+        coalesce(sum(diff_qty), 0)::numeric as dn_diff_qty,
+        coalesce(
+          jsonb_agg(
+            jsonb_build_object(
+              'dnNumber', dn_number,
+              'plannedDate', to_char(planned_date, 'YYYY-MM-DD'),
+              'sourceCategory', source_category,
+              'status', status,
+              'trackingStatus', tracking_status,
+              'docQty', doc_qty_total,
+              'receivedQty', received_qty_total,
+              'diffQty', diff_qty,
+              'rnCount', rn_count,
+              'lastReceivedAt', last_received_at
+            )
+            order by planned_date desc nulls last, dn_number desc
+          ),
+          '[]'::jsonb
+        ) as rows
+      from all_dn_rows
+      group by supplier_key
+      `,
+      [start || null, end || null, supplier || null],
+    );
+
+    const qcResult = await pool.query(
+      `
+      with incoming_qc as (
+        select
+          coalesce(dn.supplier_id, nullif(trim(rnh.supplier), ''), 'UNKNOWN') as supplier_key,
+          qc.id,
+          qc.status,
+          qc.disposition,
+          lower(coalesce(rni.qc_status, 'ok')) = 'reject'
+            or lower(coalesce(qc.disposition, '')) in ('reject', 'return_supplier') as is_reject,
+          false as is_line_claim
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        left join delivery_notes dn on dn.id = rni.origin_dn_id
+        left join quality_cases qc
+          on qc.source_type = 'incoming_rn'
+         and qc.source_id = rnh.id
+         and qc.source_line_id = rni.id
+        where rnh.status = 'posted'
+          and rni.line_status = 'posted'
+          and rnh.reversal_of is null
+          and coalesce(rnh.source, '') <> 'REVERSAL'
+          and ($1::text is null or coalesce(dn.supplier_id, rnh.supplier) = $1 or rnh.supplier = $1)
+          and ($2::date is null or coalesce(rnh.posted_at, rnh.created_at)::date >= $2::date)
+          and ($3::date is null or coalesce(rnh.posted_at, rnh.created_at)::date <= $3::date)
+      ),
+      line_qc as (
+        select
+          coalesce(nullif(trim(qc.supplier), ''), 'UNKNOWN') as supplier_key,
+          qc.id,
+          qc.status,
+          qc.disposition,
+          lower(coalesce(qc.disposition, '')) in ('reject', 'return_supplier', 'scrap', 'rework') as is_reject,
+          true as is_line_claim
+        from quality_cases qc
+        where qc.source_type = 'material_line_ng'
+          and ($1::text is null or qc.supplier = $1)
+          and ($2::date is null or coalesce(qc.discovered_at, qc.created_at)::date >= $2::date)
+          and ($3::date is null or coalesce(qc.discovered_at, qc.created_at)::date <= $3::date)
+      ),
+      all_qc as (
+        select * from incoming_qc
+        union all
+        select * from line_qc
+      )
+      select
+        supplier_key,
+        count(id)::int as qc_total,
+        count(id) filter (where coalesce(status, 'open') <> 'closed')::int as qc_open,
+        count(id) filter (where is_reject)::int as qc_reject,
+        count(id) filter (where status = 'closed')::int as qc_closed,
+        count(id) filter (where is_line_claim)::int as line_claim_total
+      from all_qc
+      group by supplier_key
+      `,
+      [supplier || null, start || null, end || null],
+    );
+
+    const dnMap = new Map((dnResult.rows || []).map((row) => [String(row.supplier_key || "UNKNOWN"), row]));
+    const qcMap = new Map((qcResult.rows || []).map((row) => [String(row.supplier_key || "UNKNOWN"), row]));
+    const suppliers = (scheduleResult.rows || []).map((row) => {
+      const supplierKey = String(row.supplier_key || "UNKNOWN");
+      const dn = dnMap.get(supplierKey) || {};
+      const qc = qcMap.get(supplierKey) || {};
+      const requestQty = Number(row.request_qty || 0);
+      const receivedQty = Number(row.received_qty || 0);
+      const onTimeQty = Number(row.on_time_qty || 0);
+      const lateQty = Number(row.late_qty || 0);
+      const qcTotal = Number(qc.qc_total || 0);
+      const qcOpen = Number(qc.qc_open || 0);
+      const qcReject = Number(qc.qc_reject || 0);
+      const timeScore = requestQty > 0 ? (onTimeQty / requestQty) * 100 : 0;
+      const qtyScoreRaw = requestQty > 0 ? (receivedQty / requestQty) * 100 : 0;
+      const qtyScore = Math.min(100, qtyScoreRaw);
+      const qcScore = qcTotal > 0 ? Math.max(0, ((qcTotal - qcOpen - qcReject) / qcTotal) * 100) : 100;
+      const weightedScore = (timeScore * 0.6) + (qtyScore * 0.3) + (qcScore * 0.1);
+      let rating = 1;
+      if (weightedScore >= 95) rating = 5;
+      else if (weightedScore >= 80) rating = 4;
+      else if (weightedScore >= 60) rating = 3;
+      else if (weightedScore >= 40) rating = 2;
+      const monthly = (Array.isArray(row.monthly) ? row.monthly : []).map((month) => {
+        const monthRequestQty = Number(month.requestQty || month.request_qty || 0);
+        const monthReceivedQty = Number(month.receivedQty || month.received_qty || 0);
+        const monthOnTimeQty = Number(month.onTimeQty || month.on_time_qty || 0);
+        const monthTimeScore = monthRequestQty > 0 ? (monthOnTimeQty / monthRequestQty) * 100 : 0;
+        const monthQtyScore = monthRequestQty > 0 ? Math.min(100, (monthReceivedQty / monthRequestQty) * 100) : 0;
+        return {
+          ...month,
+          timeScore: Math.round(monthTimeScore),
+          qtyScore: Math.round(monthQtyScore),
+          weightedScore: Math.round(((monthTimeScore * 0.7) + (monthQtyScore * 0.3)) * 100) / 100,
+        };
+      });
+      return {
+        supplier: {
+          code: supplierKey,
+          name: row.supplier_name || supplierKey,
+          category: row.supplier_role || dn.supplier_role || "Schedule",
+        },
+        period: { start: start || "", end: end || "" },
+        summary: {
+          totalSchedules: Number(row.total_schedules || 0),
+          poCount: Number(row.po_count || 0),
+          onTime: Number(row.on_time || 0),
+          late: Number(row.late || 0),
+          lateCompletion: Number(row.late_completion || 0),
+          partialOnTime: Number(row.partial_on_time || 0),
+          partialLate: Number(row.partial_late || 0),
+          tooEarly: Number(row.too_early || 0),
+          pending: Number(row.pending || 0),
+          requestQty,
+          receivedQty,
+          onTimeQty,
+          lateQty,
+          tooEarlyQty: Number(row.too_early_qty || 0),
+          timeScore: Math.round(timeScore),
+          qtyScore: Math.round(qtyScore),
+          qtyScoreRaw: Math.round(qtyScoreRaw * 100) / 100,
+          qcScore: Math.round(qcScore),
+          qcTotal,
+          qcOpen,
+          qcReject,
+          qcClosed: Number(qc.qc_closed || 0),
+          lineClaimTotal: Number(qc.line_claim_total || 0),
+          dnCount: Number(dn.dn_count || 0),
+          dnCompleted: Number(dn.dn_completed || 0),
+          dnPending: Number(dn.dn_pending || 0),
+          dnIssue: Number(dn.dn_issue || 0),
+          dnDocQty: Number(dn.dn_doc_qty || 0),
+          dnReceivedQty: Number(dn.dn_received_qty || 0),
+          dnDiffQty: Number(dn.dn_diff_qty || 0),
+          weightedScore: Math.round(weightedScore * 100) / 100,
+          rating,
+          ratingLabel: rating === 5 ? "Excellent" : rating >= 4 ? "Good" : rating >= 3 ? "Fair" : "Poor",
+        },
+        monthly,
+        schedules: Array.isArray(row.schedules) ? row.schedules : [],
+        deliveryNotes: Array.isArray(dn.rows) ? dn.rows : [],
+      };
+    }).sort((left, right) => Number(right.summary?.weightedScore || 0) - Number(left.summary?.weightedScore || 0));
+
+    const totals = suppliers.reduce((acc, item) => {
+      const summary = item.summary || {};
+      acc.totalSchedules += Number(summary.totalSchedules || 0);
+      acc.requestQty += Number(summary.requestQty || 0);
+      acc.receivedQty += Number(summary.receivedQty || 0);
+      acc.onTimeQty += Number(summary.onTimeQty || 0);
+      acc.qcTotal += Number(summary.qcTotal || 0);
+      acc.qcOpen += Number(summary.qcOpen || 0);
+      acc.qcReject += Number(summary.qcReject || 0);
+      acc.lineClaimTotal += Number(summary.lineClaimTotal || 0);
+      return acc;
+    }, { totalSchedules: 0, requestQty: 0, receivedQty: 0, onTimeQty: 0, qcTotal: 0, qcOpen: 0, qcReject: 0, lineClaimTotal: 0 });
+    const totalTimeScore = totals.requestQty > 0 ? (totals.onTimeQty / totals.requestQty) * 100 : 0;
+    const totalQtyScore = totals.requestQty > 0 ? Math.min(100, (totals.receivedQty / totals.requestQty) * 100) : 0;
+    const totalQcScore = totals.qcTotal > 0 ? Math.max(0, ((totals.qcTotal - totals.qcOpen - totals.qcReject) / totals.qcTotal) * 100) : 100;
+    const totalWeightedScore = (totalTimeScore * 0.6) + (totalQtyScore * 0.3) + (totalQcScore * 0.1);
+    res.json({
+      period: { start: start || "", end: end || "" },
+      summary: {
+        supplierCount: suppliers.length,
+        totalSchedules: totals.totalSchedules,
+        requestQty: totals.requestQty,
+        receivedQty: totals.receivedQty,
+        timeScore: Math.round(totalTimeScore),
+        qtyScore: Math.round(totalQtyScore),
+        qcScore: Math.round(totalQcScore),
+        lineClaimTotal: totals.lineClaimTotal,
+        weightedScore: Math.round(totalWeightedScore * 100) / 100,
+      },
+      suppliers,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -28530,9 +34408,9 @@ app.get("/api/reports/quality-objectives", authenticate, requirePermission("view
     const now = new Date();
     let rawMonth = req.query.month;
     let rawYear = req.query.year;
-    if (typeof rawMonth === "string" && rawMonth.includes("-") && !rawYear) {
+    if (typeof rawMonth === "string" && rawMonth.includes("-")) {
       const [yearPart, monthPart] = rawMonth.split("-");
-      rawYear = yearPart;
+      rawYear = rawYear || yearPart;
       rawMonth = monthPart;
     }
     const monthNum = Math.min(Math.max(Number(rawMonth || now.getMonth() + 1), 1), 12);
@@ -28541,6 +34419,24 @@ app.get("/api/reports/quality-objectives", authenticate, requirePermission("view
     const endDate = formatDateOnly(new Date(yearNum, monthNum, 1));
     const monthLabel = monthKeyByIndex[monthNum - 1] || String(monthNum);
     const periodLabel = `${monthLabel.toUpperCase()} ${yearNum}`;
+    const selectedSupplier = String(req.query.supplier || "").trim();
+    const normalizeMonthBoundary = (value, fallback) => {
+      if (typeof value === "string" && value.includes("-")) {
+        const [, monthPart] = value.split("-");
+        const parsed = Number(monthPart);
+        if (parsed >= 1 && parsed <= 12) return parsed;
+      }
+      const parsed = Number(value);
+      if (parsed >= 1 && parsed <= 12) return parsed;
+      const keyIndex = monthKeyByIndex.findIndex((key) => key === String(value || "").toLowerCase());
+      if (keyIndex >= 0) return keyIndex + 1;
+      return fallback;
+    };
+    let periodStartMonth = normalizeMonthBoundary(req.query.monthStart || req.query.month_start, 1);
+    let periodEndMonth = normalizeMonthBoundary(req.query.monthEnd || req.query.month_end, 12);
+    if (periodStartMonth > periodEndMonth) {
+      [periodStartMonth, periodEndMonth] = [periodEndMonth, periodStartMonth];
+    }
 
     const inboundResult = await pool.query(
       `
@@ -28570,6 +34466,96 @@ app.get("/api/reports/quality-objectives", authenticate, requirePermission("view
         status: percentRounded >= 95 ? "TERCAPAI" : "TIDAK TERCAPAI",
       };
     });
+
+    const annualStartDate = formatDateOnly(new Date(yearNum, 0, 1));
+    const annualEndDate = formatDateOnly(new Date(yearNum + 1, 0, 1));
+    const spsParams = [annualStartDate, annualEndDate];
+    let spsSupplierFilter = "";
+    if (selectedSupplier) {
+      spsParams.push(selectedSupplier);
+      spsSupplierFilter = `
+        and (
+          lower(trim(coalesce(dn.supplier, rnh.supplier, s.supplier, '-'))) = lower(trim($${spsParams.length}))
+          or exists (
+            select 1
+            from master_vendors mv
+            where lower(trim(mv.id)) = lower(trim($${spsParams.length}))
+              and lower(trim(coalesce(dn.supplier, rnh.supplier, s.supplier, '-'))) in (lower(trim(mv.id)), lower(trim(mv.name)))
+          )
+        )
+      `;
+    }
+    const spsResult = await pool.query(
+      `
+      with rn_union as (
+        select
+          rn.dn_id,
+          rn.schedule_id,
+          null::int as rn_header_id,
+          rn.item_code,
+          rn.received_qty,
+          rn.doc_qty,
+          rn.received_at
+        from receive_notes rn
+        where rn.item_code is null or rn.item_code not ilike 'TEST-%'
+        union all
+        select
+          rni.origin_dn_id as dn_id,
+          rni.schedule_id,
+          rni.rn_id as rn_header_id,
+          rni.item_code,
+          rni.received_qty,
+          rni.doc_qty,
+          coalesce(rnh.posted_at, rnh.document_date::timestamptz, rnh.created_at) as received_at
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        where rni.item_code not ilike 'TEST-%'
+      )
+      select
+        extract(month from rn_union.received_at)::int as month_num,
+        coalesce(sum(rn_union.received_qty), 0)::numeric as incoming_qty,
+        coalesce(sum(coalesce(rn_union.doc_qty, s.request_qty, rn_union.received_qty)), 0)::numeric as dn_order_qty
+      from rn_union
+      left join delivery_notes dn on dn.id = rn_union.dn_id
+      left join receive_note_headers rnh on rnh.id = rn_union.rn_header_id
+      left join schedules s on s.id = rn_union.schedule_id
+      where rn_union.received_at >= $1 and rn_union.received_at < $2
+        and extract(month from rn_union.received_at)::int between ${periodStartMonth} and ${periodEndMonth}
+        and (coalesce(s.item_code, s.item, rn_union.item_code) is null or coalesce(s.item_code, s.item, rn_union.item_code) not ilike 'TEST-%')
+        ${spsSupplierFilter}
+      group by extract(month from rn_union.received_at)::int
+      order by month_num asc
+      `,
+      spsParams,
+    );
+    const spsByMonth = new Map(spsResult.rows.map((row) => [Number(row.month_num), row]));
+    const spsMonths = monthKeyByIndex.map((monthKey, index) => {
+      const monthIndex = index + 1;
+      const row = spsByMonth.get(monthIndex);
+      const incomingQty = Number(row?.incoming_qty || 0);
+      const dnOrderQty = Number(row?.dn_order_qty || 0);
+      const percent = dnOrderQty > 0 ? (incomingQty / dnOrderQty) * 100 : 0;
+      const percentRounded = Math.round(percent * 100) / 100;
+      const isInPeriod = monthIndex >= periodStartMonth && monthIndex <= periodEndMonth;
+      const hasData = isInPeriod && (incomingQty > 0 || dnOrderQty > 0);
+      return {
+        month: monthIndex,
+        key: monthKey,
+        label: `${monthKey.charAt(0).toUpperCase()}${monthKey.slice(1)}-${String(yearNum).slice(-2)}`,
+        incomingQty,
+        dnOrderQty,
+        percent: percentRounded,
+        status: hasData ? (percentRounded >= 80 && percentRounded <= 120 ? "Tercapai" : "Tidak Tercapai") : "",
+        hasData,
+        inPeriod: isInPeriod,
+      };
+    });
+    const spsDataMonths = spsMonths.filter((row) => row.hasData);
+    const totalIncoming = spsDataMonths.reduce((sum, row) => sum + Number(row.incomingQty || 0), 0);
+    const totalDnOrder = spsDataMonths.reduce((sum, row) => sum + Number(row.dnOrderQty || 0), 0);
+    const avgIncoming = spsDataMonths.length ? totalIncoming / spsDataMonths.length : 0;
+    const avgDnOrder = spsDataMonths.length ? totalDnOrder / spsDataMonths.length : 0;
+    const avgPercent = avgDnOrder > 0 ? (avgIncoming / avgDnOrder) * 100 : 0;
 
     const dnResult = await pool.query(
       `
@@ -28711,10 +34697,344 @@ app.get("/api/reports/quality-objectives", authenticate, requirePermission("view
       .filter((row) => row.planQty > 0 || row.actualQty > 0);
 
     res.json({
-      period: { month: monthNum, year: yearNum, label: periodLabel },
+      period: {
+        month: monthNum,
+        year: yearNum,
+        label: periodLabel,
+        monthStart: periodStartMonth,
+        monthEnd: periodEndMonth,
+        supplier: selectedSupplier,
+      },
+      sps: {
+        year: yearNum,
+        supplier: selectedSupplier,
+        monthStart: periodStartMonth,
+        monthEnd: periodEndMonth,
+        targetMin: 80,
+        targetMax: 120,
+        months: spsMonths,
+        avgIncoming: Math.round(avgIncoming * 100) / 100,
+        avgDnOrder: Math.round(avgDnOrder * 100) / 100,
+        avgPercent: Math.round(avgPercent * 100) / 100,
+        avgStatus: spsDataMonths.length > 0 ? (avgPercent >= 80 && avgPercent <= 120 ? "Tercapai" : "Tidak Tercapai") : "",
+      },
       inboundSchedule: inboundRows,
       dnVsRn: dnRows,
       deliveryVsPrl: deliveryRows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/reports/qc", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const now = new Date();
+    const periodStart = req.query.start
+      ? formatDateOnly(req.query.start)
+      : formatDateOnly(new Date(now.getFullYear(), now.getMonth(), 1));
+    const periodEnd = req.query.end ? formatDateOnly(req.query.end) : formatDateOnly(now);
+    const selectedSupplier = String(req.query.supplier || "").trim();
+
+    const values = [periodStart, periodEnd];
+    const filters = [
+      "coalesce(qc.discovered_at, qc.decided_at, qc.created_at)::date >= $1::date",
+      "coalesce(qc.discovered_at, qc.decided_at, qc.created_at)::date <= $2::date",
+      "(qc.item_code is null or qc.item_code not ilike 'TEST-%')",
+    ];
+    if (selectedSupplier) {
+      values.push(selectedSupplier);
+      filters.push(`
+        (
+          lower(trim(coalesce(qc.supplier, ''))) = lower(trim($${values.length}))
+          or exists (
+            select 1
+            from master_vendors mvf
+            where lower(trim(mvf.id)) = lower(trim($${values.length}))
+              and lower(trim(coalesce(qc.supplier, ''))) in (lower(trim(mvf.id)), lower(trim(mvf.name)))
+          )
+        )
+      `);
+    }
+
+    const qcResult = await pool.query(
+      `
+      select
+        qc.*,
+        coalesce(qc.discovered_at, qc.decided_at, qc.created_at) as event_at,
+        coalesce(mv.id, nullif(trim(qc.supplier), ''), 'UNKNOWN') as supplier_code,
+        coalesce(mv.name, nullif(trim(qc.supplier), ''), 'UNKNOWN') as supplier_name,
+        uc.username as created_by_name,
+        ud.username as decided_by_name
+      from quality_cases qc
+      left join lateral (
+        select id, name
+        from master_vendors mv
+        where lower(trim(mv.id)) = lower(trim(coalesce(qc.supplier, '')))
+           or lower(trim(mv.name)) = lower(trim(coalesce(qc.supplier, '')))
+        order by case when lower(trim(mv.id)) = lower(trim(coalesce(qc.supplier, ''))) then 0 else 1 end
+        limit 1
+      ) mv on true
+      left join users uc on uc.id = qc.created_by
+      left join users ud on ud.id = qc.decided_by
+      where ${filters.join(" and ")}
+      order by event_at desc, qc.id desc
+      limit 10000
+      `,
+      values,
+    );
+
+    const millsheetValues = [periodStart, periodEnd];
+    const millsheetFilters = [
+      "m.uploaded_at::date >= $1::date",
+      "m.uploaded_at::date <= $2::date",
+    ];
+    if (selectedSupplier) {
+      millsheetValues.push(selectedSupplier);
+      millsheetFilters.push(`
+        (
+          lower(trim(coalesce(m.supplier_id, ''))) = lower(trim($${millsheetValues.length}))
+          or exists (
+            select 1
+            from master_vendors mvf
+            where lower(trim(mvf.id)) = lower(trim($${millsheetValues.length}))
+              and lower(trim(coalesce(m.supplier_id, ''))) in (lower(trim(mvf.id)), lower(trim(mvf.name)))
+          )
+        )
+      `);
+    }
+    const millsheetResult = await pool.query(
+      `
+      select
+        count(*)::int as total_documents,
+        count(*) filter (where status = 'uploaded_waiting_qc')::int as waiting_qc,
+        count(*) filter (where status = 'qc_approved')::int as approved,
+        count(*) filter (where status = 'qc_rejected')::int as rejected
+      from millsheet_documents m
+      where ${millsheetFilters.join(" and ")}
+      `,
+      millsheetValues,
+    );
+
+    const pendingValues = [];
+    const pendingFilters = [
+      "h.millsheet_required",
+      "h.status = 'posted'",
+      "h.reversal_of is null",
+      "coalesce(h.millsheet_status, 'required_pending') in ('required_pending','uploaded_waiting_qc','overdue','qc_rejected')",
+    ];
+    if (selectedSupplier) {
+      pendingValues.push(selectedSupplier);
+      pendingFilters.push(`
+        (
+          lower(trim(coalesce(h.supplier, ''))) = lower(trim($${pendingValues.length}))
+          or exists (
+            select 1
+            from master_vendors mvf
+            where lower(trim(mvf.id)) = lower(trim($${pendingValues.length}))
+              and lower(trim(coalesce(h.supplier, ''))) in (lower(trim(mvf.id)), lower(trim(mvf.name)))
+          )
+        )
+      `);
+    }
+    const pendingMillsheetResult = await pool.query(
+      `
+      select
+        count(*)::int as pending_receipts,
+        count(*) filter (
+          where h.millsheet_due_at is not null
+            and h.millsheet_due_at < now()
+            and coalesce(h.millsheet_status, 'required_pending') = 'required_pending'
+        )::int as overdue_receipts
+      from receive_note_headers h
+      where ${pendingFilters.join(" and ")}
+      `,
+      pendingValues,
+    );
+
+    const rows = qcResult.rows.map((row) => {
+      const mapped = mapQualityCaseRow(row);
+      return {
+        ...mapped,
+        eventAt: row.event_at,
+        supplierCode: row.supplier_code,
+        supplierName: row.supplier_name,
+      };
+    });
+
+    const isCorrection = (row) => row.disposition === "correction_review" || row.status === "cancelled";
+    const activeRows = rows.filter((row) => !isCorrection(row));
+    const countBy = (predicate) => activeRows.filter(predicate).length;
+    const sumBy = (list, picker) => list.reduce((sum, row) => sum + Number(picker(row) || 0), 0);
+    const closedCases = countBy((row) => row.status === "closed");
+    const openRows = activeRows.filter((row) => row.status !== "closed");
+    const totalCases = activeRows.length;
+    const incomingCases = countBy((row) => row.sourceType === "incoming_rn");
+    const releaseCount = countBy((row) => ["ok", "use_as_is"].includes(row.disposition));
+    const rejectCount = countBy((row) => row.disposition === "reject");
+    const returnSupplierCount = countBy((row) => row.disposition === "return_supplier");
+    const holdCount = countBy((row) => row.disposition === "hold" || row.status === "inspecting");
+    const defectQty = sumBy(activeRows, (row) => row.qtyNg || (["reject", "return_supplier", "scrap"].includes(row.disposition) ? row.dispositionQty || row.qty : 0));
+    const inspectedQty = sumBy(activeRows, (row) => row.qty || row.qtyOk || row.qtyNg);
+    const openAgingDays = openRows.map((row) => {
+      const from = new Date(row.createdAt || row.eventAt);
+      if (Number.isNaN(from.getTime())) return 0;
+      return Math.max(0, (Date.now() - from.getTime()) / (1000 * 60 * 60 * 24));
+    });
+    const avgOpenAgingDays = openAgingDays.length
+      ? openAgingDays.reduce((sum, value) => sum + value, 0) / openAgingDays.length
+      : 0;
+
+    const groupToRows = (list, keyPicker, rowBuilder) => {
+      const groups = new Map();
+      list.forEach((row) => {
+        const key = keyPicker(row) || "UNKNOWN";
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(row);
+      });
+      return Array.from(groups.entries()).map(([key, listRows]) => rowBuilder(key, listRows));
+    };
+    const toYearMonthKey = (value) => {
+      const date = new Date(value);
+      if (!Number.isNaN(date.getTime())) {
+        return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+      }
+      return String(value || "").slice(0, 7) || "-";
+    };
+
+    const sourceBreakdown = groupToRows(
+      activeRows,
+      (row) => row.sourceType,
+      (key, listRows) => ({
+        sourceType: key,
+        totalCases: listRows.length,
+        qty: sumBy(listRows, (row) => row.qty),
+        defectQty: sumBy(listRows, (row) => row.qtyNg),
+        openCases: listRows.filter((row) => row.status !== "closed").length,
+      }),
+    ).sort((left, right) => right.totalCases - left.totalCases);
+
+    const dispositionBreakdown = groupToRows(
+      activeRows,
+      (row) => row.disposition || "open_pending",
+      (key, listRows) => ({
+        disposition: key,
+        totalCases: listRows.length,
+        qty: sumBy(listRows, (row) => row.dispositionQty || row.qty),
+      }),
+    ).sort((left, right) => right.totalCases - left.totalCases);
+
+    const monthlyTrend = groupToRows(
+      activeRows,
+      (row) => toYearMonthKey(row.eventAt || row.createdAt),
+      (key, listRows) => {
+        const monthlyIncoming = listRows.filter((row) => row.sourceType === "incoming_rn").length;
+        const monthlyRelease = listRows.filter((row) => ["ok", "use_as_is"].includes(row.disposition)).length;
+        return {
+          month: key || "-",
+          totalCases: listRows.length,
+          openCases: listRows.filter((row) => row.status !== "closed").length,
+          releaseCount: monthlyRelease,
+          rejectCount: listRows.filter((row) => row.disposition === "reject").length,
+          returnSupplierCount: listRows.filter((row) => row.disposition === "return_supplier").length,
+          materialLineNg: listRows.filter((row) => row.sourceType === "material_line_ng").length,
+          releaseRate: monthlyIncoming > 0 ? Math.round((monthlyRelease / monthlyIncoming) * 10000) / 100 : 0,
+        };
+      },
+    ).sort((left, right) => String(left.month).localeCompare(String(right.month)));
+
+    const topDefects = groupToRows(
+      activeRows.filter((row) => {
+        const key = String(row.defectCategory || row.defectDescription || "").trim().toLowerCase();
+        return key && !["ok", "release", "passed"].includes(key);
+      }),
+      (row) => String(row.defectCategory || row.defectDescription || "UNCLASSIFIED").trim().toUpperCase(),
+      (key, listRows) => ({
+        defect: key,
+        totalCases: listRows.length,
+        defectQty: sumBy(listRows, (row) => row.qtyNg || row.dispositionQty),
+        critical: listRows.filter((row) => row.severity === "critical").length,
+        major: listRows.filter((row) => row.severity === "major").length,
+      }),
+    ).sort((left, right) => right.totalCases - left.totalCases || right.defectQty - left.defectQty).slice(0, 10);
+
+    const supplierRows = groupToRows(
+      activeRows,
+      (row) => row.supplierCode || row.supplier || "UNKNOWN",
+      (key, listRows) => {
+        const listTotal = listRows.length;
+        const listClosed = listRows.filter((row) => row.status === "closed").length;
+        const listOpen = listRows.filter((row) => row.status !== "closed").length;
+        const listReject = listRows.filter((row) => ["reject", "return_supplier", "scrap"].includes(row.disposition)).length;
+        const listLineNg = listRows.filter((row) => row.sourceType === "material_line_ng").length;
+        const listMajorCritical = listRows.filter((row) => ["major", "critical"].includes(row.severity)).length;
+        const supplierName = listRows.find((row) => row.supplierName)?.supplierName || key;
+        const rejectRate = listTotal ? listReject / listTotal : 0;
+        const openRate = listTotal ? listOpen / listTotal : 0;
+        const lineNgRate = listTotal ? listLineNg / listTotal : 0;
+        const severityRate = listTotal ? listMajorCritical / listTotal : 0;
+        const qualityScore = Math.max(0, Math.round((100 - (rejectRate * 55) - (openRate * 25) - (lineNgRate * 20) - (severityRate * 15)) * 100) / 100);
+        return {
+          supplierCode: key,
+          supplierName,
+          totalCases: listTotal,
+          incomingCases: listRows.filter((row) => row.sourceType === "incoming_rn").length,
+          materialLineNg: listLineNg,
+          openCases: listOpen,
+          closedCases: listClosed,
+          rejectCases: listReject,
+          defectQty: sumBy(listRows, (row) => row.qtyNg || (["reject", "return_supplier", "scrap"].includes(row.disposition) ? row.dispositionQty : 0)),
+          closureRate: listTotal ? Math.round((listClosed / listTotal) * 10000) / 100 : 0,
+          qualityScore,
+        };
+      },
+    ).sort((left, right) => right.qualityScore - left.qualityScore || String(left.supplierCode).localeCompare(String(right.supplierCode), "id"));
+
+    const millsheet = millsheetResult.rows[0] || {};
+    const pendingMillsheet = pendingMillsheetResult.rows[0] || {};
+
+    res.json({
+      period: { start: periodStart, end: periodEnd, supplier: selectedSupplier },
+      summary: {
+        totalCases,
+        incomingCases,
+        openCases: openRows.length,
+        closedCases,
+        releaseCount,
+        holdCount,
+        rejectCount,
+        returnSupplierCount,
+        scrapCount: countBy((row) => row.disposition === "scrap"),
+        reworkCount: countBy((row) => row.disposition === "rework"),
+        sortirCount: countBy((row) => row.disposition === "sortir"),
+        correctionReviewCount: rows.filter(isCorrection).length,
+        materialLineNg: countBy((row) => row.sourceType === "material_line_ng"),
+        productionNg: countBy((row) => row.sourceType === "production_ng"),
+        deliveryReturn: countBy((row) => row.sourceType === "delivery_return"),
+        defectQty: Math.round(defectQty * 100) / 100,
+        inspectedQty: Math.round(inspectedQty * 100) / 100,
+        defectPpm: inspectedQty > 0 ? Math.round((defectQty / inspectedQty) * 1000000) : 0,
+        releaseRate: incomingCases > 0 ? Math.round((releaseCount / incomingCases) * 10000) / 100 : 0,
+        closureRate: totalCases > 0 ? Math.round((closedCases / totalCases) * 10000) / 100 : 0,
+        avgOpenAgingDays: Math.round(avgOpenAgingDays * 10) / 10,
+      },
+      sourceBreakdown,
+      dispositionBreakdown,
+      monthlyTrend,
+      topDefects,
+      supplierRows,
+      openCases: openRows
+        .slice()
+        .sort((left, right) => new Date(left.createdAt || left.eventAt).getTime() - new Date(right.createdAt || right.eventAt).getTime())
+        .slice(0, 100),
+      millsheet: {
+        totalDocuments: Number(millsheet.total_documents || 0),
+        waitingQc: Number(millsheet.waiting_qc || 0),
+        approved: Number(millsheet.approved || 0),
+        rejected: Number(millsheet.rejected || 0),
+        pendingReceipts: Number(pendingMillsheet.pending_receipts || 0),
+        overdueReceipts: Number(pendingMillsheet.overdue_receipts || 0),
+      },
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

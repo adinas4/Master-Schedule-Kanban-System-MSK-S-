@@ -19,6 +19,7 @@ import {
   Plus,
   Printer,
   QrCode,
+  RotateCcw,
   Search,
   Settings,
   Trash2,
@@ -48,6 +49,25 @@ const validateReceiveDoNumberFormat = (value) => {
   return { valid: true, reason: '' };
 };
 
+const normalizeKanbanIdDisplay = (value) => {
+  const trimmed = String(value || '').trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      const payload = JSON.parse(trimmed);
+      return normalizeKanbanIdDisplay(payload?.kanbanId || payload?.kanban_id || payload?.cardUid || payload?.card_uid || payload?.itemCode || payload?.item_code || payload?.uniq || trimmed);
+    } catch (_error) {
+      return trimmed;
+    }
+  }
+  for (let len = 1; len <= Math.floor(trimmed.length / 2); len += 1) {
+    if (trimmed.length % len !== 0) continue;
+    const prefix = trimmed.slice(0, len);
+    if (prefix.repeat(trimmed.length / len) === trimmed) return prefix;
+  }
+  return trimmed;
+};
+
 const TabKanban = (props) => {
   const {
     apiFetch,
@@ -63,6 +83,7 @@ const TabKanban = (props) => {
     consumeQty,
     consumeStockFromScan,
     createRequestFromScan,
+    deliveryNotes,
     deliveryNotesLoading,
     dnDetailEditable,
     dnDetailEdits,
@@ -103,6 +124,7 @@ const TabKanban = (props) => {
     handleDnEmail,
     handleDnPreview,
     handleDnPrintPdf,
+    handleEmptyKanbanScanValue,
     handleEmptyKanbanSubmit,
     handleManualRequest,
     queueManualRequestFromForm,
@@ -147,6 +169,7 @@ const TabKanban = (props) => {
     kanbanSubTab,
     kanbanView,
     isStockOpnameLocked,
+    incomingQuickAction,
     mainTab,
     manualRequestForm,
     manualRequestQueue,
@@ -173,6 +196,7 @@ const TabKanban = (props) => {
     qrPayload,
     qrTitle,
     receiveForm,
+    receiveNotes,
     receiveNotesLoading,
     rnDateEnd,
     rnDateStart,
@@ -183,6 +207,7 @@ const TabKanban = (props) => {
     scanActiveResult,
     scanError,
     scanCameraStatus,
+    scanHistory,
     scanInput,
     scanMode,
     scanResults,
@@ -221,6 +246,7 @@ const TabKanban = (props) => {
     setRnDateStart,
     setRnSearch,
     setRnStatus,
+    setReportTab,
     setScanCameraEnabled,
     setScanError,
     setScanInput,
@@ -472,10 +498,16 @@ const TabKanban = (props) => {
   const canOpenDeliveryTab = canEditSchedules;
   const getLockedActionTitle = (allowed, label) => (allowed ? label : `${label} - tidak tersedia untuk role ini`);
   const getLockedButtonClassName = (baseClassName, disabled) => `${baseClassName}${disabled ? ' opacity-50 cursor-not-allowed' : ''}`;
+  const planningTabs = [
+    { key: 'delivery', label: 'Delivery', disabled: !canOpenDeliveryTab, disabledTitle: 'Delivery hanya tersedia untuk role schedule.' },
+    { key: 'production', label: 'Produksi', disabled: !canProduction, disabledTitle: 'Produksi hanya tersedia untuk role produksi.' },
+  ];
+  const planningDefaultTab = planningTabs.find((tab) => !tab.disabled)?.key || 'delivery';
   const kanbanBoardTabs = isProductionUser
     ? [
       { key: 'dashboard', label: 'Dashboard' },
       { key: 'empty', label: 'Kanban Kosong' },
+      { key: 'production', label: 'Produksi' },
       { key: 'scan', label: 'Scan QR' },
     ]
     : [
@@ -483,20 +515,19 @@ const TabKanban = (props) => {
       { key: 'items', label: 'Kanban Items' },
       { key: 'requests', label: 'Requests' },
       { key: 'dn', label: 'DN Register' },
-      { key: 'delivery', label: 'Delivery', disabled: !canOpenDeliveryTab, disabledTitle: 'Delivery hanya tersedia untuk role schedule.' },
       { key: 'receiving', label: 'Receiving Notes' },
       { key: 'empty', label: 'Kanban Kosong' },
       { key: 'scan', label: 'Scan QR' },
-      { key: 'production', label: 'Produksi', disabled: !canProduction, disabledTitle: 'Produksi hanya tersedia untuk role produksi.' },
     ];
-
   const emptyLogRef = useRef(null);
+  const emptyKanbanInputRef = useRef(null);
+  const scanManualInputRef = useRef(null);
   const [emptyScrollTop, setEmptyScrollTop] = useState(0);
   const [emptyListSize, setEmptyListSize] = useState({ height: 320, width: 0 });
   const emptyRowHeight = 44;
   const emptyOverscan = 6;
   const emptyLogGrid = useMemo(
-    () => '160px 140px minmax(220px, 1.6fr) 140px 120px 120px 140px 180px',
+    () => '160px 180px minmax(220px, 1.4fr) 150px 90px minmax(220px, 1.2fr) 140px 120px 120px 140px 180px',
     [],
   );
   const emptyLogRows = useMemo(() => kanbanEmptyPaginationMeta.rows || [], [kanbanEmptyPaginationMeta.rows]);
@@ -556,6 +587,7 @@ const TabKanban = (props) => {
   };
   const [localKanbanSearch, setLocalKanbanSearch] = useState(kanbanSearch || '');
   const [localRnSearch, setLocalRnSearch] = useState(rnSearch || '');
+  const [kanbanAnalysisRow, setKanbanAnalysisRow] = useState(null);
   const deliveryUploadInputRef = useRef(null);
   const [deliveryUploads, setDeliveryUploads] = useState([]);
   const [deliveryUploadsLoading, setDeliveryUploadsLoading] = useState(false);
@@ -565,6 +597,7 @@ const TabKanban = (props) => {
   const [deliveryUploadResult, setDeliveryUploadResult] = useState(null);
   const [deliveryWorkflowTab, setDeliveryWorkflowTab] = useState('upload-dn');
   const [selectedDeliveryUploadId, setSelectedDeliveryUploadId] = useState(null);
+  const [dnActionMenuOpen, setDnActionMenuOpen] = useState(null);
   const kanbanActiveStatusMeta = useMemo(() => ([
     {
       key: 'triggered',
@@ -1079,6 +1112,7 @@ const TabKanban = (props) => {
       planned_date: row?.planned_date || row?.plannedDate || row?.created_at || null,
       status: row?.dn_status || 'open',
     };
+    setKanbanView?.('board');
     setKanbanSubTab('dn');
     openDnDetailModal(existingDn || fallbackDn, false);
   };
@@ -1104,6 +1138,7 @@ const TabKanban = (props) => {
     setKanbanView?.('board');
 
     if (flowMeta.key === 'production' && ['triggered', 'requested', 'approved'].includes(statusKey)) {
+      setKanbanView?.('planning');
       setKanbanSubTab('production');
       setProductionTab('queue');
       openProductionRequest(row);
@@ -1144,6 +1179,7 @@ const TabKanban = (props) => {
     }
 
     if (statusKey === 'scheduled' || statusKey === 'in_transit') {
+      setKanbanView?.('planning');
       setKanbanSubTab('delivery');
       return;
     }
@@ -1156,6 +1192,85 @@ const TabKanban = (props) => {
 
     openKanbanStatusRequests(statusKey || 'all');
   };
+
+  const openKanbanItemAnalysis = (row) => {
+    setKanbanAnalysisRow(row || null);
+  };
+
+  const kanbanItemAnalysis = useMemo(() => {
+    if (!kanbanAnalysisRow) return null;
+    const itemCode = String(kanbanAnalysisRow?.item_code || '').trim();
+    const masterItem = masterItemsByCode.get(itemCode) || {};
+    const supplierMeta = resolveMasterItemSupplier(itemCode);
+    const masterLocation = masterLocationsById.get(masterItem?.location_id || kanbanAnalysisRow?.drop_zone);
+    const activeRequests = (kanbanRequests || [])
+      .filter((request) => String(request?.item_code || '').trim() === itemCode)
+      .filter((request) => !['closed', 'rejected', 'fifo'].includes(String(request?.status || '').trim().toLowerCase()));
+    const activeRequestEntries = activeRequests
+      .map((request) => ({ row: request, health: getKanbanRequestHealth(request) }))
+      .sort((left, right) => right.health.ageHours - left.health.ageHours || new Date(right.row.created_at || 0) - new Date(left.row.created_at || 0));
+    const statusCounts = activeRequests.reduce((acc, request) => {
+      const key = String(request?.status || 'requested').trim().toLowerCase() || 'requested';
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+    const onHand = Number(fifoTotalsByItemCode.get(itemCode) ?? 0);
+    const minQty = Number(kanbanAnalysisRow?.min_qty ?? masterItem?.safety_stock ?? 0);
+    const maxQty = Number(kanbanAnalysisRow?.effective_max_qty ?? kanbanAnalysisRow?.max_qty ?? 0);
+    const lotQty = Number(kanbanAnalysisRow?.lot_qty ?? masterItem?.pack_qty ?? masterItem?.packQty ?? 0);
+    const openRequestQty = activeRequests.reduce((acc, request) => acc + Number(request?.request_qty || 0), 0);
+    const andon = getKanbanItemAndon(kanbanAnalysisRow);
+    const stockGap = minQty > 0 ? onHand - minQty : null;
+    const prlQty = getDisplayPrlQty(kanbanAnalysisRow);
+    const thumbUrl = masterItem?.image_thumb_url || masterItem?.imageThumbUrl || masterItem?.image_url || masterItem?.imageUrl || '';
+    const recommendation = andon.level === 'red'
+      ? 'Prioritas proses: cek request overdue/stock gap, lakukan replenishment, atau buat request baru jika belum ada.'
+      : andon.level === 'yellow'
+        ? 'Pantau request terbuka dan siapkan replenishment sebelum stok turun di bawah minimum.'
+        : 'Supply normal. Tetap monitor konsumsi dan FIFO sesuai proses berjalan.';
+    return {
+      row: kanbanAnalysisRow,
+      itemCode,
+      itemName: kanbanAnalysisRow?.item_name || masterItem?.name || '-',
+      categoryLabel: getCategoryLabel(kanbanAnalysisRow?.item_type || masterItem?.type || ''),
+      unit: kanbanAnalysisRow?.item_unit || masterItem?.unit || 'PCS',
+      supplierLabel: supplierMeta.label,
+      locationLabel: masterLocation?.id || masterLocation?.name || kanbanAnalysisRow?.drop_zone || '-',
+      onHand,
+      minQty,
+      maxQty,
+      lotQty,
+      openRequestQty,
+      stockGap,
+      prlQty,
+      andon,
+      recommendation,
+      statusCounts,
+      activeRequestEntries,
+      thumbUrl,
+      cardsLabel: getKanbanCardsLabel(kanbanAnalysisRow),
+      regularCards: kanbanAnalysisRow?.effective_regular_kanban ?? kanbanAnalysisRow?.calculated_regular_kanban ?? '-',
+      safetyCards: kanbanAnalysisRow?.effective_safety_kanban ?? kanbanAnalysisRow?.calculated_safety_kanban ?? '-',
+      leadTimeDays: kanbanAnalysisRow?.lead_time_days || 0,
+      sourceRows: [
+        'On hand: saldo inventory FIFO saat ini.',
+        'Min/Max, lot, kartu: setup Kanban Item dan master item.',
+        'Request aktif: data Kanban Requests yang belum closed/rejected/FIFO.',
+        'Supplier: relasi supplier master item dengan share terbesar.',
+      ],
+    };
+  }, [
+    kanbanAnalysisRow,
+    kanbanRequests,
+    fifoTotalsByItemCode,
+    masterItemsByCode,
+    masterLocationsById,
+    itemSupplierMap,
+    masterVendors,
+    getKanbanRequestHealth,
+    getCategoryLabel,
+    getKanbanCardsLabel,
+  ]);
 
   const closeProductionRequestModal = () => {
     setProductionRequestModal({
@@ -1223,7 +1338,7 @@ const TabKanban = (props) => {
       return;
     }
     const printDate = new Date().toLocaleString('id-ID');
-    const pages = entries.map((entry) => {
+    const printableEntries = entries.map((entry) => {
       const row = entry.row || {};
       const productionNo = `SPK-PROD-${String(entry.productionId).padStart(5, '0')}`;
       const productionDate = String(entry.postedResult?.productionOrder?.production_date || productionBatchModal.productionDate || getTodayDnDateInput()).slice(0, 10);
@@ -1232,18 +1347,53 @@ const TabKanban = (props) => {
         : Array.isArray(entry.requirements)
           ? entry.requirements
           : [];
-      const materialRows = requirements.length > 0
-        ? requirements.map((item, index) => `
+      const lineLabel = getProductionRequestLineLabel(row);
+      const plantLabel = getProductionRequestPlantLabel(row);
+      return {
+        entry,
+        row,
+        productionNo,
+        productionDate,
+        requirements,
+        lineLabel,
+        plantLabel,
+      };
+    });
+    const lineGroups = Array.from(printableEntries.reduce((map, item) => {
+      const groupKey = [item.productionDate, item.lineLabel || '-', item.plantLabel || '-'].join('||');
+      const current = map.get(groupKey) || {
+        productionDate: item.productionDate,
+        lineLabel: item.lineLabel || '-',
+        plantLabel: item.plantLabel || '-',
+        entries: [],
+      };
+      current.entries.push(item);
+      map.set(groupKey, current);
+      return map;
+    }, new Map()).values());
+    const pages = lineGroups.map((group) => {
+      const spkNumbers = group.entries.map((item) => item.productionNo).join(', ');
+      const materialRows = group.entries.map((item, entryIndex) => {
+        const row = item.row || {};
+        const requirements = item.requirements.length > 0 ? item.requirements : [null];
+        const rowSpan = requirements.length;
+        return requirements.map((requirement, materialIndex) => `
           <tr>
-            <td>${index + 1}</td>
-            <td>${escapePrintText(item.itemCode || item.item_code || '-')}</td>
-            <td>${escapePrintText(item.itemName || item.item_name || '-')}</td>
-            <td class="right">${escapePrintText(formatNumber2(item.requiredQty || item.required_qty || 0))}</td>
-            <td>${escapePrintText(item.itemUnit || item.item_unit || '')}</td>
-            <td>${escapePrintText((item.positionCodes || item.position_codes || []).join(', ') || '-')}</td>
+            ${materialIndex === 0 ? `
+              <td rowspan="${rowSpan}" class="center">${entryIndex + 1}</td>
+              <td rowspan="${rowSpan}"><strong>${escapePrintText(item.productionNo)}</strong><br><span class="muted">${escapePrintText(getRequestIdLabel(row))}</span></td>
+              <td rowspan="${rowSpan}"><strong>${escapePrintText(row.item_code || '-')}</strong><br><span class="muted">${escapePrintText(row.part_no || masterItemsByCode.get(row.item_code)?.part_no || '-')}</span></td>
+              <td rowspan="${rowSpan}">${escapePrintText(row.item_name || masterItemsByCode.get(row.item_code)?.name || '-')}</td>
+              <td rowspan="${rowSpan}" class="right"><strong>${escapePrintText(formatQty(row.request_qty || 0))}</strong></td>
+            ` : ''}
+            <td>${escapePrintText(requirement?.itemCode || requirement?.item_code || '-')}</td>
+            <td>${escapePrintText(requirement?.itemName || requirement?.item_name || (requirement ? '-' : 'Material list is not available'))}</td>
+            <td class="right">${escapePrintText(requirement ? formatQty(requirement.requiredQty || requirement.required_qty || 0) : '-')}</td>
+            <td>${escapePrintText(requirement?.itemUnit || requirement?.item_unit || '')}</td>
+            <td>${escapePrintText((requirement?.positionCodes || requirement?.position_codes || []).join(', ') || '-')}</td>
           </tr>
-        `).join('')
-        : '<tr><td colspan="6" class="center muted">Material list is not available in this print snapshot.</td></tr>';
+        `).join('');
+      }).join('');
       return `
         <section class="page">
           <div class="header">
@@ -1252,27 +1402,29 @@ const TabKanban = (props) => {
               <div class="muted">Production Planning & Control</div>
             </div>
             <div class="doc-title">
-              <div>SURAT PERINTAH KERJA</div>
-              <strong>${productionNo}</strong>
+              <div>SPK PRODUKSI PER LINE</div>
+              <strong>${escapePrintText(group.lineLabel)}</strong>
             </div>
           </div>
           <div class="meta-grid">
-            <div><span>Request</span><strong>${escapePrintText(getRequestIdLabel(row))}</strong></div>
-            <div><span>Production Date</span><strong>${escapePrintText(productionDate)}</strong></div>
-            <div><span>Production Line</span><strong>${escapePrintText(getProductionRequestLineLabel(row))}</strong></div>
-            <div><span>Plant / Location</span><strong>${escapePrintText(getProductionRequestPlantLabel(row))}</strong></div>
-            <div><span>Item Code</span><strong>${escapePrintText(row.item_code || '-')}</strong></div>
-            <div><span>Part No</span><strong>${escapePrintText(row.part_no || masterItemsByCode.get(row.item_code)?.part_no || '-')}</strong></div>
-            <div class="wide"><span>Item Name</span><strong>${escapePrintText(row.item_name || masterItemsByCode.get(row.item_code)?.name || '-')}</strong></div>
-            <div><span>Order Qty</span><strong>${escapePrintText(formatNumber2(row.request_qty || 0))}</strong></div>
+            <div><span>Production Date</span><strong>${escapePrintText(group.productionDate)}</strong></div>
+            <div><span>Production Line</span><strong>${escapePrintText(group.lineLabel)}</strong></div>
+            <div><span>Plant / Location</span><strong>${escapePrintText(group.plantLabel)}</strong></div>
+            <div><span>Total SPK</span><strong>${group.entries.length}</strong></div>
+            <div class="wide"><span>SPK Number</span><strong>${escapePrintText(spkNumbers)}</strong></div>
+            <div class="wide"><span>Instruction</span><strong>Issue material by FIFO lot according to system recommendation.</strong></div>
           </div>
           <table>
             <thead>
               <tr>
                 <th>No</th>
+                <th>SPK / Request</th>
+                <th>FG Code / Part No</th>
+                <th>Item Name</th>
+                <th>Order Qty</th>
                 <th>Material Code</th>
                 <th>Material Name</th>
-                <th>Required Qty</th>
+                <th>Req Qty</th>
                 <th>UOM</th>
                 <th>Position</th>
               </tr>
@@ -1285,7 +1437,7 @@ const TabKanban = (props) => {
             <div><span>Production</span><div></div></div>
             <div><span>Warehouse</span><div></div></div>
           </div>
-          <div class="footer-note">Printed ${escapePrintText(printDate)}. Scan/execute material issue by FIFO lot according to system recommendation.</div>
+          <div class="footer-note">Printed ${escapePrintText(printDate)}. Format compact: 1 sheet per production line/date/location.</div>
         </section>
       `;
     }).join('');
@@ -1302,28 +1454,29 @@ const TabKanban = (props) => {
         <style>
           * { box-sizing: border-box; }
           body { margin: 0; font-family: Arial, sans-serif; color: #0f172a; background: #f8fafc; }
-          .page { width: 297mm; min-height: 210mm; margin: 0 auto 12px; padding: 14mm; background: #fff; page-break-after: always; }
-          .header { display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 2px solid #0f172a; padding-bottom: 10px; }
-          .company { font-size: 18px; font-weight: 700; }
-          .muted { color: #64748b; font-size: 11px; }
-          .doc-title { text-align: right; font-size: 18px; font-weight: 700; letter-spacing: .08em; }
-          .doc-title strong { display: block; margin-top: 6px; font-size: 13px; letter-spacing: 0; }
-          .meta-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 14px 0; }
-          .meta-grid div { border: 1px solid #cbd5e1; padding: 8px; min-height: 46px; }
+          .page { width: 297mm; min-height: 210mm; margin: 0 auto 12px; padding: 9mm; background: #fff; page-break-after: always; }
+          .header { display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 2px solid #0f172a; padding-bottom: 7px; }
+          .company { font-size: 16px; font-weight: 700; }
+          .muted { color: #64748b; font-size: 9px; }
+          .doc-title { text-align: right; font-size: 16px; font-weight: 700; letter-spacing: .08em; }
+          .doc-title strong { display: block; margin-top: 4px; font-size: 12px; letter-spacing: 0; }
+          .meta-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 8px 0; }
+          .meta-grid div { border: 1px solid #cbd5e1; padding: 5px 7px; min-height: 34px; }
           .meta-grid .wide { grid-column: span 2; }
-          .meta-grid span, .sign-grid span { display: block; color: #64748b; font-size: 10px; text-transform: uppercase; margin-bottom: 4px; }
-          .meta-grid strong { font-size: 12px; }
-          table { width: 100%; border-collapse: collapse; font-size: 11px; }
-          th, td { border: 1px solid #cbd5e1; padding: 7px; text-align: left; vertical-align: top; }
+          .meta-grid span, .sign-grid span { display: block; color: #64748b; font-size: 8px; text-transform: uppercase; margin-bottom: 3px; }
+          .meta-grid strong { font-size: 10px; }
+          table { width: 100%; border-collapse: collapse; font-size: 9px; }
+          th, td { border: 1px solid #cbd5e1; padding: 4px 5px; text-align: left; vertical-align: top; }
           th { background: #e2e8f0; }
           .right { text-align: right; }
           .center { text-align: center; }
-          .sign-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 16px; }
-          .sign-grid > div { border: 1px solid #cbd5e1; padding: 8px; height: 78px; }
-          .footer-note { margin-top: 10px; color: #64748b; font-size: 10px; }
+          .sign-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 8px; }
+          .sign-grid > div { border: 1px solid #cbd5e1; padding: 6px; height: 48px; }
+          .footer-note { margin-top: 6px; color: #64748b; font-size: 8px; }
           @media print {
+            @page { size: A4 landscape; margin: 6mm; }
             body { background: #fff; }
-            .page { margin: 0; box-shadow: none; }
+            .page { width: auto; min-height: auto; margin: 0; padding: 0; box-shadow: none; }
           }
         </style>
       </head>
@@ -1775,15 +1928,32 @@ const TabKanban = (props) => {
     if (value === null || value === undefined || value === '') return fallback;
     const num = Number(value);
     if (!Number.isFinite(num)) return fallback;
-    return formatNumber2(num);
+    return formatQty(num, fallback);
   };
 
   const formatDnQty0 = (value, fallback = '-') => {
     if (value === null || value === undefined || value === '') return fallback;
     const num = Number(value);
     if (!Number.isFinite(num)) return fallback;
-    if (typeof formatNumber0 === 'function') return formatNumber0(num);
-    return Math.round(num).toLocaleString('id-ID');
+    return formatQty(num, fallback);
+  };
+
+  const formatQty = (value, fallback = '-') => {
+    if (value === null || value === undefined || value === '') return fallback;
+    const num = Number(value);
+    if (!Number.isFinite(num)) return fallback;
+    const isWhole = Math.abs(num - Math.round(num)) < 1e-9;
+    return num.toLocaleString('id-ID', {
+      minimumFractionDigits: isWhole ? 0 : 2,
+      maximumFractionDigits: isWhole ? 0 : 2,
+    });
+  };
+
+  const formatSignedQty = (value, fallback = '-') => {
+    if (value === null || value === undefined || value === '') return fallback;
+    const num = Number(value);
+    if (!Number.isFinite(num)) return fallback;
+    return num > 0 ? `+${formatQty(num, fallback)}` : formatQty(num, fallback);
   };
 
   const formatPrintDateCode = (dateValue = new Date()) => {
@@ -1912,6 +2082,8 @@ const TabKanban = (props) => {
   const [receiveTruckNo, setReceiveTruckNo] = useState('');
   const [receiveDriverName, setReceiveDriverName] = useState('');
   const [receiveDoNumber, setReceiveDoNumber] = useState('');
+  const [receiveMillsheetQuestion, setReceiveMillsheetQuestion] = useState('follow_up');
+  const [receiveMillsheetNotes, setReceiveMillsheetNotes] = useState('');
   const [receiveDoCheck, setReceiveDoCheck] = useState({
     status: 'idle',
     message: '',
@@ -1925,6 +2097,31 @@ const TabKanban = (props) => {
   const [productionImportLoading, setProductionImportLoading] = useState(false);
   const [productionImportError, setProductionImportError] = useState('');
   const [productionImportSummary, setProductionImportSummary] = useState(null);
+  const [productionOrderRows, setProductionOrderRows] = useState([]);
+  const [productionOrderHistoryLoading, setProductionOrderHistoryLoading] = useState(false);
+  const [productionOrderHistoryError, setProductionOrderHistoryError] = useState('');
+  const [productionManualSaving, setProductionManualSaving] = useState(false);
+  const [productionManualError, setProductionManualError] = useState('');
+  const [productionManualSuccess, setProductionManualSuccess] = useState('');
+  const [showProductionManualForm, setShowProductionManualForm] = useState(false);
+  const [productionOrderPage, setProductionOrderPage] = useState(1);
+  const [productionOrderPageSize, setProductionOrderPageSize] = useState(25);
+  const [productionManualForm, setProductionManualForm] = useState(() => ({
+    productionDate: getTodayDnDateInput(),
+    productCode: '',
+    qty: '',
+    lineCode: '',
+    shiftLabel: '',
+    documentNo: '',
+    notes: '',
+  }));
+  const productionOrderPageSizeOptions = [25, 50, 100, 250];
+  const productionOrderTotalRows = productionOrderRows.length;
+  const productionOrderTotalPages = Math.max(1, Math.ceil(productionOrderTotalRows / productionOrderPageSize));
+  const productionOrderCurrentPage = Math.min(Math.max(1, productionOrderPage), productionOrderTotalPages);
+  const productionOrderStartIndex = productionOrderTotalRows === 0 ? 0 : (productionOrderCurrentPage - 1) * productionOrderPageSize;
+  const productionOrderEndIndex = Math.min(productionOrderStartIndex + productionOrderPageSize, productionOrderTotalRows);
+  const pagedProductionOrderRows = productionOrderRows.slice(productionOrderStartIndex, productionOrderEndIndex);
   const [wipImportRows, setWipImportRows] = useState([]);
   const [wipImportLoading, setWipImportLoading] = useState(false);
   const [wipImportError, setWipImportError] = useState('');
@@ -1968,6 +2165,7 @@ const TabKanban = (props) => {
   const [productionCompareCode, setProductionCompareCode] = useState('');
   const [localProductionCompareCode, setLocalProductionCompareCode] = useState('');
   const [showReceiveFormModal, setShowReceiveFormModal] = useState(false);
+  const incomingQuickActionNonceRef = useRef(null);
   const [showRnDetailModal, setShowRnDetailModal] = useState(false);
   const [selectedRnDetail, setSelectedRnDetail] = useState(null);
   const [showRnPrintModal, setShowRnPrintModal] = useState(false);
@@ -1978,6 +2176,16 @@ const TabKanban = (props) => {
   const [qrSimulationError, setQrSimulationError] = useState('');
   const [qrSimulationResult, setQrSimulationResult] = useState(null);
   const [qrSimulationRefreshNonce, setQrSimulationRefreshNonce] = useState(0);
+
+  useEffect(() => {
+    if (mainTab !== 'kanban') return;
+    if (incomingQuickAction?.type !== 'dn') return;
+    if (!incomingQuickAction?.nonce || incomingQuickActionNonceRef.current === incomingQuickAction.nonce) return;
+    incomingQuickActionNonceRef.current = incomingQuickAction.nonce;
+    setKanbanView?.('board');
+    setKanbanSubTab('receiving');
+    setShowReceiveFormModal(true);
+  }, [incomingQuickAction?.nonce, incomingQuickAction?.type, mainTab, setKanbanSubTab, setKanbanView]);
 
   useEffect(() => {
     if (dnPrintCardsTimerRef.current) {
@@ -2017,8 +2225,12 @@ const TabKanban = (props) => {
     style.innerHTML = `
       @media print {
         @page {
-          size: ${showDnPrintModal ? 'A4 landscape' : 'A4'};
+          size: ${showDnPrintModal ? 'A4 portrait' : 'A4 portrait'};
           margin: ${showDnPrintModal ? '8mm 10mm 10mm 10mm' : '10mm 15mm 15mm 15mm'};
+        }
+        @page dn-card-landscape {
+          size: A4 landscape;
+          margin: 8mm 10mm 10mm 10mm;
         }
       }
     `;
@@ -2077,6 +2289,47 @@ const TabKanban = (props) => {
     return code || part || '-';
   };
 
+  const productionOutputItemOptions = useMemo(() => {
+    const allowedTypes = new Set([
+      'fg',
+      'finishgood',
+      'finishedgood',
+      'finishedgoods',
+      'child',
+      'childpart',
+      'cp',
+      'subassy',
+      'subass',
+      'subassembly',
+      'sa',
+    ]);
+    return (Array.isArray(masterItems) ? masterItems : [])
+      .filter((item) => {
+        const typeKey = String(item?.type || item?.item_type || item?.category || '')
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '');
+        return allowedTypes.has(typeKey);
+      })
+      .map((item) => ({
+        ...item,
+        code: item.code || item.item_code,
+        label: [
+          item.code || item.item_code,
+          item.part_no || item.partNo,
+          item.name,
+        ].filter(Boolean).join(' | '),
+      }))
+      .filter((item) => item.code);
+  }, [masterItems]);
+
+  const selectedProductionManualItem = useMemo(() => {
+    const code = String(productionManualForm.productCode || '').trim();
+    if (!code) return null;
+    return productionOutputItemOptions.find((item) => String(item.code || '').trim() === code)
+      || masterItemsByCode?.get?.(code)
+      || null;
+  }, [masterItemsByCode, productionManualForm.productCode, productionOutputItemOptions]);
+
   const productionReportRows = useMemo(() => {
     const rows = Array.isArray(productionCompareRows) ? productionCompareRows : [];
     const mapped = rows.map((row) => {
@@ -2120,6 +2373,8 @@ const TabKanban = (props) => {
     setReceiveTruckNo('');
     setReceiveDriverName('');
     setReceiveDoNumber('');
+    setReceiveMillsheetQuestion('follow_up');
+    setReceiveMillsheetNotes('');
     setReceiveDoCheck({ status: 'idle', message: '', matches: [] });
   };
 
@@ -2166,37 +2421,26 @@ const TabKanban = (props) => {
     reader.readAsBinaryString(file);
   };
 
-  const notifyMessage = (message) => {
+  const notifyMessage = (message, actionLabel = '', onAction = null, tone = 'auto') => {
     if (showToastMessage) {
-      showToastMessage(message);
+      showToastMessage(message, actionLabel, onAction, tone);
       return;
     }
     alert(message);
   };
 
-  const buildLotSummaryText = (rows, { label = 'Lot', limit = 3 } = {}) => {
-    const list = Array.isArray(rows) ? rows : [];
-    const parts = list
-      .map((row) => {
-        const lotCode = String(
-          row?.batchNo
-          || row?.batch_no
-          || row?.lotNumber
-          || row?.lot_no
-          || row?.batchId
-          || row?.batch_id
-          || '',
-        ).trim();
-        if (!lotCode) return '';
-        const qtyValue = Number(row?.qty ?? row?.receivedQty ?? row?.consumedQty ?? row?.remainingQty ?? 0);
-        const qtyText = Number.isFinite(qtyValue) && qtyValue > 0 ? ` x ${qtyValue.toLocaleString('id-ID', { maximumFractionDigits: 0 })}` : '';
-        return `${lotCode}${qtyText}`;
-      })
-      .filter(Boolean);
-    if (!parts.length) return '';
-    const visible = parts.slice(0, limit).join(', ');
-    const extra = parts.length > limit ? ` +${parts.length - limit} lainnya` : '';
-    return `${label}: ${visible}${extra}`;
+  const openReceivingNoteByNumber = (rnNumber) => {
+    const targetRnNumber = String(rnNumber || '').trim();
+    setKanbanView?.('board');
+    setKanbanSubTab('receiving');
+    setRnStatus?.('all');
+    setRnDateStart?.('');
+    setRnDateEnd?.('');
+    if (targetRnNumber) setRnSearch?.(targetRnNumber);
+    setTablePagination?.((prev) => ({
+      ...prev,
+      kanbanReceiving: { ...(prev.kanbanReceiving || {}), page: 1 },
+    }));
   };
 
   const normalizeImportText = (value) => String(value ?? '').trim();
@@ -2382,15 +2626,32 @@ const TabKanban = (props) => {
   }, [isProductionUser, kanbanView, setKanbanView]);
 
   useEffect(() => {
+    const timer = setTimeout(() => {
+      if (kanbanSubTab === 'scan' && scanMode !== 'camera') {
+        scanManualInputRef.current?.focus();
+      }
+      if (kanbanSubTab === 'empty') {
+        emptyKanbanInputRef.current?.focus();
+      }
+    }, 120);
+    return () => clearTimeout(timer);
+  }, [kanbanSubTab, scanMode]);
+
+  useEffect(() => {
     if (kanbanSubTab !== 'production') return;
     if (productionTab === 'fg') {
       fetchProductionImportHistory();
+      fetchProductionOrderHistory();
     } else if (productionTab === 'wip') {
       fetchWipImportHistory();
     } else if (productionTab === 'report') {
       fetchProductionCompare({ silent: true });
     }
   }, [kanbanSubTab, productionTab]);
+
+  useEffect(() => {
+    setProductionOrderPage((prev) => Math.min(Math.max(1, prev), productionOrderTotalPages));
+  }, [productionOrderTotalPages]);
 
   useEffect(() => {
     if (kanbanSubTab !== 'delivery') return;
@@ -2409,6 +2670,22 @@ const TabKanban = (props) => {
       setProductionHistoryError(error.message || 'Gagal memuat riwayat import.');
     } finally {
       setProductionHistoryLoading(false);
+    }
+  };
+
+  const fetchProductionOrderHistory = async () => {
+    if (!canProduction) return;
+    setProductionOrderHistoryLoading(true);
+    setProductionOrderHistoryError('');
+    try {
+      const data = await apiFetch('/api/production/orders');
+      setProductionOrderRows(Array.isArray(data) ? data : []);
+      setProductionOrderPage(1);
+    } catch (error) {
+      setProductionOrderRows([]);
+      setProductionOrderHistoryError(error.message || 'Gagal memuat riwayat output produksi.');
+    } finally {
+      setProductionOrderHistoryLoading(false);
     }
   };
 
@@ -2513,6 +2790,67 @@ const TabKanban = (props) => {
     }
   };
 
+  const handleSubmitManualProductionReport = async (event) => {
+    event.preventDefault();
+    if (isStockOpnameLocked) {
+      notifyMessage('Selesaikan dulu Stock Opname!');
+      return;
+    }
+    const productionDate = String(productionManualForm.productionDate || '').trim();
+    const productCode = String(productionManualForm.productCode || '').trim();
+    const qtyNumber = Number(productionManualForm.qty);
+    if (!productionDate) {
+      setProductionManualError('Tanggal produksi wajib diisi.');
+      return;
+    }
+    if (!productCode) {
+      setProductionManualError('Kode item hasil produksi wajib dipilih.');
+      return;
+    }
+    if (!Number.isFinite(qtyNumber) || qtyNumber <= 0) {
+      setProductionManualError('Qty produksi wajib lebih dari 0.');
+      return;
+    }
+    setProductionManualSaving(true);
+    setProductionManualError('');
+    setProductionManualSuccess('');
+    try {
+      const result = await apiFetch('/api/production/consume', {
+        method: 'POST',
+        body: JSON.stringify({
+          productCode,
+          qty: qtyNumber,
+          productionDate,
+          source: 'MANUAL_REPORT',
+          lineCode: productionManualForm.lineCode,
+          shiftLabel: productionManualForm.shiftLabel,
+          documentNo: productionManualForm.documentNo,
+          notes: productionManualForm.notes,
+        }),
+      });
+      setProductionManualSuccess(`Input produksi tersimpan. PROD-${result?.productionId || '-'}`);
+      setProductionManualForm((prev) => ({
+        ...prev,
+        qty: '',
+        documentNo: '',
+        notes: '',
+      }));
+      setProductionOrderPage(1);
+      await fetchProductionOrderHistory();
+      await fetchProductionCompare({
+        silent: true,
+        start: productionCompareStart,
+        end: productionCompareEnd,
+        code: productionCompareCode || productCode,
+      });
+      notifyMessage('Input produksi manual tersimpan.');
+    } catch (error) {
+      setProductionManualError(error.message || 'Input produksi manual gagal.');
+    } finally {
+      setProductionManualSaving(false);
+    }
+  };
+
   const handleImportProductionFile = (e) => {
     if (isStockOpnameLocked) {
       notifyMessage('Selesaikan dulu Stock Opname!');
@@ -2550,6 +2888,7 @@ const TabKanban = (props) => {
         setProductionImportSummary(result);
         notifyMessage('Import produksi selesai.');
         await fetchProductionImportHistory();
+        await fetchProductionOrderHistory();
         await fetchProductionCompare({
           silent: true,
           start: productionCompareStart,
@@ -2559,6 +2898,7 @@ const TabKanban = (props) => {
       } catch (error) {
         setProductionImportError(error.message || 'Import produksi gagal.');
         await fetchProductionImportHistory();
+        await fetchProductionOrderHistory();
       } finally {
         setProductionImportLoading(false);
       }
@@ -2828,10 +3168,14 @@ const TabKanban = (props) => {
     const dnKey = resolveKey(['dn', 'dn_number', 'order', 'order_number']);
     const supplierKey = resolveKey(['supplier', 'supplier_id', 'vendor', 'vendor_id']);
     const qtyKey = resolveKey(['qty', 'snp', 'pack', 'quantity']);
+    const lotKey = resolveKey(['lot', 'lot_no', 'supplier_lot', 'supplier_lot_no', 'batch', 'batch_no']);
+    const kanbanKey = resolveKey(['kanban', 'kanban_id', 'kanbanid', 'card_uid', 'carduid']);
     let itemCode = itemKey ? String(parsed[itemKey] || '').trim() : '';
     const dnNumber = dnKey ? String(parsed[dnKey] || '').trim() : '';
     const supplier = supplierKey ? String(parsed[supplierKey] || '').trim() : '';
     let qty = qtyKey ? Number(parsed[qtyKey]) : NaN;
+    const lotNo = lotKey ? String(parsed[lotKey] || '').trim() : '';
+    const kanbanId = kanbanKey ? normalizeKanbanIdDisplay(parsed[kanbanKey]) : '';
 
     if (!itemCode && Array.isArray(itemList)) {
       const direct = itemList.find((item) => String(item.itemCode || '') === raw);
@@ -2843,7 +3187,7 @@ const TabKanban = (props) => {
     }
 
     if (!Number.isFinite(qty)) qty = NaN;
-    return { raw, itemCode, dnNumber, supplier, qty };
+    return { raw, itemCode, dnNumber, supplier, qty, lotNo, kanbanId };
   };
 
   const handleToggleDnSelection = (id) => {
@@ -2864,8 +3208,9 @@ const TabKanban = (props) => {
     try {
       const query = selectedIds.join(',');
       const rows = await apiFetch(`/api/delivery-notes/items?dnIds=${encodeURIComponent(query)}`);
-      const mapped = (Array.isArray(rows) ? rows : []).map((row) => {
+      const mapped = (Array.isArray(rows) ? rows : []).map((row, index) => {
         const itemCode = row.item_code || '-';
+        const originDnItemId = Number(row.id || row.origin_dn_item_id || row.dn_item_id || 0) || null;
         const masterItem = masterItemsByCode?.get(itemCode);
         const packQtyRaw = Number(row.pack_qty || 0);
         const lotQtyRaw = Number(kanbanSettingsByCode?.get(itemCode)?.lot_qty || 0);
@@ -2875,9 +3220,13 @@ const TabKanban = (props) => {
         const originalDocQty = Number(row.request_qty || 0);
         const alreadyReceived = Number(row.received_total || row.receivedTotal || 0);
         const docQty = Math.max(0, originalDocQty - alreadyReceived);
+        const rowKey = originDnItemId
+          ? `${row.dn_id}-${originDnItemId}`
+          : `${row.dn_id}-${itemCode}-${row.request_id || row.line_no || index}`;
         return {
-          key: `${row.dn_id}-${itemCode}`,
+          key: rowKey,
           originDnId: row.dn_id,
+          originDnItemId,
           dnNumber: row.dn_number || '-',
           itemCode,
           partNo: row.part_no || masterItem?.part_no || masterItem?.partNo || '-',
@@ -2965,7 +3314,11 @@ const TabKanban = (props) => {
       }
       let itemIndex = -1;
       if (parsed.dnNumber) {
-        itemIndex = updatedItems.findIndex((item) => item.itemCode === parsed.itemCode && item.dnNumber === parsed.dnNumber);
+        const matches = updatedItems
+          .map((item, index) => ({ item, index }))
+          .filter(({ item }) => item.itemCode === parsed.itemCode && item.dnNumber === parsed.dnNumber);
+        const openMatch = matches.find(({ item }) => Number(item.receivedQty || 0) < Number(item.docQty || 0));
+        itemIndex = (openMatch || matches[0])?.index ?? -1;
         if (itemIndex === -1) {
           latestError = `DN ${parsed.dnNumber} / Item ${parsed.itemCode} tidak ditemukan.`;
           return;
@@ -2995,8 +3348,11 @@ const TabKanban = (props) => {
         qrValue: parsed.raw,
         itemCode: parsed.itemCode,
         originDnId: item.originDnId,
+        originDnItemId: item.originDnItemId,
         dnNumber: item.dnNumber,
         qty: qtyValue,
+        lotNo: parsed.lotNo || '',
+        kanbanId: parsed.kanbanId || '',
       });
       setReceiveFlashKey(item.key || `${item.originDnId}-${item.itemCode}`);
       setTimeout(() => {
@@ -3014,15 +3370,18 @@ const TabKanban = (props) => {
       item.key === itemKey ? { ...item, receivedQty: 0 } : item
     )));
     setReceiveScanLogs((prev) => {
-      const next = prev.filter((log) => `${log.originDnId}-${log.itemCode}` !== itemKey);
+      const next = prev.filter((log) => {
+        const logKey = log.originDnItemId
+          ? `${log.originDnId}-${log.originDnItemId}`
+          : `${log.originDnId}-${log.itemCode}`;
+        return logKey !== itemKey;
+      });
       receiveScanSetRef.current = new Set(next.map((log) => log.qrValue));
       return next;
     });
   };
 
   const receiveDoFormatValidation = validateReceiveDoNumberFormat(receiveDoNumber);
-  const receiveDoSubmitBlocked = ['invalid', 'block', 'checking'].includes(receiveDoCheck.status)
-    || !receiveDoFormatValidation.valid;
   const receiveDoBadge = (() => {
     if (!normalizeReceiveDoNumber(receiveDoNumber)) return null;
     if (receiveDoCheck.status === 'ok') {
@@ -3096,8 +3455,17 @@ const TabKanban = (props) => {
       setReceiveError('DN belum dipilih.');
       return;
     }
+    const normalizedReceiveDoNumber = normalizeReceiveDoNumber(receiveDoNumber);
+    if (!normalizedReceiveDoNumber) {
+      const message = 'Nomor SJ / DO masih kosong. Isi nomor surat jalan sebelum confirm receiving.';
+      setReceiveError(message);
+      notifyMessage(message, '', null, 'warning');
+      return;
+    }
     if (!receiveDoFormatValidation.valid) {
-      setReceiveError(receiveDoFormatValidation.reason || 'Nomor SJ / DO wajib diisi.');
+      const message = receiveDoFormatValidation.reason || 'Nomor SJ / DO wajib diisi.';
+      setReceiveError(message);
+      notifyMessage(message, '', null, 'warning');
       return;
     }
     if (receiveDoCheck.status === 'checking') {
@@ -3108,11 +3476,30 @@ const TabKanban = (props) => {
       setReceiveError(receiveDoCheck.message || 'Nomor SJ / DO sudah dipakai.');
       return;
     }
-    const payloadItems = receiveItems.map((item) => ({
-      originDnId: item.originDnId,
-      itemCode: item.itemCode,
-      receivedQty: Number(item.receivedQty || 0),
-    }));
+    const scanMetaByLine = new Map();
+    receiveScanLogs.forEach((scan) => {
+      const key = scan.originDnItemId
+        ? `${scan.originDnId}-${scan.originDnItemId}`
+        : `${scan.originDnId}-${scan.itemCode}`;
+      if (!scanMetaByLine.has(key)) scanMetaByLine.set(key, { lotNo: '', kanbanId: '' });
+      const meta = scanMetaByLine.get(key);
+      if (!meta.lotNo && scan.lotNo) meta.lotNo = scan.lotNo;
+      if (!meta.kanbanId && scan.kanbanId) meta.kanbanId = scan.kanbanId;
+    });
+    const payloadItems = receiveItems.map((item) => {
+      const key = item.originDnItemId
+        ? `${item.originDnId}-${item.originDnItemId}`
+        : `${item.originDnId}-${item.itemCode}`;
+      const meta = scanMetaByLine.get(key) || {};
+      return {
+        originDnId: item.originDnId,
+        originDnItemId: item.originDnItemId,
+        itemCode: item.itemCode,
+        receivedQty: Number(item.receivedQty || 0),
+        supplierLotNo: meta.lotNo || null,
+        kanbanId: meta.kanbanId || null,
+      };
+    });
     const totalReceived = receiveItems.reduce((acc, item) => acc + Number(item.receivedQty || 0), 0);
     if (!totalReceived) {
       setReceiveError('Qty terima masih 0.');
@@ -3121,7 +3508,7 @@ const TabKanban = (props) => {
     if (receiveVarianceSummary.hasOver) {
       const details = receiveVarianceSummary.overRows
         .slice(0, 5)
-        .map((item) => `${item.itemCode}: DN ${formatNumber0(item.docQty)} / terima ${formatNumber0(item.receivedQty)} / lebih ${formatNumber0(item.variance)}`)
+        .map((item) => `${item.itemCode}: DN ${formatQty(item.docQty)} / terima ${formatQty(item.receivedQty)} / lebih ${formatQty(item.variance)}`)
         .join('\n');
       const ok = window.confirm(`Over delivery detected.\n\n${details}\n\nJika dilanjutkan, sistem akan mencatat qty lebih sebagai exception receiving. Lanjutkan?`);
       if (!ok) return;
@@ -3129,7 +3516,7 @@ const TabKanban = (props) => {
     if (receiveVarianceSummary.hasShort) {
       const details = receiveVarianceSummary.shortRows
         .slice(0, 5)
-        .map((item) => `${item.itemCode}: DN ${formatNumber0(item.docQty)} / terima ${formatNumber0(item.receivedQty)} / kurang ${formatNumber0(Math.abs(item.variance))}`)
+        .map((item) => `${item.itemCode}: DN ${formatQty(item.docQty)} / terima ${formatQty(item.receivedQty)} / kurang ${formatQty(Math.abs(item.variance))}`)
         .join('\n');
       const ok = window.confirm(`Short receiving detected.\n\n${details}\n\nJika dilanjutkan, RN akan dibuat untuk qty yang diterima dan sisa DN tetap outstanding/partial. Lanjutkan?`);
       if (!ok) return;
@@ -3145,12 +3532,15 @@ const TabKanban = (props) => {
         method: 'POST',
         body: JSON.stringify({
           supplier: receiveSupplier,
-          doNumber: normalizeReceiveDoNumber(receiveDoNumber),
+          doNumber: normalizedReceiveDoNumber,
           dnIds: receiveSelectedDnIds,
           items: payloadItems,
           scans: receiveScanLogs,
           truckNo: receiveTruckNo,
           driverName: receiveDriverName,
+          millsheetQuestion: receiveMillsheetQuestion,
+          millsheetNotes: receiveMillsheetNotes,
+          allowOverReceive: receiveVarianceSummary.hasOver,
         }),
       });
       await fetchReceiveNotes?.();
@@ -3158,8 +3548,13 @@ const TabKanban = (props) => {
       await fetchOpenDns(receiveSupplier);
       resetReceiveState();
       setReceiveSelectedDnIds([]);
-      const lotSummary = buildLotSummaryText(result?.postResult?.postedLines, { label: 'Batch/Lot' });
-      notifyMessage(lotSummary ? `Receiving berhasil disimpan. ${lotSummary}.` : 'Receiving berhasil disimpan.');
+      const rnNumber = result?.rnNumber || result?.postResult?.header?.rn_number || '';
+      notifyMessage(
+        `Penerimaan aktual ${rnNumber || normalizedReceiveDoNumber || 'RN'} tersimpan.`,
+        rnNumber ? 'Buka' : '',
+        rnNumber ? () => openReceivingNoteByNumber(rnNumber) : null,
+        'success',
+      );
     } catch (error) {
       setReceiveError(error.message || 'Gagal menyimpan receiving.');
     } finally {
@@ -3169,6 +3564,10 @@ const TabKanban = (props) => {
 
   const handleDeleteReceiveNote = async (rn) => {
     if (!rn) return;
+    if (rn.rn_type === 'header' && rn.rn_header_id) {
+      handleReverseReceiveNote(rn);
+      return;
+    }
     const label = rn.rn_number || rn.id || '';
     const ok = window.confirm(`Hapus RN ${label}?`);
     if (!ok) return;
@@ -3191,6 +3590,42 @@ const TabKanban = (props) => {
     }
   };
 
+  const handleReverseReceiveNote = async (rn) => {
+    if (!rn) return;
+    if (rn.rn_type !== 'header' || !rn.rn_header_id) {
+      alert('RN lama belum support reversal otomatis. Gunakan hapus RN hanya jika benar-benar perlu.');
+      return;
+    }
+    const label = rn.rn_number || rn.id || '';
+    const reason = window.prompt(
+      `Batalkan/Reversal RN ${label}?\n\nStok, sisa PO, dan schedule akan dibalik. Isi alasan koreksi:`,
+      'Salah input item/qty penerimaan.',
+    );
+    if (reason === null) return;
+    const cleanReason = String(reason || '').trim();
+    if (!cleanReason) {
+      alert('Alasan wajib diisi untuk reversal RN.');
+      return;
+    }
+    try {
+      const result = await apiFetch(`/api/inbound/receipts/${rn.rn_header_id}/reverse`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: cleanReason }),
+      });
+      await fetchReceiveNotes?.();
+      await fetchDeliveryNotes?.();
+      const reversedLabel = result?.header?.rn_number || label;
+      notifyMessage(
+        `RN ${reversedLabel} berhasil dibatalkan. Silakan input ulang penerimaan yang benar.`,
+        'Buka RN',
+        () => openReceivingNoteByNumber(label),
+        'warning',
+      );
+    } catch (error) {
+      alert(error.message || 'Gagal membatalkan RN.');
+    }
+  };
+
   const openRnDetailModal = (rn) => {
     if (!rn) return;
     setSelectedRnDetail(rn);
@@ -3206,7 +3641,8 @@ const TabKanban = (props) => {
     if (!rn) return null;
     const receivedDate = rn.received_at ? new Date(rn.received_at) : null;
     const items = (rn.items || []).filter((row) => Number(row.received_qty ?? 0) > 0);
-    const dnReference = rn.dn_reference || rn.dn_number || rn.dnNumber || '-';
+    const doNumber = rn.do_number || items.find((row) => row.do_number)?.do_number || '-';
+    const dnReference = rn.dn_reference || rn.dn_number || rn.dnNumber || (doNumber !== '-' ? doNumber : '-');
     const poNumbers = Array.from(new Set(
       items
         .map((row) => String(row.po_number || row.schedule_po_number || row.po_line_po_number || '').trim())
@@ -3216,7 +3652,6 @@ const TabKanban = (props) => {
     const totalActualQty = items.reduce((sum, row) => sum + Number(row.received_qty ?? row.actual_qty ?? 0), 0);
     const receivedByName = rn.received_by_name || items.find((row) => row.received_by_name)?.received_by_name || '-';
     const remarks = rn.notes || items.find((row) => row.notes)?.notes || '-';
-    const doNumber = rn.do_number || items.find((row) => row.do_number)?.do_number || '-';
     const statusLabel = totalActualQty > totalDocQty ? 'OVER'
       : totalActualQty < totalDocQty ? 'SHORT'
       : 'COMPLETE';
@@ -3575,7 +4010,7 @@ const TabKanban = (props) => {
     return (
       <div
         className="mx-auto bg-white text-slate-900 print-body dn-print-page"
-        style={{ width: '100%', maxWidth: showCardSection ? '285mm' : '210mm' }}
+        style={{ width: '100%', maxWidth: '210mm' }}
       >
         <div className={`mb-3 rounded-lg border px-3 py-2 text-[11px] print:hidden ${dnStatusNotice.className}`}>
           <div className="font-semibold">Status {dnStatusLabel}: {dnStatusNotice.title}</div>
@@ -3931,10 +4366,13 @@ const TabKanban = (props) => {
       .filter((category) => category.code || category.name);
     if (options.length > 0) return options;
     return [
+      { code: 'FG', name: 'Finished Good' },
       { code: 'CP', name: 'Child Part' },
       { code: 'SA', name: 'Sub-Assy' },
       { code: 'RM', name: 'Raw Material' },
       { code: 'IM', name: 'Indirect Material' },
+      { code: 'CB', name: 'Consumable' },
+      { code: 'SUBCON', name: 'Subcon' },
     ];
   }, [masterCategories]);
 
@@ -4211,7 +4649,19 @@ ${reasons.join('\n')}`);
   const scanPrlPlan = scanActiveResult?.prlPlan || null;
   const scanPrlEligible = Boolean(scanPrlPlan?.eligible);
   const scanPrlOver = Boolean(scanPrlPlan?.overPrl || scanActiveResult?.cardMeta?.overPrl);
-  const isScanIssueAction = scanActionType === 'issue' || scanActionType === 'consumption';
+  const scanCategoryText = [
+    scanActiveResult?.itemCategoryCode,
+    scanActiveResult?.itemCategoryLabel,
+    scanActiveResult?.category,
+    scanActiveResult?.actionLabel,
+    scanActiveResult?.actionHint,
+    scanActiveResult?.cardMeta?.itemCategoryCode,
+    scanActiveResult?.cardMeta?.itemCategoryLabel,
+  ].map((value) => String(value || '').trim().toLowerCase()).join(' ');
+  const isScanIssueAction = scanActionType === 'issue'
+    || scanActionType === 'consumption'
+    || scanActionType === 'consumption_only'
+    || /\brm\b|raw|indirect|consum/.test(scanCategoryText);
   const isScanSubconAction = scanActionType === 'external_transfer';
   const isScanRoutingAction = scanActionType === 'routing_execution';
   const executeScanFlow = async () => {
@@ -4239,6 +4689,10 @@ ${reasons.join('\n')}`);
         return;
       }
       if (isScanSubconAction) {
+        if (isProductionUser) {
+          setScanError('Kartu ini termasuk flow Subcon. Akun produksi tidak dapat memproses kartu Subcon.');
+          return;
+        }
         setMainTab('subcon');
         setScanError('');
         return;
@@ -4298,12 +4752,18 @@ ${reasons.join('\n')}`);
               <div className="flex flex-col gap-2">
                 <div>
                   <div className="text-2xl font-bold text-slate-900">
-                    {kanbanView === 'master' ? 'Setup Master Kanban' : 'Kanban Board'}
+                    {kanbanView === 'master'
+                      ? 'Setup Master Kanban'
+                      : kanbanView === 'planning'
+                        ? 'Planning'
+                        : 'Kanban Board'}
                   </div>
                   <div className="text-xs text-slate-500">
                     {kanbanView === 'master'
                       ? 'Konfigurasi parameter kanban untuk material dan layanan subcon.'
-                      : 'Pantau alur request, DN, receiving, dan kanban kosong.'}
+                      : kanbanView === 'planning'
+                        ? 'Kelola workflow delivery dan produksi.'
+                        : 'Pantau alur request, DN, receiving, dan kanban kosong.'}
                   </div>
                 </div>
                 <div className="flex gap-2 text-xs">
@@ -4324,6 +4784,17 @@ ${reasons.join('\n')}`);
                   >
                     Kanban Board
                   </button>
+                  {!isProductionUser && (
+                    <button
+                      onClick={() => {
+                        setKanbanView('planning');
+                        setKanbanSubTab(planningDefaultTab);
+                      }}
+                      className={`px-3 py-1.5 rounded border ${kanbanView === 'planning' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600'}`}
+                    >
+                      Planning
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -4957,10 +5428,10 @@ ${reasons.join('\n')}`);
               </div>
               )}
 
-              {kanbanView === 'board' && (
+              {['board', 'planning'].includes(kanbanView) && (
               <div className="space-y-4">
                 <div className="bg-white rounded-xl border p-3 flex flex-wrap gap-2 text-xs">
-                  {kanbanBoardTabs.map((tab) => (
+                  {(kanbanView === 'planning' ? planningTabs : kanbanBoardTabs).map((tab) => (
                     <button
                       key={tab.key}
                       type="button"
@@ -5207,10 +5678,16 @@ ${reasons.join('\n')}`);
                         onChange={(e) => setKanbanCategoryFilter(e.target.value)}
                       >
                         <option value="all">All Categories</option>
-                        <option value="raw">Raw Material</option>
-                        <option value="indirect">Indirect Material</option>
-                        <option value="consumable">Consumable</option>
-                        <option value="subcon">Subcon</option>
+                        {masterCategoryFilterOptions.map((category) => {
+                          const code = String(category.code || category.name || '').trim();
+                          const name = String(category.name || '').trim();
+                          if (!code) return null;
+                          return (
+                            <option key={`kanban-category-${code}`} value={code}>
+                              {[code, name].filter(Boolean).join(' - ')}
+                            </option>
+                          );
+                        })}
                       </select>
                       <div className="flex gap-2 ml-auto">
                         <button
@@ -5381,8 +5858,24 @@ ${reasons.join('\n')}`);
                               <div>Lead Time: {row.lead_time_days || 0} days</div>
                             </div>
                             <div className="mt-3 flex items-center gap-2 justify-end">
-                              <button onClick={() => openQrModal(row)} className="p-2 border rounded hover:bg-slate-50"><QrCode size={14} /></button>
-                              <button className="p-2 border rounded hover:bg-slate-50"><BarChart3 size={14} /></button>
+                              <button
+                                type="button"
+                                onClick={() => openQrModal(row)}
+                                className="p-2 border rounded hover:bg-slate-50"
+                                title="Lihat QR Kanban"
+                                aria-label={`Lihat QR ${row.item_code}`}
+                              >
+                                <QrCode size={14} />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => openKanbanItemAnalysis(row)}
+                                className="p-2 border rounded hover:bg-slate-50"
+                                title="Analisa Kanban"
+                                aria-label={`Analisa Kanban ${row.item_code}`}
+                              >
+                                <BarChart3 size={14} />
+                              </button>
                             </div>
                           </div>
                         );
@@ -5738,8 +6231,8 @@ ${reasons.join('\n')}`);
                                     </td>
                                     <td className="p-2 text-slate-700 font-semibold">{groupSupplierMeta.codeLabel}</td>
                                     <td className="p-2">{groupTriggerLabel}</td>
-                                    <td className="p-2 text-right">{groupOnHand}</td>
-                                    <td className="p-2 text-right font-semibold">{formatNumber2(group.totalQty || 0)}</td>
+                                    <td className="p-2 text-right">{formatQty(groupOnHand)}</td>
+                                    <td className="p-2 text-right font-semibold">{formatQty(group.totalQty || 0)}</td>
                                     <td className="p-2">
                                       <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
                                         groupHasOverdue
@@ -5860,8 +6353,8 @@ ${reasons.join('\n')}`);
                                         </td>
                                         <td className="p-2 text-slate-700 font-semibold">{rowSupplierMeta.codeLabel}</td>
                                         <td className="p-2">{triggerLabel}</td>
-                                        <td className="p-2 text-right">{onHand}</td>
-                                        <td className="p-2 text-right font-semibold">{formatNumber2(row.request_qty || 0)}</td>
+                                        <td className="p-2 text-right">{formatQty(onHand)}</td>
+                                        <td className="p-2 text-right font-semibold">{formatQty(row.request_qty || 0)}</td>
                                         <td className="p-2">
                                           <div className="flex flex-wrap gap-1">
                                             <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
@@ -6226,7 +6719,7 @@ ${reasons.join('\n')}`);
                               </td>
                               <td className="p-2 text-slate-600">{createdDate}</td>
                               <td className="p-2">{plannedDate}</td>
-                              <td className="p-2 text-right">{formatNumber0(dn.total_qty)}</td>
+                              <td className="p-2 text-right">{formatQty(dn.total_qty)}</td>
                               <td className="p-2">{statusLabel}</td>
                               <td className="p-2">{deliveryTypeLabel}</td>
                               <td className="p-2">
@@ -6239,69 +6732,91 @@ ${reasons.join('\n')}`);
                                 )}
                               </td>
                               <td className="p-2">
-                                <div className="flex items-center gap-1">
+                                <div className="flex items-center gap-1.5">
                                   <button
                                     type="button"
-                                    onClick={() => handleDnPreview(dn)}
-                                    className="p-1.5 border rounded text-slate-600 hover:text-slate-900"
-                                    title="Preview DN"
+                                    onClick={() => openDnDetailModal(dn, false)}
+                                    className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-1.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
+                                    title="Lihat Detail"
                                   >
-                                    <FileText size={14} />
+                                    <Eye size={13} /> Detail
                                   </button>
                                   <button
                                     type="button"
                                     onClick={() => handleDnPrintPdf(dn)}
-                                    className="p-1.5 border rounded text-slate-600 hover:text-slate-900"
-                                    title="Send / Print DN"
+                                    className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-1.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
+                                    title="Print / PDF DN"
                                   >
-                                    <Printer size={14} />
+                                    <Printer size={13} /> Print/PDF
                                   </button>
                                   <button
                                     type="button"
                                     onClick={() => handleDnEmail(dn)}
-                                    className="p-1.5 border rounded text-slate-600 hover:text-slate-900"
+                                    className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-1.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
                                     title="Email DN"
                                   >
-                                    <Mail size={14} />
+                                    <Mail size={13} /> Email
                                   </button>
-                                  {canEditDnHeader && (
+                                  <div className="relative">
                                     <button
                                       type="button"
-                                      onClick={() => openDnDetailModal(dn, true)}
-                                      className="p-1.5 border rounded text-slate-600 hover:text-slate-900"
-                                      title="Edit tanggal / rit DN"
+                                      onClick={() => setDnActionMenuOpen((prev) => (prev === dn.id ? null : dn.id))}
+                                      className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+                                      title="Aksi lainnya"
                                     >
-                                      <Edit size={14} />
+                                      Lainnya <ChevronDown size={12} />
                                     </button>
-                                  )}
-                                  {isDraft && canEditSchedules && (
-                                    <button
-                                      type="button"
-                                      onClick={() => handleSplitDnByRit(dn)}
-                                      className="p-1.5 border rounded text-slate-600 hover:text-indigo-600"
-                                      title="Split DN by supplier rit"
-                                    >
-                                      <ArrowDownUp size={14} />
-                                    </button>
-                                  )}
-                                  {isDraft && canDeleteRecords && (
-                                    <button
-                                      type="button"
-                                      onClick={() => handleDeleteDn(dn)}
-                                      className="p-1.5 border rounded text-slate-600 hover:text-rose-600"
-                                      title="Hapus DN"
-                                    >
-                                      <Trash2 size={14} />
-                                    </button>
-                                  )}
-                                  <button
-                                    type="button"
-                                    onClick={() => openDnDetailModal(dn, false)}
-                                    className="p-1.5 border rounded text-slate-600 hover:text-slate-900"
-                                    title="Lihat Detail"
-                                  >
-                                    <Eye size={14} />
-                                  </button>
+                                    {dnActionMenuOpen === dn.id && (
+                                      <div className="absolute right-0 top-full z-30 mt-1 min-w-[180px] overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg">
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setDnActionMenuOpen(null);
+                                            handleDnPreview(dn);
+                                          }}
+                                          className="flex w-full items-center gap-2 px-3 py-2 text-left text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
+                                        >
+                                          <FileText size={13} /> Preview DN
+                                        </button>
+                                        {canEditDnHeader && (
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              setDnActionMenuOpen(null);
+                                              openDnDetailModal(dn, true);
+                                            }}
+                                            className="flex w-full items-center gap-2 px-3 py-2 text-left text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
+                                          >
+                                            <Edit size={13} /> Edit tanggal / rit
+                                          </button>
+                                        )}
+                                        {isDraft && canEditSchedules && (
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              setDnActionMenuOpen(null);
+                                              handleSplitDnByRit(dn);
+                                            }}
+                                            className="flex w-full items-center gap-2 px-3 py-2 text-left text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
+                                          >
+                                            <ArrowDownUp size={13} /> Split rit
+                                          </button>
+                                        )}
+                                        {isDraft && canDeleteRecords && (
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              setDnActionMenuOpen(null);
+                                              handleDeleteDn(dn);
+                                            }}
+                                            className="flex w-full items-center gap-2 px-3 py-2 text-left text-[11px] font-semibold text-rose-600 hover:bg-rose-50"
+                                          >
+                                            <Trash2 size={13} /> Hapus DN
+                                          </button>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
                                 </div>
                               </td>
                             </tr>
@@ -6422,11 +6937,11 @@ ${reasons.join('\n')}`);
                                   </div>
                                   <div className="rounded-lg bg-slate-50 p-2">
                                     <div className="text-slate-400">Qty Order</div>
-                                    <div className="font-semibold text-slate-800">{formatNumber0(deliveryUploadResult.total_qty_order || 0)}</div>
+                                    <div className="font-semibold text-slate-800">{formatQty(deliveryUploadResult.total_qty_order || 0)}</div>
                                   </div>
                                   <div className="rounded-lg bg-slate-50 p-2">
                                     <div className="text-slate-400">Qty Kurang</div>
-                                    <div className="font-semibold text-slate-800">{formatNumber0(deliveryUploadResult.total_qty_shortage || 0)}</div>
+                                    <div className="font-semibold text-slate-800">{formatQty(deliveryUploadResult.total_qty_shortage || 0)}</div>
                                   </div>
                                 </div>
                               </div>
@@ -6542,9 +7057,9 @@ ${reasons.join('\n')}`);
                                         <td className="p-2">{row.created_at ? new Date(row.created_at).toLocaleString('id-ID') : '-'}</td>
                                         <td className="p-2">{row.customer_name || '-'}</td>
                                         <td className="p-2 font-semibold">{row.dn_number || '-'}</td>
-                                        <td className="p-2 text-right">{formatNumber0(row.total_qty_order || 0)}</td>
-                                        <td className="p-2 text-right">{formatNumber0(row.total_qty_fulfilled || 0)}</td>
-                                        <td className="p-2 text-right">{formatNumber0(row.total_qty_shortage || 0)}</td>
+                                        <td className="p-2 text-right">{formatQty(row.total_qty_order || 0)}</td>
+                                        <td className="p-2 text-right">{formatQty(row.total_qty_fulfilled || 0)}</td>
+                                        <td className="p-2 text-right">{formatQty(row.total_qty_shortage || 0)}</td>
                                         <td className="p-2">
                                           <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${statusTone}`}>
                                             {statusKey ? statusKey.replace(/_/g, ' ').toUpperCase() : '-'}
@@ -6620,10 +7135,10 @@ ${reasons.join('\n')}`);
                                             <td className="p-2">{item.lineNo || '-'}</td>
                                             <td className="p-2 font-semibold">{item.partNo || '-'}</td>
                                             <td className="p-2">{item.itemName || '-'}</td>
-                                            <td className="p-2 text-right">{formatNumber0(item.qtyOrder || 0)}</td>
-                                            <td className="p-2 text-right">{formatNumber0(item.qtyAvailable || 0)}</td>
-                                            <td className="p-2 text-right">{formatNumber0(item.qtyFulfilled || 0)}</td>
-                                            <td className="p-2 text-right">{formatNumber0(item.qtyShortage || 0)}</td>
+                                            <td className="p-2 text-right">{formatQty(item.qtyOrder || 0)}</td>
+                                            <td className="p-2 text-right">{formatQty(item.qtyAvailable || 0)}</td>
+                                            <td className="p-2 text-right">{formatQty(item.qtyFulfilled || 0)}</td>
+                                            <td className="p-2 text-right">{formatQty(item.qtyShortage || 0)}</td>
                                             <td className="p-2">
                                               <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${tone}`}>
                                                 {statusKey ? statusKey.replace(/_/g, ' ').toUpperCase() : '-'}
@@ -6743,6 +7258,34 @@ ${reasons.join('\n')}`);
                           />
                         </div>
                       </div>
+                      <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+                        <div className="grid grid-cols-1 md:grid-cols-[220px_1fr] gap-3">
+                          <div>
+                            <label className="block text-[10px] uppercase text-slate-400 mb-1">Ada Mill Sheet?</label>
+                            <select
+                              className="border p-2 rounded w-full text-sm bg-white"
+                              value={receiveMillsheetQuestion}
+                              onChange={(e) => setReceiveMillsheetQuestion(e.target.value)}
+                            >
+                              <option value="yes">Ada / dibawa supplier</option>
+                              <option value="follow_up">Belum ada, susulan</option>
+                              <option value="no">Tidak ada</option>
+                            </select>
+                          </div>
+                          <div>
+                            <label className="block text-[10px] uppercase text-slate-400 mb-1">Catatan Mill Sheet</label>
+                            <input
+                              className="border p-2 rounded w-full text-sm bg-white"
+                              placeholder="Contoh: supplier kirim susulan hari ini / file ada di portal"
+                              value={receiveMillsheetNotes}
+                              onChange={(e) => setReceiveMillsheetNotes(e.target.value)}
+                            />
+                            <div className="mt-1 text-[10px] text-slate-500">
+                              Status ini untuk follow-up dokumen QC. RN dan stok tetap diproses sesuai qty aktual.
+                            </div>
+                          </div>
+                        </div>
+                      </div>
                       {receiveDnError && (
                         <div className="mt-2 text-xs text-red-600">{receiveDnError}</div>
                       )}
@@ -6777,7 +7320,7 @@ ${reasons.join('\n')}`);
                                 </div>
                               </div>
                               <div className="text-right text-[10px] text-slate-600">
-                                Qty: {formatNumber0(dn.total_qty || 0)}
+                                Qty: {formatQty(dn.total_qty || 0)}
                               </div>
                               </label>
                             );
@@ -6858,7 +7401,7 @@ ${reasons.join('\n')}`);
                                         <div className="text-[10px] text-slate-500">{item.partName}</div>
                                         <div className="text-[10px] text-slate-400">{item.itemCode}</div>
                                       </td>
-                                      <td className="p-2 border text-right">{formatNumber0(docQty)}</td>
+                                      <td className="p-2 border text-right">{formatQty(docQty)}</td>
                                       <td className="p-2 border text-right">
                                         <input
                                           type="number"
@@ -6901,10 +7444,10 @@ ${reasons.join('\n')}`);
                               </div>
                               <div className="mt-1">
                                 {receiveVarianceSummary.hasShort && (
-                                  <span>{receiveVarianceSummary.shortRows.length} item SHORT, kurang {formatNumber0(receiveVarianceSummary.shortQty)}. </span>
+                                  <span>{receiveVarianceSummary.shortRows.length} item SHORT, kurang {formatQty(receiveVarianceSummary.shortQty)}. </span>
                                 )}
                                 {receiveVarianceSummary.hasOver && (
-                                  <span>{receiveVarianceSummary.overRows.length} item OVER, lebih {formatNumber0(receiveVarianceSummary.overQty)}. </span>
+                                  <span>{receiveVarianceSummary.overRows.length} item OVER, lebih {formatQty(receiveVarianceSummary.overQty)}. </span>
                                 )}
                                 Confirm Receiving akan mencatat qty aktual yang diterima; selisih tetap menjadi exception untuk ditindaklanjuti.
                               </div>
@@ -6921,7 +7464,7 @@ ${reasons.join('\n')}`);
                               type="button"
                               onClick={handleConfirmReceive}
                               className="px-4 py-2 bg-indigo-600 text-white rounded text-xs"
-                              disabled={receiveSubmitting || isStockOpnameLocked || receiveDoSubmitBlocked}
+                              disabled={receiveSubmitting || isStockOpnameLocked}
                             >
                               {receiveSubmitting ? 'Menyimpan...' : 'Confirm Receiving'}
                             </button>
@@ -7002,6 +7545,7 @@ ${reasons.join('\n')}`);
                             const isPartial = expected > 0 && actual < expected;
                             const statusLabel = isPartial ? 'PARTIAL' : 'RECEIVED';
                             const dnRef = rn.dn_reference || rn.dn_number || '-';
+                            const isHeaderRn = rn.rn_type === 'header' && rn.rn_header_id;
                             return (
                               <tr key={rn.id} className="border-t">
                                 <td className="p-2 font-semibold">{rn.rn_number}</td>
@@ -7013,10 +7557,10 @@ ${reasons.join('\n')}`);
                                     {qcStatus || 'OK'}
                                   </span>
                                 </td>
-                                <td className="p-2 text-right">{formatNumber2(expected)}</td>
-                                <td className="p-2 text-right">{formatNumber2(actual)}</td>
+                                <td className="p-2 text-right">{formatQty(expected)}</td>
+                                <td className="p-2 text-right">{formatQty(actual)}</td>
                                 <td className={`p-2 text-right ${variance === 0 ? 'text-emerald-600' : variance > 0 ? 'text-orange-600' : 'text-red-600'}`}>
-                                  {variance > 0 ? `+${formatNumber2(variance)}` : formatNumber2(variance)}
+                                  {formatSignedQty(variance)}
                                 </td>
                                 <td className="p-2">
                                   <span className="px-2 py-0.5 rounded-full text-[10px] bg-slate-900 text-white">
@@ -7048,10 +7592,21 @@ ${reasons.join('\n')}`);
                                     {canDeleteRecords && (
                                       <button
                                         type="button"
+                                        onClick={() => handleReverseReceiveNote(rn)}
+                                        className="p-1.5 border rounded text-amber-700 hover:text-amber-800"
+                                        title="Batalkan/Reversal RN"
+                                        aria-label="Reverse RN"
+                                      >
+                                        <RotateCcw size={12} />
+                                      </button>
+                                    )}
+                                    {canDeleteRecords && (
+                                      <button
+                                        type="button"
                                         onClick={() => handleDeleteReceiveNote(rn)}
                                         className="p-1.5 border rounded text-rose-600 hover:text-rose-700"
-                                        title="Hapus RN"
-                                        aria-label="Delete RN"
+                                        title={isHeaderRn ? 'Batalkan/Reversal RN' : 'Hapus RN'}
+                                        aria-label={isHeaderRn ? 'Reverse RN' : 'Delete RN'}
                                       >
                                         <Trash2 size={12} />
                                       </button>
@@ -7122,7 +7677,7 @@ ${reasons.join('\n')}`);
                     <div className={isProductionUser ? 'grid grid-cols-1 gap-4 max-w-3xl' : 'grid grid-cols-1 lg:grid-cols-2 gap-4'}>
                       <div className="bg-white rounded-2xl border p-5 shadow-sm">
                         <div className="text-sm font-semibold mb-1">Pemindaian Kanban Tunggal</div>
-                        <div className="text-xs text-slate-500 mb-4">Pindai atau masukkan Kanban ID untuk satu kartu kosong.</div>
+                        <div className="text-xs text-slate-500 mb-4">Input otomatis fokus. Scan QR kanban dari scanner line, lalu sistem langsung mencatat saat scanner mengirim Enter.</div>
                         <form onSubmit={handleEmptyKanbanSubmit} className="space-y-3 text-xs">
                           <div>
                             <label className="block text-[10px] uppercase text-slate-400 mb-1">Area/Lini</label>
@@ -7142,15 +7697,27 @@ ${reasons.join('\n')}`);
                           <div>
                             <label className="block text-[10px] uppercase text-slate-400 mb-1">Kanban ID</label>
                             <input
-                              className="border p-2 rounded w-full text-xs"
+                              ref={emptyKanbanInputRef}
+                              className={`border rounded w-full ${isProductionUser ? 'p-4 text-lg font-semibold' : 'p-2 text-xs'}`}
                               placeholder="Pindai atau masukkan Kanban ID dari master"
                               value={emptyKanbanForm.kanbanId}
                               onChange={(e) => setEmptyKanbanForm({ ...emptyKanbanForm, kanbanId: e.target.value })}
+                              onKeyDown={(event) => {
+                                if (event.key !== 'Enter' || event.shiftKey) return;
+                                event.preventDefault();
+                                const value = event.currentTarget.value.trim();
+                                if (!value) return;
+                                void Promise.resolve(handleEmptyKanbanScanValue?.(value))
+                                  .finally(() => {
+                                    window.requestAnimationFrame(() => emptyKanbanInputRef.current?.focus());
+                                  });
+                              }}
                             />
+                            <div className="text-[10px] text-slate-400 mt-1">Standar scanner: suffix Enter/CR aktif.</div>
                           </div>
                           <button
                             type="submit"
-                            className="w-full bg-slate-900 text-white py-2 rounded text-xs flex items-center justify-center gap-2 disabled:opacity-60"
+                            className={`w-full bg-slate-900 text-white rounded flex items-center justify-center gap-2 disabled:opacity-60 ${isProductionUser ? 'py-4 text-sm font-semibold' : 'py-2 text-xs'}`}
                             disabled={isStockOpnameLocked}
                           >
                             <QrCode size={14} /> Catat Kanban Kosong
@@ -7174,14 +7741,17 @@ ${reasons.join('\n')}`);
                     </div>
 
                     <div className="bg-white rounded-xl border p-4">
-                      <div className="text-sm font-semibold mb-1">Log Kanban Kosong</div>
-                      <div className="text-xs text-slate-500 mb-3">{isProductionUser ? 'Riwayat ringkas kartu kanban kosong.' : 'Riwayat semua kartu kanban kosong.'}</div>
+                      <div className="text-sm font-semibold mb-1">Log Kanban Kosong Aktual</div>
+                      <div className="text-xs text-slate-500 mb-3">{isProductionUser ? 'Riwayat transaksi stok dari scan/kanban kosong.' : 'Riwayat transaksi stok, request, dan lot FIFO dari kanban kosong.'}</div>
                       <div className="overflow-x-auto">
-                        <div className={`${isProductionUser ? 'min-w-[720px]' : 'min-w-[980px]'} text-xs`}>
-                          <div className="bg-slate-100 grid items-center" style={{ gridTemplateColumns: isProductionUser ? '170px 180px minmax(220px, 1fr) 120px' : emptyLogGrid }}>
+                        <div className={`${isProductionUser ? 'min-w-[1140px]' : 'min-w-[1600px]'} text-xs`}>
+                          <div className="bg-slate-100 grid items-center" style={{ gridTemplateColumns: isProductionUser ? '160px 180px minmax(220px, 1fr) 150px 90px minmax(220px, 1fr) 120px' : emptyLogGrid }}>
                             <div className="text-left p-2">Waktu</div>
                             <div className="text-left p-2">ID Kanban</div>
                             <div className="text-left p-2">Item</div>
+                            <div className="text-left p-2">Lokasi</div>
+                            <div className="text-right p-2">Qty</div>
+                            <div className="text-left p-2">Lot RN/FIFO</div>
                             {!isProductionUser && <><div className="text-left p-2">Area/Lini</div><div className="text-left p-2">Kategori</div></>}
                             <div className="text-left p-2">Status</div>
                             {!isProductionUser && <div className="text-left p-2">Referensi DN</div>}
@@ -7199,6 +7769,10 @@ ${reasons.join('\n')}`);
                                 {visibleEmptyRows.map((row, idx) => {
                                   const rowIndex = emptyWindow.startIndex + idx;
                                   const setting = kanbanSettingsByCode.get(row.item_code);
+                                  const rowKanbanId = normalizeKanbanIdDisplay(row.kanban_id || extractKanbanIdNote(row.notes)) || '-';
+                                  const locationLabel = row.location_label || row.location_id || '-';
+                                  const consumedQty = Number(row.consumed_qty ?? row.request_qty ?? 0);
+                                  const lotSummary = row.lot_summary || (row.lot_count ? `${row.lot_count} lot` : '-');
                                   const statusKey = String(row.status || '').trim().toLowerCase();
                                   const allowApprove = dnStatusFlowList.length === 0 || dnStatusFlowList.includes('APPROVE') || dnStatusFlowList.includes('APPROVED');
                                   const canApproveRequest = ['triggered', 'requested'].includes(statusKey);
@@ -7206,11 +7780,14 @@ ${reasons.join('\n')}`);
                                     <div
                                       key={row.id}
                                       className="grid items-center border-t"
-                                      style={{ gridTemplateColumns: isProductionUser ? '170px 180px minmax(220px, 1fr) 120px' : emptyLogGrid, position: 'absolute', top: rowIndex * emptyRowHeight, height: emptyRowHeight, width: '100%' }}
+                                      style={{ gridTemplateColumns: isProductionUser ? '160px 180px minmax(220px, 1fr) 150px 90px minmax(220px, 1fr) 120px' : emptyLogGrid, position: 'absolute', top: rowIndex * emptyRowHeight, height: emptyRowHeight, width: '100%' }}
                                     >
                                       <div className="p-2">{row.created_at ? new Date(row.created_at).toLocaleString('id-ID') : '-'}</div>
-                                      <div className="p-2 font-semibold">{extractKanbanIdNote(row.notes) || buildKanbanDisplayId(row.item_code, row.item_type, row)}</div>
+                                      <div className="p-2 font-semibold">{rowKanbanId}</div>
                                       <div className="p-2">{row.item_code} - {row.item_name || '-'}</div>
+                                      <div className="p-2 truncate" title={locationLabel}>{locationLabel}</div>
+                                      <div className="p-2 text-right">{formatNumber0(consumedQty)}</div>
+                                      <div className="p-2 truncate" title={lotSummary}>{lotSummary}</div>
                                       {!isProductionUser && <div className="p-2">{extractAreaNote(row.notes)}</div>}
                                       {!isProductionUser && <div className="p-2">{getCategoryLabel(setting?.item_type)}</div>}
                                       <div className="p-2">{row.status}</div>
@@ -7258,13 +7835,13 @@ ${reasons.join('\n')}`);
                   </div>
                 )}
 
-                {!isProductionUser && kanbanSubTab === 'production' && (
+                {canProduction && kanbanSubTab === 'production' && (
                   <div className="space-y-4">
                     <div className="bg-white/90 rounded-xl border px-4">
                       <div className="flex flex-wrap items-center gap-6 text-sm">
                         {[
                           { key: 'queue', label: 'Production Queue' },
-                          { key: 'fg', label: 'Import Produksi (FG)' },
+                          { key: 'fg', label: 'Input Produksi' },
                           { key: 'wip', label: 'Import Mutasi WIP' },
                           { key: 'report', label: 'Laporan Produksi' },
                         ].map((tab) => (
@@ -7310,7 +7887,7 @@ ${reasons.join('\n')}`);
                             <div>
                               <div className="text-sm font-semibold text-slate-900">Production Queue</div>
                               <div className="text-xs text-slate-500">
-                                Execute FG/Subassy/Child Part kanban requests from BOM consumption and production output.
+                                Konfirmasi hasil produksi aktual dari kanban request. Sistem cek BOM, konsumsi material FIFO, tambah stok output, lalu close request.
                               </div>
                             </div>
                             <div className="flex flex-wrap items-center gap-2">
@@ -7323,17 +7900,17 @@ ${reasons.join('\n')}`);
                               </button>
                               <button
                                 type="button"
-                                disabled={!canEditSchedules || productionQueueRows.length === 0}
+                                disabled={!canProduction || productionQueueRows.length === 0}
                                 onClick={() => {
-                                  if (!canEditSchedules || productionQueueRows.length === 0) return;
+                                  if (!canProduction || productionQueueRows.length === 0) return;
                                   void openProductionBatchRows(productionQueueRows);
                                 }}
                                 className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold ${
-                                  !canEditSchedules || productionQueueRows.length === 0
+                                  !canProduction || productionQueueRows.length === 0
                                     ? 'border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed'
                                     : 'border-emerald-600 bg-emerald-600 text-white hover:bg-emerald-700'
                                 }`}
-                                title={!canEditSchedules ? getLockedActionTitle(canEditSchedules, 'Batch production') : 'Check BOM readiness and post production requests'}
+                                title={!canProduction ? getLockedActionTitle(canProduction, 'Batch production') : 'Check BOM readiness and post production requests'}
                               >
                                 <CheckCircle size={14} /> Batch Production
                               </button>
@@ -7378,8 +7955,8 @@ ${reasons.join('\n')}`);
                                         <div className="font-semibold text-slate-900">{row.item_code || '-'}</div>
                                         <div className="text-[10px] text-slate-500">{row.item_name || '-'}</div>
                                       </td>
-                                      <td className="p-2 text-right">{formatNumber0(health.onHand || 0)}</td>
-                                      <td className="p-2 text-right font-semibold">{formatNumber2(row.request_qty || 0)}</td>
+                                      <td className="p-2 text-right">{formatQty(health.onHand || 0)}</td>
+                                      <td className="p-2 text-right font-semibold">{formatQty(row.request_qty || 0)}</td>
                                       <td className="p-2">
                                         <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
                                           health.isOverdue
@@ -7432,7 +8009,7 @@ ${reasons.join('\n')}`);
                                             onClick={() => openProductionRequest(row)}
                                             className="rounded border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100"
                                           >
-                                            Production
+                                            Konfirmasi Aktual
                                           </button>
                                         </div>
                                       </td>
@@ -7451,6 +8028,134 @@ ${reasons.join('\n')}`);
                           </div>
                         </div>
                       </div>
+                    )}
+                    {productionTab === 'fg' && (
+                    <div className="bg-white rounded-xl border p-4">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-semibold">Input Manual Laporan Produksi</div>
+                          <div className="text-xs text-slate-500">Hasil produksi akan masuk stok FG/Subassy/Child Part dan konsumsi material mengikuti BOM.</div>
+                        </div>
+                        <div className="flex flex-wrap items-center justify-end gap-2">
+                          {selectedProductionManualItem && showProductionManualForm && (
+                            <div className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                              <span className="font-semibold">{selectedProductionManualItem.code}</span>
+                              {selectedProductionManualItem.name ? ` - ${selectedProductionManualItem.name}` : ''}
+                            </div>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShowProductionManualForm((prev) => !prev);
+                              setProductionManualError('');
+                              setProductionManualSuccess('');
+                            }}
+                            className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold ${
+                              showProductionManualForm
+                                ? 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                                : 'border border-emerald-600 bg-emerald-600 text-white hover:bg-emerald-700'
+                            }`}
+                          >
+                            {showProductionManualForm ? <X size={14} /> : <Plus size={14} />}
+                            {showProductionManualForm ? 'Tutup Form' : 'Input Produksi'}
+                          </button>
+                        </div>
+                      </div>
+                      {showProductionManualForm && (
+                      <form onSubmit={handleSubmitManualProductionReport} className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-12 text-xs">
+                        <div className="lg:col-span-2">
+                          <label className="block text-[10px] uppercase text-slate-400 mb-1">Tanggal Produksi</label>
+                          <input
+                            type="date"
+                            className="border p-2 rounded w-full text-xs"
+                            value={productionManualForm.productionDate}
+                            onChange={(e) => setProductionManualForm((prev) => ({ ...prev, productionDate: e.target.value }))}
+                          />
+                        </div>
+                        <div className="lg:col-span-4">
+                          <label className="block text-[10px] uppercase text-slate-400 mb-1">Item Produksi</label>
+                          <SearchableSelectDropdown
+                            value={productionManualForm.productCode}
+                            options={productionOutputItemOptions}
+                            placeholder="Ketik kode / part no / nama"
+                            searchPlaceholder="Cari item produksi..."
+                            emptyText="Item produksi tidak ditemukan."
+                            getOptionValue={(item) => item.code}
+                            getOptionLabel={(item) => item.label || item.code}
+                            controlClassName="rounded border-slate-200 px-2 py-1.5 text-xs shadow-none"
+                            onChange={(value) => setProductionManualForm((prev) => ({ ...prev, productCode: value }))}
+                          />
+                        </div>
+                        <div className="lg:col-span-2">
+                          <label className="block text-[10px] uppercase text-slate-400 mb-1">Qty Produksi</label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="any"
+                            className="border p-2 rounded w-full text-xs text-right"
+                            placeholder="0"
+                            value={productionManualForm.qty}
+                            onChange={(e) => setProductionManualForm((prev) => ({ ...prev, qty: e.target.value }))}
+                          />
+                        </div>
+                        <div className="lg:col-span-2">
+                          <label className="block text-[10px] uppercase text-slate-400 mb-1">Line</label>
+                          <input
+                            type="text"
+                            className="border p-2 rounded w-full text-xs"
+                            placeholder="LINE-01"
+                            value={productionManualForm.lineCode}
+                            onChange={(e) => setProductionManualForm((prev) => ({ ...prev, lineCode: e.target.value }))}
+                          />
+                        </div>
+                        <div className="lg:col-span-2">
+                          <label className="block text-[10px] uppercase text-slate-400 mb-1">Shift</label>
+                          <input
+                            type="text"
+                            className="border p-2 rounded w-full text-xs"
+                            placeholder="Shift 1"
+                            value={productionManualForm.shiftLabel}
+                            onChange={(e) => setProductionManualForm((prev) => ({ ...prev, shiftLabel: e.target.value }))}
+                          />
+                        </div>
+                        <div className="lg:col-span-3">
+                          <label className="block text-[10px] uppercase text-slate-400 mb-1">No SPK / Dokumen</label>
+                          <input
+                            type="text"
+                            className="border p-2 rounded w-full text-xs"
+                            placeholder="SPK / dokumen produksi"
+                            value={productionManualForm.documentNo}
+                            onChange={(e) => setProductionManualForm((prev) => ({ ...prev, documentNo: e.target.value }))}
+                          />
+                        </div>
+                        <div className="lg:col-span-6">
+                          <label className="block text-[10px] uppercase text-slate-400 mb-1">Catatan</label>
+                          <input
+                            type="text"
+                            className="border p-2 rounded w-full text-xs"
+                            placeholder="Opsional"
+                            value={productionManualForm.notes}
+                            onChange={(e) => setProductionManualForm((prev) => ({ ...prev, notes: e.target.value }))}
+                          />
+                        </div>
+                        <div className="lg:col-span-3 flex items-end">
+                          <button
+                            type="submit"
+                            className="w-full rounded bg-emerald-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-60"
+                            disabled={productionManualSaving}
+                          >
+                            {productionManualSaving ? 'Menyimpan...' : 'Simpan Produksi'}
+                          </button>
+                        </div>
+                      </form>
+                      )}
+                      {productionManualError && (
+                        <div className="mt-2 text-xs text-red-600">{productionManualError}</div>
+                      )}
+                      {productionManualSuccess && (
+                        <div className="mt-2 text-xs text-emerald-700">{productionManualSuccess}</div>
+                      )}
+                    </div>
                     )}
                     {productionTab === 'fg' && (
                     <div className="bg-white rounded-xl border p-4">
@@ -7633,7 +8338,7 @@ ${reasons.join('\n')}`);
                                 <td className="p-2">{row.created_at ? new Date(row.created_at).toLocaleString('id-ID') : '-'}</td>
                                 <td className="p-2 font-semibold">{row.file_name || `Batch #${row.id}`}</td>
                                 <td className="p-2">{row.created_by_name || '-'}</td>
-                                <td className="p-2 text-right">{formatNumber0(row.total_qty || 0)}</td>
+                                <td className="p-2 text-right">{formatQty(row.total_qty || 0)}</td>
                                 <td className="p-2">
                                   <span className={`px-2 py-0.5 rounded-full text-[10px] ${
                                     row.status === 'success'
@@ -7649,6 +8354,108 @@ ${reasons.join('\n')}`);
                             ))}
                           </tbody>
                         </table>
+                      </div>
+                    </div>
+                    )}
+
+                    {productionTab === 'fg' && (
+                    <div className="bg-white rounded-xl border p-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-semibold">Riwayat Output Produksi</div>
+                          <div className="text-xs text-slate-500">Gabungan input manual dan upload produksi.</div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={fetchProductionOrderHistory}
+                          className="px-3 py-2 text-xs border rounded"
+                          disabled={productionOrderHistoryLoading}
+                        >
+                          {productionOrderHistoryLoading ? 'Memuat...' : 'Refresh'}
+                        </button>
+                      </div>
+                      {productionOrderHistoryError && (
+                        <div className="mt-2 text-xs text-red-600">{productionOrderHistoryError}</div>
+                      )}
+                      <div className="mt-3 overflow-x-auto">
+                        <table className="min-w-[1100px] w-full text-xs">
+                          <thead className="bg-slate-100 text-slate-600">
+                            <tr>
+                              <th className="p-2 text-left">Tanggal</th>
+                              <th className="p-2 text-left">Item</th>
+                              <th className="p-2 text-left">Nama Item</th>
+                              <th className="p-2 text-right">Qty</th>
+                              <th className="p-2 text-left">Line</th>
+                              <th className="p-2 text-left">Shift</th>
+                              <th className="p-2 text-left">No SPK / Dokumen</th>
+                              <th className="p-2 text-left">Source</th>
+                              <th className="p-2 text-left">User</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {productionOrderRows.length === 0 && !productionOrderHistoryLoading && (
+                              <tr>
+                                <td colSpan={9} className="p-3 text-center text-slate-400">Belum ada output produksi.</td>
+                              </tr>
+                            )}
+                            {pagedProductionOrderRows.map((row) => (
+                              <tr key={row.id} className="border-t">
+                                <td className="p-2">{formatProductionDateValue(row.production_date || row.created_at)}</td>
+                                <td className="p-2 font-semibold">{buildProductionUniqLabel(row.product_code, row.part_no)}</td>
+                                <td className="p-2">{row.product_name || '-'}</td>
+                                <td className="p-2 text-right">{formatNumber0(row.qty || 0)}</td>
+                                <td className="p-2">{row.line_code || '-'}</td>
+                                <td className="p-2">{row.shift_label || '-'}</td>
+                                <td className="p-2">{row.document_no || '-'}</td>
+                                <td className="p-2">
+                                  <span className={`px-2 py-0.5 rounded-full text-[10px] ${
+                                    row.source === 'MANUAL_REPORT' ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-700'
+                                  }`}>
+                                    {row.source === 'MANUAL_REPORT' ? 'MANUAL' : row.source || '-'}
+                                  </span>
+                                </td>
+                                <td className="p-2">{row.created_by_name || '-'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-3 text-xs text-slate-500">
+                        <div>
+                          Showing {productionOrderTotalRows === 0 ? 0 : productionOrderStartIndex + 1} to {productionOrderEndIndex} of {productionOrderTotalRows} entries
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span>Rows per page</span>
+                          <select
+                            className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700"
+                            value={productionOrderPageSize}
+                            onChange={(event) => {
+                              setProductionOrderPageSize(Number(event.target.value));
+                              setProductionOrderPage(1);
+                            }}
+                          >
+                            {productionOrderPageSizeOptions.map((size) => (
+                              <option key={size} value={size}>{size}</option>
+                            ))}
+                          </select>
+                          <span>Halaman {productionOrderCurrentPage} dari {productionOrderTotalPages}</span>
+                          <button
+                            type="button"
+                            disabled={productionOrderCurrentPage <= 1}
+                            onClick={() => setProductionOrderPage((prev) => Math.max(1, prev - 1))}
+                            className="rounded border border-slate-200 px-3 py-1 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            Previous
+                          </button>
+                          <button
+                            type="button"
+                            disabled={productionOrderCurrentPage >= productionOrderTotalPages}
+                            onClick={() => setProductionOrderPage((prev) => Math.min(productionOrderTotalPages, prev + 1))}
+                            className="rounded border border-slate-200 px-3 py-1 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            Next
+                          </button>
+                        </div>
                       </div>
                     </div>
                     )}
@@ -7866,11 +8673,11 @@ ${reasons.join('\n')}`);
                         <div className="flex items-center gap-2 text-sm font-semibold mb-1">
                           <QrCode size={16} /> Pemindai
                         </div>
-                        <div className="text-xs text-slate-500 mb-3">Pindai kode QR atau masukkan manual.</div>
+                        <div className="text-xs text-slate-500 mb-3">Gunakan scanner line. Input akan otomatis proses saat scanner mengirim Enter.</div>
                         <div className="flex gap-2 text-xs mb-3">
                           {[
+                            { key: 'manual', label: 'Scanner' },
                             { key: 'camera', label: 'Kamera' },
-                            { key: 'manual', label: 'Manual' },
                           ].map((mode) => (
                             <button
                               key={mode.key}
@@ -7887,7 +8694,7 @@ ${reasons.join('\n')}`);
                               <video ref={scanVideoRef} className="w-full h-52 object-cover" muted playsInline />
                             </div>
                             <div className="text-[10px] text-slate-400">
-                              Pastikan izin kamera diaktifkan. Kamera di browser butuh HTTPS atau localhost.
+                              Kamera standby otomatis saat mode kamera dibuka. Browser harus mengizinkan akses kamera.
                             </div>
                             <div className="flex gap-2">
                               <button
@@ -7897,7 +8704,7 @@ ${reasons.join('\n')}`);
                                 }}
                                 className="flex-1 bg-slate-900 text-white py-2 rounded text-xs flex items-center justify-center gap-2"
                               >
-                                <QrCode size={14} /> Mulai Kamera
+                                <QrCode size={14} /> Aktifkan Ulang
                               </button>
                               <button
                                 onClick={() => {
@@ -7919,17 +8726,26 @@ ${reasons.join('\n')}`);
 
                         {scanMode !== 'camera' && (
                           <>
-                            <label className="block text-[10px] uppercase text-slate-400 mb-2">Masukkan data QR (satu per baris untuk pemindaian multi)</label>
+                            <label className="block text-[10px] uppercase text-slate-400 mb-2">Scanner QR</label>
                             <textarea
-                              className="border p-2 rounded w-full text-xs h-36"
+                              ref={scanManualInputRef}
+                              className={`border rounded w-full ${isProductionUser ? 'h-40 p-4 text-lg font-semibold' : 'h-36 p-2 text-xs'}`}
                               placeholder="Pindai atau masukkan Kanban ID"
                               value={scanInput}
                               onChange={(e) => setScanInput(e.target.value)}
+                              onKeyDown={(event) => {
+                                if (event.key !== 'Enter' || event.shiftKey) return;
+                                event.preventDefault();
+                                void Promise.resolve(handleProcessScan({ autoExecute: true, clearInput: true, inputValue: event.currentTarget.value }))
+                                  .finally(() => {
+                                    window.requestAnimationFrame(() => scanManualInputRef.current?.focus());
+                                  });
+                              }}
                             />
-                            <div className="text-[10px] text-slate-400 mt-2">Masukkan satu QR per baris. Banyak kode akan diproses batch.</div>
+                            <div className="text-[10px] text-slate-400 mt-2">Standar scanner: suffix Enter/CR aktif. Untuk input batch manual, gunakan Shift+Enter lalu tombol proses.</div>
                             <div className="mt-3">
-                              <button onClick={handleProcessScan} className="w-full bg-slate-900 text-white py-2 rounded text-xs flex items-center justify-center gap-2">
-                                <Search size={14} /> Proses Data QR ({scanResults.length} item)
+                              <button onClick={handleProcessScan} className={`w-full bg-slate-900 text-white rounded flex items-center justify-center gap-2 ${isProductionUser ? 'py-4 text-sm font-semibold' : 'py-2 text-xs'}`}>
+                                <Search size={14} /> Proses Data QR
                               </button>
                             </div>
                           </>
@@ -7938,16 +8754,42 @@ ${reasons.join('\n')}`);
 
                       <div className="bg-white rounded-xl border p-4">
                         <div className="flex items-center gap-2 text-sm font-semibold mb-1">
-                          <Package size={16} /> Hasil Pemindaian
+                          <Clock size={16} /> History Scan
                         </div>
-                        <div className="text-xs text-slate-500 mb-3">Informasi kanban dan aksi.</div>
+                        <div className="text-xs text-slate-500 mb-3">Hanya menampilkan hasil proses scan: berhasil atau error.</div>
                         {scanError && (
                           <div className="bg-red-50 text-red-600 text-xs p-2 rounded mb-3 whitespace-pre-wrap">{scanError}</div>
                         )}
-                        {scanResults.length === 0 && (
+                        {(!Array.isArray(scanHistory) || scanHistory.length === 0) && !scanActiveResult && (
                           <div className="h-52 flex flex-col items-center justify-center text-slate-400 text-xs border border-dashed rounded-lg">
                             <QrCode size={28} />
-                            <div className="mt-2">Pindai kode QR untuk melihat detail kanban.</div>
+                            <div className="mt-2">Belum ada history scan.</div>
+                          </div>
+                        )}
+                        {Array.isArray(scanHistory) && scanHistory.length > 0 && !scanActiveResult && (
+                          <div className="space-y-2 max-h-80 overflow-y-auto">
+                            {scanHistory.map((entry) => {
+                              const success = entry.status === 'success';
+                              return (
+                                <div
+                                  key={entry.id}
+                                  className={`rounded-xl border p-3 text-xs ${success ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-rose-50 border-rose-200 text-rose-800'}`}
+                                >
+                                  <div className="flex items-start justify-between gap-3">
+                                    <div>
+                                      <div className="font-bold text-sm">{entry.kanbanId || '-'}</div>
+                                      <div className="mt-0.5">{entry.itemCode || '-'} {entry.itemName || ''}</div>
+                                      <div className="mt-1 text-[11px] opacity-80">{entry.actionLabel || '-'}</div>
+                                    </div>
+                                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${success ? 'bg-emerald-600 text-white' : 'bg-rose-600 text-white'}`}>
+                                      {success ? 'BERHASIL' : 'ERROR'}
+                                    </span>
+                                  </div>
+                                  <div className="mt-2 text-[11px]">{entry.message || (success ? 'Scan berhasil diproses.' : 'Scan gagal diproses.')}</div>
+                                  <div className="mt-1 text-[10px] opacity-70">{formatScanTime(entry.scannedAt)}</div>
+                                </div>
+                              );
+                            })}
                           </div>
                         )}
                         {scanActiveResult && (
@@ -8070,12 +8912,12 @@ ${reasons.join('\n')}`);
                               {(isScanIssueAction || isScanRoutingAction || isScanSubconAction) && (
                                 <button
                                   onClick={executeScanFlow}
-                                  className="flex-1 bg-indigo-600 text-white py-2 rounded text-xs flex items-center justify-center gap-2"
+                                  className={`flex-1 bg-indigo-600 text-white rounded flex items-center justify-center gap-2 ${isProductionUser ? 'py-4 text-sm font-semibold' : 'py-2 text-xs'}`}
                                 >
                                   <ArrowDownUp size={14} /> Eksekusi Scan
                                 </button>
                               )}
-                              {isScanIssueAction && (
+                              {!isProductionUser && isScanIssueAction && (
                                 <>
                                   <button
                                     onClick={async () => {
@@ -8098,7 +8940,7 @@ ${reasons.join('\n')}`);
                                   </button>
                                 </>
                               )}
-                              {isScanSubconAction && (
+                              {!isProductionUser && isScanSubconAction && (
                                 <button
                                   onClick={() => {
                                     setMainTab('subcon');
@@ -8109,7 +8951,7 @@ ${reasons.join('\n')}`);
                                   <Truck size={14} /> Buka Menu Subcon
                                 </button>
                               )}
-                              {isScanRoutingAction && (
+                              {!isProductionUser && isScanRoutingAction && (
                                 <>
                                   <button
                                     onClick={async () => {
@@ -8161,7 +9003,7 @@ ${reasons.join('\n')}`);
                       </div>
                     </div>
 
-                    {!isProductionUser && (
+                    {false && !isProductionUser && (
                       <div className="bg-white rounded-xl border p-4">
                       <div className="flex items-center gap-2 text-sm font-semibold mb-3">
                         <Clock size={16} /> Pemindaian Terbaru
@@ -8344,9 +9186,9 @@ ${reasons.join('\n')}`);
                   <div className="bg-white rounded-xl w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col">
                     <div className="flex items-start justify-between border-b px-5 py-4">
                       <div>
-                        <div className="text-sm font-semibold">Production Execution</div>
+                        <div className="text-sm font-semibold">Konfirmasi Aktual Produksi</div>
                         <div className="text-xs text-slate-500">
-                          Check BOM readiness before posting production output.
+                          Cek kesiapan BOM sebelum hasil produksi aktual diposting ke stok dan kanban request ditutup.
                         </div>
                       </div>
                       <button type="button" onClick={closeProductionRequestModal} className="text-slate-500 hover:text-slate-800">
@@ -8371,8 +9213,8 @@ ${reasons.join('\n')}`);
                                 <div className="text-[10px] text-slate-500">{row.item_name || '-'}</div>
                               </div>
                               <div className="rounded-lg border bg-slate-50 p-3">
-                                <div className="text-[10px] uppercase text-slate-400">Order Qty</div>
-                                <div className="mt-1 font-semibold text-slate-900">{formatNumber2(row.request_qty || 0)}</div>
+                                <div className="text-[10px] uppercase text-slate-400">Qty Aktual Produksi</div>
+                                <div className="mt-1 font-semibold text-slate-900">{formatQty(row.request_qty || 0)}</div>
                               </div>
                             </div>
                             <div className="grid grid-cols-1 md:grid-cols-[220px_1fr] gap-3 text-xs">
@@ -8398,7 +9240,7 @@ ${reasons.join('\n')}`);
                                   {productionRequestModal.loading
                                     ? 'Loading BOM requirements...'
                                     : ready
-                                      ? 'Ready for production posting'
+                                      ? 'Ready for actual production posting'
                                       : shortageRows.length > 0
                                         ? `Blocked - material shortage on ${shortageRows.length} item(s)`
                                         : 'BOM requirement is not available'}
@@ -8443,10 +9285,10 @@ ${reasons.join('\n')}`);
                                           <div className="text-[10px] text-slate-500">{item.itemName || '-'}</div>
                                         </td>
                                         <td className="p-2">{item.itemType || '-'}</td>
-                                        <td className="p-2 text-right">{formatNumber2(item.requiredQty || 0)} {item.itemUnit || ''}</td>
-                                        <td className="p-2 text-right">{formatNumber2(item.availableQty || 0)} {item.itemUnit || ''}</td>
+                                        <td className="p-2 text-right">{formatQty(item.requiredQty || 0)} {item.itemUnit || ''}</td>
+                                        <td className="p-2 text-right">{formatQty(item.availableQty || 0)} {item.itemUnit || ''}</td>
                                         <td className={`p-2 text-right font-semibold ${ok ? 'text-emerald-600' : 'text-rose-600'}`}>
-                                          {formatNumber2(shortage)} {item.itemUnit || ''}
+                                          {formatQty(shortage)} {item.itemUnit || ''}
                                         </td>
                                         <td className="p-2">
                                           <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
@@ -8487,7 +9329,7 @@ ${reasons.join('\n')}`);
                           || productionRequestModal.rows.some((item) => Number(item.shortage || 0) > 0)
                         }
                       >
-                        {productionRequestModal.saving ? 'Posting...' : 'Post Production'}
+                        {productionRequestModal.saving ? 'Posting...' : 'Konfirmasi Produksi'}
                       </button>
                     </div>
                   </div>
@@ -8659,7 +9501,7 @@ ${reasons.join('\n')}`);
                                               : 'Blocked';
                                     const shortageText = (entry.shortageRows || [])
                                       .slice(0, 2)
-                                      .map((item) => `${item.itemCode} kurang ${formatNumber2(item.shortage || 0)}`)
+                                      .map((item) => `${item.itemCode} kurang ${formatQty(item.shortage || 0)}`)
                                       .join(', ');
                                     return (
                                       <tr key={row.id} className="border-t">
@@ -8669,7 +9511,7 @@ ${reasons.join('\n')}`);
                                           <div className="text-[10px] text-slate-500">{row.item_name || '-'}</div>
                                           <div className="mt-1 text-[10px] font-semibold text-indigo-600">{getProductionRequestLineLabel(row)}</div>
                                         </td>
-                                        <td className="p-2 text-right">{formatNumber2(row.request_qty || 0)}</td>
+                                        <td className="p-2 text-right">{formatQty(row.request_qty || 0)}</td>
                                         <td className="p-2 text-right">{entry.requirements?.length || 0}</td>
                                         <td className="p-2 text-right">{entry.shortageRows?.length || 0}</td>
                                         <td className="p-2">
@@ -8871,7 +9713,7 @@ ${reasons.join('\n')}`);
                                       onChange={(e) => setDnDetailEdits((prev) => ({ ...prev, [row.id]: e.target.value }))}
                                     />
                                   ) : (
-                                    formatNumber0(row.request_qty)
+                                    formatQty(row.request_qty)
                                   )}
                                 </td>
                                 <td className="p-2">{row.item_unit || '-'}</td>
@@ -8964,10 +9806,10 @@ ${reasons.join('\n')}`);
                                   <div className="font-semibold">{row.item_code || '-'}</div>
                                   <div className="text-[10px] text-slate-400">{row.item_name || '-'}</div>
                                 </td>
-                                <td className="p-2 text-right">{formatNumber2(expected)}</td>
-                                <td className="p-2 text-right">{formatNumber2(actual)}</td>
+                                <td className="p-2 text-right">{formatQty(expected)}</td>
+                                <td className="p-2 text-right">{formatQty(actual)}</td>
                                 <td className={`p-2 text-right ${variance === 0 ? 'text-emerald-600' : variance > 0 ? 'text-orange-600' : 'text-red-600'}`}>
-                                  {variance > 0 ? `+${formatNumber2(variance)}` : formatNumber2(variance)}
+                                  {formatSignedQty(variance)}
                                 </td>
                                 <td className="p-2">{String(row.qc_status || 'OK').toUpperCase()}</td>
                               </tr>
@@ -8981,9 +9823,9 @@ ${reasons.join('\n')}`);
                           <tfoot className="bg-slate-50 border-t">
                             <tr>
                               <td className="p-2 text-right font-semibold" colSpan="2">Total</td>
-                              <td className="p-2 text-right font-semibold">{formatNumber2(selectedRnDetail?.expected_total ?? 0)}</td>
-                              <td className="p-2 text-right font-semibold">{formatNumber2(selectedRnDetail?.received_total ?? 0)}</td>
-                              <td className="p-2 text-right font-semibold">{formatNumber2(selectedRnDetail?.variance ?? 0)}</td>
+                              <td className="p-2 text-right font-semibold">{formatQty(selectedRnDetail?.expected_total ?? 0)}</td>
+                              <td className="p-2 text-right font-semibold">{formatQty(selectedRnDetail?.received_total ?? 0)}</td>
+                              <td className="p-2 text-right font-semibold">{formatQty(selectedRnDetail?.variance ?? 0)}</td>
                               <td className="p-2" />
                             </tr>
                           </tfoot>
@@ -9430,6 +10272,181 @@ ${reasons.join('\n')}`);
                                 </div>
                               </div>
                             </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {kanbanItemAnalysis && (
+                <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+                  <div className="bg-white rounded-2xl w-full max-w-5xl max-h-[92vh] overflow-y-auto shadow-xl">
+                    <div className="sticky top-0 z-10 flex items-center justify-between border-b bg-white px-5 py-4 rounded-t-2xl">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="w-14 h-14 rounded-xl border bg-slate-50 overflow-hidden flex items-center justify-center shrink-0">
+                          {kanbanItemAnalysis.thumbUrl ? (
+                            <img src={kanbanItemAnalysis.thumbUrl} alt={kanbanItemAnalysis.itemCode} className="w-full h-full object-contain" />
+                          ) : (
+                            <Package size={18} className="text-slate-300" />
+                          )}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="text-[10px] uppercase text-slate-400">Analisa Kanban</div>
+                          <div className="text-lg font-bold text-slate-900 truncate">
+                            {buildKanbanDisplayId(kanbanItemAnalysis.row.item_code, kanbanItemAnalysis.row.item_type, kanbanItemAnalysis.row)}
+                          </div>
+                          <div className="text-xs text-slate-500 truncate">
+                            {kanbanItemAnalysis.itemCode} - {kanbanItemAnalysis.itemName}
+                          </div>
+                        </div>
+                      </div>
+                      <button type="button" onClick={() => setKanbanAnalysisRow(null)} className="p-2 text-slate-500 hover:text-slate-800">
+                        <X size={18} />
+                      </button>
+                    </div>
+
+                    <div className="p-5 space-y-4">
+                      <div className={`rounded-2xl border p-4 ${kanbanItemAnalysis.andon.tone}`}>
+                        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                          <div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold ${kanbanItemAnalysis.andon.pill}`}>
+                                {kanbanItemAnalysis.andon.label}
+                              </span>
+                              <span className="text-xs font-semibold text-slate-700">{kanbanItemAnalysis.andon.note}</span>
+                            </div>
+                            <div className="mt-2 text-sm text-slate-700">{kanbanItemAnalysis.recommendation}</div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              openQrModal(kanbanItemAnalysis.row);
+                              setKanbanAnalysisRow(null);
+                            }}
+                            className="px-3 py-2 text-xs border rounded-lg bg-white hover:bg-slate-50 flex items-center gap-2 shrink-0"
+                          >
+                            <QrCode size={14} /> Lihat QR
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                        <div className="rounded-xl border bg-white p-3">
+                          <div className="text-[10px] uppercase text-slate-400">On Hand</div>
+                          <div className={`mt-1 text-xl font-bold ${kanbanItemAnalysis.andon.stockTone}`}>
+                            {formatQty(kanbanItemAnalysis.onHand)} {kanbanItemAnalysis.unit}
+                          </div>
+                          <div className="text-[10px] text-slate-500">
+                            Gap min: {kanbanItemAnalysis.stockGap === null ? '-' : formatNumber0(kanbanItemAnalysis.stockGap)}
+                          </div>
+                        </div>
+                        <div className="rounded-xl border bg-white p-3">
+                          <div className="text-[10px] uppercase text-slate-400">Min / Max</div>
+                          <div className="mt-1 text-xl font-bold text-slate-900">
+                            {formatNumber0(kanbanItemAnalysis.minQty)} / {formatNumber0(kanbanItemAnalysis.maxQty)}
+                          </div>
+                          <div className="text-[10px] text-slate-500">
+                            PRL: {kanbanItemAnalysis.prlQty !== null && kanbanItemAnalysis.prlQty !== undefined && kanbanItemAnalysis.prlQty !== '' ? formatNumber0(kanbanItemAnalysis.prlQty) : '-'}
+                          </div>
+                        </div>
+                        <div className="rounded-xl border bg-white p-3">
+                          <div className="text-[10px] uppercase text-slate-400">Kartu</div>
+                          <div className="mt-1 text-xl font-bold text-slate-900">{kanbanItemAnalysis.cardsLabel}</div>
+                          <div className="text-[10px] text-slate-500">
+                            Reg {kanbanItemAnalysis.regularCards} + Safety {kanbanItemAnalysis.safetyCards}
+                          </div>
+                        </div>
+                        <div className="rounded-xl border bg-white p-3">
+                          <div className="text-[10px] uppercase text-slate-400">Request Aktif</div>
+                          <div className="mt-1 text-xl font-bold text-slate-900">{kanbanItemAnalysis.activeRequestEntries.length}</div>
+                          <div className="text-[10px] text-slate-500">
+                            Qty open: {formatNumber0(kanbanItemAnalysis.openRequestQty)} {kanbanItemAnalysis.unit}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 lg:grid-cols-[1fr_1.2fr] gap-4">
+                        <div className="rounded-2xl border bg-white p-4">
+                          <div className="text-sm font-semibold text-slate-900">Informasi Item</div>
+                          <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
+                            <div>
+                              <div className="text-[10px] uppercase text-slate-400">Kategori</div>
+                              <div className="font-semibold text-slate-800">{kanbanItemAnalysis.categoryLabel}</div>
+                            </div>
+                            <div>
+                              <div className="text-[10px] uppercase text-slate-400">Supplier</div>
+                              <div className="font-semibold text-slate-800">{kanbanItemAnalysis.supplierLabel}</div>
+                            </div>
+                            <div>
+                              <div className="text-[10px] uppercase text-slate-400">Lokasi</div>
+                              <div className="font-semibold text-slate-800">{kanbanItemAnalysis.locationLabel}</div>
+                            </div>
+                            <div>
+                              <div className="text-[10px] uppercase text-slate-400">Lead Time</div>
+                              <div className="font-semibold text-slate-800">{kanbanItemAnalysis.leadTimeDays} hari</div>
+                            </div>
+                            <div>
+                              <div className="text-[10px] uppercase text-slate-400">Qty / Kanban</div>
+                              <div className="font-semibold text-slate-800">{formatNumber0(kanbanItemAnalysis.lotQty)} {kanbanItemAnalysis.unit}</div>
+                            </div>
+                            <div>
+                              <div className="text-[10px] uppercase text-slate-400">Status</div>
+                              <div className="font-semibold text-slate-800">{kanbanItemAnalysis.andon.note}</div>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="rounded-2xl border bg-white p-4">
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="text-sm font-semibold text-slate-900">Request Aktif</div>
+                            <div className="flex flex-wrap justify-end gap-1">
+                              {Object.entries(kanbanItemAnalysis.statusCounts).length > 0 ? Object.entries(kanbanItemAnalysis.statusCounts).map(([status, count]) => (
+                                <span key={status} className="rounded-full border bg-slate-50 px-2 py-0.5 text-[10px] text-slate-600">
+                                  {status}: {count}
+                                </span>
+                              )) : (
+                                <span className="text-[10px] text-slate-400">Tidak ada request aktif</span>
+                              )}
+                            </div>
+                          </div>
+                          <div className="mt-3 space-y-2">
+                            {kanbanItemAnalysis.activeRequestEntries.slice(0, 5).map(({ row, health }) => (
+                              <div key={row.id || `${row.item_code}-${row.created_at}`} className="rounded-xl border bg-slate-50 p-3 text-xs">
+                                <div className="flex items-center justify-between gap-3">
+                                  <div className="font-semibold text-slate-800">{getRequestIdLabel(row)}</div>
+                                  <div className="text-[10px] text-slate-500">{formatRequestAging(health.ageHours)}</div>
+                                </div>
+                                <div className="mt-1 grid grid-cols-2 gap-2 text-[11px] text-slate-600">
+                                  <div>Status: <span className="font-semibold">{row.status || '-'}</span></div>
+                                  <div>Qty: <span className="font-semibold">{formatQty(row.request_qty || 0)} {kanbanItemAnalysis.unit}</span></div>
+                                  <div>Action: <span className="font-semibold">{getKanbanNextAction(row)}</span></div>
+                                  <div>Dibuat: <span className="font-semibold">{row.created_at ? new Date(row.created_at).toLocaleString('id-ID') : '-'}</span></div>
+                                </div>
+                                {(health.isOverdue || health.hasStockGap || health.isOverPrl) && (
+                                  <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] text-amber-800">
+                                    {health.isOverdue ? 'Overdue. ' : ''}
+                                    {health.hasStockGap ? `Stock gap: on hand ${formatQty(health.onHand)} < request ${formatQty(health.requestQty)}. ` : ''}
+                                    {health.isOverPrl ? 'Over PRL. ' : ''}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                            {kanbanItemAnalysis.activeRequestEntries.length === 0 && (
+                              <div className="rounded-xl border border-dashed bg-slate-50 p-4 text-xs text-slate-500">
+                                Belum ada request aktif untuk item ini.
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="rounded-2xl border bg-slate-50 p-4">
+                        <div className="text-sm font-semibold text-slate-900">Sumber Angka</div>
+                        <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2 text-xs text-slate-600">
+                          {kanbanItemAnalysis.sourceRows.map((source) => (
+                            <div key={source} className="rounded-lg border bg-white px-3 py-2">{source}</div>
                           ))}
                         </div>
                       </div>

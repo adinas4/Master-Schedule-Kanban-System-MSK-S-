@@ -94,6 +94,7 @@ const TabKanban = (props) => {
     dnPrintLoading,
     dnPrintPayload,
     dnPrintMode,
+    dnEmailSendingId,
     dnStatusFlowList,
     emptyKanbanForm,
     extractAreaNote,
@@ -122,6 +123,7 @@ const TabKanban = (props) => {
     handleDnDetailSave,
     handleForceCloseDn,
     handleDnEmail,
+    isDnEmailSent,
     handleDnPreview,
     handleDnPrintPdf,
     handleEmptyKanbanScanValue,
@@ -339,7 +341,10 @@ const TabKanban = (props) => {
     const status = String(dn?.status || '').trim().toLowerCase();
     const doneStatuses = new Set(['closed', 'received', 'done', 'cancelled']);
     if (doneStatuses.has(status)) return null;
-    if (!['sent', 'in_transit', 'partial'].includes(status)) {
+    const hasEmailBeenSent = typeof isDnEmailSent === 'function'
+      ? isDnEmailSent(dn)
+      : Boolean(dn?.email_sent_at || dn?.emailSentAt || Number(dn?.email_send_count || dn?.emailSendCount || 0) > 0 || status === 'sent');
+    if (!hasEmailBeenSent && !['sent', 'in_transit', 'partial'].includes(status)) {
       return { label: 'DN has not been emailed to supplier', className: 'border-sky-200 bg-sky-50 text-sky-700' };
     }
     const planned = parseDnDateOnly(dn?.planned_date || dn?.plannedDate);
@@ -535,6 +540,7 @@ const TabKanban = (props) => {
     { value: 'all', label: 'All Status' },
     { value: 'pending', label: 'Pending' },
     { value: 'approved', label: 'Approved' },
+    { value: 'production_ready', label: 'WO Released' },
     { value: 'rejected', label: 'Rejected' },
     { value: 'dn_created', label: 'DN Created' },
     { value: 'scheduled', label: 'Scheduled' },
@@ -597,6 +603,14 @@ const TabKanban = (props) => {
   const [deliveryUploadResult, setDeliveryUploadResult] = useState(null);
   const [deliveryWorkflowTab, setDeliveryWorkflowTab] = useState('upload-dn');
   const [selectedDeliveryUploadId, setSelectedDeliveryUploadId] = useState(null);
+  const [customerShipments, setCustomerShipments] = useState([]);
+  const [customerShipmentsLoading, setCustomerShipmentsLoading] = useState(false);
+  const [customerShipmentsError, setCustomerShipmentsError] = useState('');
+  const [customerShipmentCreatingId, setCustomerShipmentCreatingId] = useState(null);
+  const [selectedCustomerShipmentId, setSelectedCustomerShipmentId] = useState(null);
+  const [customerShipmentScanValue, setCustomerShipmentScanValue] = useState('');
+  const [customerShipmentScanLoading, setCustomerShipmentScanLoading] = useState(false);
+  const [customerShipmentConfirmingId, setCustomerShipmentConfirmingId] = useState(null);
   const [dnActionMenuOpen, setDnActionMenuOpen] = useState(null);
   const kanbanActiveStatusMeta = useMemo(() => ([
     {
@@ -619,6 +633,13 @@ const TabKanban = (props) => {
       tone: 'border-emerald-200 bg-emerald-50 text-emerald-700',
       shortLabel: 'Siap DN',
       nextAction: 'Create DN',
+    },
+    {
+      key: 'production_ready',
+      label: 'WO Released',
+      tone: 'border-sky-200 bg-sky-50 text-sky-700',
+      shortLabel: 'Menunggu aktual',
+      nextAction: 'Konfirmasi aktual',
     },
     {
       key: 'dn_created',
@@ -669,6 +690,36 @@ const TabKanban = (props) => {
     if (!selectedDeliveryUpload) return [];
     return Array.isArray(selectedDeliveryUpload.items) ? selectedDeliveryUpload.items : [];
   }, [selectedDeliveryUpload]);
+  const lastDeliveryUploadItems = useMemo(() => {
+    return Array.isArray(deliveryUploadResult?.items) ? deliveryUploadResult.items : [];
+  }, [deliveryUploadResult]);
+  const customerShipmentsByUploadId = useMemo(() => {
+    const map = new Map();
+    customerShipments.forEach((row) => {
+      const uploadId = Number(row?.deliveryUploadId ?? row?.delivery_upload_id ?? 0);
+      if (uploadId > 0) map.set(uploadId, row);
+    });
+    return map;
+  }, [customerShipments]);
+  const customerShipmentSummary = useMemo(() => {
+    return customerShipments.reduce((acc, row) => {
+      acc.total += 1;
+      acc.totalQty += Number(row?.totalQty ?? row?.total_qty ?? 0);
+      const status = String(row?.status || '').toLowerCase();
+      if (status === 'reserved') acc.reserved += 1;
+      if (status === 'picked') acc.picked += 1;
+      if (status === 'loaded' || status === 'sj_created' || status === 'printed') acc.loaded += 1;
+      return acc;
+    }, { total: 0, totalQty: 0, reserved: 0, picked: 0, loaded: 0 });
+  }, [customerShipments]);
+  const selectedCustomerShipment = useMemo(() => {
+    const selectedId = Number(selectedCustomerShipmentId || 0);
+    if (selectedId > 0) {
+      const found = customerShipments.find((row) => Number(row?.id || 0) === selectedId);
+      if (found) return found;
+    }
+    return customerShipments[0] || null;
+  }, [customerShipments, selectedCustomerShipmentId]);
   const deliveryUploadSummary = useMemo(() => {
     return deliveryUploads.reduce((acc, row) => {
       const status = String(row?.status || '').trim().toLowerCase();
@@ -792,6 +843,7 @@ const TabKanban = (props) => {
     const statusKey = String(row?.status || '').trim().toLowerCase();
     if (statusKey === 'triggered' || statusKey === 'requested') return 'Approve / reject';
     if (statusKey === 'approved') return row?.dn_id ? 'Create schedule' : 'Create DN';
+    if (statusKey === 'production_ready') return 'Konfirmasi aktual produksi';
     if (statusKey === 'dn_created') return row?.schedule_id ? 'Monitor schedule' : 'Create schedule';
     if (statusKey === 'scheduled') return 'Monitor dispatch';
     if (statusKey === 'in_transit') return 'Receiving / check-in';
@@ -1137,11 +1189,15 @@ const TabKanban = (props) => {
 
     setKanbanView?.('board');
 
-    if (flowMeta.key === 'production' && ['triggered', 'requested', 'approved'].includes(statusKey)) {
+    if (flowMeta.key === 'production' && ['triggered', 'requested', 'approved', 'production_ready'].includes(statusKey)) {
       setKanbanView?.('planning');
       setKanbanSubTab('production');
       setProductionTab('queue');
-      openProductionRequest(row);
+      if (statusKey === 'production_ready') {
+        openProductionRequest(row);
+      } else {
+        void openProductionBatchRows([row]);
+      }
       return;
     }
 
@@ -1281,6 +1337,11 @@ const TabKanban = (props) => {
       saving: false,
       error: '',
       productionDate: '',
+      actualQty: '',
+      requirementQty: '',
+      varianceReason: '',
+      overproductionApproved: false,
+      postedResult: null,
     });
   };
 
@@ -1293,7 +1354,80 @@ const TabKanban = (props) => {
       error: '',
       productionDate: '',
       lineFilter: 'all',
+      categoryFilter: 'all',
+      actualConfirmOpen: false,
     });
+  };
+
+  const getProductionRequestCategoryMeta = (row = {}) => {
+    const flowCategory = resolveRequestFlowMeta(row)?.category || {};
+    const item = masterItemsByCode.get(row?.item_code) || {};
+    const raw = String(row?.item_type || item?.type || item?.category || flowCategory.label || '').trim();
+    const text = `${raw} ${flowCategory.key || ''} ${flowCategory.label || ''}`.toLowerCase();
+    const hasToken = (token) => new RegExp(`(^|[^a-z0-9])${token}([^a-z0-9]|$)`, 'i').test(text);
+    if (flowCategory.key === 'child' || hasToken('cp') || text.includes('childpart') || text.includes('child part') || text.includes('child')) {
+      return { key: 'child', label: 'Child Part' };
+    }
+    if (flowCategory.key === 'subassy' || flowCategory.key === 'assy' || hasToken('sa') || text.includes('subassy') || text.includes('sub assy') || text.includes('sub-assy') || text.includes('assy')) {
+      return { key: 'assy', label: 'Assy/Subassy' };
+    }
+    if (flowCategory.key === 'fg' || hasToken('fg') || text.includes('finish')) return { key: 'fg', label: 'FG' };
+    return { key: 'other', label: flowCategory.label || raw || 'Other' };
+  };
+
+  const getProductionRequestItemMeta = (row = {}) => {
+    const item = masterItemsByCode.get(row?.item_code) || {};
+    const lineValue = String(row?.line_production || item?.line_production || '').trim();
+    const location = masterLocationsById?.get?.(lineValue) || masterLocationsById?.get?.(String(lineValue));
+    const snpQty = Number(item?.pack_qty ?? item?.packQty ?? row?.pack_qty ?? row?.packQty ?? 0);
+    const cycleTimeSeconds = Number(item?.cycle_time_seconds ?? item?.cycleTimeSeconds ?? 0);
+    return {
+      item,
+      snpQty: Number.isFinite(snpQty) && snpQty > 0 ? snpQty : 0,
+      cycleTimeSeconds: Number.isFinite(cycleTimeSeconds) && cycleTimeSeconds > 0 ? cycleTimeSeconds : 0,
+      machineLabel: String(location?.machine_note || location?.machineNote || location?.note || '').trim() || '-',
+    };
+  };
+
+  const splitQtyBySnp = (qtyInput, snpInput) => {
+    const qty = Number(qtyInput || 0);
+    const snp = Number(snpInput || 0);
+    if (!Number.isFinite(qty) || qty <= 0) return [];
+    if (!Number.isFinite(snp) || snp <= 0) return [{ qty, isPartial: false }];
+    const rows = [];
+    let remaining = qty;
+    const tolerance = 0.000001;
+    while (remaining > tolerance) {
+      const labelQty = Math.min(snp, remaining);
+      rows.push({ qty: labelQty, isPartial: labelQty + tolerance < snp });
+      remaining = Math.max(0, remaining - labelQty);
+    }
+    return rows;
+  };
+
+  const formatDurationFromSeconds = (secondsInput) => {
+    const seconds = Number(secondsInput || 0);
+    if (!Number.isFinite(seconds) || seconds <= 0) return '-';
+    const totalSeconds = Math.round(seconds);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const secondsPart = totalSeconds % 60;
+    if (hours > 0) return `${hours}j ${minutes}m`;
+    if (minutes > 0) return `${minutes}m ${secondsPart}s`;
+    return `${secondsPart}s`;
+  };
+
+  const buildProductionWoGroupNo = ({ productionDate = '', lineLabel = '', machineLabel = '' } = {}) => {
+    const dateToken = String(productionDate || getTodayDnDateInput()).replaceAll('-', '');
+    const normalizeToken = (value, fallback) => {
+      const token = String(value || '')
+        .toUpperCase()
+        .replace(/[^A-Z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 18);
+      return token || fallback;
+    };
+    return `WO-${dateToken}-${normalizeToken(lineLabel, 'LINE')}-${normalizeToken(machineLabel, 'MACHINE')}`;
   };
 
   const getProductionRequestLineLabel = (row = {}) => {
@@ -1332,15 +1466,17 @@ const TabKanban = (props) => {
     .replaceAll("'", '&#39;');
 
   const printProductionWorkOrders = (entriesInput = [], { title = 'Production Work Order' } = {}) => {
-    const entries = entriesInput.filter((entry) => entry?.status === 'posted' && entry?.productionId);
+    const entries = entriesInput.filter((entry) => entry?.row || entry?.postedResult?.productionOrder);
     if (entries.length === 0) {
-      alert('Belum ada SPK production yang bisa dicetak.');
+      alert('Belum ada WO production yang bisa dicetak.');
       return;
     }
     const printDate = new Date().toLocaleString('id-ID');
     const printableEntries = entries.map((entry) => {
       const row = entry.row || {};
-      const productionNo = `SPK-PROD-${String(entry.productionId).padStart(5, '0')}`;
+      const productionOrder = entry.postedResult?.productionOrder || {};
+      const productionNo = productionOrder.wo_number
+        || (entry.productionId ? `WO-PROD-${String(entry.productionId).padStart(5, '0')}` : `WO-${getRequestIdLabel(row)}`);
       const productionDate = String(entry.postedResult?.productionOrder?.production_date || productionBatchModal.productionDate || getTodayDnDateInput()).slice(0, 10);
       const requirements = Array.isArray(entry.postedResult?.requirements)
         ? entry.postedResult.requirements
@@ -1349,6 +1485,10 @@ const TabKanban = (props) => {
           : [];
       const lineLabel = getProductionRequestLineLabel(row);
       const plantLabel = getProductionRequestPlantLabel(row);
+      const meta = getProductionRequestItemMeta(row);
+      const plannedQty = Number(productionOrder.request_qty || row.request_qty || 0);
+      const actualQty = Number(productionOrder.actual_qty || productionOrder.qty || entry.actualQty || row.request_qty || 0);
+      const labelPlan = splitQtyBySnp(actualQty || plannedQty, meta.snpQty);
       return {
         entry,
         row,
@@ -1357,13 +1497,20 @@ const TabKanban = (props) => {
         requirements,
         lineLabel,
         plantLabel,
+        meta,
+        machineLabel: meta.machineLabel,
+        plannedQty,
+        actualQty,
+        labelPlan,
+        processSeconds: (actualQty || plannedQty) * meta.cycleTimeSeconds,
       };
     });
     const lineGroups = Array.from(printableEntries.reduce((map, item) => {
-      const groupKey = [item.productionDate, item.lineLabel || '-', item.plantLabel || '-'].join('||');
+      const groupKey = [item.productionDate, item.lineLabel || '-', item.machineLabel || '-', item.plantLabel || '-'].join('||');
       const current = map.get(groupKey) || {
         productionDate: item.productionDate,
         lineLabel: item.lineLabel || '-',
+        machineLabel: item.machineLabel || '-',
         plantLabel: item.plantLabel || '-',
         entries: [],
       };
@@ -1372,7 +1519,9 @@ const TabKanban = (props) => {
       return map;
     }, new Map()).values());
     const pages = lineGroups.map((group) => {
-      const spkNumbers = group.entries.map((item) => item.productionNo).join(', ');
+      const woGroupNo = buildProductionWoGroupNo(group);
+      const requestCount = group.entries.length;
+      const partCount = new Set(group.entries.map((item) => String(item.row?.item_code || '').trim()).filter(Boolean)).size;
       const materialRows = group.entries.map((item, entryIndex) => {
         const row = item.row || {};
         const requirements = item.requirements.length > 0 ? item.requirements : [null];
@@ -1381,10 +1530,14 @@ const TabKanban = (props) => {
           <tr>
             ${materialIndex === 0 ? `
               <td rowspan="${rowSpan}" class="center">${entryIndex + 1}</td>
-              <td rowspan="${rowSpan}"><strong>${escapePrintText(item.productionNo)}</strong><br><span class="muted">${escapePrintText(getRequestIdLabel(row))}</span></td>
+              <td rowspan="${rowSpan}"><strong>${escapePrintText(getRequestIdLabel(row))}</strong><br><span class="muted">${escapePrintText(item.productionNo)}</span></td>
               <td rowspan="${rowSpan}"><strong>${escapePrintText(row.item_code || '-')}</strong><br><span class="muted">${escapePrintText(row.part_no || masterItemsByCode.get(row.item_code)?.part_no || '-')}</span></td>
               <td rowspan="${rowSpan}">${escapePrintText(row.item_name || masterItemsByCode.get(row.item_code)?.name || '-')}</td>
-              <td rowspan="${rowSpan}" class="right"><strong>${escapePrintText(formatQty(row.request_qty || 0))}</strong></td>
+              <td rowspan="${rowSpan}" class="right"><strong>${escapePrintText(formatQty(item.plannedQty || 0))}</strong></td>
+              <td rowspan="${rowSpan}" class="right"><strong>${escapePrintText(formatQty(item.actualQty || item.plannedQty || 0))}</strong></td>
+              <td rowspan="${rowSpan}">${escapePrintText(item.lineLabel)}<br><span class="muted">Mesin: ${escapePrintText(item.machineLabel)}</span></td>
+              <td rowspan="${rowSpan}" class="right">${escapePrintText(formatQty(item.meta.cycleTimeSeconds || 0))} s<br><span class="muted">${escapePrintText(formatDurationFromSeconds(item.processSeconds))}</span></td>
+              <td rowspan="${rowSpan}" class="center">${escapePrintText(String(item.labelPlan.length || 1))}<br><span class="muted">SNP ${escapePrintText(item.meta.snpQty ? formatQty(item.meta.snpQty) : '-')}</span></td>
             ` : ''}
             <td>${escapePrintText(requirement?.itemCode || requirement?.item_code || '-')}</td>
             <td>${escapePrintText(requirement?.itemName || requirement?.item_name || (requirement ? '-' : 'Material list is not available'))}</td>
@@ -1402,26 +1555,32 @@ const TabKanban = (props) => {
               <div class="muted">Production Planning & Control</div>
             </div>
             <div class="doc-title">
-              <div>SPK PRODUKSI PER LINE</div>
-              <strong>${escapePrintText(group.lineLabel)}</strong>
+              <div>WORK ORDER PRODUKSI PER LINE</div>
+              <strong>${escapePrintText(woGroupNo)}</strong>
             </div>
           </div>
           <div class="meta-grid">
             <div><span>Production Date</span><strong>${escapePrintText(group.productionDate)}</strong></div>
             <div><span>Production Line</span><strong>${escapePrintText(group.lineLabel)}</strong></div>
+            <div><span>Machine</span><strong>${escapePrintText(group.machineLabel)}</strong></div>
+            <div><span>Total Part</span><strong>${group.entries.length}</strong></div>
             <div><span>Plant / Location</span><strong>${escapePrintText(group.plantLabel)}</strong></div>
-            <div><span>Total SPK</span><strong>${group.entries.length}</strong></div>
-            <div class="wide"><span>SPK Number</span><strong>${escapePrintText(spkNumbers)}</strong></div>
+            <div><span>WO Number</span><strong>${escapePrintText(woGroupNo)}</strong></div>
+            <div class="wide"><span>Production Ref</span><strong>${requestCount} request / ${partCount} part. Detail referensi ada di tabel.</strong></div>
             <div class="wide"><span>Instruction</span><strong>Issue material by FIFO lot according to system recommendation.</strong></div>
           </div>
           <table>
             <thead>
               <tr>
                 <th>No</th>
-                <th>SPK / Request</th>
+                <th>WO / Request</th>
                 <th>FG Code / Part No</th>
                 <th>Item Name</th>
-                <th>Order Qty</th>
+                <th>WO Qty</th>
+                <th>Actual Qty</th>
+                <th>Line / Machine</th>
+                <th>Cycle / Est Time</th>
+                <th>Labels</th>
                 <th>Material Code</th>
                 <th>Material Name</th>
                 <th>Req Qty</th>
@@ -1443,7 +1602,7 @@ const TabKanban = (props) => {
     }).join('');
     const printWindow = window.open('', '_blank', 'width=1120,height=800');
     if (!printWindow) {
-      alert('Popup print diblokir browser. Izinkan popup untuk mencetak SPK.');
+      alert('Popup print diblokir browser. Izinkan popup untuk mencetak WO.');
       return;
     }
     printWindow.document.write(`
@@ -1488,23 +1647,152 @@ const TabKanban = (props) => {
     setTimeout(() => printWindow.print(), 300);
   };
 
-  const buildProductionReadinessEntry = async (row, productionDate) => {
+  const printProductionOutputLabels = (entriesInput = [], { title = 'Production Output Labels' } = {}) => {
+    const labelEntries = entriesInput.flatMap((entry) => {
+      const row = entry.row || {};
+      const productionOrder = entry.postedResult?.productionOrder || {};
+      const labels = Array.isArray(entry.postedResult?.outputLabels)
+        ? entry.postedResult.outputLabels
+        : Array.isArray(productionOrder.output_label_summary)
+          ? productionOrder.output_label_summary
+          : [];
+      return labels.map((label) => ({
+        row,
+        productionOrder,
+        label,
+        lineLabel: getProductionRequestLineLabel(row),
+        plantLabel: getProductionRequestPlantLabel(row),
+        meta: getProductionRequestItemMeta(row),
+      }));
+    });
+    if (labelEntries.length === 0) {
+      alert('Belum ada label produksi posted yang bisa dicetak.');
+      return;
+    }
+    const printDate = new Date().toLocaleString('id-ID');
+    const labelCards = labelEntries.map((item) => {
+      const row = item.row || {};
+      const label = item.label || {};
+      const productionOrder = item.productionOrder || {};
+      const labelNo = label.productionLabelNo || label.production_label_no || label.batchNo || label.batch_no || '-';
+      const qty = Number(label.qty || label.qty_in || 0);
+      const seq = label.seq || label.label_seq || '-';
+      const total = label.total || label.label_total || '-';
+      const partial = Boolean(label.isPartial || label.is_partial_label);
+      return `
+        <section class="label-card">
+          <div class="label-header">
+            <div>
+              <div class="company">PT. MATRA RODA PIRANTI</div>
+              <div class="muted">Production Output Label</div>
+            </div>
+            <div class="label-no">${escapePrintText(labelNo)}</div>
+          </div>
+          <div class="item-code">${escapePrintText(row.item_code || productionOrder.product_code || '-')}</div>
+          <div class="item-name">${escapePrintText(row.item_name || masterItemsByCode.get(row.item_code)?.name || '-')}</div>
+          <div class="grid">
+            <div><span>WO</span><strong>${escapePrintText(productionOrder.wo_number || `WO-${getRequestIdLabel(row)}`)}</strong></div>
+            <div><span>Request</span><strong>${escapePrintText(getRequestIdLabel(row))}</strong></div>
+            <div><span>Qty Label</span><strong>${escapePrintText(formatQty(qty))}</strong></div>
+            <div><span>SNP</span><strong>${escapePrintText(label.snpQty ? formatQty(label.snpQty) : item.meta.snpQty ? formatQty(item.meta.snpQty) : '-')}</strong></div>
+            <div><span>Seq</span><strong>${escapePrintText(`${seq}/${total}`)}</strong></div>
+            <div><span>Status Label</span><strong>${partial ? 'PARTIAL' : 'FULL SNP'}</strong></div>
+            <div><span>Line</span><strong>${escapePrintText(item.lineLabel)}</strong></div>
+            <div><span>Machine</span><strong>${escapePrintText(item.meta.machineLabel)}</strong></div>
+            <div><span>Production Date</span><strong>${escapePrintText(String(productionOrder.production_date || productionBatchModal.productionDate || getTodayDnDateInput()).slice(0, 10))}</strong></div>
+          </div>
+          <table class="qc-table">
+            <thead>
+              <tr>
+                <th>QC Check</th>
+                <th>OK</th>
+                <th>NG</th>
+                <th>Hold</th>
+                <th>Remark</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>Visual</td><td></td><td></td><td></td><td></td></tr>
+              <tr><td>Qty</td><td></td><td></td><td></td><td></td></tr>
+              <tr><td>Label / Part No</td><td></td><td></td><td></td><td></td></tr>
+            </tbody>
+          </table>
+          <div class="sign-row">
+            <div><span>Production</span></div>
+            <div><span>QC Inspector</span></div>
+            <div><span>Date</span></div>
+          </div>
+          <div class="footer-note">Printed ${escapePrintText(printDate)}. QC status awal sistem: ${escapePrintText(label.qcStatus || label.qc_status || 'qc_pending')}.</div>
+        </section>
+      `;
+    }).join('');
+    const printWindow = window.open('', '_blank', 'width=900,height=760');
+    if (!printWindow) {
+      alert('Popup print diblokir browser. Izinkan popup untuk mencetak label produksi.');
+      return;
+    }
+    printWindow.document.write(`
+      <!doctype html>
+      <html>
+      <head>
+        <title>${escapePrintText(title)}</title>
+        <style>
+          * { box-sizing: border-box; }
+          body { margin: 0; font-family: Arial, sans-serif; color: #0f172a; background: #f8fafc; }
+          .label-card { width: 100mm; min-height: 72mm; margin: 6mm auto; padding: 5mm; background: #fff; border: 1px solid #0f172a; page-break-after: always; }
+          .label-header { display: flex; justify-content: space-between; gap: 8px; border-bottom: 2px solid #0f172a; padding-bottom: 4px; }
+          .company { font-size: 11px; font-weight: 700; }
+          .muted, .footer-note { color: #64748b; font-size: 7px; }
+          .label-no { font-size: 11px; font-weight: 700; text-align: right; }
+          .item-code { margin-top: 5px; font-size: 20px; font-weight: 800; }
+          .item-name { font-size: 8px; color: #334155; min-height: 18px; }
+          .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px; margin: 5px 0; }
+          .grid div { border: 1px solid #cbd5e1; padding: 3px; min-height: 25px; }
+          span { display: block; color: #64748b; font-size: 6px; text-transform: uppercase; }
+          strong { display: block; margin-top: 1px; font-size: 8px; }
+          table { width: 100%; border-collapse: collapse; font-size: 7px; }
+          th, td { border: 1px solid #94a3b8; height: 13px; padding: 2px; text-align: left; }
+          th { background: #e2e8f0; }
+          .sign-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; margin-top: 5px; }
+          .sign-row div { border: 1px solid #cbd5e1; height: 20px; padding: 2px; }
+          @media print {
+            @page { size: 100mm 80mm; margin: 3mm; }
+            body { background: #fff; }
+            .label-card { margin: 0; width: auto; min-height: auto; border: 1px solid #0f172a; }
+          }
+        </style>
+      </head>
+      <body>${labelCards}</body>
+      </html>
+    `);
+    printWindow.document.close();
+    printWindow.focus();
+    setTimeout(() => printWindow.print(), 300);
+  };
+
+  const buildProductionReadinessEntry = async (row, productionDate, actualQtyInput = null, previousEntry = {}) => {
+    const actualQtyValue = Number(actualQtyInput ?? previousEntry.actualQty ?? row.request_qty ?? 0);
     try {
       const query = new URLSearchParams({
         productCode: String(row.item_code || ''),
-        qty: String(row.request_qty || 0),
+        qty: String(actualQtyValue),
         asOfDate: productionDate,
       });
       const data = await apiFetch(`/api/production/requirements?${query.toString()}`);
       const requirements = Array.isArray(data) ? data : [];
       const shortageRows = requirements.filter((item) => Number(item.shortage || 0) > 0);
+      const requestStatusKey = String(row?.status || '').trim().toLowerCase();
       return {
         row,
         requirements,
-        status: shortageRows.length > 0 ? 'shortage' : 'ready',
+        status: shortageRows.length > 0 ? 'shortage' : requestStatusKey === 'production_ready' ? 'released' : 'ready',
         shortageRows,
         error: '',
         productionId: null,
+        actualQty: String(actualQtyValue || ''),
+        requirementQty: String(actualQtyValue || ''),
+        varianceReason: previousEntry.varianceReason || '',
+        overproductionApproved: Boolean(previousEntry.overproductionApproved),
       };
     } catch (error) {
       return {
@@ -1514,6 +1802,10 @@ const TabKanban = (props) => {
         shortageRows: [],
         error: error?.message || 'Failed to load BOM requirements.',
         productionId: null,
+        actualQty: String(actualQtyValue || ''),
+        requirementQty: String(actualQtyValue || ''),
+        varianceReason: previousEntry.varianceReason || '',
+        overproductionApproved: Boolean(previousEntry.overproductionApproved),
       };
     }
   };
@@ -1530,6 +1822,8 @@ const TabKanban = (props) => {
       return;
     }
     const productionDate = getTodayDnDateInput();
+    const categoryKeys = new Set(productionRows.map((row) => getProductionRequestCategoryMeta(row).key));
+    const initialCategoryFilter = categoryKeys.size === 1 ? Array.from(categoryKeys)[0] : 'all';
     setProductionBatchModal({
       open: true,
       entries: productionRows.map((row) => ({
@@ -1539,14 +1833,20 @@ const TabKanban = (props) => {
         shortageRows: [],
         error: '',
         productionId: null,
+        actualQty: String(row.request_qty || ''),
+        requirementQty: '',
+        varianceReason: '',
+        overproductionApproved: false,
       })),
       loading: true,
       posting: false,
       error: '',
       productionDate,
       lineFilter: 'all',
+      categoryFilter: initialCategoryFilter,
+      actualConfirmOpen: false,
     });
-    const entries = await Promise.all(productionRows.map((row) => buildProductionReadinessEntry(row, productionDate)));
+    const entries = await Promise.all(productionRows.map((row) => buildProductionReadinessEntry(row, productionDate, row.request_qty)));
     setProductionBatchModal((prev) => ({
       ...prev,
       entries,
@@ -1562,16 +1862,16 @@ const TabKanban = (props) => {
   };
 
   const reloadProductionBatchRequirements = async (productionDate) => {
-    const currentRows = productionBatchModal.entries.map((entry) => entry.row).filter(Boolean);
-    if (currentRows.length === 0) return;
+    const currentEntries = productionBatchModal.entries.filter((entry) => entry?.row);
+    if (currentEntries.length === 0) return;
     const dateValue = productionDate || productionBatchModal.productionDate || getTodayDnDateInput();
     setProductionBatchModal((prev) => ({
       ...prev,
       productionDate: dateValue,
       loading: true,
       error: '',
-      entries: currentRows.map((row) => ({
-        row,
+      entries: currentEntries.map((entry) => ({
+        ...entry,
         requirements: [],
         status: 'loading',
         shortageRows: [],
@@ -1579,7 +1879,12 @@ const TabKanban = (props) => {
         productionId: null,
       })),
     }));
-    const entries = await Promise.all(currentRows.map((row) => buildProductionReadinessEntry(row, dateValue)));
+    const entries = await Promise.all(currentEntries.map((entry) => buildProductionReadinessEntry(
+      entry.row,
+      dateValue,
+      entry.actualQty || entry.row?.request_qty,
+      entry,
+    )));
     setProductionBatchModal((prev) => ({
       ...prev,
       entries,
@@ -1587,24 +1892,187 @@ const TabKanban = (props) => {
     }));
   };
 
-  const confirmProductionBatch = async () => {
+  const isProductionBatchEntryInScope = (entry, lineFilter = 'all', categoryFilter = 'all') => (
+    (String(lineFilter || 'all') === 'all' || getProductionRequestLineLabel(entry?.row) === String(lineFilter || 'all'))
+    && (String(categoryFilter || 'all') === 'all' || getProductionRequestCategoryMeta(entry?.row).key === String(categoryFilter || 'all'))
+  );
+
+  const releaseProductionBatch = async () => {
     const activeLineFilter = String(productionBatchModal.lineFilter || 'all');
+    const activeCategoryFilter = String(productionBatchModal.categoryFilter || 'all');
     const lineFilteredEntries = productionBatchModal.entries.filter((entry) => (
-      activeLineFilter === 'all' || getProductionRequestLineLabel(entry.row) === activeLineFilter
+      isProductionBatchEntryInScope(entry, activeLineFilter, activeCategoryFilter)
     ));
     const readyEntries = lineFilteredEntries.filter((entry) => entry.status === 'ready');
     if (readyEntries.length === 0) {
-      setProductionBatchModal((prev) => ({ ...prev, error: 'Tidak ada request yang ready untuk production posting.' }));
+      setProductionBatchModal((prev) => ({ ...prev, error: 'Tidak ada request Ready yang bisa dibuat WO.' }));
       return;
     }
-    const scopeText = activeLineFilter === 'all' ? 'semua line' : `line ${activeLineFilter}`;
-    if (!window.confirm(`Post production untuk ${readyEntries.length} request ready pada ${scopeText}? Request shortage tetap tertahan.`)) return;
+    const categoryScopeText = activeCategoryFilter === 'all'
+      ? 'semua kategori'
+      : getProductionRequestCategoryMeta(lineFilteredEntries[0]?.row).label;
+    const scopeText = `${activeLineFilter === 'all' ? 'semua line' : `line ${activeLineFilter}`} / ${categoryScopeText}`;
+    if (!window.confirm(`Release WO untuk ${readyEntries.length} request ready pada ${scopeText}? Aktual produksi akan dikonfirmasi setelah proses selesai.`)) return;
     setProductionBatchModal((prev) => ({ ...prev, posting: true, error: '' }));
     const nextEntries = [];
     let successCount = 0;
     for (const entry of productionBatchModal.entries) {
-      const inActiveLine = activeLineFilter === 'all' || getProductionRequestLineLabel(entry.row) === activeLineFilter;
-      if (entry.status !== 'ready' || !inActiveLine) {
+      const inActiveScope = isProductionBatchEntryInScope(entry, activeLineFilter, activeCategoryFilter);
+      if (entry.status !== 'ready' || !inActiveScope) {
+        nextEntries.push(entry);
+        continue;
+      }
+      try {
+        const result = await apiFetch(`/api/kanban/requests/${entry.row.id}/release-production`, {
+          method: 'POST',
+          body: JSON.stringify({
+            productionDate: productionBatchModal.productionDate || getTodayDnDateInput(),
+          }),
+        });
+        successCount += 1;
+        nextEntries.push({
+          ...entry,
+          row: { ...entry.row, ...(result?.request || {}), status: 'production_ready' },
+          status: 'released',
+          productionId: result?.productionOrder?.id || null,
+          postedResult: result,
+          error: '',
+        });
+      } catch (error) {
+        nextEntries.push({
+          ...entry,
+          status: 'failed',
+          error: error?.message || 'Failed to release WO.',
+        });
+      }
+    }
+    setProductionBatchModal((prev) => ({
+      ...prev,
+      entries: nextEntries,
+      posting: false,
+      error: '',
+    }));
+    if (successCount > 0) {
+      if (showToastMessage) {
+        showToastMessage(`WO released untuk ${successCount} request.`, 'Status sekarang menunggu konfirmasi aktual.', null, 'success');
+      } else {
+        alert(`WO released untuk ${successCount} request. Status sekarang menunggu konfirmasi aktual.`);
+      }
+      await fetchKanbanRequests?.();
+      await fetchKanbanSettings?.();
+    }
+  };
+
+  const openProductionBatchActualConfirm = () => {
+    const activeLineFilter = String(productionBatchModal.lineFilter || 'all');
+    const activeCategoryFilter = String(productionBatchModal.categoryFilter || 'all');
+    const readyEntries = productionBatchModal.entries.filter((entry) => (
+      entry.status === 'released'
+      && isProductionBatchEntryInScope(entry, activeLineFilter, activeCategoryFilter)
+    ));
+    if (readyEntries.length === 0) {
+      setProductionBatchModal((prev) => ({ ...prev, error: 'Tidak ada WO Released yang siap dikonfirmasi aktual.' }));
+      return;
+    }
+    setProductionBatchModal((prev) => ({
+      ...prev,
+      error: '',
+      actualConfirmOpen: true,
+      entries: prev.entries.map((entry) => (
+        readyEntries.some((readyEntry) => readyEntry.row?.id === entry.row?.id)
+          ? {
+              ...entry,
+              actualQty: String(entry.actualQty || entry.row?.request_qty || ''),
+              requirementQty: String(entry.requirementQty || entry.row?.request_qty || ''),
+              varianceReason: entry.varianceReason || '',
+              overproductionApproved: Boolean(entry.overproductionApproved),
+            }
+          : entry
+      )),
+    }));
+  };
+
+  const updateProductionBatchEntry = (rowId, changes = {}) => {
+    setProductionBatchModal((prev) => ({
+      ...prev,
+      error: '',
+      entries: prev.entries.map((entry) => (
+        entry.row?.id === rowId ? { ...entry, ...changes } : entry
+      )),
+    }));
+  };
+
+  const reloadProductionBatchEntryRequirements = async (rowId) => {
+    const entry = productionBatchModal.entries.find((item) => item.row?.id === rowId);
+    if (!entry?.row) return;
+    const actualQtyValue = Number(entry.actualQty || 0);
+    if (!Number.isFinite(actualQtyValue) || actualQtyValue <= 0) {
+      updateProductionBatchEntry(rowId, { error: 'Qty aktual wajib lebih dari 0.', status: 'blocked' });
+      return;
+    }
+    updateProductionBatchEntry(rowId, {
+      requirements: [],
+      shortageRows: [],
+      status: 'loading',
+      error: '',
+      productionId: null,
+      postedResult: null,
+    });
+    const nextEntry = await buildProductionReadinessEntry(
+      entry.row,
+      productionBatchModal.productionDate || getTodayDnDateInput(),
+      actualQtyValue,
+      entry,
+    );
+    setProductionBatchModal((prev) => ({
+      ...prev,
+      entries: prev.entries.map((item) => (item.row?.id === rowId ? nextEntry : item)),
+    }));
+  };
+
+  const confirmProductionBatch = async () => {
+    if (!productionBatchModal.actualConfirmOpen) {
+      openProductionBatchActualConfirm();
+      return;
+    }
+    const activeLineFilter = String(productionBatchModal.lineFilter || 'all');
+    const activeCategoryFilter = String(productionBatchModal.categoryFilter || 'all');
+    const lineFilteredEntries = productionBatchModal.entries.filter((entry) => (
+      isProductionBatchEntryInScope(entry, activeLineFilter, activeCategoryFilter)
+    ));
+    const readyEntries = lineFilteredEntries.filter((entry) => entry.status === 'released');
+    if (readyEntries.length === 0) {
+      setProductionBatchModal((prev) => ({ ...prev, error: 'Tidak ada WO Released yang siap dikonfirmasi aktual.' }));
+      return;
+    }
+    const invalidEntry = readyEntries.find((entry) => {
+      const requestQty = Number(entry.row?.request_qty || 0);
+      const actualQty = Number(entry.actualQty || 0);
+      const hasVariance = Number.isFinite(actualQty) && actualQty > 0 && actualQty !== requestQty;
+      return !Number.isFinite(actualQty)
+        || actualQty <= 0
+        || Number(entry.requirementQty || 0) !== actualQty
+        || (hasVariance && !String(entry.varianceReason || '').trim())
+        || (actualQty > requestQty && !entry.overproductionApproved);
+    });
+    if (invalidEntry) {
+      setProductionBatchModal((prev) => ({
+        ...prev,
+        error: `Cek actual qty/alasan/approval untuk ${getRequestIdLabel(invalidEntry.row)} sebelum batch posting.`,
+      }));
+      return;
+    }
+    const categoryScopeText = activeCategoryFilter === 'all'
+      ? 'semua kategori'
+      : getProductionRequestCategoryMeta(lineFilteredEntries[0]?.row).label;
+    const scopeText = `${activeLineFilter === 'all' ? 'semua line' : `line ${activeLineFilter}`} / ${categoryScopeText}`;
+    if (!window.confirm(`Post aktual produksi untuk ${readyEntries.length} WO Released pada ${scopeText}? Request shortage tetap tertahan.`)) return;
+    setProductionBatchModal((prev) => ({ ...prev, posting: true, error: '' }));
+    const nextEntries = [];
+    let successCount = 0;
+    for (const entry of productionBatchModal.entries) {
+      const inActiveScope = isProductionBatchEntryInScope(entry, activeLineFilter, activeCategoryFilter);
+      if (entry.status !== 'released' || !inActiveScope) {
         nextEntries.push(entry);
         continue;
       }
@@ -1613,6 +2081,9 @@ const TabKanban = (props) => {
           method: 'POST',
           body: JSON.stringify({
             productionDate: productionBatchModal.productionDate || getTodayDnDateInput(),
+            actualQty: Number(entry.actualQty || entry.row.request_qty || 0),
+            varianceReason: entry.varianceReason || '',
+            overproductionApproved: Boolean(entry.overproductionApproved),
           }),
         });
         successCount += 1;
@@ -1636,12 +2107,13 @@ const TabKanban = (props) => {
       entries: nextEntries,
       posting: false,
       error: '',
+      actualConfirmOpen: successCount > 0 ? false : prev.actualConfirmOpen,
     }));
     if (successCount > 0) {
       if (showToastMessage) {
-        showToastMessage(`Batch production posted for ${successCount} request.`, '', null, 'success');
+        showToastMessage(`Aktual produksi diposting untuk ${successCount} WO.`, '', null, 'success');
       } else {
-        alert(`Batch production posted for ${successCount} request.`);
+        alert(`Aktual produksi diposting untuk ${successCount} WO.`);
       }
       await fetchKanbanRequests?.();
       await fetchKanbanSettings?.();
@@ -1661,6 +2133,11 @@ const TabKanban = (props) => {
       saving: false,
       error: '',
       productionDate,
+      actualQty: String(qty || ''),
+      requirementQty: String(qty || ''),
+      varianceReason: '',
+      overproductionApproved: false,
+      postedResult: null,
     });
     try {
       const query = new URLSearchParams({
@@ -1673,6 +2150,7 @@ const TabKanban = (props) => {
         ...prev,
         rows: Array.isArray(data) ? data : [],
         loading: false,
+        requirementQty: String(qty),
         error: '',
       }));
     } catch (error) {
@@ -1689,6 +2167,15 @@ const TabKanban = (props) => {
     const row = productionRequestModal.row;
     if (!row?.id) return;
     const dateValue = productionDate || productionRequestModal.productionDate || getTodayDnDateInput();
+    const actualQtyValue = Number(productionRequestModal.actualQty || row.request_qty || 0);
+    if (!Number.isFinite(actualQtyValue) || actualQtyValue <= 0) {
+      setProductionRequestModal((prev) => ({
+        ...prev,
+        productionDate: dateValue,
+        error: 'Qty aktual produksi wajib lebih dari 0.',
+      }));
+      return;
+    }
     setProductionRequestModal((prev) => ({
       ...prev,
       productionDate: dateValue,
@@ -1698,7 +2185,7 @@ const TabKanban = (props) => {
     try {
       const query = new URLSearchParams({
         productCode: String(row.item_code || ''),
-        qty: String(row.request_qty || 0),
+        qty: String(actualQtyValue),
         asOfDate: dateValue,
       });
       const data = await apiFetch(`/api/production/requirements?${query.toString()}`);
@@ -1706,6 +2193,7 @@ const TabKanban = (props) => {
         ...prev,
         rows: Array.isArray(data) ? data : [],
         loading: false,
+        requirementQty: String(actualQtyValue),
       }));
     } catch (error) {
       setProductionRequestModal((prev) => ({
@@ -1720,6 +2208,25 @@ const TabKanban = (props) => {
   const confirmProductionRequest = async () => {
     const row = productionRequestModal.row;
     if (!row?.id) return;
+    const requestQty = Number(row.request_qty || 0);
+    const actualQty = Number(productionRequestModal.actualQty || 0);
+    if (!Number.isFinite(actualQty) || actualQty <= 0) {
+      setProductionRequestModal((prev) => ({ ...prev, error: 'Qty aktual produksi wajib lebih dari 0.' }));
+      return;
+    }
+    if (Number(productionRequestModal.requirementQty || 0) !== actualQty) {
+      setProductionRequestModal((prev) => ({ ...prev, error: 'Recheck BOM untuk qty aktual terbaru sebelum posting.' }));
+      return;
+    }
+    const hasVariance = actualQty !== requestQty;
+    if (hasVariance && !String(productionRequestModal.varianceReason || '').trim()) {
+      setProductionRequestModal((prev) => ({ ...prev, error: 'Alasan selisih wajib diisi jika qty aktual berbeda dari WO.' }));
+      return;
+    }
+    if (actualQty > requestQty && !productionRequestModal.overproductionApproved) {
+      setProductionRequestModal((prev) => ({ ...prev, error: 'Qty aktual melebihi WO. Centang approval overproduction sebelum posting.' }));
+      return;
+    }
     const shortageRows = productionRequestModal.rows.filter((item) => Number(item.shortage || 0) > 0);
     if (shortageRows.length > 0) {
       setProductionRequestModal((prev) => ({
@@ -1729,22 +2236,31 @@ const TabKanban = (props) => {
       return;
     }
     const label = getRequestIdLabel(row);
-    if (!window.confirm(`Post production untuk ${label} dan close request?`)) return;
+    const closeText = actualQty >= requestQty ? 'close request' : `sisakan ${formatQty(requestQty - actualQty)} pada request`;
+    if (!window.confirm(`Post actual production ${formatQty(actualQty)} untuk ${label} dan ${closeText}?`)) return;
     setProductionRequestModal((prev) => ({ ...prev, saving: true, error: '' }));
     try {
       const result = await apiFetch(`/api/kanban/requests/${row.id}/complete-production`, {
         method: 'POST',
         body: JSON.stringify({
           productionDate: productionRequestModal.productionDate || getTodayDnDateInput(),
+          actualQty,
+          varianceReason: productionRequestModal.varianceReason || '',
+          overproductionApproved: productionRequestModal.overproductionApproved,
         }),
       });
-      const message = `Production posted. PROD-${result?.productionOrder?.id || '-'} created and request closed.`;
+      const message = `Production posted. ${result?.productionOrder?.wo_number || `WO-PROD-${result?.productionOrder?.id || '-'}`} created.`;
       if (showToastMessage) {
         showToastMessage(message, '', null, 'success');
       } else {
         alert(message);
       }
-      closeProductionRequestModal();
+      setProductionRequestModal((prev) => ({
+        ...prev,
+        saving: false,
+        error: '',
+        postedResult: result,
+      }));
       await fetchKanbanRequests?.();
       await fetchKanbanSettings?.();
     } catch (error) {
@@ -1754,6 +2270,26 @@ const TabKanban = (props) => {
         error: error?.message || 'Failed to post production.',
       }));
     }
+  };
+
+  const openProductionLineBatchFromRequest = async (row) => {
+    const lineLabel = getProductionRequestLineLabel(row);
+    const categoryMeta = getProductionRequestCategoryMeta(row);
+    const lineRows = productionQueueRows.filter((item) => (
+      isRequestSelectable(item)
+      && resolveRequestFlowMeta(item).key === 'production'
+      && getProductionRequestLineLabel(item) === lineLabel
+      && getProductionRequestCategoryMeta(item).key === categoryMeta.key
+    ));
+    if (lineRows.length === 0) {
+      setProductionRequestModal((prev) => ({
+        ...prev,
+        error: `Tidak ada request production ${categoryMeta.label} lain untuk line ${lineLabel}.`,
+      }));
+      return;
+    }
+    closeProductionRequestModal();
+    await openProductionBatchRows(lineRows);
   };
 
   const handleSplitDnByRit = async (dn) => {
@@ -1823,7 +2359,7 @@ const TabKanban = (props) => {
   const isRequestSelectable = (row) => {
     if (!row) return false;
     const statusKey = String(row?.status || 'requested').trim().toLowerCase();
-    return ['triggered', 'requested', 'approved'].includes(statusKey) && !row?.dn_id;
+    return ['triggered', 'requested', 'approved', 'production_ready'].includes(statusKey) && !row?.dn_id;
   };
   const requestRows = kanbanPaginationMeta.rows || [];
   const [expandedRequestGroups, setExpandedRequestGroups] = useState(() => new Set());
@@ -2093,6 +2629,11 @@ const TabKanban = (props) => {
   const productionImportRef = useRef(null);
   const wipImportRef = useRef(null);
   const [productionTab, setProductionTab] = useState('queue');
+  const [productionQueueStatusFilter, setProductionQueueStatusFilter] = useState('all');
+  const [productionQueueHealthFilter, setProductionQueueHealthFilter] = useState('all');
+  const [productionQueueCategoryFilter, setProductionQueueCategoryFilter] = useState('all');
+  const [productionQueuePage, setProductionQueuePage] = useState(1);
+  const [productionQueuePageSize, setProductionQueuePageSize] = useState(25);
   const [productionImportRows, setProductionImportRows] = useState([]);
   const [productionImportLoading, setProductionImportLoading] = useState(false);
   const [productionImportError, setProductionImportError] = useState('');
@@ -2111,10 +2652,11 @@ const TabKanban = (props) => {
     productCode: '',
     qty: '',
     lineCode: '',
-    shiftLabel: '',
+    shiftLabel: 'Shift 1',
     documentNo: '',
     notes: '',
   }));
+  const productionShiftOptions = ['Shift 1', 'Shift 2'];
   const productionOrderPageSizeOptions = [25, 50, 100, 250];
   const productionOrderTotalRows = productionOrderRows.length;
   const productionOrderTotalPages = Math.max(1, Math.ceil(productionOrderTotalRows / productionOrderPageSize));
@@ -2142,6 +2684,11 @@ const TabKanban = (props) => {
     saving: false,
     error: '',
     productionDate: '',
+    actualQty: '',
+    requirementQty: '',
+    varianceReason: '',
+    overproductionApproved: false,
+    postedResult: null,
   });
   const [productionBatchModal, setProductionBatchModal] = useState({
     open: false,
@@ -2151,6 +2698,8 @@ const TabKanban = (props) => {
     error: '',
     productionDate: '',
     lineFilter: 'all',
+    categoryFilter: 'all',
+    actualConfirmOpen: false,
   });
   const [productionCompareStart, setProductionCompareStart] = useState(() => {
     const now = new Date();
@@ -2329,6 +2878,47 @@ const TabKanban = (props) => {
       || masterItemsByCode?.get?.(code)
       || null;
   }, [masterItemsByCode, productionManualForm.productCode, productionOutputItemOptions]);
+
+  const productionLineOptions = useMemo(() => {
+    const normalizeLocationType = (value) => {
+      const raw = String(value || '').trim();
+      if (/production\s*line/i.test(raw)) return 'Production Line';
+      if (/work\s*center/i.test(raw)) return 'Work Center';
+      return '';
+    };
+    const sourceRows = Array.isArray(masterLocations) ? masterLocations : Array.from(masterLocationsById?.values?.() || []);
+    const rows = sourceRows.filter((location) => location?.id);
+    const processRows = rows.filter((location) => normalizeLocationType(location.line_description || location.lineDescription) || normalizeLocationType(location.category));
+    const list = processRows.length > 0 ? processRows : rows;
+    return list
+      .map((location) => {
+        const id = String(location.id || '').trim();
+        const type = normalizeLocationType(location.line_description || location.lineDescription) || normalizeLocationType(location.category);
+        const processName = String(location.fifo_lane || location.fifoLane || '').trim();
+        const machineNote = String(location.machine_note || location.machineNote || '').trim();
+        const primaryLabel = processName || machineNote || id;
+        const detail = [
+          id !== primaryLabel ? id : '',
+          type,
+          location.category && location.category !== type ? location.category : '',
+          machineNote && machineNote !== primaryLabel ? machineNote : '',
+        ].filter(Boolean).join(' | ');
+        return {
+          ...location,
+          value: id,
+          processName,
+          label: detail ? `${primaryLabel} | ${detail}` : primaryLabel,
+        };
+      })
+      .sort((left, right) => String(left.label || '').localeCompare(String(right.label || '')));
+  }, [masterLocations, masterLocationsById]);
+
+  const getProductionLineDisplayLabel = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '-';
+    const option = productionLineOptions.find((row) => String(row.value || '').trim() === raw);
+    return option?.processName || option?.fifo_lane || option?.fifoLane || raw;
+  };
 
   const productionReportRows = useMemo(() => {
     const rows = Array.isArray(productionCompareRows) ? productionCompareRows : [];
@@ -2655,7 +3245,7 @@ const TabKanban = (props) => {
 
   useEffect(() => {
     if (kanbanSubTab !== 'delivery') return;
-    fetchDeliveryUploads();
+    refreshDeliveryWorkflow();
   }, [kanbanSubTab]);
 
   const fetchProductionImportHistory = async () => {
@@ -2734,6 +3324,277 @@ const TabKanban = (props) => {
     }
   };
 
+  const fetchCustomerShipments = async ({ silent = false } = {}) => {
+    if (!canOpenDeliveryTab) return;
+    if (!silent) setCustomerShipmentsLoading(true);
+    setCustomerShipmentsError('');
+    try {
+      const data = await apiFetch('/api/delivery/customer-shipments?limit=50&offset=0');
+      const rows = Array.isArray(data?.rows) ? data.rows : [];
+      setCustomerShipments(rows);
+      if (!selectedCustomerShipmentId && rows.length > 0) {
+        setSelectedCustomerShipmentId(rows[0].id);
+      }
+    } catch (error) {
+      setCustomerShipments([]);
+      setCustomerShipmentsError(error.message || 'Gagal memuat Outbound Customer.');
+    } finally {
+      if (!silent) setCustomerShipmentsLoading(false);
+    }
+  };
+
+  const refreshDeliveryWorkflow = async ({ silent = false } = {}) => {
+    await Promise.all([
+      fetchDeliveryUploads({ silent }),
+      fetchCustomerShipments({ silent }),
+    ]);
+  };
+
+  const getShipmentUploadId = (shipment = {}) => Number(shipment?.deliveryUploadId ?? shipment?.delivery_upload_id ?? 0);
+
+  const getDeliveryUploadFulfilledQty = (upload = {}) => {
+    const direct = Number(upload?.total_qty_fulfilled ?? upload?.totalQtyFulfilled ?? 0);
+    if (Number.isFinite(direct) && direct > 0) return direct;
+    const items = Array.isArray(upload?.items) ? upload.items : [];
+    return items.reduce((sum, item) => sum + Number(item?.qtyFulfilled ?? item?.qty_fulfilled ?? 0), 0);
+  };
+
+  const getDeliveryUploadShipment = (upload = {}) => {
+    const uploadId = Number(upload?.id || 0);
+    if (!uploadId) return null;
+    return customerShipmentsByUploadId.get(uploadId) || upload.customer_sj || upload.customerSj || null;
+  };
+
+  const getCustomerOutboundNumber = (shipment = {}) => (
+    shipment.outboundNumber || shipment.outbound_number || shipment.sjNumber || shipment.sj_number || '-'
+  );
+
+  const getCustomerSjNumber = (shipment = {}) => (
+    shipment.customerSjNumber || shipment.customer_sj_number || ''
+  );
+
+  const isCustomerShipmentLoaded = (shipment = {}) => {
+    const status = String(shipment.status || '').toLowerCase();
+    return status === 'loaded' || status === 'sj_created' || status === 'printed';
+  };
+
+  const getCustomerShipmentStatusMeta = (statusValue) => {
+    const status = String(statusValue || '').toLowerCase();
+    if (status === 'reserved') return { label: 'RESERVED', className: 'bg-slate-100 text-slate-700' };
+    if (status === 'picked') return { label: 'PICKED', className: 'bg-sky-100 text-sky-700' };
+    if (status === 'loaded') return { label: 'LOADED / STOCK OUT', className: 'bg-emerald-100 text-emerald-700' };
+    if (status === 'sj_created') return { label: 'SJ CREATED', className: 'bg-emerald-100 text-emerald-700' };
+    if (status === 'printed') return { label: 'PRINTED', className: 'bg-indigo-100 text-indigo-700' };
+    return { label: status ? status.toUpperCase() : '-', className: 'bg-slate-100 text-slate-700' };
+  };
+
+  const getCustomerShipmentPickedQty = (shipment = {}) => {
+    const items = Array.isArray(shipment.items) ? shipment.items : [];
+    return items.reduce((sum, item) => sum + Number(item.qtyPicked ?? item.qty_picked ?? 0), 0);
+  };
+
+  const getCustomerShipmentLoadedQty = (shipment = {}) => {
+    const items = Array.isArray(shipment.items) ? shipment.items : [];
+    return items.reduce((sum, item) => sum + Number(item.qtyLoaded ?? item.qty_loaded ?? 0), 0);
+  };
+
+  const isCustomerShipmentFullyPicked = (shipment = {}) => {
+    const items = Array.isArray(shipment.items) ? shipment.items : [];
+    return items.length > 0 && items.every((item) => Number(item.qtyPicked ?? item.qty_picked ?? 0) >= Number(item.qtyShip ?? item.qty_ship ?? 0));
+  };
+
+  const printCustomerShipment = (shipment = {}) => {
+    const items = Array.isArray(shipment.items) ? shipment.items : [];
+    const loaded = isCustomerShipmentLoaded(shipment);
+    const docNumber = loaded ? (getCustomerSjNumber(shipment) || getCustomerOutboundNumber(shipment)) : getCustomerOutboundNumber(shipment);
+    const documentTitle = loaded ? 'SURAT JALAN CUSTOMER' : 'ORDER MUAT / PICKING LIST';
+    const customerName = shipment.customerName || shipment.customer_name || '-';
+    const customerDn = shipment.customerDnNumber || shipment.customer_dn_number || '-';
+    const sjDate = String(shipment.sjDate || shipment.sj_date || '').slice(0, 10) || getTodayDnDateInput();
+    const totalQty = loaded
+      ? Number(getCustomerShipmentLoadedQty(shipment) || shipment.totalQty || shipment.total_qty || 0)
+      : Number(shipment.totalQty ?? shipment.total_qty ?? items.reduce((sum, item) => sum + Number(item.qtyShip || item.qty_ship || 0), 0));
+    const rowsHtml = items.map((item, index) => `
+      <tr>
+        <td class="center">${index + 1}</td>
+        <td>${escapePrintText(item.itemCode || item.item_code || '-')}</td>
+        <td>${escapePrintText(item.partNo || item.part_no || '-')}</td>
+        <td>${escapePrintText(item.itemName || item.item_name || '-')}</td>
+        <td class="right">${escapePrintText(formatQty(loaded ? (item.qtyLoaded ?? item.qty_loaded ?? item.qtyShip ?? item.qty_ship ?? 0) : (item.qtyShip ?? item.qty_ship ?? 0)))}</td>
+        <td class="center">${escapePrintText(item.uom || 'PC')}</td>
+      </tr>
+    `).join('');
+    const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>${escapePrintText(docNumber)}</title>
+  <style>
+    @page { size: A4 portrait; margin: 10mm; }
+    * { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; color: #0f172a; margin: 0; font-size: 11px; }
+    .page { min-height: 277mm; padding: 2mm; }
+    .header { display: flex; justify-content: space-between; gap: 16px; border-bottom: 2px solid #0f172a; padding-bottom: 10px; margin-bottom: 12px; }
+    .brand { font-size: 15px; font-weight: 800; }
+    .muted { color: #64748b; font-size: 10px; }
+    .title { text-align: right; }
+    .title h1 { margin: 0; font-size: 20px; letter-spacing: 0; }
+    .title .number { margin-top: 4px; font-weight: 800; }
+    .meta { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 18px; margin-bottom: 12px; }
+    .meta div { border: 1px solid #cbd5e1; padding: 6px 8px; min-height: 34px; }
+    .meta span { display: block; color: #64748b; font-size: 9px; text-transform: uppercase; }
+    .meta strong { display: block; margin-top: 2px; font-size: 11px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border: 1px solid #0f172a; padding: 5px; vertical-align: top; }
+    th { background: #e2e8f0; font-size: 10px; text-transform: uppercase; }
+    .center { text-align: center; }
+    .right { text-align: right; }
+    .summary { margin-top: 8px; display: flex; justify-content: flex-end; }
+    .summary div { border: 1px solid #0f172a; padding: 6px 10px; min-width: 180px; text-align: right; font-weight: 800; }
+    .signatures { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 28px; }
+    .signature { border: 1px solid #0f172a; height: 78px; padding: 6px; text-align: center; font-weight: 700; }
+    .signature span { display: block; margin-top: 42px; border-top: 1px solid #0f172a; padding-top: 4px; font-weight: 400; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div>
+        <div class="brand">PT. Matra Roda Piranti</div>
+        <div class="muted">Customer Delivery Document</div>
+      </div>
+      <div class="title">
+        <h1>${escapePrintText(documentTitle)}</h1>
+        <div class="number">${escapePrintText(docNumber)}</div>
+      </div>
+    </div>
+    <div class="meta">
+      <div><span>Customer</span><strong>${escapePrintText(customerName)}</strong></div>
+      <div><span>Tanggal</span><strong>${escapePrintText(sjDate)}</strong></div>
+      <div><span>Ref DN Customer</span><strong>${escapePrintText(customerDn)}</strong></div>
+      <div><span>${loaded ? 'Total Qty Kirim' : 'Total Qty Rencana Muat'}</span><strong>${escapePrintText(formatQty(totalQty || 0))}</strong></div>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:40px;">No</th>
+          <th style="width:90px;">UNIQ</th>
+          <th style="width:150px;">Part No</th>
+          <th>Part Name</th>
+          <th style="width:90px;">${loaded ? 'Qty Kirim' : 'Qty Muat'}</th>
+          <th style="width:60px;">UOM</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rowsHtml || '<tr><td colspan="6" class="center">Tidak ada item.</td></tr>'}
+      </tbody>
+    </table>
+    <div class="summary"><div>Total: ${escapePrintText(formatQty(totalQty || 0))}</div></div>
+    <div class="signatures">
+      <div class="signature">Prepared<span>Admin Delivery</span></div>
+      <div class="signature">${loaded ? 'Security' : 'Warehouse'}<span>&nbsp;</span></div>
+      <div class="signature">${loaded ? 'Customer' : 'Loaded By'}<span>&nbsp;</span></div>
+    </div>
+  </div>
+</body>
+</html>`;
+    const printWindow = window.open('', '_blank', 'width=980,height=720');
+    if (!printWindow) {
+      alert('Popup print diblokir browser. Izinkan popup untuk mencetak dokumen.');
+      return;
+    }
+    printWindow.document.open();
+    printWindow.document.write(html);
+    printWindow.document.close();
+    printWindow.focus();
+    setTimeout(() => {
+      printWindow.print();
+    }, 350);
+  };
+
+  const handleCreateCustomerShipment = async (upload, { printAfter = true } = {}) => {
+    const uploadId = Number(upload?.id || 0);
+    if (!uploadId) return;
+    const fulfilledQty = getDeliveryUploadFulfilledQty(upload);
+    if (!(fulfilledQty > 0)) {
+      setDeliveryUploadError('Order Muat belum bisa dibuat karena stok tersedia masih 0.');
+      return;
+    }
+    const existing = getDeliveryUploadShipment(upload);
+    if (existing?.id) {
+      if (printAfter) printCustomerShipment(existing);
+      setSelectedCustomerShipmentId(existing.id);
+      setDeliveryWorkflowTab('outbound-customer');
+      return;
+    }
+    setCustomerShipmentCreatingId(uploadId);
+    setCustomerShipmentsError('');
+    try {
+      const data = await apiFetch(`/api/delivery/uploads/${uploadId}/customer-sj`, {
+        method: 'POST',
+        body: {},
+      });
+      const shipment = data?.shipment || null;
+      await refreshDeliveryWorkflow({ silent: true });
+      if (shipment) {
+        setSelectedCustomerShipmentId(shipment.id);
+        setDeliveryWorkflowTab('outbound-customer');
+        notifyMessage(data?.existing ? 'Order Muat sudah pernah dibuat.' : 'Order Muat berhasil dibuat.');
+        if (printAfter) printCustomerShipment(shipment);
+      }
+    } catch (error) {
+      setCustomerShipmentsError(error.message || 'Gagal membuat Order Muat.');
+      setDeliveryUploadError(error.message || 'Gagal membuat Order Muat.');
+    } finally {
+      setCustomerShipmentCreatingId(null);
+    }
+  };
+
+  const handleScanCustomerShipmentKanban = async (event) => {
+    event?.preventDefault?.();
+    const shipmentId = Number(selectedCustomerShipment?.id || 0);
+    const kanbanId = String(customerShipmentScanValue || '').trim();
+    if (!shipmentId || !kanbanId) return;
+    setCustomerShipmentScanLoading(true);
+    setCustomerShipmentsError('');
+    try {
+      const data = await apiFetch(`/api/delivery/customer-shipments/${shipmentId}/scan-kanban`, {
+        method: 'POST',
+        body: { kanbanId },
+      });
+      await refreshDeliveryWorkflow({ silent: true });
+      setCustomerShipmentScanValue('');
+      notifyMessage(data?.message || 'Scan kanban berhasil.');
+    } catch (error) {
+      setCustomerShipmentsError(error.message || 'Scan kanban gagal.');
+    } finally {
+      setCustomerShipmentScanLoading(false);
+    }
+  };
+
+  const handleConfirmCustomerShipmentLoaded = async (shipment = selectedCustomerShipment) => {
+    const shipmentId = Number(shipment?.id || 0);
+    if (!shipmentId) return;
+    setCustomerShipmentConfirmingId(shipmentId);
+    setCustomerShipmentsError('');
+    try {
+      const data = await apiFetch(`/api/delivery/customer-shipments/${shipmentId}/confirm-loaded`, {
+        method: 'POST',
+        body: {},
+      });
+      await refreshDeliveryWorkflow({ silent: true });
+      if (data?.shipment?.id) {
+        setSelectedCustomerShipmentId(data.shipment.id);
+        printCustomerShipment(data.shipment);
+      }
+      notifyMessage(data?.message || 'Confirm muat berhasil.');
+    } catch (error) {
+      setCustomerShipmentsError(error.message || 'Confirm muat gagal.');
+    } finally {
+      setCustomerShipmentConfirmingId(null);
+    }
+  };
+
   const handleDeliveryUpload = async () => {
     const file = deliveryUploadInputRef.current?.files?.[0] || null;
     if (!file) {
@@ -2748,9 +3609,10 @@ const TabKanban = (props) => {
       const result = await apiFetch('/api/delivery/upload-dn', {
         method: 'POST',
         body: formData,
+        timeoutMs: 180000,
       });
       setDeliveryUploadResult(result?.upload || null);
-      await fetchDeliveryUploads({ silent: true });
+      await refreshDeliveryWorkflow({ silent: true });
       if (deliveryUploadInputRef.current) deliveryUploadInputRef.current.value = '';
       setSelectedDeliveryUploadId(result?.upload?.id || null);
       notifyMessage('DN customer berhasil diproses.');
@@ -4491,6 +5353,7 @@ const TabKanban = (props) => {
   const [dnBatchGroups, setDnBatchGroups] = useState([]);
   const [dnBatchRemarks, setDnBatchRemarks] = useState({});
   const [dnBatchWarnings, setDnBatchWarnings] = useState({ missingSupplier: [], invalidRole: [], invalidFlow: [] });
+  const [requestBatchResultModal, setRequestBatchResultModal] = useState(null);
 
   const openRequestFilter = (key) => {
     setRequestFilterOpen((prev) => (prev === key ? null : key));
@@ -4564,6 +5427,236 @@ const TabKanban = (props) => {
       </div>
     </div>
   );
+
+  const getRequestSupplyLabel = (row = {}) => {
+    const supplySource = String(row?.supply_source || row?.supplySource || '').trim().toLowerCase();
+    if (supplySource === 'prl') {
+      const ref = String(row?.supply_ref || row?.supplyRef || '').trim();
+      const remaining = row?.supply_qty_remaining_snapshot ?? row?.supplyQtyRemainingSnapshot;
+      const remainingLabel = Number.isFinite(Number(remaining)) ? ` | sisa ${formatQty(remaining)}` : '';
+      return `${ref || 'PRL'}${remainingLabel}`;
+    }
+    const poNumber = String(row?.po_number || row?.poNumber || '').trim();
+    if (!poNumber) return '-';
+    const lineNo = row?.po_line_no ?? row?.poLineNo;
+    const remaining = row?.po_qty_remaining_snapshot ?? row?.poQtyRemainingSnapshot;
+    const lineLabel = lineNo !== null && lineNo !== undefined && String(lineNo).trim() !== '' ? ` / L${lineNo}` : '';
+    const remainingLabel = Number.isFinite(Number(remaining)) ? ` | sisa ${formatQty(remaining)}` : '';
+    return `${poNumber}${lineLabel}${remainingLabel}`;
+  };
+
+  const getBatchResultRequestRow = (modal, requestId) => {
+    const idText = String(requestId || '');
+    return (modal?.selectedRows || []).find((row) => String(row?.id || '') === idText)
+      || kanbanRequests.find((row) => String(row?.id || '') === idText)
+      || null;
+  };
+
+  const getBatchResultRequestLabel = (row, fallbackId = '') => {
+    if (row) return getRequestIdLabel(row);
+    return fallbackId ? `Request #${fallbackId}` : '-';
+  };
+
+  const getBatchResultPartName = (row = null, fallbackItemCode = '') => {
+    const direct = row?.item_name || row?.itemName || row?.part_name || row?.partName || '';
+    if (String(direct || '').trim()) return String(direct).trim();
+    const itemCode = String(fallbackItemCode || row?.item_code || row?.itemCode || '').trim();
+    const masterItem = itemCode ? masterItemsByCode?.get?.(itemCode) : null;
+    return masterItem?.name || masterItem?.part_name || masterItem?.partName || '-';
+  };
+
+  const getBatchSkippedReasonLabel = (skip = {}) => {
+    const reason = String(skip.reason || skip.code || '').trim().toLowerCase();
+    if (reason === 'kanban_po_required' || reason === 'kanban_po_qty_exceeded' || reason === 'po_required') return 'PO kurang';
+    if (reason === 'kanban_prl_qty_exceeded') return 'PRL kurang';
+    if (reason === 'missing_supplier') return 'Supplier belum ada';
+    if (reason === 'invalid_role') return 'Role supplier bukan Delivery Note';
+    if (reason === 'invalid_flow') return 'Flow bukan Supplier DN';
+    if (reason === 'dn_linked') return 'Sudah punya DN';
+    if (reason === 'manual_role') return 'Approval manual butuh supervisor';
+    if (reason === 'status') return `Status tidak valid${skip.status ? ` (${skip.status})` : ''}`;
+    return reason ? reason.replace(/_/g, ' ') : 'Tidak diproses';
+  };
+
+  const getBatchSkippedQtyText = (skip = {}, row = null) => {
+    const details = skip.details || {};
+    const requiredQty = details.requiredQty ?? skip.requestQty ?? row?.request_qty;
+    const availableQty = details.availableQty;
+    const shortageQty = details.shortageQty;
+    const parts = [];
+    if (Number.isFinite(Number(requiredQty))) parts.push(`request ${formatQty(requiredQty)}`);
+    if (Number.isFinite(Number(availableQty))) parts.push(`tersedia ${formatQty(availableQty)}`);
+    if (Number.isFinite(Number(shortageQty)) && Number(shortageQty) > 0) parts.push(`kurang ${formatQty(shortageQty)}`);
+    return parts.join(' | ');
+  };
+
+  const openRequestBatchResult = (action, outcome) => {
+    if (!outcome || typeof outcome !== 'object') return;
+    setRequestBatchResultModal({
+      action,
+      ok: Boolean(outcome.ok),
+      error: outcome.error || outcome.result?.error || '',
+      result: outcome.result || {},
+      selectedRows: outcome.selectedRows || [],
+    });
+  };
+
+  const renderRequestBatchResultModal = () => {
+    const modal = requestBatchResultModal;
+    if (!modal) return null;
+    const result = modal.result || {};
+    const approvedRows = Array.isArray(result.approved) ? result.approved : [];
+    const skippedRows = Array.isArray(result.skipped) ? result.skipped : [];
+    const dnLinks = Array.isArray(result.dnRequestLinks) ? result.dnRequestLinks : [];
+    const actionLabel = modal.action === 'approve-dn'
+      ? 'Batch Approve + DN'
+      : modal.action === 'dn'
+        ? 'Batch DN'
+        : 'Batch Approve';
+    const dnRequestCount = dnLinks.reduce((sum, link) => sum + Number(link.requestCount || link.requestIds?.length || 0), 0);
+    const successCount = modal.action === 'approve' ? approvedRows.length : dnRequestCount;
+    return (
+      <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+        <div className="bg-white rounded-xl w-full max-w-5xl max-h-[88vh] overflow-hidden shadow-2xl">
+          <div className="flex items-start justify-between gap-3 border-b p-4">
+            <div>
+              <div className="text-sm font-semibold text-slate-900">{actionLabel} Result</div>
+              <div className="text-xs text-slate-500">
+                {successCount} sukses diproses
+                {skippedRows.length > 0 ? `, ${skippedRows.length} gagal/skip` : ''}
+                {modal.error && !modal.ok ? ` - ${modal.error}` : ''}
+              </div>
+            </div>
+            <button type="button" onClick={() => setRequestBatchResultModal(null)} className="text-slate-500 hover:text-slate-700">
+              <X size={18} />
+            </button>
+          </div>
+
+          <div className="max-h-[72vh] overflow-y-auto p-4 space-y-4">
+            {dnLinks.length > 0 && (
+              <div>
+                <div className="mb-2 flex items-center justify-between">
+                  <div className="text-xs font-semibold uppercase text-emerald-700">Masuk DN Register</div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setKanbanSubTab('dn');
+                      setRequestBatchResultModal(null);
+                    }}
+                    className="rounded border border-emerald-200 px-2 py-1 text-xs font-semibold text-emerald-700 hover:bg-emerald-50"
+                  >
+                    Buka DN Register
+                  </button>
+                </div>
+                <div className="overflow-x-auto rounded-lg border border-emerald-100">
+                  <table className="min-w-full text-xs">
+                    <thead className="bg-emerald-50 text-emerald-800">
+                      <tr>
+                        <th className="px-3 py-2 text-left">DN Number</th>
+                        <th className="px-3 py-2 text-left">Supplier</th>
+                        <th className="px-3 py-2 text-left">Request Masuk</th>
+                        <th className="px-3 py-2 text-left">Item</th>
+                        <th className="px-3 py-2 text-left">Part Name</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y">
+                      {dnLinks.map((link) => (
+                        <tr key={`${link.dnId || link.dnNumber}-${link.supplier}`}>
+                          <td className="px-3 py-2 font-semibold text-slate-900">{link.dnNumber || `DN-${link.dnId || '-'}`}</td>
+                          <td className="px-3 py-2">{link.supplier || '-'}</td>
+                          <td className="px-3 py-2">
+                            {(link.requestIds || []).map((id) => getBatchResultRequestLabel(getBatchResultRequestRow(modal, id), id)).join(', ')}
+                          </td>
+                          <td className="px-3 py-2">{(link.itemCodes || []).join(', ') || '-'}</td>
+                          <td className="px-3 py-2">
+                            {(link.requestIds || []).map((id, index) => {
+                              const row = getBatchResultRequestRow(modal, id);
+                              return getBatchResultPartName(row, (link.itemCodes || [])[index]);
+                            }).join(', ')}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {approvedRows.length > 0 && (
+              <div>
+                <div className="mb-2 text-xs font-semibold uppercase text-emerald-700">Berhasil Approve</div>
+                <div className="overflow-x-auto rounded-lg border border-emerald-100">
+                  <table className="min-w-full text-xs">
+                    <thead className="bg-emerald-50 text-emerald-800">
+                      <tr>
+                        <th className="px-3 py-2 text-left">Request</th>
+                        <th className="px-3 py-2 text-left">Item</th>
+                        <th className="px-3 py-2 text-left">Part Name</th>
+                        <th className="px-3 py-2 text-right">Qty</th>
+                        <th className="px-3 py-2 text-left">Supply</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y">
+                      {approvedRows.map((row) => (
+                        <tr key={row.id}>
+                          <td className="px-3 py-2 font-semibold text-slate-900">{getBatchResultRequestLabel(row, row.id)}</td>
+                          <td className="px-3 py-2">{row.item_code || '-'}</td>
+                          <td className="px-3 py-2">{getBatchResultPartName(row, row.item_code)}</td>
+                          <td className="px-3 py-2 text-right">{formatQty(row.request_qty)}</td>
+                          <td className="px-3 py-2">{getRequestSupplyLabel(row)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {skippedRows.length > 0 && (
+              <div>
+                <div className="mb-2 text-xs font-semibold uppercase text-rose-700">Gagal / Tidak Diproses</div>
+                <div className="overflow-x-auto rounded-lg border border-rose-100">
+                  <table className="min-w-full text-xs">
+                    <thead className="bg-rose-50 text-rose-800">
+                      <tr>
+                        <th className="px-3 py-2 text-left">Request</th>
+                        <th className="px-3 py-2 text-left">Item</th>
+                        <th className="px-3 py-2 text-left">Part Name</th>
+                        <th className="px-3 py-2 text-left">Alasan</th>
+                        <th className="px-3 py-2 text-left">Qty Detail</th>
+                        <th className="px-3 py-2 text-left">Pesan</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y">
+                      {skippedRows.map((skip, index) => {
+                        const row = getBatchResultRequestRow(modal, skip.id);
+                        return (
+                          <tr key={`${skip.id || 'skip'}-${index}`}>
+                            <td className="px-3 py-2 font-semibold text-slate-900">{getBatchResultRequestLabel(row, skip.id)}</td>
+                            <td className="px-3 py-2">{skip.itemCode || skip.item_code || row?.item_code || '-'}</td>
+                            <td className="px-3 py-2">{getBatchResultPartName(row, skip.itemCode || skip.item_code)}</td>
+                            <td className="px-3 py-2 font-semibold text-rose-700">{getBatchSkippedReasonLabel(skip)}</td>
+                            <td className="px-3 py-2">{getBatchSkippedQtyText(skip, row) || '-'}</td>
+                            <td className="px-3 py-2 text-slate-600">{skip.error || '-'}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {dnLinks.length === 0 && approvedRows.length === 0 && skippedRows.length === 0 && (
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
+                {modal.error || 'Tidak ada detail hasil dari server.'}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   const buildDnBatchGroups = () => {
     const missingSupplier = [];
@@ -4703,7 +5796,7 @@ ${reasons.join('\n')}`);
     }
   };
 
-  const productionQueueRows = kanbanRequests
+  const productionQueueAllRows = kanbanRequests
     .filter((row) => isRequestSelectable(row) && resolveRequestFlowMeta(row).key === 'production')
     .sort((a, b) => {
       const healthA = getKanbanRequestHealth(a);
@@ -4713,8 +5806,50 @@ ${reasons.join('\n')}`);
       }
       return new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime();
     });
-  const productionQueueReadyCount = productionQueueRows.filter((row) => !getKanbanRequestHealth(row).hasStockGap).length;
-  const productionQueueStockGapCount = productionQueueRows.length - productionQueueReadyCount;
+  const productionQueueNeedWoRows = productionQueueAllRows.filter((row) => String(row.status || '').trim().toLowerCase() !== 'production_ready');
+  const productionQueueReleasedRows = productionQueueAllRows.filter((row) => String(row.status || '').trim().toLowerCase() === 'production_ready');
+  const productionQueueStatusRows = productionQueueAllRows.filter((row) => {
+    const statusKey = String(row.status || '').trim().toLowerCase();
+    if (productionQueueStatusFilter === 'need_wo') return statusKey !== 'production_ready';
+    if (productionQueueStatusFilter === 'released') return statusKey === 'production_ready';
+    return true;
+  });
+  const productionQueueHealthRows = productionQueueStatusRows.filter((row) => {
+    const statusKey = String(row.status || '').trim().toLowerCase();
+    const health = getKanbanRequestHealth(row);
+    if (productionQueueHealthFilter === 'ready') return statusKey !== 'production_ready' && !health.hasStockGap;
+    if (productionQueueHealthFilter === 'review') return statusKey !== 'production_ready' && health.hasStockGap;
+    return true;
+  });
+  const productionQueueRows = productionQueueHealthRows.filter((row) => {
+    if (productionQueueCategoryFilter === 'all') return true;
+    return getProductionRequestCategoryMeta(row).key === productionQueueCategoryFilter;
+  });
+  const productionQueueActionableRows = productionQueueRows.filter((row) => {
+    const statusKey = String(row.status || '').trim().toLowerCase();
+    return statusKey === 'production_ready' || !getKanbanRequestHealth(row).hasStockGap;
+  });
+  const productionQueuePageSizeOptions = [10, 25, 50, 100];
+  const productionQueueTotalRows = productionQueueRows.length;
+  const productionQueueTotalPages = Math.max(1, Math.ceil(productionQueueTotalRows / productionQueuePageSize));
+  const productionQueueCurrentPage = Math.min(Math.max(1, Number(productionQueuePage) || 1), productionQueueTotalPages);
+  const productionQueueStartIndex = productionQueueTotalRows === 0 ? 0 : (productionQueueCurrentPage - 1) * productionQueuePageSize;
+  const productionQueueEndIndex = Math.min(productionQueueStartIndex + productionQueuePageSize, productionQueueTotalRows);
+  const productionQueuePagedRows = productionQueueRows.slice(productionQueueStartIndex, productionQueueEndIndex);
+  const productionQueueReadyCount = productionQueueNeedWoRows.filter((row) => !getKanbanRequestHealth(row).hasStockGap).length;
+  const productionQueueStockGapCount = productionQueueNeedWoRows.length - productionQueueReadyCount;
+  const productionQueueReleasedCount = productionQueueReleasedRows.length;
+  const productionQueueAssyCount = productionQueueAllRows.filter((row) => getProductionRequestCategoryMeta(row).key === 'assy').length;
+  const productionQueueChildCount = productionQueueAllRows.filter((row) => getProductionRequestCategoryMeta(row).key === 'child').length;
+  const productionDashboardCardClass = (active, baseClass) => `rounded-xl border p-4 text-left transition focus:outline-none focus:ring-2 focus:ring-slate-300 ${baseClass} ${
+    active ? 'ring-2 ring-slate-900 ring-offset-1' : 'hover:shadow-sm'
+  }`;
+
+  useEffect(() => {
+    if (productionQueueCurrentPage !== productionQueuePage) {
+      setProductionQueuePage(productionQueueCurrentPage);
+    }
+  }, [productionQueueCurrentPage, productionQueuePage]);
 
   const selectedRequestRows = selectedRequestIds
     .map((id) => kanbanRequests.find((row) => row.id === id))
@@ -6080,8 +7215,13 @@ ${reasons.join('\n')}`);
                                 disabled={!canEditSchedules || selectedBatchApproveCount === 0}
                                 onClick={async () => {
                                   if (!canEditSchedules || selectedBatchApproveCount === 0) return;
-                                  const ok = await handleBatchApproveKanban?.();
-                                  if (ok) setSelectedRequestIds([]);
+                                  const outcome = await handleBatchApproveKanban?.();
+                                  if (outcome && typeof outcome === 'object') {
+                                    openRequestBatchResult('approve', outcome);
+                                    if (outcome.ok) setSelectedRequestIds([]);
+                                  } else if (outcome) {
+                                    setSelectedRequestIds([]);
+                                  }
                                 }}
                                 className={`px-3 py-1.5 text-xs rounded border ${
                                   !canEditSchedules || selectedBatchApproveCount === 0
@@ -6097,8 +7237,13 @@ ${reasons.join('\n')}`);
                                 disabled={!canEditSchedules || selectedSupplierDnCount === 0}
                                 onClick={async () => {
                                   if (!canEditSchedules || selectedSupplierDnCount === 0) return;
-                                  const ok = await handleBatchApproveAndDn?.();
-                                  if (ok) setSelectedRequestIds([]);
+                                  const outcome = await handleBatchApproveAndDn?.();
+                                  if (outcome && typeof outcome === 'object') {
+                                    openRequestBatchResult('approve-dn', outcome);
+                                    if (outcome.ok) setSelectedRequestIds([]);
+                                  } else if (outcome) {
+                                    setSelectedRequestIds([]);
+                                  }
                                 }}
                                 className={`px-3 py-1.5 text-xs rounded border ${
                                   !canEditSchedules || selectedSupplierDnCount === 0
@@ -6153,6 +7298,7 @@ ${reasons.join('\n')}`);
                               <th className="text-left p-2">{renderFilterHeader('Category', 'category')}</th>
                               <th className="text-left p-2">{renderFilterHeader('Flow', 'flow')}</th>
                               <th className="text-left p-2">{renderFilterHeader('Supplier', 'supplier')}</th>
+                              <th className="text-left p-2">Supply</th>
                               <th className="text-left p-2">{renderFilterHeader('Trigger', 'trigger')}</th>
                               <th className="text-right p-2">{renderFilterHeader('On Hand', 'onHand', 'right')}</th>
                               <th className="text-right p-2">{renderFilterHeader('Order Qty', 'suggested', 'right')}</th>
@@ -6172,6 +7318,8 @@ ${reasons.join('\n')}`);
                               const groupKanbanId = firstRow ? buildKanbanDisplayId(firstRow.item_code, firstRow.item_type, firstRow) : '-';
                               const groupSupplierMeta = getRequestSupplierMeta(firstRow || {});
                               const groupFlowMeta = resolveRequestFlowMeta(firstRow || {});
+                              const groupSupplyLabels = Array.from(new Set(group.rows.map((row) => getRequestSupplyLabel(row)).filter((label) => label && label !== '-')));
+                              const firstRowStatusKey = String(firstRow?.status || '').trim().toLowerCase();
                               const groupFlowKeys = new Set(group.rows.map((row) => resolveRequestFlowMeta(row).key));
                               const groupFlowLabel = groupFlowKeys.size > 1 ? 'Mixed' : groupFlowMeta.label;
                               const groupCategoryKeys = new Set(group.rows.map((row) => resolveRequestFlowMeta(row).category?.key || 'other'));
@@ -6228,9 +7376,10 @@ ${reasons.join('\n')}`);
                                       <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold ${groupFlowKeys.size > 1 ? 'border-slate-200 bg-white text-slate-600' : getRequestFlowBadgeClass(groupFlowMeta.key)}`}>
                                         {groupFlowLabel}
                                       </span>
-                                    </td>
-                                    <td className="p-2 text-slate-700 font-semibold">{groupSupplierMeta.codeLabel}</td>
-                                    <td className="p-2">{groupTriggerLabel}</td>
+                                     </td>
+                                     <td className="p-2 text-slate-700 font-semibold">{groupSupplierMeta.codeLabel}</td>
+                                    <td className="p-2 text-slate-600">{groupSupplyLabels.length === 0 ? '-' : groupSupplyLabels.length === 1 ? groupSupplyLabels[0] : 'Mixed'}</td>
+                                     <td className="p-2">{groupTriggerLabel}</td>
                                     <td className="p-2 text-right">{formatQty(groupOnHand)}</td>
                                     <td className="p-2 text-right font-semibold">{formatQty(group.totalQty || 0)}</td>
                                     <td className="p-2">
@@ -6282,11 +7431,17 @@ ${reasons.join('\n')}`);
                                       ) : groupFlowMeta.key === 'production' && firstRow ? (
                                         <button
                                           type="button"
-                                          onClick={() => openProductionRequest(firstRow)}
+                                          onClick={() => {
+                                            if (firstRowStatusKey === 'production_ready') {
+                                              openProductionRequest(firstRow);
+                                            } else {
+                                              void openProductionBatchRows([firstRow]);
+                                            }
+                                          }}
                                           className="px-2 py-1 border rounded text-emerald-700 bg-emerald-50 hover:bg-emerald-100 text-[11px] font-semibold"
-                                          title={groupFlowMeta.reason || 'Check BOM readiness and post production'}
+                                          title={groupFlowMeta.reason || 'Release WO atau konfirmasi aktual produksi'}
                                         >
-                                          Production
+                                          {firstRowStatusKey === 'production_ready' ? 'Konfirmasi Aktual' : 'Buat WO'}
                                         </button>
                                       ) : (
                                         <span className="text-slate-400">-</span>
@@ -6302,6 +7457,8 @@ ${reasons.join('\n')}`);
                                       ? 'Pending'
                                       : statusKey === 'approved'
                                         ? 'Approved'
+                                        : statusKey === 'production_ready'
+                                          ? 'WO Released'
                                         : statusKey === 'rejected'
                                           ? 'Rejected'
                                           : row.status;
@@ -6312,6 +7469,8 @@ ${reasons.join('\n')}`);
                                         : baseStatusLabel;
                                     const statusClass = health.hasStockGap && ['triggered', 'requested', 'approved'].includes(statusKey)
                                       ? 'bg-orange-100 text-orange-700'
+                                      : statusLabel === 'WO Released'
+                                        ? 'bg-sky-100 text-sky-700'
                                       : statusLabel === 'Approved'
                                         ? 'bg-slate-900 text-white'
                                         : statusLabel === 'Rejected'
@@ -6350,9 +7509,10 @@ ${reasons.join('\n')}`);
                                           <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold ${getRequestFlowBadgeClass(rowFlowMeta.key)}`} title={rowFlowMeta.reason || rowFlowMeta.actionLabel || ''}>
                                             {rowFlowMeta.label}
                                           </span>
-                                        </td>
-                                        <td className="p-2 text-slate-700 font-semibold">{rowSupplierMeta.codeLabel}</td>
-                                        <td className="p-2">{triggerLabel}</td>
+                                         </td>
+                                         <td className="p-2 text-slate-700 font-semibold">{rowSupplierMeta.codeLabel}</td>
+                                        <td className="p-2 text-slate-600">{getRequestSupplyLabel(row)}</td>
+                                         <td className="p-2">{triggerLabel}</td>
                                         <td className="p-2 text-right">{formatQty(onHand)}</td>
                                         <td className="p-2 text-right font-semibold">{formatQty(row.request_qty || 0)}</td>
                                         <td className="p-2">
@@ -6429,9 +7589,12 @@ ${reasons.join('\n')}`);
                                               <>
                                                 <button
                                                   disabled={!canEditSchedules}
-                                                  onClick={() => {
+                                                  onClick={async () => {
                                                     if (!canEditSchedules) return;
-                                                    handleApproveKanban(row);
+                                                    const outcome = await handleApproveKanban(row);
+                                                    if (outcome && typeof outcome === 'object') {
+                                                      openRequestBatchResult('approve', outcome);
+                                                    }
                                                   }}
                                                   className={getLockedButtonClassName('px-2 py-1 border rounded text-emerald-700 bg-emerald-50 hover:bg-emerald-100', !canEditSchedules)}
                                                   title={getLockedActionTitle(canEditSchedules, 'Approve request')}
@@ -6442,9 +7605,12 @@ ${reasons.join('\n')}`);
                                                 {allowApproveAndDn && canCreateDnForRow && !health.hasStockGap && (
                                                   <button
                                                     disabled={!canEditSchedules}
-                                                    onClick={() => {
+                                                    onClick={async () => {
                                                       if (!canEditSchedules) return;
-                                                      handleApproveAndCreateDn(row);
+                                                      const outcome = await handleApproveAndCreateDn(row);
+                                                      if (outcome && typeof outcome === 'object') {
+                                                        openRequestBatchResult('approve-dn', outcome);
+                                                      }
                                                     }}
                                                     className={getLockedButtonClassName('px-2 py-1 border rounded text-indigo-700 bg-indigo-50 hover:bg-indigo-100', !canEditSchedules)}
                                                     title={getLockedActionTitle(canEditSchedules, 'Approve + DN')}
@@ -6456,11 +7622,17 @@ ${reasons.join('\n')}`);
                                                 {!canCreateDnForRow && rowFlowMeta.key === 'production' && (
                                                   <button
                                                     type="button"
-                                                    onClick={() => openProductionRequest(row)}
+                                                    onClick={() => {
+                                                      if (statusKey === 'production_ready') {
+                                                        openProductionRequest(row);
+                                                      } else {
+                                                        void openProductionBatchRows([row]);
+                                                      }
+                                                    }}
                                                     className="px-2 py-1 border rounded text-emerald-700 bg-emerald-50 hover:bg-emerald-100"
-                                                    title={rowFlowMeta.reason || 'Check BOM readiness and post production'}
+                                                    title={rowFlowMeta.reason || 'Release WO atau konfirmasi aktual produksi'}
                                                   >
-                                                    Production
+                                                    {statusKey === 'production_ready' ? 'Konfirmasi Aktual' : 'Buat WO'}
                                                   </button>
                                                 )}
                                                 {!canCreateDnForRow && rowFlowMeta.key === 'subcon' && (
@@ -6554,11 +7726,21 @@ ${reasons.join('\n')}`);
                                             {row.status === 'approved' && !row.dn_id && !canCreateDnForRow && rowFlowMeta.key === 'production' && (
                                               <button
                                                 type="button"
-                                                onClick={() => openProductionRequest(row)}
+                                                onClick={() => { void openProductionBatchRows([row]); }}
                                                 className="px-2 py-1 border rounded text-emerald-700 bg-emerald-50 hover:bg-emerald-100"
-                                                title={rowFlowMeta.reason || 'Check BOM readiness and post production'}
+                                                title={rowFlowMeta.reason || 'Check BOM readiness and release WO'}
                                               >
-                                                Production
+                                                Buat WO
+                                              </button>
+                                            )}
+                                            {row.status === 'production_ready' && !row.dn_id && !canCreateDnForRow && rowFlowMeta.key === 'production' && (
+                                              <button
+                                                type="button"
+                                                onClick={() => openProductionRequest(row)}
+                                                className="px-2 py-1 border rounded text-sky-700 bg-sky-50 hover:bg-sky-100"
+                                                title={rowFlowMeta.reason || 'Konfirmasi aktual produksi'}
+                                              >
+                                                Konfirmasi Aktual
                                               </button>
                                             )}
                                             {row.status === 'approved' && !row.dn_id && !canCreateDnForRow && rowFlowMeta.key === 'subcon' && (
@@ -6619,7 +7801,7 @@ ${reasons.join('\n')}`);
                               );
                             })}
                             {groupedKanbanRequests.length === 0 && (
-                              <tr><td colSpan="15" className="p-3 text-center text-gray-400">No requests found.</td></tr>
+                              <tr><td colSpan="16" className="p-3 text-center text-gray-400">No requests found.</td></tr>
                             )}
                           </tbody>
                         </table>
@@ -6710,6 +7892,11 @@ ${reasons.join('\n')}`);
                             const isDraft = statusValue === 'draft';
                             const canEditDnHeader = ['draft', 'open'].includes(statusValue);
                             const arrivalWarning = getDnArrivalWarning(dn);
+                            const isEmailSending = Number(dnEmailSendingId) === Number(dn.id);
+                            const isEmailLocked = ['closed', 'received', 'cancelled', 'canceled'].includes(statusValue);
+                            const hasEmailBeenSent = typeof isDnEmailSent === 'function'
+                              ? isDnEmailSent(dn)
+                              : Boolean(dn?.email_sent_at || dn?.emailSentAt || Number(dn?.email_send_count || dn?.emailSendCount || 0) > 0 || statusValue === 'sent');
                             return (
                             <tr key={dn.id} className="border-t">
                               <td className="p-2 font-semibold">{dn.dn_number}</td>
@@ -6752,10 +7939,20 @@ ${reasons.join('\n')}`);
                                   <button
                                     type="button"
                                     onClick={() => handleDnEmail(dn)}
-                                    className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-1.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
-                                    title="Email DN"
+                                    disabled={isEmailSending || isEmailLocked}
+                                    className={`inline-flex items-center gap-1 rounded border px-2 py-1.5 text-[11px] font-semibold ${
+                                      isEmailSending
+                                        ? 'cursor-wait border-sky-200 bg-sky-50 text-sky-700'
+                                        : isEmailLocked
+                                          ? 'cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400'
+                                        : hasEmailBeenSent
+                                          ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                                    }`}
+                                    title={isEmailSending ? 'Email sedang dikirim' : isEmailLocked ? 'Email terkunci karena DN sudah selesai' : hasEmailBeenSent ? 'Email sudah dikirim - klik untuk detail atau resend' : 'Email DN'}
                                   >
-                                    <Mail size={13} /> Email
+                                    {isEmailSending ? <Clock size={13} /> : hasEmailBeenSent && !isEmailLocked ? <CheckCircle size={13} /> : <Mail size={13} />}
+                                    {isEmailSending ? 'Mengirim...' : 'Email'}
                                   </button>
                                   <div className="relative">
                                     <button
@@ -6845,6 +8042,7 @@ ${reasons.join('\n')}`);
                         {[
                           { key: 'upload-dn', label: 'Upload DN' },
                           { key: 'import-aktual', label: 'Import Aktual' },
+                          { key: 'outbound-customer', label: 'Outbound Customer' },
                           { key: 'history', label: 'History' },
                         ].map((tab) => (
                           <button
@@ -6863,10 +8061,10 @@ ${reasons.join('\n')}`);
                         <button
                           type="button"
                           className="px-3 py-2 text-xs border rounded"
-                          onClick={() => fetchDeliveryUploads()}
-                          disabled={deliveryUploadsLoading}
+                          onClick={() => refreshDeliveryWorkflow()}
+                          disabled={deliveryUploadsLoading || customerShipmentsLoading}
                         >
-                          {deliveryUploadsLoading ? 'Memuat...' : 'Refresh'}
+                          {deliveryUploadsLoading || customerShipmentsLoading ? 'Memuat...' : 'Refresh'}
                         </button>
                       </div>
                     </div>
@@ -6877,8 +8075,11 @@ ${reasons.join('\n')}`);
                           <div className="flex items-start justify-between gap-3">
                             <div>
                               <div className="text-sm font-semibold">Upload Delivery Note</div>
-                              <div className="text-xs text-slate-500">Upload foto atau PDF DN customer. Sistem akan baca teks, potong stok parent, lalu trigger backorder BOM jika kurang.</div>
+                              <div className="text-xs text-slate-500">Upload foto atau PDF DN customer. Sistem akan baca teks, cek stok tersedia, lalu trigger backorder BOM jika kurang.</div>
                             </div>
+                          </div>
+                          <div className="rounded-lg border border-sky-100 bg-sky-50 px-3 py-2 text-xs text-sky-800">
+                            OCR utama memakai Gemini. Jika Gemini terkena limit/rate-limit, sistem akan mencoba OCR lokal Tesseract bila sudah terpasang di server.
                           </div>
                           <div className="rounded-xl border border-dashed bg-slate-50 p-4">
                             <input
@@ -6912,7 +8113,9 @@ ${reasons.join('\n')}`);
                               </button>
                             </div>
                             {deliveryUploadError && (
-                              <div className="mt-3 text-xs text-red-600 whitespace-pre-wrap">{deliveryUploadError}</div>
+                              <div className="mt-3 rounded-lg border border-red-100 bg-red-50 p-3 text-xs text-red-700 whitespace-pre-wrap">
+                                {deliveryUploadError}
+                              </div>
                             )}
                             {deliveryUploadResult && (
                               <div className="mt-4 rounded-xl border bg-white p-3 space-y-3">
@@ -6926,6 +8129,11 @@ ${reasons.join('\n')}`);
                                     {String(deliveryUploadResult.status || '-').toUpperCase()}
                                   </span>
                                 </div>
+                                {deliveryUploadResult.extraction_warning && (
+                                  <div className="rounded-lg border border-amber-100 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+                                    {deliveryUploadResult.extraction_warning}
+                                  </div>
+                                )}
                                 <div className="grid grid-cols-2 gap-2 text-[11px]">
                                   <div className="rounded-lg bg-slate-50 p-2">
                                     <div className="text-slate-400">Customer</div>
@@ -6943,6 +8151,86 @@ ${reasons.join('\n')}`);
                                     <div className="text-slate-400">Qty Kurang</div>
                                     <div className="font-semibold text-slate-800">{formatQty(deliveryUploadResult.total_qty_shortage || 0)}</div>
                                   </div>
+                                </div>
+                                {(() => {
+                                  const fulfilledQty = getDeliveryUploadFulfilledQty(deliveryUploadResult);
+                                  const shipment = getDeliveryUploadShipment(deliveryUploadResult);
+                                  const isCreating = Number(customerShipmentCreatingId) === Number(deliveryUploadResult.id);
+                                  return (
+                                    <div className="flex flex-col gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-[11px] md:flex-row md:items-center md:justify-between">
+                                      <div>
+                                        <div className="font-semibold text-slate-800">
+                                          {shipment?.id ? `Order Muat: ${getCustomerOutboundNumber(shipment)}` : fulfilledQty > 0 ? 'Qty tersedia siap dibuat Order Muat.' : 'Stok belum ada untuk dibuat Order Muat.'}
+                                        </div>
+                                        <div className="text-slate-500">Order Muat mengambil qty tersedia, bukan qty kurang/backorder.</div>
+                                      </div>
+                                      <button
+                                        type="button"
+                                        disabled={isCreating || !(fulfilledQty > 0)}
+                                        onClick={() => handleCreateCustomerShipment(deliveryUploadResult)}
+                                        className="inline-flex items-center justify-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+                                      >
+                                        <Printer size={13} />
+                                        {isCreating ? 'Membuat...' : shipment?.id ? 'Print Order Muat' : 'Buat Order Muat'}
+                                      </button>
+                                    </div>
+                                  );
+                                })()}
+                                <div className="overflow-x-auto">
+                                  <table className="min-w-[900px] w-full text-[11px]">
+                                    <thead className="bg-slate-100 text-slate-600">
+                                      <tr>
+                                        <th className="p-2 text-left">No</th>
+                                        <th className="p-2 text-left">UNIQ</th>
+                                        <th className="p-2 text-left">Part No</th>
+                                        <th className="p-2 text-left">Item Master</th>
+                                        <th className="p-2 text-right">Order</th>
+                                        <th className="p-2 text-right">Stok</th>
+                                        <th className="p-2 text-right">Tersedia Muat</th>
+                                        <th className="p-2 text-right">Kurang</th>
+                                        <th className="p-2 text-left">Status</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {lastDeliveryUploadItems.map((item) => {
+                                        const statusKey = String(item.status || '').toLowerCase();
+                                        const details = item.details && typeof item.details === 'object' ? item.details : {};
+                                        const parsed = details.parsed && typeof details.parsed === 'object' ? details.parsed : {};
+                                        const tone = statusKey === 'full'
+                                          ? 'bg-emerald-100 text-emerald-700'
+                                          : statusKey === 'partial_backorder'
+                                            ? 'bg-amber-100 text-amber-700'
+                                            : statusKey === 'missing_item'
+                                              ? 'bg-rose-100 text-rose-700'
+                                              : 'bg-slate-100 text-slate-700';
+                                        return (
+                                          <tr key={item.id || `${item.lineNo}-${item.partNo}`} className="border-t">
+                                            <td className="p-2">{item.lineNo || '-'}</td>
+                                            <td className="p-2 font-semibold">{parsed.uniq || details.uniq || item.itemCode || '-'}</td>
+                                            <td className="p-2">{item.partNo || parsed.partNo || '-'}</td>
+                                            <td className="p-2">
+                                              <div className="font-semibold">{item.itemCode || '-'}</div>
+                                              <div className="text-slate-500">{item.itemName || '-'}</div>
+                                            </td>
+                                            <td className="p-2 text-right">{formatQty(item.qtyOrder || 0)}</td>
+                                            <td className="p-2 text-right">{formatQty(item.qtyAvailable || 0)}</td>
+                                            <td className="p-2 text-right text-emerald-700 font-semibold">{formatQty(item.qtyFulfilled || 0)}</td>
+                                            <td className="p-2 text-right text-rose-700 font-semibold">{formatQty(item.qtyShortage || 0)}</td>
+                                            <td className="p-2">
+                                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${tone}`}>
+                                                {statusKey ? statusKey.replace(/_/g, ' ').toUpperCase() : '-'}
+                                              </span>
+                                            </td>
+                                          </tr>
+                                        );
+                                      })}
+                                      {lastDeliveryUploadItems.length === 0 && (
+                                        <tr>
+                                          <td colSpan="9" className="p-3 text-center text-slate-400">Detail item akan tampil setelah upload selesai.</td>
+                                        </tr>
+                                      )}
+                                    </tbody>
+                                  </table>
                                 </div>
                               </div>
                             )}
@@ -6991,6 +8279,247 @@ ${reasons.join('\n')}`);
                       </div>
                     )}
 
+                    {deliveryWorkflowTab === 'outbound-customer' && (
+                      <div className="space-y-4">
+                        {customerShipmentsError && (
+                          <div className="rounded-lg border border-red-100 bg-red-50 p-3 text-xs text-red-700">{customerShipmentsError}</div>
+                        )}
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                          <div className="rounded-xl border bg-slate-50 p-3">
+                            <div className="text-[10px] uppercase tracking-wide text-slate-400">Order Muat</div>
+                            <div className="mt-1 text-xl font-bold text-slate-900">{customerShipmentSummary.total}</div>
+                          </div>
+                          <div className="rounded-xl border bg-sky-50 p-3">
+                            <div className="text-[10px] uppercase tracking-wide text-sky-600">Picked</div>
+                            <div className="mt-1 text-xl font-bold text-sky-700">{customerShipmentSummary.picked}</div>
+                          </div>
+                          <div className="rounded-xl border bg-emerald-50 p-3">
+                            <div className="text-[10px] uppercase tracking-wide text-emerald-600">Loaded / Stock Out</div>
+                            <div className="mt-1 text-xl font-bold text-emerald-700">{customerShipmentSummary.loaded}</div>
+                          </div>
+                          <div className="rounded-xl border bg-amber-50 p-3">
+                            <div className="text-[10px] uppercase tracking-wide text-amber-600">Qty Rencana</div>
+                            <div className="mt-1 text-xl font-bold text-amber-700">{formatQty(customerShipmentSummary.totalQty || 0)}</div>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,0.95fr)_minmax(0,1.2fr)] gap-4">
+                          <div className="bg-white rounded-xl border p-4">
+                            <div className="mb-3 flex items-center justify-between gap-3">
+                              <div>
+                                <div className="text-sm font-semibold">Daftar Order Muat</div>
+                                <div className="text-xs text-slate-500">Dari DN customer, untuk picking dan loading warehouse.</div>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => fetchCustomerShipments()}
+                                disabled={customerShipmentsLoading}
+                                className="inline-flex items-center justify-center rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                              >
+                                {customerShipmentsLoading ? 'Memuat...' : 'Refresh'}
+                              </button>
+                            </div>
+                            <div className="overflow-x-auto">
+                              <table className="min-w-[820px] w-full text-xs">
+                                <thead className="bg-slate-100 text-slate-600">
+                                  <tr>
+                                    <th className="p-2 text-left">Order Muat</th>
+                                    <th className="p-2 text-left">SJ Customer</th>
+                                    <th className="p-2 text-left">Customer</th>
+                                    <th className="p-2 text-left">Ref DN</th>
+                                    <th className="p-2 text-right">Qty</th>
+                                    <th className="p-2 text-left">Status</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {customerShipmentsLoading && (
+                                    <tr>
+                                      <td colSpan="6" className="p-3 text-center text-slate-400">Memuat...</td>
+                                    </tr>
+                                  )}
+                                  {!customerShipmentsLoading && customerShipments.map((row) => {
+                                    const active = Number(selectedCustomerShipment?.id || 0) === Number(row.id || 0);
+                                    const statusMeta = getCustomerShipmentStatusMeta(row.status);
+                                    return (
+                                      <tr
+                                        key={row.id}
+                                        className={`border-t cursor-pointer ${active ? 'bg-slate-50' : 'hover:bg-slate-50'}`}
+                                        onClick={() => setSelectedCustomerShipmentId(row.id)}
+                                      >
+                                        <td className="p-2 font-semibold">{getCustomerOutboundNumber(row)}</td>
+                                        <td className="p-2">{getCustomerSjNumber(row) || '-'}</td>
+                                        <td className="p-2">{row.customerName || row.customer_name || '-'}</td>
+                                        <td className="p-2">{row.customerDnNumber || row.customer_dn_number || '-'}</td>
+                                        <td className="p-2 text-right font-semibold">{formatQty(row.totalQty || row.total_qty || 0)}</td>
+                                        <td className="p-2">
+                                          <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${statusMeta.className}`}>
+                                            {statusMeta.label}
+                                          </span>
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                  {!customerShipmentsLoading && customerShipments.length === 0 && (
+                                    <tr>
+                                      <td colSpan="6" className="p-3 text-center text-slate-400">Belum ada Order Muat.</td>
+                                    </tr>
+                                  )}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+
+                          <div className="bg-white rounded-xl border p-4 space-y-4">
+                            {selectedCustomerShipment ? (() => {
+                              const shipment = selectedCustomerShipment;
+                              const statusMeta = getCustomerShipmentStatusMeta(shipment.status);
+                              const loaded = isCustomerShipmentLoaded(shipment);
+                              const fullyPicked = isCustomerShipmentFullyPicked(shipment);
+                              const pickedQty = getCustomerShipmentPickedQty(shipment);
+                              const loadedQty = getCustomerShipmentLoadedQty(shipment);
+                              const uploadId = getShipmentUploadId(shipment);
+                              const isConfirming = Number(customerShipmentConfirmingId) === Number(shipment.id);
+                              return (
+                                <>
+                                  <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                                    <div>
+                                      <div className="text-sm font-semibold">Warehouse Pick & Confirm</div>
+                                      <div className="mt-1 text-xs text-slate-500">{getCustomerOutboundNumber(shipment)} | Ref DN {shipment.customerDnNumber || shipment.customer_dn_number || '-'}</div>
+                                      <div className="mt-2 flex flex-wrap gap-2 text-[10px] font-semibold">
+                                        <span className={`rounded-full px-2 py-0.5 ${statusMeta.className}`}>{statusMeta.label}</span>
+                                        {getCustomerSjNumber(shipment) && <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-emerald-700">SJ {getCustomerSjNumber(shipment)}</span>}
+                                      </div>
+                                    </div>
+                                    <div className="flex flex-wrap gap-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => printCustomerShipment(shipment)}
+                                        className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2.5 py-2 text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
+                                      >
+                                        <Printer size={13} /> {loaded ? 'Print SJ' : 'Print Order Muat'}
+                                      </button>
+                                      {uploadId > 0 && (
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setSelectedDeliveryUploadId(uploadId);
+                                            setDeliveryWorkflowTab('history');
+                                          }}
+                                          className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2.5 py-2 text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
+                                        >
+                                          <Eye size={13} /> DN
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
+
+                                  <div className="grid grid-cols-3 gap-2 text-xs">
+                                    <div className="rounded-lg border bg-slate-50 p-3">
+                                      <div className="text-[10px] uppercase text-slate-400">Rencana</div>
+                                      <div className="font-bold">{formatQty(shipment.totalQty || shipment.total_qty || 0)}</div>
+                                    </div>
+                                    <div className="rounded-lg border bg-sky-50 p-3">
+                                      <div className="text-[10px] uppercase text-sky-600">Picked</div>
+                                      <div className="font-bold text-sky-700">{formatQty(pickedQty)}</div>
+                                    </div>
+                                    <div className="rounded-lg border bg-emerald-50 p-3">
+                                      <div className="text-[10px] uppercase text-emerald-600">Loaded</div>
+                                      <div className="font-bold text-emerald-700">{formatQty(loadedQty)}</div>
+                                    </div>
+                                  </div>
+
+                                  {!loaded && (
+                                    <form onSubmit={handleScanCustomerShipmentKanban} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                                      <div className="mb-2 text-xs font-semibold text-slate-700">Scan Kanban Kosong / Label Stok</div>
+                                      <div className="flex flex-col gap-2 sm:flex-row">
+                                        <input
+                                          value={customerShipmentScanValue}
+                                          onChange={(event) => setCustomerShipmentScanValue(event.target.value)}
+                                          className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                          placeholder="Scan atau input kanban ID"
+                                          autoComplete="off"
+                                        />
+                                        <button
+                                          type="submit"
+                                          disabled={customerShipmentScanLoading || !customerShipmentScanValue.trim()}
+                                          className="inline-flex items-center justify-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
+                                        >
+                                          <QrCode size={13} /> {customerShipmentScanLoading ? 'Scan...' : 'Scan Pick'}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          disabled={!fullyPicked || isConfirming}
+                                          onClick={() => handleConfirmCustomerShipmentLoaded(shipment)}
+                                          className="inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
+                                        >
+                                          <Truck size={13} /> {isConfirming ? 'Confirm...' : 'Confirm Muat'}
+                                        </button>
+                                      </div>
+                                    </form>
+                                  )}
+
+                                  <div className="overflow-x-auto rounded-xl border">
+                                    <table className="min-w-[940px] w-full text-xs">
+                                      <thead className="bg-slate-100 text-slate-600">
+                                        <tr>
+                                          <th className="p-2 text-left">UNIQ</th>
+                                          <th className="p-2 text-left">Part No</th>
+                                          <th className="p-2 text-left">Part Name</th>
+                                          <th className="p-2 text-right">Rencana</th>
+                                          <th className="p-2 text-right">Picked</th>
+                                          <th className="p-2 text-right">Loaded</th>
+                                          <th className="p-2 text-left">Scan</th>
+                                          <th className="p-2 text-left">Status</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {(shipment.items || []).map((item) => {
+                                          const itemStatus = getCustomerShipmentStatusMeta(item.pickStatus || item.pick_status || shipment.status);
+                                          const refs = Array.isArray(item.scanRefs) ? item.scanRefs : Array.isArray(item.scan_refs) ? item.scan_refs : [];
+                                          return (
+                                            <tr key={item.id} className="border-t align-top">
+                                              <td className="p-2 font-semibold">{item.itemCode || item.item_code || '-'}</td>
+                                              <td className="p-2">{item.partNo || item.part_no || '-'}</td>
+                                              <td className="p-2">{item.itemName || item.item_name || '-'}</td>
+                                              <td className="p-2 text-right">{formatQty(item.qtyShip || item.qty_ship || 0)}</td>
+                                              <td className="p-2 text-right text-sky-700 font-semibold">{formatQty(item.qtyPicked || item.qty_picked || 0)}</td>
+                                              <td className="p-2 text-right text-emerald-700 font-semibold">{formatQty(item.qtyLoaded || item.qty_loaded || 0)}</td>
+                                              <td className="p-2">
+                                                {refs.length > 0 ? (
+                                                  <div className="space-y-1">
+                                                    {refs.slice(-3).map((ref, index) => (
+                                                      <div key={`${item.id}-scan-${index}`} className="rounded bg-slate-50 px-2 py-1 text-[10px] text-slate-600">
+                                                        {ref.kanbanId || '-'} | {formatQty(ref.qty || 0)}
+                                                      </div>
+                                                    ))}
+                                                  </div>
+                                                ) : (
+                                                  <span className="text-slate-400">-</span>
+                                                )}
+                                              </td>
+                                              <td className="p-2">
+                                                <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${itemStatus.className}`}>
+                                                  {itemStatus.label}
+                                                </span>
+                                              </td>
+                                            </tr>
+                                          );
+                                        })}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                </>
+                              );
+                            })() : (
+                              <div className="rounded-xl border border-dashed bg-slate-50 p-6 text-center text-xs text-slate-500">
+                                Belum ada Order Muat. Buat dari hasil upload DN yang stoknya tersedia.
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
                     {deliveryWorkflowTab === 'history' && (
                       <div className="space-y-4">
                         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -7029,7 +8558,7 @@ ${reasons.join('\n')}`);
                                     <th className="p-2 text-left">Customer</th>
                                     <th className="p-2 text-left">DN Number</th>
                                     <th className="p-2 text-right">Order</th>
-                                    <th className="p-2 text-right">Fulfilled</th>
+                                    <th className="p-2 text-right">Tersedia Muat</th>
                                     <th className="p-2 text-right">Shortage</th>
                                     <th className="p-2 text-left">Status</th>
                                   </tr>
@@ -7106,16 +8635,41 @@ ${reasons.join('\n')}`);
                                     <div className="mt-1 font-semibold">{String(selectedDeliveryUpload.status || '-').toUpperCase()}</div>
                                   </div>
                                 </div>
+                                {(() => {
+                                  const fulfilledQty = getDeliveryUploadFulfilledQty(selectedDeliveryUpload);
+                                  const shipment = getDeliveryUploadShipment(selectedDeliveryUpload);
+                                  const isCreating = Number(customerShipmentCreatingId) === Number(selectedDeliveryUpload.id);
+                                  return (
+                                    <div className="flex flex-col gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs md:flex-row md:items-center md:justify-between">
+                                      <div>
+                                        <div className="font-semibold text-slate-800">
+                                          {shipment?.id ? `Order Muat sudah dibuat: ${getCustomerOutboundNumber(shipment)}` : fulfilledQty > 0 ? `Qty tersedia ${formatQty(fulfilledQty)} siap dibuat Order Muat.` : 'Belum ada stok tersedia untuk Order Muat.'}
+                                        </div>
+                                        <div className="text-slate-500">Gunakan tombol ini untuk membuat atau print ulang Order Muat ke warehouse.</div>
+                                      </div>
+                                      <button
+                                        type="button"
+                                        disabled={isCreating || !(fulfilledQty > 0)}
+                                        onClick={() => handleCreateCustomerShipment(selectedDeliveryUpload)}
+                                        className="inline-flex items-center justify-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+                                      >
+                                        <Printer size={13} />
+                                        {isCreating ? 'Membuat...' : shipment?.id ? 'Print Order Muat' : 'Buat Order Muat'}
+                                      </button>
+                                    </div>
+                                  );
+                                })()}
                                 <div className="overflow-x-auto">
-                                  <table className="min-w-[980px] w-full text-xs">
+                                  <table className="min-w-[1120px] w-full text-xs">
                                     <thead className="bg-slate-100 text-slate-600">
                                       <tr>
                                         <th className="p-2 text-left">No</th>
+                                        <th className="p-2 text-left">UNIQ</th>
                                         <th className="p-2 text-left">Part No</th>
-                                        <th className="p-2 text-left">Part Name</th>
+                                        <th className="p-2 text-left">Item Master</th>
                                         <th className="p-2 text-right">Qty Order</th>
                                         <th className="p-2 text-right">Stock</th>
-                                        <th className="p-2 text-right">Fulfilled</th>
+                                        <th className="p-2 text-right">Tersedia Muat</th>
                                         <th className="p-2 text-right">Shortage</th>
                                         <th className="p-2 text-left">Status</th>
                                       </tr>
@@ -7123,6 +8677,8 @@ ${reasons.join('\n')}`);
                                     <tbody>
                                       {selectedDeliveryUploadItems.map((item) => {
                                         const statusKey = String(item.status || '').toLowerCase();
+                                        const details = item.details && typeof item.details === 'object' ? item.details : {};
+                                        const parsed = details.parsed && typeof details.parsed === 'object' ? details.parsed : {};
                                         const tone = statusKey === 'full'
                                           ? 'bg-emerald-100 text-emerald-700'
                                           : statusKey === 'partial_backorder'
@@ -7133,12 +8689,16 @@ ${reasons.join('\n')}`);
                                         return (
                                           <tr key={item.id} className="border-t">
                                             <td className="p-2">{item.lineNo || '-'}</td>
-                                            <td className="p-2 font-semibold">{item.partNo || '-'}</td>
-                                            <td className="p-2">{item.itemName || '-'}</td>
+                                            <td className="p-2 font-semibold">{parsed.uniq || details.uniq || item.itemCode || '-'}</td>
+                                            <td className="p-2">{item.partNo || parsed.partNo || '-'}</td>
+                                            <td className="p-2">
+                                              <div className="font-semibold">{item.itemCode || '-'}</div>
+                                              <div className="text-slate-500">{item.itemName || '-'}</div>
+                                            </td>
                                             <td className="p-2 text-right">{formatQty(item.qtyOrder || 0)}</td>
                                             <td className="p-2 text-right">{formatQty(item.qtyAvailable || 0)}</td>
-                                            <td className="p-2 text-right">{formatQty(item.qtyFulfilled || 0)}</td>
-                                            <td className="p-2 text-right">{formatQty(item.qtyShortage || 0)}</td>
+                                            <td className="p-2 text-right text-emerald-700 font-semibold">{formatQty(item.qtyFulfilled || 0)}</td>
+                                            <td className="p-2 text-right text-rose-700 font-semibold">{formatQty(item.qtyShortage || 0)}</td>
                                             <td className="p-2">
                                               <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${tone}`}>
                                                 {statusKey ? statusKey.replace(/_/g, ' ').toUpperCase() : '-'}
@@ -7149,7 +8709,7 @@ ${reasons.join('\n')}`);
                                       })}
                                       {selectedDeliveryUploadItems.length === 0 && (
                                         <tr>
-                                          <td colSpan="8" className="p-3 text-center text-slate-400">Belum ada detail item.</td>
+                                          <td colSpan="9" className="p-3 text-center text-slate-400">Belum ada detail item.</td>
                                         </tr>
                                       )}
                                     </tbody>
@@ -7796,7 +9356,12 @@ ${reasons.join('\n')}`);
                                         <div className="p-2 flex flex-wrap items-center gap-1">
                                           {canApproveRequest && allowApprove && (
                                             <button
-                                              onClick={() => handleApproveAndCreateDn(row)}
+                                              onClick={async () => {
+                                                const outcome = await handleApproveAndCreateDn(row);
+                                                if (outcome && typeof outcome === 'object') {
+                                                  openRequestBatchResult('approve-dn', outcome);
+                                                }
+                                              }}
                                               className="px-2 py-1 text-[10px] bg-emerald-600 text-white rounded"
                                               title="Approve + DN"
                                             >
@@ -7865,29 +9430,107 @@ ${reasons.join('\n')}`);
                     </div>
                     {productionTab === 'queue' && (
                       <div className="space-y-4">
-                        <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-                          <div className="rounded-xl border border-slate-200 bg-white p-4">
+                        <div className="grid grid-cols-1 gap-3 md:grid-cols-3 xl:grid-cols-6">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setProductionQueueStatusFilter('all');
+                              setProductionQueueHealthFilter('all');
+                              setProductionQueueCategoryFilter('all');
+                              setProductionQueuePage(1);
+                            }}
+                            className={productionDashboardCardClass(
+                              productionQueueStatusFilter === 'all' && productionQueueHealthFilter === 'all' && productionQueueCategoryFilter === 'all',
+                              'border-slate-200 bg-white',
+                            )}
+                          >
                             <div className="text-[10px] font-semibold uppercase text-slate-500">Production Requests</div>
-                            <div className="mt-2 text-2xl font-bold text-slate-900">{productionQueueRows.length}</div>
+                            <div className="mt-2 text-2xl font-bold text-slate-900">{productionQueueAllRows.length}</div>
                             <div className="mt-1 text-xs text-slate-500">Open kanban requests routed to production.</div>
-                          </div>
-                          <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4">
-                            <div className="text-[10px] font-semibold uppercase text-emerald-700">Ready To Post</div>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setProductionQueueStatusFilter('all');
+                              setProductionQueueHealthFilter('all');
+                              setProductionQueueCategoryFilter('assy');
+                              setProductionQueuePage(1);
+                            }}
+                            className={productionDashboardCardClass(productionQueueCategoryFilter === 'assy', 'border-violet-200 bg-violet-50')}
+                          >
+                            <div className="text-[10px] font-semibold uppercase text-violet-700">Assy/Subassy</div>
+                            <div className="mt-2 text-2xl font-bold text-violet-700">{productionQueueAssyCount}</div>
+                            <div className="mt-1 text-xs text-violet-700">WO assembly dipisah dari Child Part.</div>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setProductionQueueStatusFilter('all');
+                              setProductionQueueHealthFilter('all');
+                              setProductionQueueCategoryFilter('child');
+                              setProductionQueuePage(1);
+                            }}
+                            className={productionDashboardCardClass(productionQueueCategoryFilter === 'child', 'border-cyan-200 bg-cyan-50')}
+                          >
+                            <div className="text-[10px] font-semibold uppercase text-cyan-700">Child Part</div>
+                            <div className="mt-2 text-2xl font-bold text-cyan-700">{productionQueueChildCount}</div>
+                            <div className="mt-1 text-xs text-cyan-700">Pilih filter ini untuk WO Child Part.</div>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setProductionQueueStatusFilter('need_wo');
+                              setProductionQueueHealthFilter('ready');
+                              setProductionQueueCategoryFilter('all');
+                              setProductionQueuePage(1);
+                            }}
+                            className={productionDashboardCardClass(
+                              productionQueueStatusFilter === 'need_wo' && productionQueueHealthFilter === 'ready',
+                              'border-emerald-200 bg-emerald-50',
+                            )}
+                          >
+                            <div className="text-[10px] font-semibold uppercase text-emerald-700">Ready For WO</div>
                             <div className="mt-2 text-2xl font-bold text-emerald-700">{productionQueueReadyCount}</div>
-                            <div className="mt-1 text-xs text-emerald-700">No stock gap detected in request summary.</div>
-                          </div>
-                          <div className="rounded-xl border border-orange-200 bg-orange-50 p-4">
+                            <div className="mt-1 text-xs text-emerald-700">BOM/material clear untuk release WO.</div>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setProductionQueueStatusFilter('released');
+                              setProductionQueueHealthFilter('all');
+                              setProductionQueueCategoryFilter('all');
+                              setProductionQueuePage(1);
+                            }}
+                            className={productionDashboardCardClass(productionQueueStatusFilter === 'released', 'border-sky-200 bg-sky-50')}
+                          >
+                            <div className="text-[10px] font-semibold uppercase text-sky-700">WO Released</div>
+                            <div className="mt-2 text-2xl font-bold text-sky-700">{productionQueueReleasedCount}</div>
+                            <div className="mt-1 text-xs text-sky-700">Menunggu konfirmasi aktual produksi.</div>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setProductionQueueStatusFilter('need_wo');
+                              setProductionQueueHealthFilter('review');
+                              setProductionQueueCategoryFilter('all');
+                              setProductionQueuePage(1);
+                            }}
+                            className={productionDashboardCardClass(
+                              productionQueueStatusFilter === 'need_wo' && productionQueueHealthFilter === 'review',
+                              'border-orange-200 bg-orange-50',
+                            )}
+                          >
                             <div className="text-[10px] font-semibold uppercase text-orange-700">Needs Review</div>
                             <div className="mt-2 text-2xl font-bold text-orange-700">{productionQueueStockGapCount}</div>
                             <div className="mt-1 text-xs text-orange-700">Stock gap must be checked before posting.</div>
-                          </div>
+                          </button>
                         </div>
                         <div className="rounded-xl border bg-white p-4">
                           <div className="flex flex-wrap items-center justify-between gap-3">
                             <div>
                               <div className="text-sm font-semibold text-slate-900">Production Queue</div>
                               <div className="text-xs text-slate-500">
-                                Konfirmasi hasil produksi aktual dari kanban request. Sistem cek BOM, konsumsi material FIFO, tambah stok output, lalu close request.
+                                Release WO setelah BOM/material siap. Aktual produksi diposting setelah proses produksi selesai.
                               </div>
                             </div>
                             <div className="flex flex-wrap items-center gap-2">
@@ -7900,29 +9543,34 @@ ${reasons.join('\n')}`);
                               </button>
                               <button
                                 type="button"
-                                disabled={!canProduction || productionQueueRows.length === 0}
+                                disabled={!canProduction || productionQueueActionableRows.length === 0}
                                 onClick={() => {
-                                  if (!canProduction || productionQueueRows.length === 0) return;
-                                  void openProductionBatchRows(productionQueueRows);
+                                  if (!canProduction || productionQueueActionableRows.length === 0) return;
+                                  void openProductionBatchRows(productionQueueActionableRows);
                                 }}
                                 className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold ${
-                                  !canProduction || productionQueueRows.length === 0
+                                  !canProduction || productionQueueActionableRows.length === 0
                                     ? 'border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed'
                                     : 'border-emerald-600 bg-emerald-600 text-white hover:bg-emerald-700'
                                 }`}
-                                title={!canProduction ? getLockedActionTitle(canProduction, 'Batch production') : 'Check BOM readiness and post production requests'}
+                                title={!canProduction
+                                  ? getLockedActionTitle(canProduction, 'Batch production')
+                                  : productionQueueActionableRows.length === 0
+                                    ? 'Tidak ada request ready atau WO Released pada filter ini.'
+                                    : 'Check BOM readiness, release WO, atau konfirmasi aktual sesuai status'}
                               >
                                 <CheckCircle size={14} /> Batch Production
                               </button>
                             </div>
                           </div>
                           <div className="mt-4 overflow-x-auto">
-                            <table className="min-w-[980px] w-full text-xs">
+                            <table className="min-w-[1060px] w-full text-xs">
                               <thead className="bg-slate-100 text-slate-600">
                                 <tr>
                                   <th className="p-2 text-left">Request ID</th>
                                   <th className="p-2 text-left">Date/Time</th>
                                   <th className="p-2 text-left">Kanban ID</th>
+                                  <th className="p-2 text-left">Category</th>
                                   <th className="p-2 text-left">Item</th>
                                   <th className="p-2 text-right">On Hand</th>
                                   <th className="p-2 text-right">Order Qty</th>
@@ -7933,24 +9581,34 @@ ${reasons.join('\n')}`);
                                 </tr>
                               </thead>
                               <tbody>
-                                {productionQueueRows.map((row) => {
+                                {productionQueuePagedRows.map((row) => {
                                   const health = getKanbanRequestHealth(row);
                                   const statusKey = String(row.status || '').trim().toLowerCase();
+                                  const isWoReleased = statusKey === 'production_ready';
+                                  const canReleaseWo = !isWoReleased && !health.hasStockGap;
                                   const statusLabel = health.hasStockGap && ['triggered', 'requested'].includes(statusKey)
                                     ? 'Pending - Stock Gap'
                                     : statusKey === 'approved'
                                       ? 'Approved'
+                                      : statusKey === 'production_ready'
+                                        ? 'WO Released'
                                       : statusKey === 'rejected'
                                         ? 'Rejected'
                                         : statusKey === 'triggered' || statusKey === 'requested'
                                           ? 'Pending'
                                           : row.status || '-';
                                   const rowKanbanId = extractKanbanIdNote(row.notes) || buildKanbanDisplayId(row.item_code, row.item_type, row);
+                                  const categoryMeta = getProductionRequestCategoryMeta(row);
                                   return (
                                     <tr key={row.id} className="border-t align-top">
                                       <td className="p-2 font-semibold text-slate-900">{getRequestIdLabel(row)}</td>
                                       <td className="p-2 text-slate-600">{row.created_at ? new Date(row.created_at).toLocaleString('id-ID') : '-'}</td>
                                       <td className="p-2 text-slate-700">{rowKanbanId}</td>
+                                      <td className="p-2">
+                                        <span className="inline-flex rounded-full border border-cyan-200 bg-cyan-50 px-2 py-0.5 text-[10px] font-semibold text-cyan-700">
+                                          {categoryMeta.label}
+                                        </span>
+                                      </td>
                                       <td className="p-2">
                                         <div className="font-semibold text-slate-900">{row.item_code || '-'}</div>
                                         <div className="text-[10px] text-slate-500">{row.item_name || '-'}</div>
@@ -7986,6 +9644,8 @@ ${reasons.join('\n')}`);
                                         <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold ${
                                           health.hasStockGap
                                             ? 'bg-orange-100 text-orange-700'
+                                            : statusLabel === 'WO Released'
+                                              ? 'bg-sky-100 text-sky-700'
                                             : statusLabel === 'Approved'
                                               ? 'bg-slate-900 text-white'
                                               : statusLabel === 'Rejected'
@@ -7997,19 +9657,55 @@ ${reasons.join('\n')}`);
                                       </td>
                                       <td className="p-2">
                                         <div className="flex flex-wrap gap-1">
+                                          {health.hasStockGap && !isWoReleased && (
+                                            <button
+                                              type="button"
+                                              disabled={!canEditSchedules}
+                                              onClick={() => {
+                                                if (!canEditSchedules) return;
+                                                openKanbanShortageInPrl(row);
+                                              }}
+                                              className={getLockedButtonClassName('rounded border border-orange-200 bg-orange-50 px-2 py-1 text-[11px] font-semibold text-orange-700 hover:bg-orange-100', !canEditSchedules)}
+                                              title={getLockedActionTitle(canEditSchedules, 'Review shortage di PRL sebelum WO')}
+                                            >
+                                              Review PRL
+                                            </button>
+                                          )}
+                                          {canReleaseWo && (
+                                            <button
+                                              type="button"
+                                              disabled={!canProduction}
+                                              onClick={() => {
+                                                if (!canProduction) return;
+                                                void openProductionBatchRows([row]);
+                                              }}
+                                              className={getLockedButtonClassName('rounded border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100', !canProduction)}
+                                              title={getLockedActionTitle(canProduction, 'Check BOM dan release WO')}
+                                            >
+                                              Buat WO
+                                            </button>
+                                          )}
+                                          {isWoReleased && (
+                                            <button
+                                              type="button"
+                                              disabled={!canProduction}
+                                              onClick={() => {
+                                                if (!canProduction) return;
+                                                openProductionRequest(row);
+                                              }}
+                                              className={getLockedButtonClassName('rounded border border-sky-200 bg-sky-50 px-2 py-1 text-[11px] font-semibold text-sky-700 hover:bg-sky-100', !canProduction)}
+                                              title={getLockedActionTitle(canProduction, 'Konfirmasi aktual produksi')}
+                                            >
+                                              Konfirmasi Aktual
+                                            </button>
+                                          )}
                                           <button
                                             type="button"
                                             onClick={() => openKanbanInScan(rowKanbanId)}
                                             className="rounded border border-indigo-200 bg-indigo-50 px-2 py-1 text-[11px] font-semibold text-indigo-700 hover:bg-indigo-100"
+                                            title="Ambil Kanban ID ini untuk scan"
                                           >
                                             Scan
-                                          </button>
-                                          <button
-                                            type="button"
-                                            onClick={() => openProductionRequest(row)}
-                                            className="rounded border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100"
-                                          >
-                                            Konfirmasi Aktual
                                           </button>
                                         </div>
                                       </td>
@@ -8018,13 +9714,83 @@ ${reasons.join('\n')}`);
                                 })}
                                 {productionQueueRows.length === 0 && (
                                   <tr>
-                                    <td colSpan={10} className="p-6 text-center text-slate-400">
+                                    <td colSpan={11} className="p-6 text-center text-slate-400">
                                       No production requests.
                                     </td>
                                   </tr>
                                 )}
                               </tbody>
                             </table>
+                          </div>
+                          <div className="mt-3 flex flex-col gap-3 text-[11px] text-slate-600 lg:flex-row lg:items-center lg:justify-between">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span>Tampilkan</span>
+                              <select
+                                className="rounded border border-slate-200 bg-white px-2 py-1 text-[11px]"
+                                value={productionQueuePageSize}
+                                onChange={(event) => {
+                                  setProductionQueuePageSize(Number(event.target.value) || 25);
+                                  setProductionQueuePage(1);
+                                }}
+                              >
+                                {productionQueuePageSizeOptions.map((option) => (
+                                  <option key={option} value={option}>{option}</option>
+                                ))}
+                              </select>
+                              <span>baris per halaman</span>
+                              <span className="text-slate-400">
+                                {productionQueueTotalRows === 0
+                                  ? 'Menampilkan 0-0 dari 0 entri'
+                                  : `Menampilkan ${productionQueueStartIndex + 1}-${productionQueueEndIndex} dari ${productionQueueTotalRows} entri`}
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-end gap-1">
+                              <button
+                                type="button"
+                                onClick={() => setProductionQueuePage((prev) => Math.max(1, prev - 1))}
+                                disabled={productionQueueCurrentPage <= 1}
+                                className="rounded border border-slate-200 px-2 py-1 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-slate-300"
+                              >
+                                Previous
+                              </button>
+                              {Array.from({ length: productionQueueTotalPages }, (_, idx) => idx + 1)
+                                .filter((pageNo) => (
+                                  pageNo === 1
+                                  || pageNo === productionQueueTotalPages
+                                  || Math.abs(pageNo - productionQueueCurrentPage) <= 1
+                                ))
+                                .reduce((acc, pageNo, idx, arr) => {
+                                  if (idx > 0 && pageNo - arr[idx - 1] > 1) acc.push(`gap-${pageNo}`);
+                                  acc.push(pageNo);
+                                  return acc;
+                                }, [])
+                                .map((entry) => (
+                                  typeof entry === 'string' ? (
+                                    <span key={entry} className="px-1 text-slate-300">...</span>
+                                  ) : (
+                                    <button
+                                      key={entry}
+                                      type="button"
+                                      onClick={() => setProductionQueuePage(entry)}
+                                      className={`min-w-7 rounded border px-2 py-1 ${
+                                        entry === productionQueueCurrentPage
+                                          ? 'border-slate-900 bg-slate-900 text-white'
+                                          : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                                      }`}
+                                    >
+                                      {entry}
+                                    </button>
+                                  )
+                                ))}
+                              <button
+                                type="button"
+                                onClick={() => setProductionQueuePage((prev) => Math.min(productionQueueTotalPages, prev + 1))}
+                                disabled={productionQueueCurrentPage >= productionQueueTotalPages}
+                                className="rounded border border-slate-200 px-2 py-1 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-slate-300"
+                              >
+                                Next
+                              </button>
+                            </div>
                           </div>
                         </div>
                       </div>
@@ -8083,10 +9849,14 @@ ${reasons.join('\n')}`);
                             getOptionValue={(item) => item.code}
                             getOptionLabel={(item) => item.label || item.code}
                             controlClassName="rounded border-slate-200 px-2 py-1.5 text-xs shadow-none"
-                            onChange={(value) => setProductionManualForm((prev) => ({ ...prev, productCode: value }))}
+                            onChange={(value, option) => setProductionManualForm((prev) => ({
+                              ...prev,
+                              productCode: value,
+                              lineCode: prev.lineCode || option?.line_production || option?.lineProduction || '',
+                            }))}
                           />
                         </div>
-                        <div className="lg:col-span-2">
+                        <div className="lg:col-span-1">
                           <label className="block text-[10px] uppercase text-slate-400 mb-1">Qty Produksi</label>
                           <input
                             type="number"
@@ -8098,32 +9868,38 @@ ${reasons.join('\n')}`);
                             onChange={(e) => setProductionManualForm((prev) => ({ ...prev, qty: e.target.value }))}
                           />
                         </div>
-                        <div className="lg:col-span-2">
+                        <div className="lg:col-span-3">
                           <label className="block text-[10px] uppercase text-slate-400 mb-1">Line</label>
-                          <input
-                            type="text"
-                            className="border p-2 rounded w-full text-xs"
-                            placeholder="LINE-01"
+                          <SearchableSelectDropdown
                             value={productionManualForm.lineCode}
-                            onChange={(e) => setProductionManualForm((prev) => ({ ...prev, lineCode: e.target.value }))}
+                            options={productionLineOptions}
+                            placeholder="Pilih line produksi"
+                            searchPlaceholder="Cari line dari Master Ref..."
+                            emptyText="Line produksi tidak ditemukan di Master Ref."
+                            getOptionValue={(item) => item.value || item.id}
+                            getOptionLabel={(item) => item.label || item.id}
+                            controlClassName="rounded border-slate-200 px-2 py-1.5 text-xs shadow-none"
+                            onChange={(value) => setProductionManualForm((prev) => ({ ...prev, lineCode: value }))}
                           />
                         </div>
                         <div className="lg:col-span-2">
                           <label className="block text-[10px] uppercase text-slate-400 mb-1">Shift</label>
-                          <input
-                            type="text"
-                            className="border p-2 rounded w-full text-xs"
-                            placeholder="Shift 1"
+                          <select
+                            className="border p-2 rounded w-full text-xs bg-white"
                             value={productionManualForm.shiftLabel}
                             onChange={(e) => setProductionManualForm((prev) => ({ ...prev, shiftLabel: e.target.value }))}
-                          />
+                          >
+                            {productionShiftOptions.map((shift) => (
+                              <option key={shift} value={shift}>{shift}</option>
+                            ))}
+                          </select>
                         </div>
                         <div className="lg:col-span-3">
-                          <label className="block text-[10px] uppercase text-slate-400 mb-1">No SPK / Dokumen</label>
+                          <label className="block text-[10px] uppercase text-slate-400 mb-1">No WO / Dokumen</label>
                           <input
                             type="text"
                             className="border p-2 rounded w-full text-xs"
-                            placeholder="SPK / dokumen produksi"
+                            placeholder="WO / dokumen produksi"
                             value={productionManualForm.documentNo}
                             onChange={(e) => setProductionManualForm((prev) => ({ ...prev, documentNo: e.target.value }))}
                           />
@@ -8387,7 +10163,7 @@ ${reasons.join('\n')}`);
                               <th className="p-2 text-right">Qty</th>
                               <th className="p-2 text-left">Line</th>
                               <th className="p-2 text-left">Shift</th>
-                              <th className="p-2 text-left">No SPK / Dokumen</th>
+                              <th className="p-2 text-left">No WO / Dokumen</th>
                               <th className="p-2 text-left">Source</th>
                               <th className="p-2 text-left">User</th>
                             </tr>
@@ -8404,7 +10180,7 @@ ${reasons.join('\n')}`);
                                 <td className="p-2 font-semibold">{buildProductionUniqLabel(row.product_code, row.part_no)}</td>
                                 <td className="p-2">{row.product_name || '-'}</td>
                                 <td className="p-2 text-right">{formatNumber0(row.qty || 0)}</td>
-                                <td className="p-2">{row.line_code || '-'}</td>
+                                <td className="p-2">{getProductionLineDisplayLabel(row.line_code)}</td>
                                 <td className="p-2">{row.shift_label || '-'}</td>
                                 <td className="p-2">{row.document_no || '-'}</td>
                                 <td className="p-2">
@@ -9195,50 +10971,83 @@ ${reasons.join('\n')}`);
                         <X size={16} />
                       </button>
                     </div>
-                    <div className="flex-1 overflow-y-auto p-5 space-y-4">
+                    <div className="flex-1 overflow-y-auto p-4 space-y-3">
                       {(() => {
                         const row = productionRequestModal.row || {};
                         const shortageRows = productionRequestModal.rows.filter((item) => Number(item.shortage || 0) > 0);
                         const ready = productionRequestModal.rows.length > 0 && shortageRows.length === 0 && !productionRequestModal.loading;
+                        const requestQty = Number(row.request_qty || 0);
+                        const actualQty = Number(productionRequestModal.actualQty || 0);
+                        const hasVariance = Number.isFinite(actualQty) && actualQty > 0 && actualQty !== requestQty;
+                        const meta = getProductionRequestItemMeta(row);
+                        const labelPlan = splitQtyBySnp(actualQty, meta.snpQty);
+                        const partialCount = labelPlan.filter((label) => label.isPartial).length;
+                        const processSeconds = actualQty * meta.cycleTimeSeconds;
+                        const needsBomRecheck = Number(productionRequestModal.requirementQty || 0) !== actualQty;
                         return (
                           <>
-                            <div className="grid grid-cols-1 md:grid-cols-4 gap-3 text-xs">
-                              <div className="rounded-lg border bg-slate-50 p-3">
-                                <div className="text-[10px] uppercase text-slate-400">Request</div>
-                                <div className="mt-1 font-semibold text-slate-900">{getRequestIdLabel(row)}</div>
+                            <div className="grid grid-cols-1 gap-2 text-xs md:grid-cols-[145px_1fr_96px_96px]">
+                              <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                                <div className="text-[9px] uppercase text-slate-400">Request</div>
+                                <div className="mt-0.5 font-semibold text-slate-900">{getRequestIdLabel(row)}</div>
                               </div>
-                              <div className="rounded-lg border bg-slate-50 p-3 md:col-span-2">
-                                <div className="text-[10px] uppercase text-slate-400">Item</div>
-                                <div className="mt-1 font-semibold text-slate-900">{row.item_code || '-'}</div>
+                              <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                                <div className="text-[9px] uppercase text-slate-400">Item</div>
+                                <div className="mt-0.5 font-semibold text-slate-900">{row.item_code || '-'}</div>
                                 <div className="text-[10px] text-slate-500">{row.item_name || '-'}</div>
                               </div>
-                              <div className="rounded-lg border bg-slate-50 p-3">
-                                <div className="text-[10px] uppercase text-slate-400">Qty Aktual Produksi</div>
-                                <div className="mt-1 font-semibold text-slate-900">{formatQty(row.request_qty || 0)}</div>
+                              <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                                <div className="text-[9px] uppercase text-slate-400">WO Qty</div>
+                                <div className="mt-0.5 font-semibold text-slate-900">{formatQty(requestQty)}</div>
+                              </div>
+                              <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                                <div className="text-[9px] uppercase text-slate-400">SNP / Label</div>
+                                <div className="mt-0.5 font-semibold text-slate-900">{meta.snpQty ? formatQty(meta.snpQty) : '-'}</div>
                               </div>
                             </div>
-                            <div className="grid grid-cols-1 md:grid-cols-[220px_1fr] gap-3 text-xs">
-                              <label>
-                                <span className="mb-1 block text-[10px] uppercase text-slate-400">Production Date</span>
+                            <div className="grid grid-cols-1 gap-2 text-xs md:grid-cols-[160px_170px_1fr]">
+                              <label className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2">
+                                <span className="mb-1 block text-[9px] font-semibold uppercase text-sky-700">Production Date</span>
                                 <input
                                   type="date"
-                                  className="w-full rounded border border-slate-200 px-3 py-2 text-xs"
+                                  className="w-full rounded border border-sky-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-200"
                                   value={productionRequestModal.productionDate || ''}
                                   onChange={(event) => reloadProductionRequestRequirements(event.target.value)}
                                   disabled={productionRequestModal.loading || productionRequestModal.saving}
                                 />
                               </label>
-                              <div className={`rounded-lg border p-3 ${
+                              <label className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2">
+                                <span className="mb-1 block text-[9px] font-semibold uppercase text-emerald-700">Qty Aktual Produksi</span>
+                                <input
+                                  type="number"
+                                  min="0"
+                                  step="0.001"
+                                  className="w-full rounded border border-emerald-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                                  value={productionRequestModal.actualQty || ''}
+                                  onChange={(event) => setProductionRequestModal((prev) => ({
+                                    ...prev,
+                                    actualQty: event.target.value,
+                                    error: '',
+                                  }))}
+                                  onBlur={() => reloadProductionRequestRequirements(productionRequestModal.productionDate)}
+                                  disabled={productionRequestModal.loading || productionRequestModal.saving || Boolean(productionRequestModal.postedResult)}
+                                />
+                              </label>
+                              <div className={`rounded-md border px-3 py-2 ${
                                 productionRequestModal.loading
                                   ? 'border-slate-200 bg-slate-50 text-slate-500'
+                                  : needsBomRecheck
+                                    ? 'border-sky-200 bg-sky-50 text-sky-700'
                                   : ready
                                     ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
                                     : 'border-amber-200 bg-amber-50 text-amber-700'
                               }`}>
-                                <div className="text-[10px] uppercase font-semibold">Readiness</div>
-                                <div className="mt-1 font-semibold">
+                                <div className="text-[9px] uppercase font-semibold">Readiness</div>
+                                <div className="mt-0.5 font-semibold">
                                   {productionRequestModal.loading
                                     ? 'Loading BOM requirements...'
+                                    : needsBomRecheck
+                                      ? 'Qty aktual berubah. Recheck BOM sebelum posting.'
                                     : ready
                                       ? 'Ready for actual production posting'
                                       : shortageRows.length > 0
@@ -9247,6 +11056,84 @@ ${reasons.join('\n')}`);
                                 </div>
                               </div>
                             </div>
+                            <div className="grid grid-cols-1 gap-2 text-xs md:grid-cols-4">
+                              <div className="rounded-md border border-slate-200 bg-white px-3 py-2">
+                                <div className="text-[9px] uppercase text-slate-400">Label Plan</div>
+                                <div className="mt-0.5 font-semibold text-slate-900">
+                                  {labelPlan.length || '-'} label{partialCount > 0 ? `, ${partialCount} partial` : ''}
+                                </div>
+                              </div>
+                              <div className="rounded-md border border-slate-200 bg-white px-3 py-2">
+                                <div className="text-[9px] uppercase text-slate-400">Line / Machine</div>
+                                <div className="mt-0.5 font-semibold text-slate-900">{getProductionRequestLineLabel(row)}</div>
+                                <div className="text-[10px] text-slate-500">Mesin: {meta.machineLabel}</div>
+                              </div>
+                              <div className="rounded-md border border-slate-200 bg-white px-3 py-2">
+                                <div className="text-[9px] uppercase text-slate-400">Cycle Time</div>
+                                <div className="mt-0.5 font-semibold text-slate-900">{meta.cycleTimeSeconds ? `${formatQty(meta.cycleTimeSeconds)} s/pcs` : '-'}</div>
+                              </div>
+                              <div className="rounded-md border border-slate-200 bg-white px-3 py-2">
+                                <div className="text-[9px] uppercase text-slate-400">Est. Process Time</div>
+                                <div className="mt-0.5 font-semibold text-slate-900">{formatDurationFromSeconds(processSeconds)}</div>
+                              </div>
+                            </div>
+                            {labelPlan.length > 0 && (
+                              <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs">
+                                <div className="mb-1.5 text-[9px] font-semibold uppercase text-slate-500">Split Label Produksi</div>
+                                <div className="flex flex-wrap gap-1.5">
+                                  {labelPlan.map((label, index) => (
+                                    <span
+                                      key={`production-label-plan-${index}`}
+                                      className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
+                                        label.isPartial
+                                          ? 'border-amber-200 bg-amber-50 text-amber-700'
+                                          : 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                      }`}
+                                    >
+                                      L{index + 1}: {formatQty(label.qty)}{label.isPartial ? ' Partial' : ''}
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                            {hasVariance && (
+                              <div className="grid grid-cols-1 gap-2 text-xs md:grid-cols-[1fr_210px]">
+                                <label className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2">
+                                  <span className="mb-1 block text-[9px] font-semibold uppercase text-amber-700">Alasan Selisih Aktual vs WO</span>
+                                  <input
+                                    className="w-full rounded border border-amber-300 bg-white px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-amber-200"
+                                    placeholder="Contoh: material kurang, mesin stop, NG, sisa shift"
+                                    value={productionRequestModal.varianceReason || ''}
+                                    onChange={(event) => setProductionRequestModal((prev) => ({
+                                      ...prev,
+                                      varianceReason: event.target.value,
+                                      error: '',
+                                    }))}
+                                    disabled={productionRequestModal.saving || Boolean(productionRequestModal.postedResult)}
+                                  />
+                                </label>
+                                <label className={`flex items-center gap-2 rounded-md border px-3 py-2 ${
+                                  actualQty > requestQty ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-slate-200 bg-slate-50 text-slate-600'
+                                }`}>
+                                  <input
+                                    type="checkbox"
+                                    checked={Boolean(productionRequestModal.overproductionApproved)}
+                                    onChange={(event) => setProductionRequestModal((prev) => ({
+                                      ...prev,
+                                      overproductionApproved: event.target.checked,
+                                      error: '',
+                                    }))}
+                                    disabled={actualQty <= requestQty || productionRequestModal.saving || Boolean(productionRequestModal.postedResult)}
+                                  />
+                                  <span className="text-xs font-semibold normal-case text-inherit">Approval overproduction</span>
+                                </label>
+                              </div>
+                            )}
+                            {productionRequestModal.postedResult && (
+                              <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-700">
+                                Production posted sebagai {productionRequestModal.postedResult?.productionOrder?.wo_number || `WO-PROD-${productionRequestModal.postedResult?.productionOrder?.id || '-'}`}. Label produksi siap dicetak.
+                              </div>
+                            )}
                             {productionRequestModal.error && (
                               <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">
                                 {productionRequestModal.error}
@@ -9310,6 +11197,45 @@ ${reasons.join('\n')}`);
                       })()}
                     </div>
                     <div className="flex justify-end gap-2 border-t px-5 py-4">
+                      {!productionRequestModal.postedResult && (
+                        <button
+                          type="button"
+                          onClick={() => openProductionLineBatchFromRequest(productionRequestModal.row)}
+                          className="px-3 py-2 text-sm border rounded bg-white text-slate-700 disabled:bg-slate-100 disabled:text-slate-400"
+                          disabled={productionRequestModal.saving || productionRequestModal.loading}
+                          title="Buka konfirmasi batch untuk production request pada line yang sama"
+                        >
+                          Konfirmasi Satu Line
+                        </button>
+                      )}
+                      {productionRequestModal.postedResult && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => printProductionWorkOrders([{
+                              row: productionRequestModal.row,
+                              status: 'posted',
+                              productionId: productionRequestModal.postedResult?.productionOrder?.id,
+                              postedResult: productionRequestModal.postedResult,
+                            }], { title: 'Production Work Order' })}
+                            className="px-3 py-2 text-sm border rounded bg-white text-slate-700"
+                          >
+                            Print WO
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => printProductionOutputLabels([{
+                              row: productionRequestModal.row,
+                              status: 'posted',
+                              productionId: productionRequestModal.postedResult?.productionOrder?.id,
+                              postedResult: productionRequestModal.postedResult,
+                            }])}
+                            className="px-3 py-2 text-sm border rounded bg-white text-slate-700"
+                          >
+                            Print Label
+                          </button>
+                        </>
+                      )}
                       <button
                         type="button"
                         onClick={closeProductionRequestModal}
@@ -9325,8 +11251,19 @@ ${reasons.join('\n')}`);
                         disabled={
                           productionRequestModal.loading
                           || productionRequestModal.saving
+                          || Boolean(productionRequestModal.postedResult)
                           || productionRequestModal.rows.length === 0
                           || productionRequestModal.rows.some((item) => Number(item.shortage || 0) > 0)
+                          || !(Number(productionRequestModal.actualQty || 0) > 0)
+                          || Number(productionRequestModal.requirementQty || 0) !== Number(productionRequestModal.actualQty || 0)
+                          || (
+                            Number(productionRequestModal.actualQty || 0) !== Number(productionRequestModal.row?.request_qty || 0)
+                            && !String(productionRequestModal.varianceReason || '').trim()
+                          )
+                          || (
+                            Number(productionRequestModal.actualQty || 0) > Number(productionRequestModal.row?.request_qty || 0)
+                            && !productionRequestModal.overproductionApproved
+                          )
                         }
                       >
                         {productionRequestModal.saving ? 'Posting...' : 'Konfirmasi Produksi'}
@@ -9343,7 +11280,7 @@ ${reasons.join('\n')}`);
                       <div>
                         <div className="text-sm font-semibold">Batch Production Execution</div>
                         <div className="text-xs text-slate-500">
-                          Selected production requests are checked against BOM stock before posting.
+                          Selected production requests are checked against BOM stock before WO release.
                         </div>
                       </div>
                       <button type="button" onClick={closeProductionBatchModal} className="text-slate-500 hover:text-slate-800">
@@ -9355,27 +11292,44 @@ ${reasons.join('\n')}`);
                         const entries = productionBatchModal.entries || [];
                         const readyCount = entries.filter((entry) => entry.status === 'ready').length;
                         const postedCount = entries.filter((entry) => entry.status === 'posted').length;
+                        const releasedCount = entries.filter((entry) => entry.status === 'released').length;
                         const shortageCount = entries.filter((entry) => entry.status === 'shortage').length;
                         const blockedCount = entries.filter((entry) => entry.status === 'blocked' || entry.status === 'failed').length;
                         const lineSummary = entries.reduce((acc, entry) => {
                           const lineLabel = getProductionRequestLineLabel(entry.row);
-                          const current = acc.get(lineLabel) || { total: 0, ready: 0, shortage: 0, blocked: 0, posted: 0 };
+                          const current = acc.get(lineLabel) || { total: 0, ready: 0, shortage: 0, blocked: 0, released: 0, posted: 0 };
                           current.total += 1;
                           if (entry.status === 'ready') current.ready += 1;
                           if (entry.status === 'shortage') current.shortage += 1;
                           if (entry.status === 'blocked' || entry.status === 'failed') current.blocked += 1;
+                          if (entry.status === 'released') current.released += 1;
                           if (entry.status === 'posted') current.posted += 1;
                           acc.set(lineLabel, current);
                           return acc;
                         }, new Map());
+                        const categorySummary = entries.reduce((acc, entry) => {
+                          const categoryMeta = getProductionRequestCategoryMeta(entry.row);
+                          const current = acc.get(categoryMeta.key) || { label: categoryMeta.label, total: 0, ready: 0, shortage: 0, blocked: 0, released: 0, posted: 0 };
+                          current.total += 1;
+                          if (entry.status === 'ready') current.ready += 1;
+                          if (entry.status === 'shortage') current.shortage += 1;
+                          if (entry.status === 'blocked' || entry.status === 'failed') current.blocked += 1;
+                          if (entry.status === 'released') current.released += 1;
+                          if (entry.status === 'posted') current.posted += 1;
+                          acc.set(categoryMeta.key, current);
+                          return acc;
+                        }, new Map());
                         const lineOptions = Array.from(lineSummary.entries()).sort((left, right) => String(left[0]).localeCompare(String(right[0])));
                         const activeLineFilter = String(productionBatchModal.lineFilter || 'all');
+                        const categoryOptions = Array.from(categorySummary.entries()).sort((left, right) => String(left[1].label).localeCompare(String(right[1].label)));
+                        const activeCategoryFilter = String(productionBatchModal.categoryFilter || 'all');
                         const visibleEntries = entries.filter((entry) => (
-                          activeLineFilter === 'all' || getProductionRequestLineLabel(entry.row) === activeLineFilter
+                          (activeLineFilter === 'all' || getProductionRequestLineLabel(entry.row) === activeLineFilter)
+                          && (activeCategoryFilter === 'all' || getProductionRequestCategoryMeta(entry.row).key === activeCategoryFilter)
                         ));
                         return (
                           <>
-                            <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs">
+                            <div className="grid grid-cols-2 md:grid-cols-6 gap-3 text-xs">
                               <div className="rounded-lg border bg-slate-50 p-3">
                                 <div className="text-[10px] uppercase text-slate-400">Selected</div>
                                 <div className="mt-1 text-lg font-bold text-slate-900">{entries.length}</div>
@@ -9393,11 +11347,15 @@ ${reasons.join('\n')}`);
                                 <div className="mt-1 text-lg font-bold text-rose-700">{blockedCount}</div>
                               </div>
                               <div className="rounded-lg border border-sky-200 bg-sky-50 p-3">
-                                <div className="text-[10px] uppercase text-sky-600">Posted</div>
-                                <div className="mt-1 text-lg font-bold text-sky-700">{postedCount}</div>
+                                <div className="text-[10px] uppercase text-sky-600">WO Released</div>
+                                <div className="mt-1 text-lg font-bold text-sky-700">{releasedCount}</div>
+                              </div>
+                              <div className="rounded-lg border border-indigo-200 bg-indigo-50 p-3">
+                                <div className="text-[10px] uppercase text-indigo-600">Actual Posted</div>
+                                <div className="mt-1 text-lg font-bold text-indigo-700">{postedCount}</div>
                               </div>
                             </div>
-                            <div className="grid grid-cols-1 md:grid-cols-[220px_260px_1fr] gap-3 text-xs">
+                            <div className="grid grid-cols-1 md:grid-cols-[190px_220px_220px_1fr] gap-3 text-xs">
                               <label>
                                 <span className="mb-1 block text-[10px] uppercase text-slate-400">Production Date</span>
                                 <input
@@ -9424,13 +11382,50 @@ ${reasons.join('\n')}`);
                                   ))}
                                 </select>
                               </label>
+                              <label>
+                                <span className="mb-1 block text-[10px] uppercase text-slate-400">Category</span>
+                                <select
+                                  className="w-full rounded border border-slate-200 px-3 py-2 text-xs"
+                                  value={activeCategoryFilter}
+                                  onChange={(event) => setProductionBatchModal((prev) => ({ ...prev, categoryFilter: event.target.value, error: '' }))}
+                                  disabled={productionBatchModal.loading || productionBatchModal.posting}
+                                >
+                                  <option value="all">All Category ({entries.length})</option>
+                                  {categoryOptions.map(([categoryKey, summary]) => (
+                                    <option key={categoryKey} value={categoryKey}>
+                                      {summary.label} ({summary.ready}/{summary.total} ready)
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
                               <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-slate-600">
                                 <div className="text-[10px] uppercase font-semibold">Batch Rule</div>
                                 <div className="mt-1">
-                                  Only Ready rows in the selected production line will be posted. Shortage rows stay open and must be supplied first.
+                                  Only Ready rows in the selected production line and category will be released to WO. Actual qty is posted later from WO Released rows.
                                 </div>
                               </div>
                             </div>
+                            {categoryOptions.length > 1 && (
+                              <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
+                                {categoryOptions.map(([categoryKey, summary]) => (
+                                  <button
+                                    key={categoryKey}
+                                    type="button"
+                                    onClick={() => setProductionBatchModal((prev) => ({ ...prev, categoryFilter: categoryKey, error: '' }))}
+                                    className={`rounded-lg border p-3 text-left text-xs transition ${
+                                      activeCategoryFilter === categoryKey
+                                        ? 'border-cyan-700 bg-cyan-700 text-white'
+                                        : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300 hover:bg-slate-50'
+                                    }`}
+                                  >
+                                    <div className="font-semibold">{summary.label}</div>
+                                    <div className={`mt-1 text-[10px] ${activeCategoryFilter === categoryKey ? 'text-cyan-100' : 'text-slate-500'}`}>
+                                      Ready {summary.ready} / Total {summary.total} - WO Released {summary.released} - Shortage {summary.shortage}
+                                    </div>
+                                  </button>
+                                ))}
+                              </div>
+                            )}
                             {lineOptions.length > 0 && (
                               <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
                                 {lineOptions.map(([lineLabel, summary]) => (
@@ -9446,7 +11441,7 @@ ${reasons.join('\n')}`);
                                   >
                                     <div className="font-semibold">{lineLabel}</div>
                                     <div className={`mt-1 text-[10px] ${activeLineFilter === lineLabel ? 'text-slate-200' : 'text-slate-500'}`}>
-                                      Ready {summary.ready} / Total {summary.total} - Shortage {summary.shortage} - Blocked {summary.blocked}
+                                      Ready {summary.ready} / Total {summary.total} - WO Released {summary.released} - Shortage {summary.shortage}
                                     </div>
                                   </button>
                                 ))}
@@ -9458,12 +11453,14 @@ ${reasons.join('\n')}`);
                               </div>
                             )}
                             <div className="overflow-x-auto rounded-lg border">
-                              <table className="min-w-[960px] w-full text-xs">
+                              <table className="min-w-[1060px] w-full text-xs">
                                 <thead className="bg-slate-100 text-slate-600">
                                   <tr>
                                     <th className="p-2 text-left">Request</th>
+                                    <th className="p-2 text-left">Category</th>
                                     <th className="p-2 text-left">Item</th>
-                                    <th className="p-2 text-right">Qty</th>
+                                    <th className="p-2 text-right">WO Qty</th>
+                                    <th className="p-2 text-left">Labels</th>
                                     <th className="p-2 text-right">BOM Lines</th>
                                     <th className="p-2 text-right">Shortage Lines</th>
                                     <th className="p-2 text-left">Status</th>
@@ -9473,14 +11470,21 @@ ${reasons.join('\n')}`);
                                 <tbody>
                                   {visibleEntries.length === 0 && !productionBatchModal.loading && (
                                     <tr>
-                                      <td colSpan={7} className="p-3 text-center text-slate-400">No production request selected.</td>
+                                      <td colSpan={9} className="p-3 text-center text-slate-400">No production request selected.</td>
                                     </tr>
                                   )}
                                   {visibleEntries.map((entry) => {
                                     const row = entry.row || {};
+                                    const requestQty = Number(row.request_qty || 0);
+                                    const categoryMeta = getProductionRequestCategoryMeta(row);
+                                    const meta = getProductionRequestItemMeta(row);
+                                    const labelPlan = splitQtyBySnp(requestQty, meta.snpQty);
+                                    const partialCount = labelPlan.filter((label) => label.isPartial).length;
                                     const statusKey = String(entry.status || '').toLowerCase();
                                     const statusClass = statusKey === 'ready'
                                       ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                      : statusKey === 'released'
+                                        ? 'border-sky-200 bg-sky-50 text-sky-700'
                                       : statusKey === 'posted'
                                         ? 'border-sky-200 bg-sky-50 text-sky-700'
                                         : statusKey === 'shortage'
@@ -9490,6 +11494,8 @@ ${reasons.join('\n')}`);
                                             : 'border-rose-200 bg-rose-50 text-rose-700';
                                     const statusLabel = statusKey === 'posted'
                                       ? `Posted${entry.productionId ? ` PROD-${entry.productionId}` : ''}`
+                                      : statusKey === 'released'
+                                        ? `WO Released${entry.productionId ? ` PROD-${entry.productionId}` : ''}`
                                       : statusKey === 'shortage'
                                         ? 'Shortage'
                                         : statusKey === 'ready'
@@ -9507,11 +11513,22 @@ ${reasons.join('\n')}`);
                                       <tr key={row.id} className="border-t">
                                         <td className="p-2 font-semibold">{getRequestIdLabel(row)}</td>
                                         <td className="p-2">
+                                          <span className="inline-flex rounded-full border border-cyan-200 bg-cyan-50 px-2 py-0.5 text-[10px] font-semibold text-cyan-700">
+                                            {categoryMeta.label}
+                                          </span>
+                                        </td>
+                                        <td className="p-2">
                                           <div className="font-semibold text-slate-900">{row.item_code || '-'}</div>
                                           <div className="text-[10px] text-slate-500">{row.item_name || '-'}</div>
                                           <div className="mt-1 text-[10px] font-semibold text-indigo-600">{getProductionRequestLineLabel(row)}</div>
                                         </td>
-                                        <td className="p-2 text-right">{formatQty(row.request_qty || 0)}</td>
+                                        <td className="p-2 text-right font-semibold">{formatQty(requestQty)}</td>
+                                        <td className="p-2 text-slate-600">
+                                          <div className="font-semibold text-slate-900">{labelPlan.length || '-'}</div>
+                                          <div className="text-[10px] text-slate-500">
+                                            SNP {meta.snpQty ? formatQty(meta.snpQty) : '-'}{partialCount > 0 ? `, ${partialCount} partial` : ''}
+                                          </div>
+                                        </td>
                                         <td className="p-2 text-right">{entry.requirements?.length || 0}</td>
                                         <td className="p-2 text-right">{entry.shortageRows?.length || 0}</td>
                                         <td className="p-2">
@@ -9535,11 +11552,25 @@ ${reasons.join('\n')}`);
                     <div className="flex justify-end gap-2 border-t px-5 py-4">
                       <button
                         type="button"
-                        onClick={() => printProductionWorkOrders(productionBatchModal.entries, { title: 'Batch Production Work Order' })}
+                        onClick={() => printProductionWorkOrders(
+                          productionBatchModal.entries.filter((entry) => isProductionBatchEntryInScope(entry, productionBatchModal.lineFilter, productionBatchModal.categoryFilter)),
+                          { title: 'Batch Production Work Order' },
+                        )}
+                        className="px-3 py-2 text-sm border rounded bg-white text-slate-700 disabled:bg-slate-100 disabled:text-slate-400"
+                        disabled={
+                          productionBatchModal.posting
+                          || !productionBatchModal.entries.some((entry) => isProductionBatchEntryInScope(entry, productionBatchModal.lineFilter, productionBatchModal.categoryFilter))
+                        }
+                      >
+                        Print WO
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => printProductionOutputLabels(productionBatchModal.entries)}
                         className="px-3 py-2 text-sm border rounded bg-white text-slate-700 disabled:bg-slate-100 disabled:text-slate-400"
                         disabled={productionBatchModal.posting || !productionBatchModal.entries.some((entry) => entry.status === 'posted' && entry.productionId)}
                       >
-                        Print SPK Posted
+                        Print Label Posted
                       </button>
                       <button
                         type="button"
@@ -9551,21 +11582,238 @@ ${reasons.join('\n')}`);
                       </button>
                       <button
                         type="button"
-                        onClick={confirmProductionBatch}
+                        onClick={openProductionBatchActualConfirm}
+                        className="px-3 py-2 text-sm rounded border border-sky-200 bg-sky-50 text-sky-700 disabled:bg-slate-100 disabled:text-slate-400"
+                        disabled={
+                          productionBatchModal.loading
+                          || productionBatchModal.posting
+                          || !productionBatchModal.entries.some((entry) => (
+                            entry.status === 'released'
+                            && isProductionBatchEntryInScope(entry, productionBatchModal.lineFilter, productionBatchModal.categoryFilter)
+                          ))
+                        }
+                      >
+                        Konfirmasi Aktual
+                      </button>
+                      <button
+                        type="button"
+                        onClick={releaseProductionBatch}
                         className="px-3 py-2 text-sm rounded bg-emerald-600 text-white disabled:bg-slate-200 disabled:text-slate-400"
                         disabled={
                           productionBatchModal.loading
                           || productionBatchModal.posting
                           || !productionBatchModal.entries.some((entry) => (
                             entry.status === 'ready'
-                            && (
-                              String(productionBatchModal.lineFilter || 'all') === 'all'
-                              || getProductionRequestLineLabel(entry.row) === String(productionBatchModal.lineFilter || 'all')
-                            )
+                            && isProductionBatchEntryInScope(entry, productionBatchModal.lineFilter, productionBatchModal.categoryFilter)
                           ))
                         }
                       >
-                        {productionBatchModal.posting ? 'Posting...' : 'Post Ready Production'}
+                        {productionBatchModal.posting ? 'Processing...' : 'Post Ready Production'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {productionBatchModal.actualConfirmOpen && (
+                <div className="fixed inset-0 bg-black/40 z-[60] flex items-center justify-center p-4">
+                  <div className="bg-white rounded-xl w-full max-w-6xl max-h-[90vh] overflow-hidden flex flex-col">
+                    <div className="flex items-start justify-between border-b px-5 py-4">
+                      <div>
+                        <div className="text-sm font-semibold">Konfirmasi Aktual Batch</div>
+                        <div className="text-xs text-slate-500">
+                          Isi qty aktual setelah produksi selesai. Sistem recheck BOM berdasarkan qty aktual sebelum posting.
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setProductionBatchModal((prev) => ({ ...prev, actualConfirmOpen: false, error: '' }))}
+                        className="text-slate-500 hover:text-slate-800"
+                        disabled={productionBatchModal.posting}
+                      >
+                        <X size={16} />
+                      </button>
+                    </div>
+                    <div className="flex-1 overflow-y-auto p-5 space-y-3">
+                      {(() => {
+                        const activeLineFilter = String(productionBatchModal.lineFilter || 'all');
+                        const activeCategoryFilter = String(productionBatchModal.categoryFilter || 'all');
+                        const activeCategoryLabel = activeCategoryFilter === 'all'
+                          ? 'All Category'
+                          : getProductionRequestCategoryMeta((productionBatchModal.entries || []).find((entry) => getProductionRequestCategoryMeta(entry.row).key === activeCategoryFilter)?.row).label;
+                        const actualEntries = (productionBatchModal.entries || []).filter((entry) => (
+                          entry.status === 'released'
+                          && isProductionBatchEntryInScope(entry, activeLineFilter, activeCategoryFilter)
+                        ));
+                        return (
+                          <>
+                            <div className="grid grid-cols-1 gap-2 text-xs md:grid-cols-5">
+                              <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                                <div className="text-[9px] uppercase text-slate-400">Production Date</div>
+                                <div className="mt-0.5 font-semibold text-slate-900">{productionBatchModal.productionDate || '-'}</div>
+                              </div>
+                              <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                                <div className="text-[9px] uppercase text-slate-400">Line Scope</div>
+                                <div className="mt-0.5 font-semibold text-slate-900">{activeLineFilter === 'all' ? 'All Lines' : activeLineFilter}</div>
+                              </div>
+                              <div className="rounded-md border border-cyan-200 bg-cyan-50 px-3 py-2">
+                                <div className="text-[9px] uppercase text-cyan-700">Category Scope</div>
+                                <div className="mt-0.5 font-semibold text-cyan-700">{activeCategoryLabel}</div>
+                              </div>
+                              <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2">
+                                <div className="text-[9px] uppercase text-emerald-700">Ready To Confirm</div>
+                                <div className="mt-0.5 font-semibold text-emerald-700">{actualEntries.length}</div>
+                              </div>
+                              <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                                <div className="text-[9px] uppercase text-slate-400">Rule</div>
+                                <div className="mt-0.5 font-semibold text-slate-900">No BOM / no material = blocked</div>
+                              </div>
+                            </div>
+                            {productionBatchModal.error && (
+                              <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">
+                                {productionBatchModal.error}
+                              </div>
+                            )}
+                            <div className="overflow-x-auto rounded-lg border">
+                              <table className="min-w-[1200px] w-full text-xs">
+                                <thead className="bg-slate-100 text-slate-600">
+                                  <tr>
+                                    <th className="p-2 text-left">Request</th>
+                                    <th className="p-2 text-left">Category</th>
+                                    <th className="p-2 text-left">Item</th>
+                                    <th className="p-2 text-right">WO Qty</th>
+                                    <th className="p-2 text-left">Actual Qty</th>
+                                    <th className="p-2 text-left">Labels</th>
+                                    <th className="p-2 text-left">Readiness</th>
+                                    <th className="p-2 text-left">Reason / Approval</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {actualEntries.length === 0 && (
+                                    <tr>
+                                      <td colSpan={8} className="p-4 text-center text-slate-400">Tidak ada WO Released untuk dikonfirmasi.</td>
+                                    </tr>
+                                  )}
+                                  {actualEntries.map((entry) => {
+                                    const row = entry.row || {};
+                                    const requestQty = Number(row.request_qty || 0);
+                                    const actualQty = Number(entry.actualQty || 0);
+                                    const hasVariance = Number.isFinite(actualQty) && actualQty > 0 && actualQty !== requestQty;
+                                    const needsBomRecheck = Number(entry.requirementQty || 0) !== actualQty;
+                                    const categoryMeta = getProductionRequestCategoryMeta(row);
+                                    const meta = getProductionRequestItemMeta(row);
+                                    const labelPlan = splitQtyBySnp(actualQty, meta.snpQty);
+                                    const partialCount = labelPlan.filter((label) => label.isPartial).length;
+                                    const shortageCount = entry.shortageRows?.length || 0;
+                                    const readyForPost = !needsBomRecheck && shortageCount === 0 && !entry.error;
+                                    return (
+                                      <tr key={`actual-confirm-${row.id}`} className="border-t align-top">
+                                        <td className="p-2 font-semibold">{getRequestIdLabel(row)}</td>
+                                        <td className="p-2">
+                                          <span className="inline-flex rounded-full border border-cyan-200 bg-cyan-50 px-2 py-0.5 text-[10px] font-semibold text-cyan-700">
+                                            {categoryMeta.label}
+                                          </span>
+                                        </td>
+                                        <td className="p-2">
+                                          <div className="font-semibold text-slate-900">{row.item_code || '-'}</div>
+                                          <div className="text-[10px] text-slate-500">{row.item_name || '-'}</div>
+                                          <div className="mt-1 text-[10px] font-semibold text-indigo-600">{getProductionRequestLineLabel(row)}</div>
+                                        </td>
+                                        <td className="p-2 text-right font-semibold">{formatQty(requestQty)}</td>
+                                        <td className="p-2">
+                                          <input
+                                            type="number"
+                                            min="0"
+                                            step="0.001"
+                                            className="w-24 rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-right text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                                            value={entry.actualQty || ''}
+                                            onChange={(event) => updateProductionBatchEntry(row.id, {
+                                              actualQty: event.target.value,
+                                              error: '',
+                                              postedResult: null,
+                                            })}
+                                            onBlur={() => reloadProductionBatchEntryRequirements(row.id)}
+                                            disabled={productionBatchModal.posting}
+                                          />
+                                          {needsBomRecheck && (
+                                            <div className="mt-1 text-[10px] font-semibold text-sky-700">Recheck BOM required</div>
+                                          )}
+                                        </td>
+                                        <td className="p-2">
+                                          <div className="font-semibold text-slate-900">{labelPlan.length || '-'}</div>
+                                          <div className="text-[10px] text-slate-500">
+                                            SNP {meta.snpQty ? formatQty(meta.snpQty) : '-'}{partialCount > 0 ? `, ${partialCount} partial` : ''}
+                                          </div>
+                                        </td>
+                                        <td className="p-2">
+                                          <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
+                                            readyForPost
+                                              ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                              : 'border-amber-200 bg-amber-50 text-amber-700'
+                                          }`}>
+                                            {readyForPost ? 'Ready' : needsBomRecheck ? 'Needs Recheck' : 'Blocked'}
+                                          </span>
+                                          {entry.error && <div className="mt-1 text-[10px] text-rose-600">{entry.error}</div>}
+                                          {shortageCount > 0 && <div className="mt-1 text-[10px] text-orange-600">Shortage {shortageCount} line</div>}
+                                        </td>
+                                        <td className="p-2">
+                                          {hasVariance ? (
+                                            <div className="space-y-1">
+                                              <input
+                                                className="w-full rounded border border-amber-300 bg-amber-50 px-2 py-1 text-[10px] focus:outline-none focus:ring-2 focus:ring-amber-200"
+                                                placeholder="Alasan selisih aktual"
+                                                value={entry.varianceReason || ''}
+                                                onChange={(event) => updateProductionBatchEntry(row.id, {
+                                                  varianceReason: event.target.value,
+                                                  error: '',
+                                                })}
+                                                disabled={productionBatchModal.posting}
+                                              />
+                                              {actualQty > requestQty && (
+                                                <label className="flex items-center gap-1 text-[10px] font-semibold text-amber-700">
+                                                  <input
+                                                    type="checkbox"
+                                                    checked={Boolean(entry.overproductionApproved)}
+                                                    onChange={(event) => updateProductionBatchEntry(row.id, {
+                                                      overproductionApproved: event.target.checked,
+                                                      error: '',
+                                                    })}
+                                                    disabled={productionBatchModal.posting}
+                                                  />
+                                                  Approval overproduction
+                                                </label>
+                                              )}
+                                            </div>
+                                          ) : (
+                                            <span className="text-slate-400">-</span>
+                                          )}
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            </div>
+                          </>
+                        );
+                      })()}
+                    </div>
+                    <div className="flex justify-end gap-2 border-t px-5 py-4">
+                      <button
+                        type="button"
+                        onClick={() => setProductionBatchModal((prev) => ({ ...prev, actualConfirmOpen: false, error: '' }))}
+                        className="px-3 py-2 text-sm border rounded"
+                        disabled={productionBatchModal.posting}
+                      >
+                        Back
+                      </button>
+                      <button
+                        type="button"
+                        onClick={confirmProductionBatch}
+                        className="px-3 py-2 text-sm rounded bg-emerald-600 text-white disabled:bg-slate-200 disabled:text-slate-400"
+                        disabled={productionBatchModal.posting}
+                      >
+                        {productionBatchModal.posting ? 'Posting...' : 'Konfirmasi Aktual & Posting'}
                       </button>
                     </div>
                   </div>
@@ -9932,8 +12180,11 @@ ${reasons.join('\n')}`);
                             const text = String(dnBatchRemarks[group.supplierKey] || '').trim();
                             if (text) remarksBySupplier[group.supplierKey] = text;
                           });
-                          const ok = await handleRequestDnBatch({ remarksBySupplier });
-                          if (ok) {
+                          const outcome = await handleRequestDnBatch({ remarksBySupplier });
+                          if (outcome && typeof outcome === 'object') {
+                            openRequestBatchResult('dn', outcome);
+                          }
+                          if ((outcome && typeof outcome === 'object' && outcome.ok) || outcome === true) {
                             setShowDnBatchModal(false);
                             setDnBatchGroups([]);
                             setDnBatchRemarks({});
@@ -9946,6 +12197,8 @@ ${reasons.join('\n')}`);
                   </div>
                 </div>
               )}
+
+              {renderRequestBatchResultModal()}
 
               {showDnPrintModal && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm print:static print:bg-white print:p-0 print:items-start print:justify-start kanban-print-scope">

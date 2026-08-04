@@ -126,28 +126,32 @@ const HELP_CONTENT = {
       'Gunakan dashboard sebagai monitoring awal; input atau koreksi tetap dilakukan di menu transaksi masing-masing.',
     ],
     links: [
-      { label: 'Kanban Board', description: 'Cek scan, request, delivery, dan receiving.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'dashboard' },
+      { label: 'Inbound Schedule', description: 'Cek jadwal datang, pending, partial, dan follow up supplier.', mainTab: 'monitoring' },
+      { label: 'Kanban Board', description: 'Cek request, reserved, delivery, receiving, dan kartu kosong.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'requests' },
       { label: 'Inventory', description: 'Cek on hand, reserved, available, dan kartu stok.', mainTab: 'inventory' },
-      { label: 'PRL', description: 'Cek kebutuhan part per model dan bulan.', mainTab: 'prl' },
-      { label: 'Laporan Mutasi', description: 'Cek aliran masuk dan keluar material.', mainTab: 'reports', reportTab: 'all-mutations' },
+      { label: 'Quality Control', description: 'Cek incoming QC, hold/reject, dan case mutu terbuka.', mainTab: 'quality' },
+      { label: 'Laporan Mutasi', description: 'Cek aliran masuk dan keluar material bila angka dashboard perlu ditelusuri.', mainTab: 'reports', reportTab: 'all-mutations' },
     ],
   },
   monitoring: {
     title: 'Inbound Schedule',
     subtitle: 'Kelola PO inbound, jadwal kedatangan, penerimaan aktual, dan follow up supplier.',
     sop: [
-      'Gunakan pencarian PO atau supplier untuk memuat data supplier dan item secara otomatis.',
-      'Validasi tanggal jadwal terhadap surat jalan aktual sebelum menyimpan penerimaan; kedatangan H-1 tetap dihitung On Time dengan tanda H-1 Early.',
-      'Isi No. SJ/DO sebagai bukti wajib; lengkapi nomor polisi, nama sopir, dan remarks bila tersedia.',
+      'Gunakan filter tanggal, supplier, status, dan pencarian PO/item untuk memastikan baris yang diproses benar.',
+      'Untuk penerimaan aktual, pilih PO, isi tanggal tiba, No. SJ/DO, nomor polisi, nama sopir, remarks, lalu masukkan qty per item.',
+      'No. SJ/DO wajib unik per supplier. Jika nomor sudah pernah dipakai, cek duplikasi sebelum menyimpan.',
+      'Validasi tanggal jadwal terhadap surat jalan aktual; kedatangan H-1 tetap dihitung On Time dengan tanda H-1 Early.',
       'Aktifkan Izin Over Qty hanya bila penerimaan melebihi sisa PO sudah disetujui oleh pihak berwenang.',
-      'Saat import Excel, cek template, mapping kolom, dan ringkasan hasil import sebelum data dipakai operasional.',
-      'Setelah receiving tersimpan, cocokkan perubahan stok di Inventory dan cek performa di laporan inbound.',
-      'Jika status tidak berubah, refresh data lalu telusuri transaksi sumber lewat Global Search atau notifikasi.',
+      'Gunakan Kirim PDF Langsung untuk mengirim schedule resmi ke supplier; gunakan Reminder untuk follow up jadwal yang belum terpenuhi.',
+      'Reminder dan kirim PDF sama-sama mencatat metadata email pada baris schedule, sehingga indikator email dan riwayat tetap konsisten.',
+      'Setelah receiving tersimpan, cek perubahan stok di Inventory, antrian Incoming QC, dan laporan inbound.',
+      'Jika status tidak berubah, refresh data lalu telusuri transaksi sumber lewat Global Search, notifikasi, atau laporan mutasi.',
     ],
     links: [
-      { label: 'Receiving Kanban', description: 'Lanjutkan penerimaan kanban.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'receiving' },
-      { label: 'Inventory', description: 'Validasi stok setelah receiving.', mainTab: 'inventory' },
-      { label: 'Inbound Performance', description: 'Cek kinerja kedatangan supplier.', mainTab: 'reports', reportTab: 'inbound-performance' },
+      { label: 'Quality Control', description: 'Cek Incoming RN setelah penerimaan dan validasi RN + No. SJ/DO.', mainTab: 'quality' },
+      { label: 'Inventory', description: 'Validasi lot, saldo, dan status stok setelah receiving.', mainTab: 'inventory' },
+      { label: 'Inbound Performance', description: 'Cek kinerja kedatangan supplier dan ketepatan schedule vs aktual.', mainTab: 'reports', reportTab: 'inbound-performance' },
+      { label: 'Laporan QC', description: 'Cek item datang, Qty OK/NG, dan PPM dari penerimaan.', mainTab: 'reports', reportTab: 'qc-report' },
     ],
   },
   kanban: {
@@ -156,55 +160,60 @@ const HELP_CONTENT = {
     sop: [
       'Mulai dari scan QR untuk mencatat konsumsi atau status kartu.',
       'QR Kanban menunjukkan kartu dan kebutuhan item, bukan nomor lot fisik. Untuk bukti lot aktual, gunakan QR Label Lot/Part dari Inventory > Kartu Stok per Lot.',
-      'Jika stok habis, cek Kanban Kosong dan request kanban.',
-      'Untuk request manual, pilih Kanban ID dari Master Kanban agar item/on hand/qty terisi. Setelah request dibuat, klik tombol Scan pada baris request untuk membawa Kanban ID ke tab Scan.',
-      'Request manual yang dibuat dari Kanban menyimpan catatan kanban: <Kanban ID>, sehingga operator bisa mengambil kartu yang sama untuk proses scan.',
-      'Request yang masih aktif akan menjadi Reserved di Inventory sampai proses ditutup, diterima, atau dibatalkan.',
+      'Jika stok habis atau Available tidak cukup, cek Kanban Kosong dan buat request kanban dari Kanban ID yang sesuai.',
+      'Request manual dari Kanban ID mengisi item/on hand/qty otomatis dan menyimpan catatan kartu agar operator memakai kartu yang sama saat scan.',
+      'Request yang masih aktif menjadi Reserved di Inventory sampai request ditutup, diterima, dibatalkan, atau ditolak.',
+      'Jika konfigurasi supply source memakai PRL, qty request divalidasi terhadap sisa PRL bulan berjalan dan dapat muncul sebagai Over PRL.',
       'Create Schedule hanya muncul untuk supplier/vendor dengan role Schedule. Vendor role Delivery Note diproses lewat DN Register/Delivery tanpa popup schedule.',
       'Untuk incoming dari supplier, scan QR Label Incoming yang dicetak supplier dari Supplier Portal > Tracking DN.',
-      'Lanjutkan proses ke Delivery/Receiving sampai stok dan reservasi berubah sesuai transaksi.',
-      'Untuk pelanggaran FIFO atau konsumsi tanpa reorder, cek notifikasi dan laporan terkait.',
+      'Flow Subcon diarahkan ke proses Subcon dan tidak diproses otomatis oleh user produksi biasa.',
+      'Lanjutkan proses ke Delivery/Receiving sampai stok, reservasi, dan status request berubah sesuai transaksi.',
+      'Untuk pelanggaran FIFO, Over PRL, atau konsumsi tanpa reorder, cek notifikasi, health request, dan laporan terkait.',
     ],
     links: [
       { label: 'Scan QR', description: 'Input konsumsi atau perpindahan kanban.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'scan' },
       { label: 'Manual Request', description: 'Buat request dari Kanban ID lalu kirim ke Scan.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'requests' },
       { label: 'Kanban Kosong', description: 'Cek kartu kosong yang perlu diisi ulang.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'empty' },
-      { label: 'Inventory', description: 'Cek efek scan ke stok.', mainTab: 'inventory' },
-      { label: 'PRL', description: 'Cek kebutuhan reorder per bulan.', mainTab: 'prl' },
+      { label: 'Inventory', description: 'Cek efek request/scan ke reserved, available, dan stok.', mainTab: 'inventory' },
+      { label: 'PRL', description: 'Cek sisa PRL bulan berjalan bila request terkena Over PRL.', mainTab: 'prl' },
+      { label: 'Subcon', description: 'Lanjutkan kartu yang terdeteksi sebagai flow Subcon.', mainTab: 'subcon' },
     ],
   },
   quality: {
     title: 'Quality Control',
     subtitle: 'Kontrol mutu receiving, klaim supplier, dan sasaran mutu operasional.',
     sop: [
-      'Incoming dari RN atau Inbound masuk ke Incoming QC terlebih dahulu sebagai sampling sebelum benar-benar release ke stok.',
-      'Jika hasil incoming sampling OK, release barang agar stok bisa dipakai produksi.',
+      'Incoming dari RN atau Inbound masuk ke Incoming QC sebagai sampling; kolom Source menampilkan RN dan No. SJ/DO untuk validasi dokumen.',
+      'Jika hasil incoming sampling OK, Release barang agar stok bisa dipakai produksi.',
       'Jika RN sudah dibatalkan/reversal karena salah item, qty, SJ/DO, atau tanggal, QC tidak boleh Release/Hold/Reject/Return lagi. Row tersebut ditutup dengan Close Review sebagai bukti koreksi.',
       'Close Review RN batal hanya memastikan alasan reversal jelas, stok/PO/schedule sudah kembali benar, dan penerimaan baru dibuat ulang bila barang fisik tetap diterima.',
       'Jika masalahnya defect/NG material, jangan batalkan RN. Gunakan Hold, Reject, atau Return Supplier agar histori kualitas supplier tetap tercatat.',
       'Jika raw material NG baru ditemukan di line setelah release, jangan batalkan RN dan jangan balik ke Incoming QC. Catat sebagai Material NG Line.',
       'Pada Material NG Line, pilih item lalu ketik/cari batch FIFO/RN, isi qty NG, line, proses, operator/shift, dan detail defect. Sistem akan menahan stok batch terkait.',
       'Gunakan disposition Sortir, Return, Scrap, Rework, atau Use As Is sesuai keputusan QC. Performance supplier membaca QC incoming dan Line Claim.',
+      'Gunakan Laporan QC untuk membaca seluruh item datang, Qty OK/NG, total PPM, case open, top defect, dan performance supplier.',
     ],
     links: [
       { label: 'Inbound Schedule', description: 'Cek dokumen penerimaan sumber quality.', mainTab: 'monitoring' },
-      { label: 'Inventory', description: 'Validasi status stok setelah QC.', mainTab: 'inventory' },
-      { label: 'Sasaran Mutu', description: 'Pantau KPI mutu supplier.', mainTab: 'reports', reportTab: 'sasaran-mutu' },
+      { label: 'Inventory', description: 'Validasi lot, batch hold, dan stok available setelah QC.', mainTab: 'inventory' },
+      { label: 'Laporan QC', description: 'Pantau item datang, PPM, defect, dan performance QC supplier.', mainTab: 'reports', reportTab: 'qc-report' },
     ],
   },
   fifo: {
     title: 'Management FIFO',
     subtitle: 'Kelola lot masuk, lot keluar, dan urutan oldest first.',
     sop: [
-      'Terima material ke lot yang benar agar tanggal received/expiry tercatat.',
+      'Terima material melalui RN/Inbound agar lot, tanggal received, tanggal produksi, expiry, dan No. SJ/DO tercatat.',
       'Setelah receiving membuat lot, cetak Label Lot/Part dari Inventory > Kartu Stok per Lot lalu tempel ke barang fisik.',
-      'Saat issue material, pakai lot paling atas dalam urutan FIFO.',
+      'Saat issue material, pakai lot paling tua atau lot expiry terdekat sesuai konfigurasi FIFO kategori item.',
       'Scan kanban dipakai untuk konsumsi/request, sedangkan scan label lot dipakai untuk memastikan item dan lot fisik saat cek aktual atau stok opname.',
-      'Jika aktual lot berbeda dari sistem, catat koreksi lewat stok opname atau transaksi penyesuaian.',
-      'Pelanggaran FIFO dibaca di laporan FIFO Violation Log.',
+      'Jika QC menahan atau reject batch, jangan keluarkan lot tersebut sampai disposition selesai.',
+      'Jika aktual lot berbeda dari sistem, catat koreksi lewat stok opname atau transaksi penyesuaian dan dokumentasikan penyebabnya.',
+      'Pelanggaran FIFO dibaca di laporan FIFO Violation Log dan dibandingkan dengan Kartu Stok per Lot.',
     ],
     links: [
-      { label: 'Inventory', description: 'Cek saldo per item dan kartu stok.', mainTab: 'inventory' },
+      { label: 'Inventory', description: 'Cek saldo per item, batch, dan Kartu Stok per Lot.', mainTab: 'inventory' },
+      { label: 'Quality Control', description: 'Pastikan batch hold/reject tidak dipakai sebelum disposition selesai.', mainTab: 'quality' },
       { label: 'FIFO Violation Log', description: 'Baca pelanggaran urutan lot.', mainTab: 'reports', reportTab: 'fifo-violations' },
       { label: 'All Laporan Mutasi', description: 'Telusuri mutasi masuk/keluar.', mainTab: 'reports', reportTab: 'all-mutations' },
     ],
@@ -216,33 +225,38 @@ const HELP_CONTENT = {
       'Gunakan pencarian item untuk cek saldo on hand, reserved, available, dan threshold min/max.',
       'Reserved adalah kebutuhan kanban/request aktif, bukan stok fisik. Available dihitung dari On Hand dikurangi Reserved.',
       'Jika On Hand 0 tetapi Reserved masih ada, Available menjadi minus. Artinya ada kebutuhan aktif yang belum terpenuhi, bukan stok fisik benar-benar negatif.',
-      'Klik detail atau analytics pada kartu kanban untuk membaca sumber angka.',
-      'Cek Kartu Stok dan Kartu Stok per Lot untuk melihat histori transaksi.',
+      'Klik detail atau analytics pada kartu item untuk membaca sumber angka, aging, min/max, dan relasi kebutuhan.',
+      'Cek Kartu Stok dan Kartu Stok per Lot untuk melihat histori transaksi, batch, No. SJ/DO, dan sisa qty.',
       'Untuk memastikan koneksi aktual, pilih batch di Kartu Stok per Lot, klik Label Lot/Part, print, lalu tempel ke barang yang diterima.',
-      'Saat stok opname, cocokkan barang fisik dengan QR Label Lot/Part. Jika lot fisik berbeda dari urutan FIFO sistem, catat sebagai koreksi/indikasi pelanggaran FIFO.',
-      'Jika saldo hilang setelah sync, cek kanban source, laporan mutasi, dan referensi master item.',
+      'Saat stok opname, cocokkan barang fisik dengan QR Label Lot/Part. Jika lot fisik berbeda dari urutan FIFO sistem, catat koreksi dan indikasi pelanggaran FIFO.',
+      'Batch QC Hold/Reject tidak boleh dianggap available untuk produksi sampai QC memberi disposition final.',
+      'Jika saldo hilang setelah sync, cek sumber kanban/RN, laporan mutasi, dan referensi master item.',
     ],
     links: [
       { label: 'Kanban Board', description: 'Cek sumber sync dan status kartu.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'items' },
-      { label: 'Kartu Stok / Mutasi', description: 'Telusuri transaksi masuk dan keluar.', mainTab: 'reports', reportTab: 'all-mutations' },
+      { label: 'Management FIFO', description: 'Cek urutan lot FIFO dan lot yang harus dipakai lebih dulu.', mainTab: 'fifo' },
+      { label: 'Laporan Mutasi', description: 'Telusuri transaksi masuk dan keluar.', mainTab: 'reports', reportTab: 'all-mutations' },
       { label: 'Master Item', description: 'Validasi kategori, lokasi, supplier, customer, model, packing.', mainTab: 'masterref', masterRefTab: 'item' },
-      { label: 'FIFO Lots', description: 'Cek lot dan remaining quantity.', mainTab: 'fifo' },
+      { label: 'Quality Control', description: 'Cek batch yang masih hold/reject sebelum dipakai produksi.', mainTab: 'quality' },
     ],
   },
   subcon: {
     title: 'Subcon',
     subtitle: 'Kelola kebutuhan dan pergerakan material subcontractor.',
     sop: [
-      'Cek item, supplier, customer, dan lokasi subcon dari Master Referensi sebelum membuat transaksi.',
-      'Catat material keluar ke subcon dengan qty, dokumen, dan tujuan yang jelas.',
-      'Catat material kembali dari subcon agar saldo inventory dan histori proses tetap sinkron.',
-      'Gunakan laporan mutasi untuk membandingkan saldo sebelum dan sesudah proses subcon.',
+      'Pastikan vendor bertipe/berperan Subcon, warehouse subcon, routing BOM, dan item terkait sudah lengkap di Master Referensi.',
+      'Buka BOM Routing Subcon untuk melihat item yang memiliki langkah proses Subcon sebelum membuat pengiriman.',
+      'Catat Kirim Bahan/RM ke Subcon dengan vendor, tanggal, nomor SJ Subcon, item, qty, dan catatan yang jelas.',
+      'Gunakan DO Subcon atau referensi dokumen yang tersedia saat menerima hasil dari vendor.',
+      'Catat Receipt Subcon agar saldo warehouse subcon, inventory internal, dan histori proses tetap sinkron.',
+      'Pantau Subcon Stock Card untuk melihat saldo per item/vendor dan membandingkan pergerakan keluar/masuk.',
       'Jika ada selisih, tahan proses berikutnya sampai dokumen, stok, dan pihak terkait sudah dikonfirmasi.',
     ],
     links: [
       { label: 'Inventory', description: 'Cek stok yang terdampak proses subcon.', mainTab: 'inventory' },
-      { label: 'Master Customer', description: 'Validasi customer subcon.', mainTab: 'masterref', masterRefTab: 'customer' },
-      { label: 'All Laporan Mutasi', description: 'Cek histori transaksi.', mainTab: 'reports', reportTab: 'all-mutations' },
+      { label: 'Master Vendor', description: 'Validasi vendor Subcon, role, email, dan warehouse terkait.', mainTab: 'masterref', masterRefTab: 'vendor' },
+      { label: 'Master Item', description: 'Validasi routing BOM, kategori Subcon, dan relasi item.', mainTab: 'masterref', masterRefTab: 'item' },
+      { label: 'Laporan Mutasi', description: 'Cek histori material keluar/masuk Subcon.', mainTab: 'reports', reportTab: 'all-mutations' },
     ],
   },
   prl: {
@@ -251,15 +265,17 @@ const HELP_CONTENT = {
     sop: [
       'Pilih tahun, bulan fokus, model, category, dan supplier sebelum menampilkan kebutuhan.',
       'Pastikan model item berasal dari Master Model dan master item hanya memakai kode model yang valid.',
-      'Review qty kebutuhan, forecast, dan item mapping sebelum PRL dirilis.',
-      'Rilis PRL setelah kebutuhan disetujui; jangan mengubah master item dari halaman transaksi.',
-      'Jika scan kanban terjadi tanpa PRL, buka notifikasi lalu cek PRL bulan terkait.',
+      'Import PRL dari template yang benar, cek riwayat import, lalu validasi item, model, supplier, dan qty per bulan.',
+      'Review qty kebutuhan, forecast, suggested qty, dan mapping item sebelum PRL dirilis.',
+      'Rilis PRL setelah kebutuhan disetujui; PRL menjadi referensi forecast supplier dan kontrol supply source bila mode PRL aktif.',
+      'Gunakan PRL to Supplier untuk menyiapkan preview/print kebutuhan supplier setelah data rilis.',
+      'Jika scan/request kanban ditolak karena PRL belum ada atau Over PRL, cek PRL bulan berjalan dan sisa PRL item tersebut.',
       'Pantau Outstanding PRL untuk memastikan kebutuhan yang sudah rilis benar-benar ditindaklanjuti.',
     ],
     links: [
       { label: 'Master Model', description: 'Validasi kode model sumber PRL.', mainTab: 'masterref', masterRefTab: 'model' },
       { label: 'Master Item', description: 'Cek mapping item ke model/supplier/customer.', mainTab: 'masterref', masterRefTab: 'item' },
-      { label: 'Kanban Board', description: 'Cek konsumsi dan reorder.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'scan' },
+      { label: 'Kanban Request', description: 'Cek request yang memakai validasi PRL dan status Over PRL.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'requests' },
       { label: 'Outstanding PRL', description: 'Cek PRL yang belum selesai.', mainTab: 'reports', reportTab: 'outstanding-prl' },
     ],
   },
@@ -269,8 +285,11 @@ const HELP_CONTENT = {
     sop: [
       'Tambah atau update referensi dari tab yang sesuai: org, vendor, customer, model, process, category, item, packing, atau config.',
       'Pastikan kode referensi unik, konsisten, dan tidak berubah sembarangan karena dipakai transaksi lintas modul.',
-      'Lengkapi relasi item ke supplier, customer, model, lokasi, kategori, packing, dan parameter min/max.',
+      'Lengkapi relasi item ke supplier, customer, model, lokasi, kategori, packing, process routing, dan parameter min/max.',
+      'Set vendor type/role dengan benar: Supplier Schedule, Delivery Note, atau Subcon menentukan alur Inbound, DN, dan Subcon.',
+      'Pastikan email vendor diisi dan valid agar Kirim PDF Langsung, Reminder, dan notifikasi supplier dapat terkirim.',
       'Gunakan pencarian di setiap tab untuk validasi data sebelum import atau proses transaksi.',
+      'Konfigurasi format DN, RN, SJ Subcon, PRL, QR, FIFO method, QC status, dan supply source dilakukan di tab Config.',
       'Jangan mengisi default manual di modul lain; modul operasional harus mengambil data dari Master Referensi.',
       'Setelah update besar, cek Dashboard, Inventory, Kanban, PRL, dan laporan untuk memastikan data terbaca benar.',
     ],
@@ -278,7 +297,8 @@ const HELP_CONTENT = {
       { label: 'Master Item', description: 'Mapping referensi ke item.', mainTab: 'masterref', masterRefTab: 'item' },
       { label: 'Master Model', description: 'Sumber kode model.', mainTab: 'masterref', masterRefTab: 'model' },
       { label: 'Master Vendor', description: 'Sumber supplier/vendor.', mainTab: 'masterref', masterRefTab: 'vendor' },
-      { label: 'Setup Kanban', description: 'Generate dan cek master kanban dari referensi.', mainTab: 'kanban', kanbanView: 'master' },
+      { label: 'Master Config', description: 'Atur format dokumen, QR, FIFO, QC status, dan supply source.', mainTab: 'masterref', masterRefTab: 'config' },
+      { label: 'Setup Kanban', description: 'Generate dan cek master kanban dari referensi item.', mainTab: 'kanban', kanbanView: 'master' },
     ],
   },
   settings: {
@@ -292,8 +312,9 @@ const HELP_CONTENT = {
       'Gunakan Audit Log untuk menelusuri perubahan penting dan aktivitas user.',
     ],
     links: [
-      { label: 'Master Config', description: 'Cek konfigurasi referensi operasional.', mainTab: 'masterref', masterRefTab: 'config' },
-      { label: 'Audit Log', description: 'Telusuri perubahan sistem.', mainTab: 'audit' },
+      { label: 'Master Config', description: 'Cek konfigurasi operasional yang dipakai transaksi.', mainTab: 'masterref', masterRefTab: 'config' },
+      { label: 'Master Vendor', description: 'Cek email dan role supplier/subcon yang terdampak setting email.', mainTab: 'masterref', masterRefTab: 'vendor' },
+      { label: 'Audit Log', description: 'Telusuri perubahan user, akses, dan konfigurasi.', mainTab: 'audit' },
     ],
   },
   audit: {
@@ -463,6 +484,7 @@ const API_TIMEOUT_MS = 20000;
 const API_HEALTH_INTERVAL_MS = 15000;
 const AUTO_LOGOUT_IDLE_MS = 15 * 60 * 1000;
 const DEFAULT_RESET_PASSWORD = '123456';
+const PUBLIC_APP_URL = String(import.meta.env.VITE_PUBLIC_APP_URL || '').trim().replace(/\/+$/, '');
 const ADMIN_WHATSAPP_NUMBER = String(import.meta.env.VITE_ADMIN_WHATSAPP_NUMBER || '').replace(/[^\d]/g, '');
 const ADMIN_WHATSAPP_MESSAGE = encodeURIComponent('Halo Admin/IT, saya lupa password. Mohon bantu reset password akun saya. Terima kasih.');
 const ADMIN_WHATSAPP_LINK = ADMIN_WHATSAPP_NUMBER
@@ -508,6 +530,15 @@ const getCurrentMonthRange = () => {
 };
 
 const normalizeDuplicateKey = (value) => String(value ?? '').trim().toLowerCase();
+
+const normalizeItemActiveStatus = (value) => {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (!raw) return 'active';
+  const compact = raw.replace(/[^a-z0-9]+/g, '');
+  return ['inactive', 'nonactive', 'nonaktif', 'tidakaktif', 'disabled', 'disable', '0', 'false'].includes(compact)
+    ? 'inactive'
+    : 'active';
+};
 
 const apiRequest = async (path, options = {}, token) => {
   const {
@@ -883,6 +914,19 @@ const LoginPage = ({ onLogin, notice = '' }) => {
       </div>
     </div>
   );
+};
+
+const publicFormatNumber0 = (value) => {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return value ?? '-';
+  return new Intl.NumberFormat('id-ID', { maximumFractionDigits: 0 }).format(num);
+};
+
+const publicFormatDateID = (dateString) => {
+  if (!dateString) return '-';
+  const date = new Date(dateString);
+  if (Number.isNaN(date.getTime())) return String(dateString);
+  return date.toLocaleDateString('id-ID', { day: '2-digit', month: 'short', year: 'numeric' });
 };
 
 // ==========================================
@@ -1285,6 +1329,10 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [dnPrintLoading, setDnPrintLoading] = useState(false);
   const [dnPrintAuto, setDnPrintAuto] = useState(false);
   const [dnPrintMode, setDnPrintMode] = useState('dn');
+  const [dnEmailPreview, setDnEmailPreview] = useState(null);
+  const [dnEmailSendingId, setDnEmailSendingId] = useState(null);
+  const [dnEmailResult, setDnEmailResult] = useState(null);
+  const [dnEmailConfirm, setDnEmailConfirm] = useState(null);
   const [inboundCardPrintRows, setInboundCardPrintRows] = useState([]);
   const [inboundCardScanOpen, setInboundCardScanOpen] = useState(false);
   const [inboundCardScanValue, setInboundCardScanValue] = useState('');
@@ -1484,6 +1532,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     workingDays: '',
     kanbanIdFormat: '',
     requestIdFormat: '',
+    kanbanRequestSupplySource: 'po_master',
     locationPrefixWarehouse: 'LOC-WH',
     locationPrefixProduction: 'LOC-PR',
     locationPrefixWorkCenter: 'LOC-WC',
@@ -1639,6 +1688,8 @@ const Dashboard = ({ onLogout, token, user }) => {
     locationName: '',
     lineProduction: '',
     processRouting: [],
+    itemStatus: 'active',
+    inactiveRemarks: '',
     leadTimeDays: '',
     cycleTimeSeconds: '',
     imageUrl: '',
@@ -1682,6 +1733,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     location: '',
     supplier: '',
     customer: '',
+    status: '',
     duplicatesOnly: false,
   });
   const openNotificationTarget = useCallback((item) => {
@@ -2040,16 +2092,35 @@ const Dashboard = ({ onLogout, token, user }) => {
   }, [masterVendors]);
   const resolveSupplierLabel = useCallback((rowOrValue) => {
     if (!rowOrValue) return '-';
+    const candidates = [];
     if (typeof rowOrValue === 'object') {
-      const direct = rowOrValue.supplierName || rowOrValue.supplier_name || rowOrValue.supplierLabel;
-      if (direct) return direct;
+      candidates.push(
+        rowOrValue.supplier_id,
+        rowOrValue.supplierId,
+        rowOrValue.po_supplier_id,
+        rowOrValue.poSupplierId,
+        rowOrValue.supplier,
+        rowOrValue.supplier_code,
+        rowOrValue.supplierCode,
+        rowOrValue.vendor_id,
+        rowOrValue.vendorId,
+        rowOrValue.default_supplier,
+        rowOrValue.supplierName,
+        rowOrValue.supplier_name,
+        rowOrValue.supplierLabel,
+      );
+    } else {
+      candidates.push(rowOrValue);
     }
-    const raw = typeof rowOrValue === 'string'
-      ? rowOrValue
-      : (rowOrValue.supplier || rowOrValue.supplier_code || rowOrValue.supplierCode || rowOrValue.vendor_id || rowOrValue.vendorId || rowOrValue.default_supplier || '');
-    const trimmed = String(raw || '').trim();
-    if (!trimmed) return '-';
-    return masterVendorNameMap.get(trimmed.toLowerCase()) || trimmed;
+    let fallback = '';
+    for (const candidate of candidates) {
+      const trimmed = String(candidate || '').trim();
+      if (!trimmed) continue;
+      if (!fallback) fallback = trimmed;
+      const masterName = masterVendorNameMap.get(trimmed.toLowerCase());
+      if (masterName) return masterName;
+    }
+    return fallback || '-';
   }, [masterVendorNameMap]);
   const resolveScorecardSupplierMeta = useCallback((rowOrValue) => {
     const candidates = [];
@@ -2393,7 +2464,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       editSchedules: true,
       production: true,
       manageUsers: false,
-      useAI: false,
+      useAI: true,
       importExport: true,
       deleteRecords: false,
       resetAll: false,
@@ -2738,6 +2809,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     const targetTab = link?.mainTab || 'dashboard';
     const blocked = (
       (targetTab === 'kanban' && !canEditSchedules && !isProductionUser)
+      || (targetTab === 'quality' && !canQuality)
       || (targetTab === 'subcon' && !canSubcon)
       || (targetTab === 'prl' && !canViewPrl)
       || (targetTab === 'masterref' && !canViewMaster)
@@ -2762,6 +2834,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   }, [
     canEditSchedules,
     canOpenReportMenu,
+    canQuality,
     canSubcon,
     canViewMaster,
     canViewPrl,
@@ -3280,7 +3353,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       const prev = receivedTotals.get(itemCode) || 0;
       receivedTotals.set(itemCode, prev + Number(note.received_qty || 0));
     });
-    const reservedStatuses = new Set(['triggered', 'requested', 'approved', 'dn_created', 'scheduled', 'in_transit']);
+    const reservedStatuses = new Set(['triggered', 'requested', 'approved', 'production_ready', 'dn_created', 'scheduled', 'in_transit']);
     const terminalDnStatuses = new Set(['closed', 'received', 'cancelled', 'canceled', 'rejected']);
     const reservedTotals = new Map();
     (kanbanRequests || []).forEach((row) => {
@@ -3560,6 +3633,10 @@ const Dashboard = ({ onLogout, token, user }) => {
     setShowInboundPrint,
     inboundPrintOrientation,
     setInboundPrintOrientation,
+    inboundEmailNotice,
+    setInboundEmailNotice,
+    inboundFullEmailReport,
+    setInboundFullEmailReport,
     scheduleEditOpen,
     scheduleEditForm,
     setScheduleEditForm,
@@ -3590,6 +3667,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     handleImportExcel,
     handleExportExcel,
     handleSendEmail,
+    handleSendFullScheduleEmail,
     handleSendEmailReminder,
   } = scheduleStore;
 
@@ -4393,6 +4471,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     const locationFilter = itemTableFilters.location.trim();
     const supplierFilter = itemTableFilters.supplier.trim();
     const customerFilter = itemTableFilters.customer.trim();
+    const statusFilter = normalizeItemActiveStatus(itemTableFilters.status || '');
     const resolveItemCategoryCode = (value) => {
       const raw = String(value || '').trim();
       if (!raw) return '';
@@ -4434,6 +4513,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       if (typePackFilter && !String(item.type_pack || '').toLowerCase().includes(typePackFilter)) return false;
       if (itemTableFilters.category && resolveItemCategoryCode(item.type) !== itemTableFilters.category) return false;
       if (locationFilter && String(item.location_id || '').trim() !== locationFilter) return false;
+      if (itemTableFilters.status && normalizeItemActiveStatus(item.item_status || item.itemStatus) !== statusFilter) return false;
       if (itemTableFilters.duplicatesOnly) {
         const codeKey = normalizeDuplicateKey(item.code);
         const partKey = normalizeDuplicateKey(item.part_no || item.partNo);
@@ -5729,7 +5809,7 @@ const Dashboard = ({ onLogout, token, user }) => {
 
   const supplierPerformanceData = useMemo(() => {
     return [...masterVendors]
-      .filter((vendor) => vendor.type === 'Supplier')
+      .filter((vendor) => String(vendor.type || '').trim().toLowerCase() === 'supplier')
       .sort((a, b) => Number(a.lead_time_days || 0) - Number(b.lead_time_days || 0))
       .slice(0, 10)
       .map((vendor) => ({
@@ -5800,6 +5880,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   const dnFormatTokens = ['{PREFIX}', '{SUPPLIER_CODE}', '{SUPPLIER}', '{YY}', '{YEAR}', '{COUNTER}', '{ROMAN_MONTH}', '{MONTH}'];
   const sjSubFormatTokens = ['{YEAR}', '{YY}', '{MONTH}', '{ROMAN_MONTH}', '{COUNTER}'];
   const prlFormatTokens = ['{SUPPLIER_CODE}', '{SUPPLIER}', '{YY}', '{YEAR}', '{COUNTER}', '{ROMAN_MONTH}', '{MONTH}'];
+  const kanbanRequestSupplySourceOptions = ['po_master', 'prl'];
   const configModalMeta = {
     dnFormat: { label: 'DN Format', type: 'text', helper: dnFormatTokens },
     rnFormat: { label: 'RN Format', type: 'text' },
@@ -5811,6 +5892,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     holdLocation: { label: 'Hold Location', type: 'text' },
     kanbanIdFormat: { label: 'Kanban ID Format', type: 'text', helper: ['{CATEGORY}', '{SUPPLIER}', '{MODEL}', '{PART_NO}', '{UNIQ}', '{SEQ}', '{TOTAL}', '{COUNTER}', '{YEAR}', '{YY}', '{MONTH}', '{ROMAN_MONTH}'] },
     requestIdFormat: { label: 'Request ID Format', type: 'text', helper: ['{ITEM_ID}', '{COUNTER}'] },
+    kanbanRequestSupplySource: { label: 'Kanban Request Supply Source', type: 'select', options: kanbanRequestSupplySourceOptions },
     locationPrefixWarehouse: { label: 'Location Prefix - Warehouse', type: 'text' },
     locationPrefixProduction: { label: 'Location Prefix - Production Line', type: 'text' },
     locationPrefixWorkCenter: { label: 'Location Prefix - Work Center', type: 'text' },
@@ -5902,7 +5984,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       dailyCapacityQty: '',
       deliverySchedule: [],
     });
-    setItemMasterForm({ code: '', name: '', partNo: '', type: 'Raw Material', unit: 'PCS', typePack: '', packQty: '', orderLotSize: '', maxDeliveryPerRit: '', isSeasonal: false, suppliers: [], customers: [], modelCodes: [], weight: '', locationId: '', locationName: '', lineProduction: '', processRouting: [], leadTimeDays: '', cycleTimeSeconds: '', imageUrl: '', imageThumbUrl: '', shelfLifeDays: '' });
+    setItemMasterForm({ code: '', name: '', partNo: '', type: 'Raw Material', unit: 'PCS', typePack: '', packQty: '', orderLotSize: '', maxDeliveryPerRit: '', isSeasonal: false, suppliers: [], customers: [], modelCodes: [], weight: '', locationId: '', locationName: '', lineProduction: '', processRouting: [], itemStatus: 'active', inactiveRemarks: '', leadTimeDays: '', cycleTimeSeconds: '', imageUrl: '', imageThumbUrl: '', shelfLifeDays: '' });
       setItemModelEntry('');
     setLocationForm({ id: '', lineDescription: '', areaId: '', warehouseId: '', category: 'Raw Material', fifoLane: '', machineNote: '' });
     setPackingForm({ code: '', name: '' });
@@ -6013,6 +6095,7 @@ const Dashboard = ({ onLogout, token, user }) => {
         workingDays: config?.working_days ? JSON.stringify(config.working_days, null, 2) : masterConfig.workingDays,
         kanbanIdFormat: config?.kanban_id_format || '',
         requestIdFormat: config?.request_id_format || '',
+        kanbanRequestSupplySource: config?.kanban_request_supply_source || 'po_master',
         locationPrefixWarehouse: docNumbering.locationPrefixWarehouse || masterConfig.locationPrefixWarehouse,
         locationPrefixProduction: docNumbering.locationPrefixProduction || masterConfig.locationPrefixProduction,
         locationPrefixWorkCenter: docNumbering.locationPrefixWorkCenter || masterConfig.locationPrefixWorkCenter,
@@ -6131,9 +6214,32 @@ const Dashboard = ({ onLogout, token, user }) => {
     await finalizeMasterSave('Warehouse berhasil disimpan.');
   };
 
+  const parseEmailRecipientsText = (value) => {
+    const seen = new Set();
+    return String(value || '')
+      .split(/[;,\n]+/)
+      .map((email) => email.trim())
+      .filter(Boolean)
+      .filter((email) => {
+        const key = email.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  };
+
+  const isValidEmailRecipient = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+
+  const normalizeEmailRecipientsText = (value) => parseEmailRecipientsText(value).join(', ');
+
   const handleSaveVendor = async () => {
     if (!vendorForm.id || !vendorForm.name || !vendorForm.type || !vendorForm.role) {
       alert('Vendor ID, Name, Type wajib diisi.');
+      return;
+    }
+    const invalidEmails = parseEmailRecipientsText(vendorForm.email).filter((email) => !isValidEmailRecipient(email));
+    if (invalidEmails.length > 0) {
+      showToastMessage(`Format email supplier tidak valid: ${invalidEmails.join(', ')}`, '', null, 'warning');
       return;
     }
     const leadTimeValue = parseFloat(String(vendorForm.leadTimeDays || '').replace(',', '.'));
@@ -6145,6 +6251,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     const deliveryTimeValue = String(firstSchedule.time || '').trim() || null;
     const payload = {
       ...vendorForm,
+      email: normalizeEmailRecipientsText(vendorForm.email),
       leadTimeDays: Number.isFinite(leadTimeValue) ? Math.max(0, Math.round(leadTimeValue)) : 0,
       dailyCapacityQty: Number.isFinite(dailyCapacityValue) ? Math.max(0, dailyCapacityValue) : 0,
       deliverySchedule: scheduleRows,
@@ -6248,6 +6355,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     const cycleTimeSecondsValue = normalizedProcessRouting.length > 0
       ? derivedCycleTimeSeconds
       : Number(itemMasterForm.cycleTimeSeconds || 0);
+    const itemStatusValue = normalizeItemActiveStatus(itemMasterForm.itemStatus ?? itemMasterForm.item_status);
     const { vendorId, ...itemMasterPayload } = itemMasterForm;
     const payload = {
       ...itemMasterPayload,
@@ -6263,6 +6371,8 @@ const Dashboard = ({ onLogout, token, user }) => {
       cycleTimeSeconds: Number.isFinite(cycleTimeSecondsValue) ? Math.max(0, cycleTimeSecondsValue) : 0,
       processFlow: processFlowValue,
       processRouting: normalizedProcessRouting,
+      itemStatus: itemStatusValue,
+      inactiveRemarks: itemStatusValue === 'inactive' ? String(itemMasterForm.inactiveRemarks || itemMasterForm.inactive_remarks || '').trim() : '',
       suppliers: normalizedSuppliers,
       customers: normalizedCustomers,
     };
@@ -6565,6 +6675,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       workingDays: workingDaysPayload,
       kanbanIdFormat: nextConfig.kanbanIdFormat,
       requestIdFormat: nextConfig.requestIdFormat,
+      kanbanRequestSupplySource: nextConfig.kanbanRequestSupplySource || 'po_master',
     };
     await apiFetch('/api/master/config', { method: 'PUT', body: JSON.stringify(payload) });
     await finalizeMasterSave('Konfigurasi master berhasil disimpan.');
@@ -6614,17 +6725,40 @@ const Dashboard = ({ onLogout, token, user }) => {
 
   const handleApproveKanban = async (row) => {
     try {
-      await apiFetch(`/api/kanban/requests/${row.id}/approve`, { method: 'POST' });
+      const approved = await apiFetch(`/api/kanban/requests/${row.id}/approve`, { method: 'POST' });
+      showToastMessage(`Request ${getRequestIdLabel(row)} di-approve.`, '', null, 'success');
       await fetchKanbanRequests();
+      return {
+        ok: true,
+        action: 'approve',
+        result: { approved: [approved || row], skipped: [] },
+        selectedRows: [row],
+      };
     } catch (error) {
-      alert(`Gagal approve: ${error.message || 'Unknown error'}`);
+      return {
+        ok: false,
+        action: 'approve',
+        error: error.message || 'Gagal approve.',
+        result: {
+          skipped: [{
+            id: row?.id,
+            itemCode: row?.item_code,
+            requestQty: Number(row?.request_qty || 0),
+            reason: error.response?.code || error.code || 'approve_failed',
+            error: error.message || 'Gagal approve.',
+            details: error.response?.details || error.details || null,
+          }],
+        },
+        selectedRows: [row],
+        status: error.status || null,
+      };
     }
   };
 
   const handleBatchApproveKanban = async () => {
     if (selectedRequestIds.length === 0) {
-      alert('Pilih minimal 1 request.');
-      return false;
+      showToastMessage('Pilih minimal 1 request.', '', null, 'warning');
+      return { ok: false, action: 'approve', error: 'Pilih minimal 1 request.' };
     }
     const selectedRows = selectedRequestIds
       .map((id) => kanbanRequests.find((reqRow) => reqRow.id === id))
@@ -6635,11 +6769,22 @@ const Dashboard = ({ onLogout, token, user }) => {
       const statusKey = String(row?.status || '').trim().toLowerCase();
       return ['triggered', 'requested'].includes(statusKey) && !row?.dn_id;
     });
+    const localSkipped = selectedRows
+      .filter((row) => !eligibleIds.includes(row.id))
+      .map((row) => ({
+        id: row.id,
+        itemCode: row.item_code,
+        requestQty: Number(row.request_qty || 0),
+        reason: row?.dn_id ? 'dn_linked' : 'status',
+        status: row.status,
+        dnId: row.dn_id || null,
+      }));
     if (eligibleIds.length === 0) {
-      alert(`Tidak ada request yang valid untuk di-approve.
+      const message = `Tidak ada request yang valid untuk di-approve.
 Kemungkinan status masih ${getKanbanRequestStatusLabel(selectedRows[0]) || 'Pending'}, sudah punya DN, atau belum masuk antrian approve.
-${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
-      return false;
+${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`;
+      showToastMessage(message, '', null, 'warning');
+      return { ok: false, action: 'approve', error: message, result: { skipped: localSkipped }, selectedRows };
     }
     if (eligibleIds.length !== selectedRequestIds.length) {
       showToastMessage(`Sebagian request di-skip karena status tidak valid atau sudah punya DN.
@@ -6650,15 +6795,25 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         method: 'POST',
         body: JSON.stringify({ requestIds: eligibleIds }),
       });
+      const resultPayload = result || {};
+      resultPayload.skipped = [...localSkipped, ...(Array.isArray(resultPayload?.skipped) ? resultPayload.skipped : [])];
       setSelectedRequestIds([]);
-      const approvedCount = Array.isArray(result?.approved) ? result.approved.length : eligibleIds.length;
-      const skippedCount = Array.isArray(result?.skipped) ? result.skipped.length : 0;
+      const approvedCount = Array.isArray(resultPayload?.approved) ? resultPayload.approved.length : eligibleIds.length;
+      const skippedCount = Array.isArray(resultPayload?.skipped) ? resultPayload.skipped.length : 0;
       showToastMessage(`Batch approve selesai untuk ${approvedCount} request.${skippedCount ? ` (${skippedCount} di-skip)` : ''}`);
       await fetchKanbanRequests();
-      return true;
+      return { ok: true, action: 'approve', result: resultPayload, selectedRows };
     } catch (error) {
-      alert(`Gagal batch approve: ${error.message || 'Unknown error'}`);
-      return false;
+      const errorResult = error.response ? { ...error.response } : {};
+      errorResult.skipped = [...localSkipped, ...(Array.isArray(errorResult.skipped) ? errorResult.skipped : [])];
+      return {
+        ok: false,
+        action: 'approve',
+        error: error.message || 'Gagal batch approve.',
+        result: errorResult,
+        selectedRows,
+        status: error.status || null,
+      };
     }
   };
 
@@ -6667,23 +6822,36 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
     const supplierMeta = resolveItemPrimarySupplier(row.item_code, masterItem);
     const supplier = supplierMeta.supplierCode || supplierMeta.supplierName || '';
     if (!supplier) {
-      alert('Supplier belum ada di Master Item. Silakan isi supplier di Master Referensi.');
+      showToastMessage('Supplier belum ada di Master Item. Silakan isi supplier di Master Referensi.', '', null, 'warning');
       openDnModal(row);
-      return;
+      return {
+        ok: false,
+        action: 'approve-dn',
+        error: 'Supplier belum ada di Master Item.',
+        result: { skipped: [{ id: row?.id, itemCode: row?.item_code, requestQty: Number(row?.request_qty || 0), reason: 'missing_supplier' }] },
+        selectedRows: [row],
+      };
     }
     const vendorMatch = masterVendors.find(
       (vendor) => String(vendor.id).toLowerCase() === String(supplier).toLowerCase()
         || String(vendor.name).toLowerCase() === String(supplier).toLowerCase()
     );
     if (vendorMatch && vendorMatch.role && vendorMatch.role !== 'Delivery Note') {
-      alert(`Vendor ${vendorMatch.name} tidak berperan sebagai Delivery Note.`);
-      return;
+      const message = `Vendor ${vendorMatch.name} tidak berperan sebagai Delivery Note.`;
+      showToastMessage(message, '', null, 'warning');
+      return {
+        ok: false,
+        action: 'approve-dn',
+        error: message,
+        result: { skipped: [{ id: row?.id, itemCode: row?.item_code, requestQty: Number(row?.request_qty || 0), reason: 'invalid_role' }] },
+        selectedRows: [row],
+      };
     }
     const plannedDate = new Date().toISOString().slice(0, 10);
     const ok = window.confirm(`Approve ${getRequestIdLabel(row)} dan buat DN untuk supplier ${supplier}?`);
-    if (!ok) return;
+    if (!ok) return { ok: false, action: 'approve-dn', error: 'Dibatalkan.', selectedRows: [row] };
     try {
-      await apiFetch(`/api/kanban/requests/${row.id}/approve-dn`, {
+      const dn = await apiFetch(`/api/kanban/requests/${row.id}/approve-dn`, {
         method: 'POST',
         body: JSON.stringify({
           dnNumber: null,
@@ -6694,8 +6862,43 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
       showToastMessage(`Approved & DN dibuat untuk ${supplier}.`);
       await fetchKanbanRequests();
       await fetchDeliveryNotes();
+      return {
+        ok: true,
+        action: 'approve-dn',
+        result: {
+          dns: dn ? [dn] : [],
+          dnRequestLinks: [{
+            dnId: dn?.id || null,
+            dnNumber: dn?.dn_number || null,
+            supplier,
+            requestIds: [row.id],
+            itemCodes: [row.item_code],
+            requestCount: 1,
+          }],
+          skipped: [],
+          approvedIds: ['triggered', 'requested'].includes(String(row?.status || '').trim().toLowerCase()) ? [row.id] : [],
+        },
+        selectedRows: [row],
+      };
     } catch (error) {
-      alert(`Gagal approve/DN: ${error.message || 'Unknown error'}`);
+      return {
+        ok: false,
+        action: 'approve-dn',
+        error: error.message || 'Gagal approve/DN.',
+        result: {
+          skipped: [{
+            id: row?.id,
+            itemCode: row?.item_code,
+            requestQty: Number(row?.request_qty || 0),
+            supplier,
+            reason: error.response?.code || error.code || 'approve_dn_failed',
+            error: error.message || 'Gagal approve/DN.',
+            details: error.response?.details || error.details || null,
+          }],
+        },
+        selectedRows: [row],
+        status: error.status || null,
+      };
     }
   };
 
@@ -7097,7 +7300,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
     const planned = row?.planned_date || row?.plannedDate || today;
     setSelectedKanban(row);
     setScheduleForm({
-      poNumber: '',
+      poNumber: row?.po_number || row?.poNumber || '',
       requestDate: planned,
       deliveryTime: '',
     });
@@ -7569,48 +7772,149 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
       .join(',')
   );
 
-  const handleDnEmail = async (dn) => {
+  const getDnNumberLabel = (dn) => (
+    dn?.dn_number || dn?.dnNumber || (dn?.id ? `DN-${dn.id}` : '')
+  );
+
+  const buildPublicDnLink = (dnNumber, mode = 'dn-label') => {
+    const appOrigin = PUBLIC_APP_URL || (
+      typeof window !== 'undefined' && window.location?.origin
+        ? window.location.origin
+        : ''
+    );
+    if (!appOrigin) return '';
+    const params = new URLSearchParams({
+      public: mode,
+      dn: String(dnNumber || '').trim(),
+    });
+    return `${appOrigin}/?${params.toString()}`;
+  };
+
+  const buildSupplierPortalDnLink = (dnNumber, options = {}) => (
+    buildPublicDnLink(dnNumber, options.preview ? 'dn-preview' : 'dn-label')
+  );
+
+  const isDnEmailSent = (dn) => {
+    if (!dn) return false;
+    if (dn.email_sent_at || dn.emailSentAt) return true;
+    const sendCount = Number(dn.email_send_count ?? dn.emailSendCount ?? 0);
+    if (Number.isFinite(sendCount) && sendCount > 0) return true;
+    return String(dn.status || '').trim().toLowerCase() === 'sent';
+  };
+
+  const isDnEmailLocked = (dn) => (
+    ['closed', 'received', 'cancelled', 'canceled'].includes(String(dn?.status || '').trim().toLowerCase())
+  );
+
+  const getDnEmailMeta = (dn) => {
+    const dnNumber = getDnNumberLabel(dn);
+    const sentAtRaw = dn?.email_sent_at || dn?.emailSentAt || '';
+    const sentAt = sentAtRaw ? new Date(sentAtRaw) : null;
+    const sendCount = Number(dn?.email_send_count ?? dn?.emailSendCount ?? 0);
+    return {
+      dnNumber,
+      subject: dn?.email_last_subject || dn?.emailLastSubject || (dnNumber ? `Supplier Order ${dnNumber}` : ''),
+      to: dn?.email_sent_to || dn?.emailSentTo || '',
+      sentAtLabel: sentAt && !Number.isNaN(sentAt.getTime()) ? sentAt.toLocaleString('id-ID') : '',
+      sendCount: Number.isFinite(sendCount) ? sendCount : 0,
+      smtpStatus: dn?.email_smtp_status || dn?.emailSmtpStatus || '',
+      messageId: dn?.email_message_id || dn?.emailMessageId || '',
+      rejectedTo: dn?.email_rejected_to || dn?.emailRejectedTo || '',
+      lastError: dn?.email_last_error || dn?.emailLastError || '',
+      previewUrl: buildPublicDnLink(dnNumber, 'dn-preview'),
+      labelUrl: buildPublicDnLink(dnNumber, 'dn-label'),
+    };
+  };
+
+  const calculateDnLabelCount = (items = []) => (
+    items.reduce((sum, item) => {
+      const qty = Number(item.orderUnit || 0);
+      const snp = Number(item.qtyKbn || 0);
+      if (!Number.isFinite(qty) || qty <= 0) return sum;
+      if (!Number.isFinite(snp) || snp <= 0) return sum + 1;
+      return sum + Math.ceil(qty / snp);
+    }, 0)
+  );
+
+  const handleDnEmail = async (dn, options = {}) => {
     if (!dn?.id) return;
+    if (dnEmailSendingId) return;
+    if (isDnEmailLocked(dn)) {
+      showToastMessage(`Email DN ${getDnNumberLabel(dn)} terkunci karena status sudah ${String(dn.status || '').toUpperCase()}.`, '', null, 'warning');
+      return;
+    }
+    const forceResend = Boolean(options.resend);
+    const dnNumberLabel = getDnNumberLabel(dn);
+    if (isDnEmailSent(dn) && !forceResend) {
+      setDnEmailConfirm({ dn, meta: getDnEmailMeta(dn) });
+      return;
+    }
+    setDnEmailConfirm(null);
+    setDnEmailSendingId(dn.id);
+    setDnEmailResult(null);
+    showToastMessage(`${forceResend ? 'Resend' : 'Mengirim'} email ${dnNumberLabel}...`, '', null, 'info');
     try {
       const resolvedDn = await publishDnIfDraft(dn);
-      let itemRows = [];
-      try {
-        itemRows = await apiFetch(`/api/delivery-notes/${dn.id}/items`);
-      } catch (error) {
-        itemRows = [];
-      }
-      const payload = buildDnPrintPayload(resolvedDn || dn, itemRows || [], []);
-      const subject = `Delivery Note ${payload.dnNumber}`;
-      let body = `Yth. ${payload.supplierName},\n\n`;
-      body += `Berikut Delivery Note ${payload.dnNumber}.\n`;
-      body += `Tanggal: ${payload.dateLabel}\n`;
-      body += `Delivery: ${payload.deliveryDateLabel}\n`;
-      body += `Area: ${payload.areaLabel}\n`;
-      body += `Recipient: ${payload.recipientLabel || 'PPIC / Receiving Warehouse'}\n\n`;
-      body += `Detail Item:\n`;
-      payload.items.forEach((item, idx) => {
-        const qty = Number.isFinite(Number(item.orderUnit)) ? formatNumber0(item.orderUnit) : item.orderUnit || '-';
-        body += `${idx + 1}. ${item.uniq} - ${item.partNo} ${item.partName} | Qty ${qty} ${item.unit}\n`;
+      const result = await apiFetch(`/api/delivery-notes/${resolvedDn?.id || dn.id}/email`, {
+        method: 'POST',
+        body: JSON.stringify({}),
       });
-      const totalQty = Number.isFinite(Number(payload.totals.orderUnit))
-        ? formatNumber0(payload.totals.orderUnit)
-        : payload.totals.orderUnit || '-';
-      body += `\nTotal: ${totalQty}\n\nTerima kasih.`;
-      if (payload.remarksText) {
-        body += `\n\nRemarks: ${payload.remarksText}`;
-      }
-      const email = normalizeMailtoRecipients(payload.supplierEmail || '');
-      const currentStatus = String(resolvedDn?.status || dn.status || '').toLowerCase();
-      if (!['sent', 'in_transit', 'partial', 'closed', 'received', 'cancelled'].includes(currentStatus)) {
-        await apiFetch(`/api/dn/${dn.id}/status`, {
-          method: 'PUT',
-          body: JSON.stringify({ status: 'sent' }),
+      if (result?.sent) {
+        const message = `Email ${result.subject || dnNumberLabel} terkirim ke ${result.to || 'supplier'}.`;
+        setDnEmailResult({
+          sent: true,
+          title: 'Email DN terkirim',
+          message,
+          subject: result.subject || '',
+          to: result.to || '',
+          portalUrl: result.portalUrl || '',
+          previewUrl: result.previewUrl || '',
+          labelUrl: result.labelUrl || result.portalUrl || '',
+          emailSentAt: result.emailSentAt || '',
+          emailSendCount: result.emailSendCount || 0,
+          smtpStatus: result.smtpStatus || '',
+          messageId: result.messageId || '',
+          rejectedTo: result.rejectedTo || '',
+          emailLastError: result.emailLastError || '',
         });
+        showToastMessage(message, '', null, 'success');
         await fetchDeliveryNotes();
+        return;
       }
-      window.location.href = `mailto:${encodeURI(email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+      const notice = result?.notice || 'Email belum terkirim. Template ditampilkan sebagai preview.';
+      setDnEmailPreview({
+        subject: result?.subject || `Supplier Order ${resolvedDn?.dn_number || dn.dn_number || ''}`,
+        html: result?.html || '',
+        to: result?.to || '',
+        notice,
+        portalUrl: result?.portalUrl || '',
+      });
+      setDnEmailResult({
+        sent: false,
+        title: 'Email DN belum terkirim',
+        message: notice,
+        subject: result?.subject || '',
+        to: result?.to || '',
+        portalUrl: result?.portalUrl || '',
+        previewUrl: result?.previewUrl || '',
+        labelUrl: result?.labelUrl || result?.portalUrl || '',
+      });
+      showToastMessage(notice, '', null, 'warning');
     } catch (error) {
-      alert(error.message || 'Gagal menyiapkan email DN.');
+      const message = error.message || 'Gagal mengirim email DN.';
+      setDnEmailResult({
+        sent: false,
+        title: 'Email DN gagal',
+        message,
+        subject: '',
+        to: '',
+        portalUrl: '',
+        previewUrl: '',
+        labelUrl: '',
+      });
+      showToastMessage(message, '', null, 'error');
+    } finally {
+      setDnEmailSendingId(null);
     }
   };
 
@@ -8494,6 +8798,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
           const shelfLifeMonths = getImportValue(row, ['Shelf Life (bulan)', 'Shelf Life Months', 'shelfLifeMonths', 'shelf_life_months']);
           const movingStatus = getImportValue(row, ['Moving Status', 'movingStatus', 'moving_status']);
           const seasonalValue = getImportValue(row, ['Seasonal', 'Is Seasonal', 'isSeasonal', 'is_seasonal']);
+          const itemStatus = getImportValue(row, ['Status Item', 'Item Status', 'Status', 'itemStatus', 'item_status']);
+          const inactiveRemarks = getImportValue(row, ['Remarks Non Aktif', 'Non Aktif Remarks', 'Inactive Remarks', 'Remarks', 'inactiveRemarks', 'inactive_remarks']);
           const locationInput = getImportValue(row, ['Master Ord Warehouse', 'Nama Master Ord Warehouse', 'Warehouse / Lokasi', 'Warehouse', 'Warehouse ID', 'Location', 'Location Name', 'Lokasi', 'Storage Location', 'locationId', 'location_id', 'location_name']);
           const supplierInput = getImportValue(row, ['Supplier / Vendor', 'Supplier', 'Vendor', 'Supplier Code', 'Vendor Code', 'Kode Supplier', 'Kode Vendor', 'supplier', 'vendor', 'vendor_id', 'supplier_id', 'default_supplier']);
           const lineProductionInput = getImportValue(row, ['Line Produksi / Work Center', 'Line Produksi', 'Master Proses', 'Process', 'Process Code', 'Process Name', 'Line Production', 'Production Line', 'Line', 'Work Center', 'lineProduction', 'line_production']);
@@ -8564,6 +8870,9 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
           const derivedCycleTimeSeconds = normalizedProcessRouting.reduce((sum, step) => sum + Number(step.standardTime || 0), 0);
           const normalizedCode = String(code).trim();
           const existingItem = masterItems.find((item) => String(item.code || '').trim() === normalizedCode) || null;
+          const itemStatusValue = hasImportValue(itemStatus)
+            ? normalizeItemActiveStatus(itemStatus)
+            : normalizeItemActiveStatus(existingItem?.item_status || existingItem?.itemStatus || 'active');
           const existingSupplierRows = itemSupplierMap.get(normalizedCode) || [];
           const existingCustomerRows = itemCustomerMap.get(normalizedCode) || [];
           const mergedSuppliers = isReplaceMode
@@ -8622,6 +8931,10 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
               : (existingItem?.shelf_life_months ?? existingItem?.shelfLifeMonths ?? null),
             movingStatus: pickTextValue(movingStatus, existingItem?.moving_status || existingItem?.movingStatus || ''),
             isSeasonal: pickBooleanValue(seasonalValue, existingItem?.is_seasonal || existingItem?.isSeasonal || false),
+            itemStatus: itemStatusValue,
+            inactiveRemarks: itemStatusValue === 'inactive'
+              ? pickTextValue(inactiveRemarks, existingItem?.inactive_remarks || existingItem?.inactiveRemarks || '')
+              : '',
             typePack: pickTextValue(typePack, existingItem?.type_pack || existingItem?.typePack || ''),
             orderLotSize: pickNumberValue(orderLotSize, existingItem?.order_lot_size || existingItem?.orderLotSize || 0),
             maxDeliveryPerRit: pickNumberValue(maxDeliveryPerRit, existingItem?.max_delivery_per_rit || existingItem?.maxDeliveryPerRit || 0),
@@ -8764,6 +9077,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         "Cycle Time 3 (s)": 10,
         "Lead Time (hari)": 2,
         "Shelf Life (hari)": 180,
+        "Status Item": "Active",
+        "Remarks Non Aktif": "",
         "Safety Stock": 5,
       },
       {
@@ -8793,6 +9108,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         "Cycle Time 3 (s)": 20,
         "Lead Time (hari)": 1,
         "Shelf Life (hari)": 365,
+        "Status Item": "Active",
+        "Remarks Non Aktif": "",
         "Safety Stock": 100,
       },
       {
@@ -8822,6 +9139,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         "Cycle Time 3 (s)": 12,
         "Lead Time (hari)": 3,
         "Shelf Life (hari)": 90,
+        "Status Item": "Active",
+        "Remarks Non Aktif": "",
         "Safety Stock": 20,
       },
       {
@@ -8851,6 +9170,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         "Cycle Time 3 (s)": 5,
         "Lead Time (hari)": 2,
         "Shelf Life (hari)": 720,
+        "Status Item": "Active",
+        "Remarks Non Aktif": "",
         "Safety Stock": 500,
       },
     ];
@@ -8909,6 +9230,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         "Shelf Life (hari)": item.shelf_life_days ?? (item.shelf_life_months ? Math.round(Number(item.shelf_life_months) * 30) : ''),
         "Moving Status": item.moving_status || '',
         Seasonal: !!item.is_seasonal,
+        "Status Item": normalizeItemActiveStatus(item.item_status || item.itemStatus) === 'inactive' ? 'Non Aktif' : 'Active',
+        "Remarks Non Aktif": normalizeItemActiveStatus(item.item_status || item.itemStatus) === 'inactive' ? (item.inactive_remarks || item.inactiveRemarks || '') : '',
         "Safety Stock": item.safety_stock ?? '',
         "Image URL": item.image_url || '',
       };
@@ -9261,8 +9584,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
 
   const handleRequestDnBatch = async ({ remarksBySupplier = null, remarks = '', approveBeforeDn = false } = {}) => {
     if (selectedRequestIds.length === 0) {
-      alert('Pilih minimal 1 request.');
-      return false;
+      showToastMessage('Pilih minimal 1 request.', '', null, 'warning');
+      return { ok: false, action: approveBeforeDn ? 'approve-dn' : 'dn', error: 'Pilih minimal 1 request.' };
     }
     const selectedRows = selectedRequestIds
       .map((id) => kanbanRequests.find((reqRow) => reqRow.id === id))
@@ -9271,13 +9594,24 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
       const row = kanbanRequests.find((reqRow) => reqRow.id === id);
       if (!row) return false;
       const statusKey = String(row?.status || 'requested').trim().toLowerCase();
-      return ['triggered', 'requested', 'approved'].includes(statusKey) && !row?.dn_id;
+      return ['triggered', 'requested', 'approved', 'production_ready'].includes(statusKey) && !row?.dn_id;
     });
+    const localSkipped = selectedRows
+      .filter((row) => !eligibleIds.includes(row.id))
+      .map((row) => ({
+        id: row.id,
+        itemCode: row.item_code,
+        requestQty: Number(row.request_qty || 0),
+        reason: row?.dn_id ? 'dn_linked' : 'status',
+        status: row.status,
+        dnId: row.dn_id || null,
+      }));
     if (eligibleIds.length === 0) {
-      alert(`Tidak ada request yang valid untuk dibuat DN.
+      const message = `Tidak ada request yang valid untuk dibuat DN.
 Kemungkinan status masih ${getKanbanRequestStatusLabel(selectedRows[0]) || 'Pending'}, sudah punya DN, atau belum lolos eligibility DN.
-${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
-      return false;
+${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`;
+      showToastMessage(message, '', null, 'warning');
+      return { ok: false, action: approveBeforeDn ? 'approve-dn' : 'dn', error: message, result: { skipped: localSkipped }, selectedRows };
     }
     const invalidSupplierItems = [];
     const invalidRoleItems = [];
@@ -9288,6 +9622,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       const flowMeta = getKanbanRequestFlowMeta(row);
       if (flowMeta.key !== 'supplier-dn') {
         invalidFlowItems.push(`${row.item_code} (${flowMeta.label})`);
+        localSkipped.push({ id: row.id, itemCode: row.item_code, requestQty: Number(row.request_qty || 0), reason: 'invalid_flow' });
         return false;
       }
       const masterItem = masterItemsByCode.get(row.item_code);
@@ -9295,6 +9630,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       const supplier = String(supplierMeta.supplierCode || supplierMeta.supplierName || '').trim();
       if (!supplier) {
         invalidSupplierItems.push(row.item_code);
+        localSkipped.push({ id: row.id, itemCode: row.item_code, requestQty: Number(row.request_qty || 0), reason: 'missing_supplier' });
         return false;
       }
       const vendor = masterVendors.find((v) => String(v.id).toLowerCase() === supplier.toLowerCase()
@@ -9302,6 +9638,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       const vendorRole = String(vendor?.role || '').trim().toLowerCase();
       if (vendorRole && vendorRole !== 'delivery note') {
         invalidRoleItems.push(row.item_code);
+        localSkipped.push({ id: row.id, itemCode: row.item_code, requestQty: Number(row.request_qty || 0), supplier, reason: 'invalid_role' });
         return false;
       }
       return true;
@@ -9322,9 +9659,10 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       showToastMessage(`Request bukan flow Supplier DN: ${preview}${suffix}.`);
     }
     if (validIds.length === 0) {
-      alert(`Tidak ada request yang valid untuk dibuat DN.
-${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
-      return false;
+      const message = `Tidak ada request yang valid untuk dibuat DN.
+${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`;
+      showToastMessage(message, '', null, 'warning');
+      return { ok: false, action: approveBeforeDn ? 'approve-dn' : 'dn', error: message, result: { skipped: localSkipped }, selectedRows };
     }
     if (eligibleIds.length !== selectedRequestIds.length) {
       showToastMessage(`Sebagian request di-skip karena status tidak valid atau sudah punya DN.
@@ -9340,10 +9678,12 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
           approveBeforeDn,
         }),
       });
+      const resultPayload = result || {};
+      resultPayload.skipped = [...localSkipped, ...(Array.isArray(resultPayload?.skipped) ? resultPayload.skipped : [])];
       setSelectedRequestIds([]);
-      const dns = Array.isArray(result?.dns) ? result.dns : result?.dn ? [result.dn] : [];
-      const skippedCount = Array.isArray(result?.skipped) ? result.skipped.length : 0;
-      const approvedCount = Array.isArray(result?.approvedIds) ? result.approvedIds.length : 0;
+      const dns = Array.isArray(resultPayload?.dns) ? resultPayload.dns : resultPayload?.dn ? [resultPayload.dn] : [];
+      const skippedCount = Array.isArray(resultPayload?.skipped) ? resultPayload.skipped.length : 0;
+      const approvedCount = Array.isArray(resultPayload?.approvedIds) ? resultPayload.approvedIds.length : 0;
       const dnLabels = dns.map((dn) => dn?.dn_number).filter(Boolean);
       const dnText = dnLabels.length ? dnLabels.join(', ') : '';
       const dnPrefix = dnText ? `DN ${dnText}` : 'DN';
@@ -9351,14 +9691,22 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       const approvedNote = approveBeforeDn && approvedCount > 0 ? ` (${approvedCount} di-approve dulu)` : '';
       showToastMessage(`${approvePrefix} dibuat untuk ${validIds.length} request${approvedNote}.${skippedCount ? ` (${skippedCount} di-skip)` : ''}`);
       if (skippedCount) {
-        console.warn('Batch DN skipped rows:', result.skipped);
+        console.warn('Batch DN skipped rows:', resultPayload.skipped);
       }
       await fetchKanbanRequests();
       await fetchDeliveryNotes();
-      return true;
+      return { ok: true, action: approveBeforeDn ? 'approve-dn' : 'dn', result: resultPayload, selectedRows };
     } catch (error) {
-      alert(error.message || 'Gagal membuat DN.');
-      return false;
+      const errorResult = error.response ? { ...error.response } : {};
+      errorResult.skipped = [...localSkipped, ...(Array.isArray(errorResult.skipped) ? errorResult.skipped : [])];
+      return {
+        ok: false,
+        action: approveBeforeDn ? 'approve-dn' : 'dn',
+        error: error.message || 'Gagal membuat DN.',
+        result: errorResult,
+        selectedRows,
+        status: error.status || null,
+      };
     }
   };
 
@@ -9587,7 +9935,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       alert('Data master kanban belum tersedia.');
       return;
     }
-    const reservedStatuses = new Set(['triggered', 'requested', 'approved', 'dn_created', 'scheduled', 'in_transit']);
+    const reservedStatuses = new Set(['triggered', 'requested', 'approved', 'production_ready', 'dn_created', 'scheduled', 'in_transit']);
     const terminalDnStatuses = new Set(['closed', 'received', 'cancelled', 'canceled', 'rejected']);
     const reservedTotals = new Map();
     (kanbanRequests || []).forEach((request) => {
@@ -11572,7 +11920,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     const exceptionNote = String(row?.exception_note || '').trim();
     const isOverPrl = exceptionCode === 'OVER_PRL' || /over[_\s-]?prl/i.test(`${exceptionCode} ${exceptionNote} ${row?.notes || ''}`);
     const hasException = Boolean(exceptionCode || exceptionNote);
-    const hasStockGap = ['triggered', 'requested', 'approved'].includes(statusKey) && onHand < requestQty;
+    const hasStockGap = ['triggered', 'requested', 'approved', 'production_ready'].includes(statusKey) && onHand < requestQty;
     const isClosedLike = ['closed', 'rejected', 'fifo'].includes(statusKey);
     const fallbackOverdue = !isClosedLike && createdAtMs && ageHours >= 24;
     const isOverdue = !isClosedLike && (
@@ -11616,6 +11964,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     const statusKey = String(row?.status || 'requested').trim().toLowerCase();
     if (statusKey === 'triggered' || statusKey === 'requested') return 'Pending';
     if (statusKey === 'approved') return 'Approved';
+    if (statusKey === 'production_ready') return 'WO Released';
     if (statusKey === 'dn_created') return 'DN Issued';
     if (statusKey === 'scheduled') return 'Scheduled';
     if (statusKey === 'in_transit') return 'In Transit';
@@ -11765,7 +12114,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       const blockers = [];
       if (mode === 'approve') {
         if (!['triggered', 'requested'].includes(statusKey)) blockers.push(`status ${getKanbanRequestStatusLabel(row)}`);
-      } else if (!['triggered', 'requested', 'approved'].includes(statusKey)) {
+      } else if (!['triggered', 'requested', 'approved', 'production_ready'].includes(statusKey)) {
         blockers.push(`status ${getKanbanRequestStatusLabel(row)}`);
       }
       if (row?.dn_id) blockers.push(`sudah punya DN ${row.dn_number || row.dn_id}`);
@@ -13252,6 +13601,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     dnPrintLoading,
     dnPrintPayload,
     dnPrintMode,
+    dnEmailSendingId,
     dnStatusFlowList,
     emptyKanbanForm,
     expiringSoonRows,
@@ -13363,6 +13713,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     handleDeleteModel,
     handleDeleteProcess,
     handleDnEmail,
+    isDnEmailSent,
     handleDnDetailSave,
     handleForceCloseDn,
     handleDnPreview,
@@ -13427,7 +13778,12 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     handleSaveVendor,
     handleSaveWarehouse,
     handleSendEmail,
+    handleSendFullScheduleEmail,
     handleSendEmailReminder,
+    inboundEmailNotice,
+    setInboundEmailNotice,
+    inboundFullEmailReport,
+    setInboundFullEmailReport,
     handleSyncInventoryFromKanban,
     handleUnlockActual,
     handleUpdateActual,
@@ -14069,7 +14425,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                       if (!canEditSchedules) return;
                       setMainTab('kanban');
                       setKanbanView('board');
-                      setKanbanSubTab('dashboard');
+                      setKanbanSubTab('requests');
                     }}
                     disabled={!canEditSchedules}
                     title={canEditSchedules ? 'Buka Kanban Board' : getMainNavAccessMessage('kanban')}
@@ -15142,6 +15498,242 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
           </div>
         )}
 
+        {dnEmailConfirm && (
+          <div className="fixed inset-0 z-[1200] flex items-center justify-center bg-slate-900/40 p-4 print:hidden">
+            <div className="w-full max-w-md overflow-hidden rounded-xl border border-slate-200 bg-white shadow-2xl">
+              <div className="bg-sky-50 px-5 py-4">
+                <div className="flex items-start gap-3">
+                  <div className="mt-0.5 rounded-full bg-sky-100 p-2 text-sky-700">
+                    <Mail size={18} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-semibold text-sky-950">Email DN sudah pernah dikirim</div>
+                    <div className="mt-1 text-sm leading-6 text-sky-800">
+                      Klik Resend Email hanya jika supplier belum menerima email.
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setDnEmailConfirm(null)}
+                    className="rounded-lg p-1 text-slate-400 hover:bg-white/70 hover:text-slate-600"
+                    title="Tutup konfirmasi email"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+              </div>
+              <div className="space-y-3 px-5 py-4 text-sm">
+                <div>
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">DN Number</div>
+                  <div className="mt-1 font-semibold text-slate-900">{dnEmailConfirm.meta?.dnNumber || '-'}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Penerima terakhir</div>
+                  <div className="mt-1 text-slate-800">{dnEmailConfirm.meta?.to || 'Belum tercatat'}</div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Waktu kirim</div>
+                    <div className="mt-1 text-slate-800">{dnEmailConfirm.meta?.sentAtLabel || 'Belum tercatat'}</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Status SMTP</div>
+                    <div className="mt-1 text-slate-800">
+                      {dnEmailConfirm.meta?.smtpStatus
+                        ? String(dnEmailConfirm.meta.smtpStatus).toUpperCase()
+                        : (dnEmailConfirm.meta?.sendCount ? 'ACCEPTED' : 'RIWAYAT LAMA')}
+                    </div>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Jumlah kirim</div>
+                    <div className="mt-1 text-slate-800">{dnEmailConfirm.meta?.sendCount ? `${dnEmailConfirm.meta.sendCount}x` : 'Riwayat lama'}</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Message ID</div>
+                    <div className="mt-1 truncate text-slate-800" title={dnEmailConfirm.meta?.messageId || ''}>{dnEmailConfirm.meta?.messageId || '-'}</div>
+                  </div>
+                </div>
+                {(dnEmailConfirm.meta?.rejectedTo || dnEmailConfirm.meta?.lastError) && (
+                  <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                    {dnEmailConfirm.meta?.lastError || `Penerima ditolak SMTP: ${dnEmailConfirm.meta.rejectedTo}`}
+                  </div>
+                )}
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+                  Status ACCEPTED berarti SMTP sudah menerima email. Jika supplier belum menerima, cek Spam/Junk atau kemungkinan server penerima menahan email; bounce belakangan belum bisa dibaca otomatis oleh sistem.
+                </div>
+              </div>
+              <div className="flex flex-wrap justify-end gap-2 border-t border-slate-100 px-5 py-3">
+                {dnEmailConfirm.meta?.previewUrl && (
+                  <a
+                    href={dnEmailConfirm.meta.previewUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+                  >
+                    <FileText size={14} /> Preview DN
+                  </a>
+                )}
+                {dnEmailConfirm.meta?.labelUrl && (
+                  <a
+                    href={dnEmailConfirm.meta.labelUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+                  >
+                    Setting Label
+                  </a>
+                )}
+                <button
+                  type="button"
+                  onClick={() => handleDnEmail(dnEmailConfirm.dn, { resend: true })}
+                  disabled={Number(dnEmailSendingId) === Number(dnEmailConfirm.dn?.id)}
+                  className="rounded-lg bg-sky-700 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-800 disabled:cursor-wait disabled:bg-sky-300"
+                >
+                  {Number(dnEmailSendingId) === Number(dnEmailConfirm.dn?.id) ? 'Mengirim...' : 'Resend Email'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDnEmailConfirm(null)}
+                  className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+                >
+                  OK
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {dnEmailResult && (
+          <div className="fixed inset-0 z-[1200] flex items-center justify-center bg-slate-900/40 p-4 print:hidden">
+            <div className="w-full max-w-md overflow-hidden rounded-xl border border-slate-200 bg-white shadow-2xl">
+              <div className={`px-5 py-4 ${dnEmailResult.sent ? 'bg-emerald-50' : 'bg-amber-50'}`}>
+                <div className="flex items-start gap-3">
+                  <div className={`mt-0.5 rounded-full p-2 ${dnEmailResult.sent ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
+                    {dnEmailResult.sent ? <CheckCircle size={18} /> : <AlertTriangle size={18} />}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className={`text-sm font-semibold ${dnEmailResult.sent ? 'text-emerald-900' : 'text-amber-900'}`}>
+                      {dnEmailResult.title}
+                    </div>
+                    <div className={`mt-1 text-sm leading-6 ${dnEmailResult.sent ? 'text-emerald-800' : 'text-amber-800'}`}>
+                      {dnEmailResult.message}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setDnEmailResult(null)}
+                    className="rounded-lg p-1 text-slate-400 hover:bg-white/70 hover:text-slate-600"
+                    title="Tutup hasil email"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+              </div>
+              <div className="space-y-3 px-5 py-4 text-sm">
+                {dnEmailResult.subject && (
+                  <div>
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Subject</div>
+                    <div className="mt-1 text-slate-800">{dnEmailResult.subject}</div>
+                  </div>
+                )}
+                {dnEmailResult.to && (
+                  <div>
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Penerima</div>
+                    <div className="mt-1 text-slate-800">{dnEmailResult.to}</div>
+                  </div>
+                )}
+              </div>
+              <div className="flex flex-wrap justify-end gap-2 border-t border-slate-100 px-5 py-3">
+                {dnEmailResult.previewUrl && (
+                  <a
+                    href={dnEmailResult.previewUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+                  >
+                    <FileText size={14} /> Preview DN
+                  </a>
+                )}
+                {(dnEmailResult.labelUrl || dnEmailResult.portalUrl) && (
+                  <a
+                    href={dnEmailResult.labelUrl || dnEmailResult.portalUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+                  >
+                    Setting Label
+                  </a>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setDnEmailResult(null)}
+                  className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+                >
+                  OK
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {dnEmailPreview && (
+          <div className="fixed inset-0 z-[1200] flex items-center justify-center bg-slate-900/45 p-4 print:hidden">
+            <div className="flex max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-2xl">
+              <div className="flex items-start justify-between gap-4 border-b border-slate-100 px-5 py-4">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-sky-600">
+                    <Mail size={14} />
+                    Preview Email DN
+                  </div>
+                  <div className="mt-1 truncate text-base font-semibold text-slate-900">{dnEmailPreview.subject}</div>
+                  <div className="mt-1 text-xs text-slate-500">
+                    {dnEmailPreview.to ? `To: ${dnEmailPreview.to}` : 'Penerima belum tersedia'}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setDnEmailPreview(null)}
+                  className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                  title="Tutup preview email"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="border-b border-amber-100 bg-amber-50 px-5 py-3 text-sm text-amber-800">
+                {dnEmailPreview.notice}
+              </div>
+              <div className="min-h-0 flex-1 bg-slate-100 p-4">
+                <iframe
+                  title="Preview Email DN"
+                  srcDoc={dnEmailPreview.html}
+                  className="h-[68vh] w-full rounded-lg border border-slate-200 bg-white"
+                />
+              </div>
+              <div className="flex flex-wrap justify-end gap-2 border-t border-slate-100 px-5 py-3">
+                {dnEmailPreview.portalUrl && (
+                  <a
+                    href={dnEmailPreview.portalUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+                  >
+                    Buka Portal
+                  </a>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setDnEmailPreview(null)}
+                  className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+                >
+                  Tutup
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {toast.open && (
             <div className="fixed top-6 right-6 z-[1210] print:hidden">
               <div
@@ -15254,6 +15846,17 @@ const MainApp = () => {
   const authBootstrappedRef = useRef(false);
   const idleLogoutTimerRef = useRef(null);
   const idleLogoutPendingRef = useRef(false);
+  const publicDnRoute = useMemo(() => {
+    if (typeof window === 'undefined') return null;
+    const params = new URLSearchParams(window.location.search || '');
+    const mode = String(params.get('public') || '').trim().toLowerCase();
+    if (!['dn-preview', 'dn-label'].includes(mode)) return null;
+    return {
+      mode,
+      dnNumber: String(params.get('dn') || params.get('dnNumber') || '').trim(),
+    };
+  }, []);
+  const publicApiFetch = useCallback((path, options = {}) => apiRequest(path, options), []);
 
   useEffect(() => {
     if (authBootstrappedRef.current) return;
@@ -15353,6 +15956,32 @@ const MainApp = () => {
 
   if (auth.loading) {
     return <div className="min-h-screen bg-slate-100 flex items-center justify-center text-slate-600">Loading...</div>;
+  }
+
+  if (publicDnRoute) {
+    return (
+      <>
+        <ApiStatusBanner
+          online={apiHealth.online}
+          checking={apiHealth.checking}
+          lastCheckedAt={apiHealth.lastCheckedAt}
+          lastError={apiHealth.lastError}
+          lastLatencyMs={apiHealth.lastLatencyMs}
+          onRetry={apiHealth.checkNow}
+        />
+        <Suspense fallback={<div className="min-h-screen bg-slate-50 p-6 text-sm text-slate-500">Memuat halaman DN publik...</div>}>
+          <TabSupplierPortal
+            apiFetch={publicApiFetch}
+            ensureXlsx={null}
+            formatDateID={publicFormatDateID}
+            formatNumber0={publicFormatNumber0}
+            publicMode
+            publicView={publicDnRoute.mode}
+            publicDnNumber={publicDnRoute.dnNumber}
+          />
+        </Suspense>
+      </>
+    );
   }
 
   return (

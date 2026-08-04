@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bar,
   CartesianGrid,
@@ -425,6 +425,56 @@ const TabReports = (props) => {
 
   const normalizeInboundStatus = (value) => String(value || '').toLowerCase().replace(/\s+/g, '');
 
+  const masterSupplierLookup = useMemo(() => {
+    const map = new Map();
+    (Array.isArray(masterVendors) ? masterVendors : []).forEach((vendor) => {
+      if (!vendor) return;
+      const id = String(vendor.id || '').trim();
+      const name = String(vendor.name || '').trim();
+      if (id) map.set(id.toLowerCase(), vendor);
+      if (name) map.set(name.toLowerCase(), vendor);
+    });
+    return map;
+  }, [masterVendors]);
+
+  const resolveInboundSupplierMeta = useCallback((rowOrValue) => {
+    const candidates = [];
+    if (rowOrValue && typeof rowOrValue === 'object') {
+      candidates.push(
+        rowOrValue.supplierId,
+        rowOrValue.supplier_id,
+        rowOrValue.poSupplierId,
+        rowOrValue.po_supplier_id,
+        rowOrValue.supplier,
+        rowOrValue.supplierName,
+        rowOrValue.supplier_name,
+      );
+    } else {
+      candidates.push(rowOrValue);
+    }
+    let fallback = '';
+    for (const candidate of candidates) {
+      const text = String(candidate || '').trim();
+      if (!text) continue;
+      if (!fallback) fallback = text;
+      const vendor = masterSupplierLookup.get(text.toLowerCase());
+      if (vendor) {
+        const id = String(vendor.id || text).trim();
+        const name = String(vendor.name || id || text).trim();
+        return {
+          key: id || name || text,
+          name: name || id || text,
+          label: id && name && id !== name ? `${id} - ${name}` : (name || id || text),
+        };
+      }
+    }
+    return {
+      key: fallback || 'UNKNOWN',
+      name: fallback || 'UNKNOWN',
+      label: fallback || 'UNKNOWN',
+    };
+  }, [masterSupplierLookup]);
+
   const inboundDailyTrend = useMemo(() => {
     const dateKeys = buildDateKeys(reportStart, reportEnd, inboundPerformanceRows);
     const map = new Map(dateKeys.map((dateKey) => [dateKey, {
@@ -454,10 +504,13 @@ const TabReports = (props) => {
   const inboundSupplierKpiRows = useMemo(() => {
     const grouped = new Map();
     inboundPerformanceRows.forEach((row) => {
-      const supplier = String(row?.supplier || '').trim() || 'UNKNOWN';
-      if (!grouped.has(supplier)) {
-        grouped.set(supplier, {
-          supplier,
+      const supplierMeta = resolveInboundSupplierMeta(row);
+      const supplierKey = String(supplierMeta.key || '').trim() || 'UNKNOWN';
+      if (!grouped.has(supplierKey)) {
+        grouped.set(supplierKey, {
+          supplier: supplierMeta.name || supplierKey,
+          supplierLabel: supplierMeta.label || supplierMeta.name || supplierKey,
+          supplierKey,
           total: 0,
           onTime: 0,
           late: 0,
@@ -465,7 +518,9 @@ const TabReports = (props) => {
           tooEarly: 0,
         });
       }
-      const bucket = grouped.get(supplier);
+      const bucket = grouped.get(supplierKey);
+      bucket.supplier = supplierMeta.name || bucket.supplier || supplierKey;
+      bucket.supplierLabel = supplierMeta.label || bucket.supplierLabel || bucket.supplier;
       bucket.total += 1;
       const status = normalizeInboundStatus(row?.status);
       if (status.includes('late')) bucket.late += 1;
@@ -480,7 +535,7 @@ const TabReports = (props) => {
         lateRate: row.total ? (row.late / row.total) * 100 : 0,
       }))
       .sort((left, right) => right.late - left.late || right.total - left.total || String(left.supplier).localeCompare(String(right.supplier), 'id'));
-  }, [inboundPerformanceRows]);
+  }, [inboundPerformanceRows, resolveInboundSupplierMeta]);
 
   const inboundSupplierChartRows = useMemo(
     () => inboundSupplierKpiRows.slice(0, 8).map((row) => ({
@@ -514,7 +569,10 @@ const TabReports = (props) => {
 
   const masterSupplierOptions = useMemo(() => {
     const seen = new Set();
-    return (Array.isArray(masterVendors) ? masterVendors : [])
+    const vendorRows = Array.isArray(masterVendors) ? masterVendors : [];
+    const supplierRows = vendorRows.filter((vendor) => String(vendor?.type || '').trim().toLowerCase() === 'supplier');
+    const sourceRows = supplierRows.length > 0 ? supplierRows : vendorRows;
+    return sourceRows
       .map((vendor) => {
         const id = String(vendor?.id || '').trim();
         const name = String(vendor?.name || '').trim();
@@ -715,6 +773,7 @@ const TabReports = (props) => {
     monthlyTrend: [],
     topDefects: [],
     supplierRows: [],
+    incomingItemRows: [],
     openCases: [],
     millsheet: {},
   });
@@ -759,6 +818,7 @@ const TabReports = (props) => {
         monthlyTrend: Array.isArray(data?.monthlyTrend) ? data.monthlyTrend : [],
         topDefects: Array.isArray(data?.topDefects) ? data.topDefects : [],
         supplierRows: Array.isArray(data?.supplierRows) ? data.supplierRows : [],
+        incomingItemRows: Array.isArray(data?.incomingItemRows) ? data.incomingItemRows : [],
         openCases: Array.isArray(data?.openCases) ? data.openCases : [],
         millsheet: data?.millsheet || {},
       });
@@ -770,6 +830,27 @@ const TabReports = (props) => {
   };
   const handleExportQcReportExcel = async () => {
     const rows = [
+      ...(qcReportData.incomingItemRows || []).map((row) => ({
+        Section: 'Seluruh Item Datang',
+        Supplier: row.supplierCode,
+        'Nama Supplier': row.supplierName,
+        Item: row.itemCode,
+        'Nama Item': row.itemName,
+        'Part No': row.partNo,
+        Unit: row.unit,
+        'RN Count': row.rnCount,
+        'Line Count': row.receiptLines,
+        'First Received': formatPrintDate(row.firstReceivedAt),
+        'Last Received': formatPrintDate(row.lastReceivedAt),
+        'Qty Dokumen': row.docQty,
+        'Qty Datang': row.receivedQty,
+        'Qty OK': row.qtyOk,
+        'Qty NG': row.qtyNg,
+        PPM: row.ppm,
+        'QC Issue Line': row.qcIssueLines,
+        'QC Status': row.qcStatus,
+        Defect: row.defectCategory,
+      })),
       ...(qcReportData.supplierRows || []).map((row) => ({
         Section: 'Supplier Performance',
         Supplier: row.supplierCode,
@@ -816,7 +897,12 @@ const TabReports = (props) => {
         return;
       }
     }
-    const headers = rows.length ? Object.keys(rows[0]) : ['Info'];
+    const headers = rows.length
+      ? Array.from(rows.reduce((set, row) => {
+        Object.keys(row).forEach((key) => set.add(key));
+        return set;
+      }, new Set()))
+      : ['Info'];
     const bodyRows = rows.length ? rows : [{ Info: 'Tidak ada data' }];
     const csv = [
       headers.join(','),
@@ -978,6 +1064,11 @@ const TabReports = (props) => {
     if (key === 'status') return month.status || '';
     return '';
   };
+  const getQualitySpsStatusClass = (status) => {
+    const normalized = String(status || '').trim().toLowerCase();
+    if (!normalized) return '';
+    return normalized.includes('tidak') ? 'quality-sps-status-bad' : 'quality-sps-status-good';
+  };
   const renderQualitySpsTable = () => (
     <div className="quality-sps-table-wrap">
       <table className="quality-sps-table">
@@ -1013,11 +1104,11 @@ const TabReports = (props) => {
             <td className="quality-sps-percent">{qualitySps.avgStatus ? formatSpsPercent(qualitySps.avgPercent) : ''}</td>
           </tr>
           <tr>
-            <td>Hasil 100%<br />+-20%</td>
+            <td>Hasil Target<br />100% +/-20%</td>
             {qualitySpsMonths.map((month) => (
-              <td key={`sps-status-${month.key || month.month}`} className="quality-sps-status">{renderQualitySpsValue(month, 'status')}</td>
+              <td key={`sps-status-${month.key || month.month}`} className={`quality-sps-status ${getQualitySpsStatusClass(renderQualitySpsValue(month, 'status'))}`}>{renderQualitySpsValue(month, 'status')}</td>
             ))}
-            <td className="quality-sps-status">{qualitySps.avgStatus || ''}</td>
+            <td className={`quality-sps-status ${getQualitySpsStatusClass(qualitySps.avgStatus)}`}>{qualitySps.avgStatus || ''}</td>
           </tr>
         </tbody>
       </table>
@@ -2167,7 +2258,7 @@ const TabReports = (props) => {
                               )}
                               {!reportLoading && inboundPerformanceRows.map((row, idx) => (
                                 <tr key={`${row.poNumber}-${idx}`} className="border-t">
-                                  <td className="p-3">{row.supplier}</td>
+                                  <td className="p-3">{resolveInboundSupplierMeta(row).name}</td>
                                   <td className="p-3">{row.poNumber}</td>
                                   <td className="p-3">{row.doNumber || '-'}</td>
                                   <td className="p-3">{row.item}</td>
@@ -2273,7 +2364,7 @@ const TabReports = (props) => {
                                 <tr><td colSpan="6" className="p-4 text-center text-gray-400">Tidak ada data.</td></tr>
                               )}
                               {!reportLoading && inboundSupplierKpiRows.map((row) => (
-                                <tr key={row.supplier} className="border-t">
+                                <tr key={row.supplierKey || row.supplier} className="border-t">
                                   <td className="p-3 font-medium text-slate-900">{row.supplier}</td>
                                   <td className="p-3 text-right">{formatCount(row.total)}</td>
                                   <td className="p-3 text-right text-emerald-600">{formatCount(row.onTime)}</td>
@@ -2883,14 +2974,22 @@ const TabReports = (props) => {
                     <div className="quality-sps-header">
                       <div className="quality-sps-brand">
                         <img src={logoPrl} alt="PT. Matra Roda Piranti" />
-                        <div>PT. Matra Roda Piranti</div>
+                        <div className="quality-sps-company">PT. Matra Roda Piranti</div>
+                        <div className="quality-sps-dept">Production Planning & Inventory Control</div>
                       </div>
                       <div className="quality-sps-title">
-                        SASARAN MUTU PPIC TAHUN {qualitySpsYear}
+                        <div>SASARAN MUTU PPIC</div>
+                        <span>TAHUN {qualitySpsYear}</span>
                       </div>
                       <div className="quality-sps-meta">
-                        <div>{qualitySpsSupplierLabel}</div>
-                        <div>{qualityMonthRangeText}</div>
+                        <div className="quality-sps-meta-row">
+                          <span>Supplier</span>
+                          <b>{qualitySpsSupplierLabel}</b>
+                        </div>
+                        <div className="quality-sps-meta-row">
+                          <span>Periode</span>
+                          <b>{qualityMonthRangeText}</b>
+                        </div>
                       </div>
                     </div>
 
@@ -2901,24 +3000,24 @@ const TabReports = (props) => {
                         {renderQualitySpsTable()}
                         <div className="quality-sps-chart">
                           <SafeResponsiveContainer>
-                            <ComposedChart data={qualitySpsChartRows} margin={{ top: 12, right: 34, bottom: 30, left: 6 }}>
-                              <CartesianGrid stroke="#d9d9d9" vertical={false} />
-                              <XAxis dataKey="label" tick={{ fontSize: 10 }} interval={0} />
-                              <YAxis yAxisId="qty" tick={{ fontSize: 10 }} tickFormatter={(value) => Number(value || 0).toLocaleString('id-ID')} />
-                              <YAxis yAxisId="percent" orientation="right" domain={[0, 120]} tick={{ fontSize: 10 }} tickFormatter={(value) => `${value}%`} />
+                            <ComposedChart data={qualitySpsChartRows} margin={{ top: 18, right: 42, bottom: 34, left: 10 }}>
+                              <CartesianGrid stroke="#e2e8f0" vertical={false} />
+                              <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#334155' }} interval={0} axisLine={{ stroke: '#94a3b8' }} tickLine={{ stroke: '#94a3b8' }} />
+                              <YAxis yAxisId="qty" tick={{ fontSize: 10, fill: '#334155' }} tickFormatter={(value) => Number(value || 0).toLocaleString('id-ID')} axisLine={{ stroke: '#94a3b8' }} tickLine={{ stroke: '#94a3b8' }} />
+                              <YAxis yAxisId="percent" orientation="right" domain={[0, 120]} tick={{ fontSize: 10, fill: '#334155' }} tickFormatter={(value) => `${value}%`} axisLine={{ stroke: '#94a3b8' }} tickLine={{ stroke: '#94a3b8' }} />
                               <Tooltip formatter={(value, name) => {
                                 if (name === '%') return [`${Number(value || 0).toFixed(0)}%`, name];
                                 return [Number(value || 0).toLocaleString('id-ID'), name];
                               }} />
-                              <Legend verticalAlign="bottom" height={24} wrapperStyle={{ fontSize: 10 }} />
-                              <Bar yAxisId="qty" dataKey="incomingQty" name="Total Incoming (Pcs)" fill="#4472c4" barSize={26}>
+                              <Legend verticalAlign="bottom" height={28} wrapperStyle={{ fontSize: 10, color: '#334155' }} />
+                              <Bar yAxisId="qty" dataKey="incomingQty" name="Total Incoming (Pcs)" fill="#2563eb" barSize={22}>
                                 <LabelList dataKey="incomingQty" position="insideBottom" angle={-90} formatter={(value) => (value ? formatSpsQty(value) : '')} fill="#ffffff" fontSize={10} />
                               </Bar>
-                              <Bar yAxisId="qty" dataKey="dnOrderQty" name="Total DN Order (Pcs)" fill="#ed7d31" barSize={26}>
+                              <Bar yAxisId="qty" dataKey="dnOrderQty" name="Total DN Order (Pcs)" fill="#f97316" barSize={22}>
                                 <LabelList dataKey="dnOrderQty" position="insideBottom" angle={-90} formatter={(value) => (value ? formatSpsQty(value) : '')} fill="#ffffff" fontSize={10} />
                               </Bar>
-                              <Line yAxisId="percent" type="monotone" dataKey="percent" name="%" stroke="#8c8c8c" strokeWidth={2} dot={false} connectNulls={false}>
-                                <LabelList dataKey="percent" position="top" formatter={(value) => (value ? `${Math.round(value)}%` : '')} fill="#111827" fontSize={10} />
+                              <Line yAxisId="percent" type="monotone" dataKey="percent" name="%" stroke="#475569" strokeWidth={2.2} dot={{ r: 3, fill: '#475569' }} connectNulls={false}>
+                                <LabelList dataKey="percent" position="top" formatter={(value) => (value ? `${Math.round(value)}%` : '')} fill="#111827" fontSize={10} fontWeight={700} />
                               </Line>
                             </ComposedChart>
                           </SafeResponsiveContainer>
@@ -2989,6 +3088,25 @@ const TabReports = (props) => {
                     <div className="mb-4 rounded border border-red-200 bg-red-50 p-3 text-sm text-red-700">{qcReportError}</div>
                   )}
 
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+                    <div className="bg-slate-900 text-white p-3 rounded border border-slate-900">
+                      <div className="text-xs text-slate-300 uppercase">Item Datang</div>
+                      <div className="font-bold text-xl">{formatCount(qcSummary.incomingItemCount)}</div>
+                    </div>
+                    <div className="bg-white p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Qty Datang</div>
+                      <div className="font-bold text-xl">{formatQuantity(qcSummary.incomingReceivedQty)}</div>
+                    </div>
+                    <div className="bg-white p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Qty NG</div>
+                      <div className="font-bold text-xl text-rose-600">{formatQuantity(qcSummary.incomingNgQty)}</div>
+                    </div>
+                    <div className="bg-white p-3 rounded border">
+                      <div className="text-xs text-gray-400 uppercase">Total PPM</div>
+                      <div className="font-bold text-xl text-indigo-700">{formatCount(qcSummary.incomingPpm)}</div>
+                    </div>
+                  </div>
+
                   <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mb-6">
                     <div className="bg-white p-3 rounded border">
                       <div className="text-xs text-gray-400 uppercase">Total Case</div>
@@ -3007,7 +3125,7 @@ const TabReports = (props) => {
                       <div className="font-bold text-xl text-rose-600">{formatCount((qcSummary.rejectCount || 0) + (qcSummary.returnSupplierCount || 0))}</div>
                     </div>
                     <div className="bg-white p-3 rounded border">
-                      <div className="text-xs text-gray-400 uppercase">Defect PPM</div>
+                      <div className="text-xs text-gray-400 uppercase">Case PPM</div>
                       <div className="font-bold text-xl">{formatCount(qcSummary.defectPpm)}</div>
                     </div>
                     <div className="bg-white p-3 rounded border">
@@ -3040,6 +3158,58 @@ const TabReports = (props) => {
                     <div className="bg-slate-50 p-3 rounded border">
                       <div className="text-xs text-gray-400 uppercase">Mill Sheet Open</div>
                       <div className="font-bold text-purple-700">{formatCount((qcMillsheet.waitingQc || 0) + (qcMillsheet.pendingReceipts || 0))}</div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border overflow-hidden mb-6">
+                    <div className="bg-slate-50 px-3 py-2 text-sm font-semibold">Seluruh Item Datang dan PPM</div>
+                    <div className="overflow-x-auto">
+                      <table className="min-w-full text-xs">
+                        <thead className="bg-slate-100 text-slate-600">
+                          <tr>
+                            <th className="p-2 text-left">Supplier</th>
+                            <th className="p-2 text-left">Item</th>
+                            <th className="p-2 text-left">Part No</th>
+                            <th className="p-2 text-right">RN</th>
+                            <th className="p-2 text-left">Datang Terakhir</th>
+                            <th className="p-2 text-right">Qty Datang</th>
+                            <th className="p-2 text-right">Qty OK</th>
+                            <th className="p-2 text-right">Qty NG</th>
+                            <th className="p-2 text-right">PPM</th>
+                            <th className="p-2 text-left">QC Status</th>
+                            <th className="p-2 text-left">Defect</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {qcReportLoading && (
+                            <tr><td colSpan="11" className="p-4 text-center text-slate-400">Memuat...</td></tr>
+                          )}
+                          {!qcReportLoading && (qcReportData.incomingItemRows || []).length === 0 && (
+                            <tr><td colSpan="11" className="p-4 text-center text-slate-400">Belum ada item datang pada periode ini.</td></tr>
+                          )}
+                          {!qcReportLoading && (qcReportData.incomingItemRows || []).map((row) => (
+                            <tr key={`qc-incoming-${row.supplierCode}-${row.itemCode}`} className="border-t">
+                              <td className="p-2">
+                                <div className="font-semibold">{row.supplierCode || '-'}</div>
+                                <div className="text-[11px] text-slate-500">{row.supplierName || '-'}</div>
+                              </td>
+                              <td className="p-2">
+                                <div className="font-semibold">{row.itemCode || '-'}</div>
+                                <div className="text-[11px] text-slate-500">{row.itemName || '-'}</div>
+                              </td>
+                              <td className="p-2">{row.partNo || '-'}</td>
+                              <td className="p-2 text-right">{formatCount(row.rnCount)}</td>
+                              <td className="p-2">{formatPrintDate(row.lastReceivedAt)}</td>
+                              <td className="p-2 text-right">{formatQuantity(row.receivedQty)}</td>
+                              <td className="p-2 text-right text-emerald-700">{formatQuantity(row.qtyOk)}</td>
+                              <td className="p-2 text-right text-rose-700">{formatQuantity(row.qtyNg)}</td>
+                              <td className="p-2 text-right font-semibold">{formatCount(row.ppm)}</td>
+                              <td className="p-2">{row.qcStatus || '-'}</td>
+                              <td className="p-2">{row.defectCategory || '-'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
                     </div>
                   </div>
 

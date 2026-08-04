@@ -214,6 +214,7 @@ const TabQuality = (props) => {
     return rows.filter((row) => [
       row.caseNumber,
       row.sourceDoc,
+      row.doNumber,
       row.itemCode,
       row.itemName,
       row.partNo,
@@ -699,6 +700,9 @@ const TabQuality = (props) => {
                 </td>
                 <td className="p-3">
                   <div className="font-semibold text-slate-900">{row.sourceDoc || '-'}</div>
+                  {row.doNumber && (
+                    <div className="text-xs font-semibold text-slate-600">SJ/DO: {row.doNumber}</div>
+                  )}
                   <div className="text-xs text-slate-500">{sourceLabel[row.sourceType] || row.sourceType}</div>
                   {isCorrectionReviewRow(row) && (
                     <div className="mt-1 inline-flex rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[11px] font-semibold text-indigo-700">

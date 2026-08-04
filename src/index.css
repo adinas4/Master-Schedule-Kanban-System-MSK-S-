@@ -456,134 +456,205 @@
 .quality-sps-sheet {
   min-width: 1060px;
   background: #fff;
-  color: #000;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  color: #0f172a;
   font-family: Arial, Helvetica, sans-serif;
+  padding: 22px 26px 18px;
+  box-shadow: 0 16px 35px -30px rgba(15, 23, 42, 0.45);
 }
 
 .quality-sps-header {
   display: grid;
-  grid-template-columns: 180px 1fr 180px;
-  align-items: start;
-  gap: 12px;
-  margin-bottom: 28px;
+  grid-template-columns: 220px 1fr 220px;
+  align-items: center;
+  gap: 18px;
+  margin-bottom: 16px;
+  border-bottom: 2px solid #0f172a;
+  padding-bottom: 12px;
 }
 
 .quality-sps-brand {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 2px;
-  color: #1d4ed8;
+  gap: 3px;
+  color: #0f172a;
   font-size: 10px;
   font-weight: 700;
 }
 
 .quality-sps-brand img {
-  width: 86px;
-  height: 58px;
+  width: 72px;
+  height: 48px;
   object-fit: contain;
+}
+
+.quality-sps-company {
+  color: #1d4ed8;
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.quality-sps-dept {
+  color: #64748b;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.2;
 }
 
 .quality-sps-title {
   text-align: center;
-  font-size: 24px;
+  font-size: 23px;
   font-weight: 800;
-  line-height: 1.2;
-  color: #000;
+  line-height: 1.1;
+  color: #020617;
+  letter-spacing: 0.02em;
+}
+
+.quality-sps-title span {
+  display: block;
+  margin-top: 3px;
+  color: #334155;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0;
 }
 
 .quality-sps-meta {
   text-align: right;
-  font-size: 11px;
-  line-height: 1.4;
-  color: #334155;
+  font-size: 10px;
+  color: #0f172a;
+}
+
+.quality-sps-meta-row {
+  display: grid;
+  grid-template-columns: 58px 1fr;
+  gap: 8px;
+  align-items: center;
+  border-bottom: 1px solid #cbd5e1;
+  padding: 5px 0;
+  text-align: left;
+}
+
+.quality-sps-meta-row span {
+  color: #64748b;
+  font-weight: 700;
+}
+
+.quality-sps-meta-row b {
+  text-align: right;
+  font-weight: 800;
 }
 
 .quality-sps-table-wrap {
   width: 100%;
   overflow-x: auto;
+  margin-top: 10px;
 }
 
 .quality-sps-table {
   width: 100%;
   border-collapse: collapse;
   table-layout: fixed;
-  font-size: 12px;
-  color: #000;
+  font-size: 10px;
+  color: #0f172a;
 }
 
 .quality-sps-table th,
 .quality-sps-table td {
-  border: 1px solid #000;
-  padding: 3px 5px;
+  border: 1px solid #94a3b8;
+  padding: 5px 6px;
   text-align: center;
   line-height: 1.2;
-  height: 23px;
+  height: 26px;
 }
 
 .quality-sps-table th {
-  font-weight: 700;
-  background: #fff;
+  background: #e2e8f0;
+  color: #0f172a;
+  font-weight: 800;
 }
 
 .quality-sps-table th:first-child,
 .quality-sps-table td:first-child {
-  width: 120px;
+  width: 132px;
 }
 
 .quality-sps-table td:first-child {
+  background: #f8fafc;
+  color: #334155;
+  font-weight: 700;
   text-align: left;
 }
 
 .quality-sps-table .quality-sps-number {
   text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 .quality-sps-table .quality-sps-percent {
   text-align: center;
+  color: #1e40af;
+  font-weight: 800;
 }
 
 .quality-sps-table .quality-sps-status {
-  color: #000;
-  font-size: 11px;
-  font-weight: 600;
+  color: #334155;
+  font-size: 9px;
+  font-weight: 800;
   white-space: nowrap;
+}
+
+.quality-sps-table .quality-sps-status-good {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.quality-sps-table .quality-sps-status-bad {
+  background: #fee2e2;
+  color: #991b1b;
 }
 
 .quality-sps-chart {
   width: 100%;
-  height: 290px;
-  margin-top: 10px;
+  height: 310px;
+  margin-top: 18px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 8px 10px 2px;
+  background: #ffffff;
 }
 
 .quality-sps-signatures {
   display: flex;
   justify-content: flex-end;
-  margin-top: 34px;
+  margin-top: 18px;
 }
 
 .quality-sps-signatures table {
-  width: 320px;
+  width: 360px;
   border-collapse: collapse;
   table-layout: fixed;
-  font-size: 12px;
-  color: #000;
+  font-size: 10px;
+  color: #0f172a;
 }
 
 .quality-sps-signatures th,
 .quality-sps-signatures td {
-  border: 1px solid #000;
-  padding: 2px 4px;
+  border: 1px solid #334155;
+  padding: 4px 6px;
   text-align: center;
   line-height: 1.2;
 }
 
 .quality-sps-signatures th {
-  font-weight: 400;
+  background: #f1f5f9;
+  font-weight: 800;
 }
 
 .quality-sps-sign-space td {
-  height: 58px;
+  height: 46px;
 }
 
 .scorecard-card {
@@ -1157,64 +1228,89 @@
   }
 
   body.report-print-active .quality-sps-sheet {
-    width: 273mm !important;
-    min-width: 273mm !important;
+    width: 275mm !important;
+    min-width: 275mm !important;
     margin: 0 auto !important;
+    padding: 6mm 7mm 5mm !important;
+    border: 1px solid #94a3b8 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
   }
 
   body.report-print-active .quality-sps-header {
-    grid-template-columns: 42mm 1fr 42mm !important;
-    margin-bottom: 8mm !important;
+    grid-template-columns: 50mm 1fr 52mm !important;
+    gap: 5mm !important;
+    margin-bottom: 4mm !important;
+    padding-bottom: 3mm !important;
   }
 
   body.report-print-active .quality-sps-brand img {
-    width: 23mm !important;
-    height: 15mm !important;
+    width: 19mm !important;
+    height: 13mm !important;
   }
 
   body.report-print-active .quality-sps-brand {
-    font-size: 7pt !important;
+    font-size: 6.5pt !important;
+    gap: 0.8mm !important;
   }
 
   body.report-print-active .quality-sps-title {
-    font-size: 18pt !important;
+    font-size: 17pt !important;
+  }
+
+  body.report-print-active .quality-sps-title span {
+    font-size: 11pt !important;
+    margin-top: 1mm !important;
   }
 
   body.report-print-active .quality-sps-meta {
-    font-size: 7.5pt !important;
+    font-size: 7pt !important;
+  }
+
+  body.report-print-active .quality-sps-meta-row {
+    grid-template-columns: 16mm 1fr !important;
+    gap: 2mm !important;
+    padding: 1.1mm 0 !important;
+  }
+
+  body.report-print-active .quality-sps-table-wrap {
+    margin-top: 2mm !important;
   }
 
   body.report-print-active .quality-sps-table {
-    font-size: 7.8pt !important;
+    font-size: 6.8pt !important;
   }
 
   body.report-print-active .quality-sps-table th,
   body.report-print-active .quality-sps-table td {
-    padding: 1.3mm 1.5mm !important;
-    height: 5.8mm !important;
+    padding: 1mm 1.2mm !important;
+    height: 5.2mm !important;
+    line-height: 1.1 !important;
   }
 
   body.report-print-active .quality-sps-table th:first-child,
   body.report-print-active .quality-sps-table td:first-child {
-    width: 32mm !important;
+    width: 34mm !important;
   }
 
   body.report-print-active .quality-sps-chart {
-    height: 72mm !important;
-    margin-top: 3mm !important;
+    height: 82mm !important;
+    margin-top: 4mm !important;
+    padding: 2mm 2.5mm 0 !important;
+    border-radius: 0 !important;
   }
 
   body.report-print-active .quality-sps-signatures {
-    margin-top: 8mm !important;
+    margin-top: 4mm !important;
   }
 
   body.report-print-active .quality-sps-signatures table {
-    width: 82mm !important;
-    font-size: 8pt !important;
+    width: 88mm !important;
+    font-size: 6.8pt !important;
   }
 
   body.report-print-active .quality-sps-sign-space td {
-    height: 16mm !important;
+    height: 12mm !important;
   }
 
   .report-page-footer {

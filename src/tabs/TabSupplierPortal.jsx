@@ -1,5 +1,5 @@
 ﻿
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BarChart3,
   BookOpen,
@@ -36,11 +36,15 @@ const TabSupplierPortal = (props) => {
     ensureXlsx,
     formatDateID,
     formatNumber0,
+    publicMode = false,
+    publicView = '',
+    publicDnNumber = '',
   } = props;
 
   const todayIso = new Date().toISOString().slice(0, 10);
   const monthStartIso = `${todayIso.slice(0, 8)}01`;
-  const [activeView, setActiveView] = useState('po');
+  const [activeView, setActiveView] = useState(publicMode ? 'dn' : 'po');
+  const [publicDnInput, setPublicDnInput] = useState(publicDnNumber || '');
 
   const [poDraft, setPoDraft] = useState({ q: '', status: '', start: '', end: '' });
   const [poFilters, setPoFilters] = useState({ q: '', status: '', start: '', end: '' });
@@ -77,9 +81,11 @@ const TabSupplierPortal = (props) => {
   const [dnPage, setDnPage] = useState(1);
   const [dnPageSize, setDnPageSize] = useState(50);
   const [dnDetails, setDnDetails] = useState({});
-  const [labelModal, setLabelModal] = useState({ open: false, dnNumber: '', header: null, items: [], controls: {} });
+  const [labelModal, setLabelModal] = useState({ open: false, mode: 'label', dnNumber: '', header: null, items: [], controls: {} });
   const [labelBulkDraft, setLabelBulkDraft] = useState({ packageText: '' });
   const [labelSelectedKeys, setLabelSelectedKeys] = useState([]);
+  const portalDeepLinkHandledRef = useRef(false);
+  const publicPrintTriggeredRef = useRef('');
 
   const [reportDraft, setReportDraft] = useState({ start: monthStartIso, end: todayIso });
   const [reportFilters, setReportFilters] = useState({ start: monthStartIso, end: todayIso });
@@ -421,6 +427,15 @@ const TabSupplierPortal = (props) => {
   }, [formatQty, labelModal]);
 
   const labelBuild = useMemo(() => buildSupplierLabels(labelModal), [buildSupplierLabels, labelModal]);
+  useEffect(() => {
+    if (!publicMode || !labelModal.open || labelModal.mode !== 'dn') return undefined;
+    const key = labelModal.dnNumber || '';
+    if (!key || publicPrintTriggeredRef.current === key) return undefined;
+    publicPrintTriggeredRef.current = key;
+    const timer = setTimeout(() => window.print(), 650);
+    return () => clearTimeout(timer);
+  }, [labelModal.dnNumber, labelModal.mode, labelModal.open, publicMode]);
+
   const supplierDnSummary = useMemo(() => {
     const header = labelModal.header || {};
     const dnNumber = labelModal.dnNumber || header.dn_number || '';
@@ -466,25 +481,30 @@ const TabSupplierPortal = (props) => {
     };
   }, [labelBuild.labels, labelModal]);
 
-  const openDnLabelModal = async (dnNumber) => {
+  const openDnLabelModal = async (dnNumber, options = {}) => {
     if (!dnNumber || !apiFetch) return;
-    let detail = dnDetails[dnNumber];
+    const mode = options.mode === 'dn' ? 'dn' : 'label';
+    const cacheKey = publicMode ? `public:${dnNumber}` : dnNumber;
+    let detail = dnDetails[cacheKey];
     if (!detail?.items || !detail?.header) {
       setDnDetails((prev) => ({
         ...prev,
-        [dnNumber]: { ...(prev[dnNumber] || {}), loading: true, error: '' },
+        [cacheKey]: { ...(prev[cacheKey] || {}), loading: true, error: '' },
       }));
       try {
-        const data = await apiFetch(`/api/supplier/dn/${encodeURIComponent(dnNumber)}`);
+        const endpoint = publicMode
+          ? `/api/public/delivery-notes/lookup?dnNumber=${encodeURIComponent(dnNumber)}`
+          : `/api/supplier/dn/${encodeURIComponent(dnNumber)}`;
+        const data = await apiFetch(endpoint);
         detail = { ...(detail || {}), loading: false, header: data?.header || null, items: data?.items || [] };
         setDnDetails((prev) => ({
           ...prev,
-          [dnNumber]: { ...(prev[dnNumber] || {}), ...detail },
+          [cacheKey]: { ...(prev[cacheKey] || {}), ...detail },
         }));
       } catch (error) {
         setDnDetails((prev) => ({
           ...prev,
-          [dnNumber]: { ...(prev[dnNumber] || {}), loading: false, error: error.message || 'Gagal memuat detail DN.' },
+          [cacheKey]: { ...(prev[cacheKey] || {}), loading: false, error: error.message || 'Gagal memuat detail DN.' },
         }));
         alert(error.message || 'Gagal memuat detail DN.');
         return;
@@ -502,6 +522,7 @@ const TabSupplierPortal = (props) => {
     });
     setLabelModal({
       open: true,
+      mode,
       dnNumber,
       header: detail?.header || null,
       items: itemsForLabel,
@@ -509,6 +530,43 @@ const TabSupplierPortal = (props) => {
     });
     setLabelSelectedKeys([]);
   };
+
+  useEffect(() => {
+    if (publicMode) return;
+    if (portalDeepLinkHandledRef.current || typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search || '');
+    const portal = String(params.get('portal') || '').trim().toLowerCase();
+    const view = String(params.get('view') || '').trim().toLowerCase();
+    const dnNumber = String(params.get('dn') || params.get('dnNumber') || '').trim();
+    const openLabel = ['1', 'true', 'yes', 'label'].includes(String(params.get('label') || '').trim().toLowerCase());
+    const openPreview = ['1', 'true', 'yes', 'pdf', 'preview'].includes(String(params.get('preview') || '').trim().toLowerCase());
+    if (portal !== 'supplier' && view !== 'dn' && !dnNumber) return;
+    portalDeepLinkHandledRef.current = true;
+    setActiveView('dn');
+    if (dnNumber) {
+      setDnDraft((prev) => ({ ...prev, q: dnNumber, status: '', dnStatus: '', start: '', end: '' }));
+      setDnFilters((prev) => ({ ...prev, q: dnNumber, status: '', dnStatus: '', start: '', end: '' }));
+      setDnPage(1);
+      if (openLabel || openPreview) {
+        setTimeout(() => {
+          void openDnLabelModal(dnNumber, { mode: openPreview && !openLabel ? 'dn' : 'label' });
+        }, 250);
+      }
+    }
+  }, [openDnLabelModal, publicMode]);
+
+  useEffect(() => {
+    if (!publicMode || portalDeepLinkHandledRef.current) return;
+    const dnNumber = String(publicDnNumber || '').trim();
+    if (!dnNumber) return;
+    portalDeepLinkHandledRef.current = true;
+    setPublicDnInput(dnNumber);
+    setActiveView('dn');
+    const mode = publicView === 'dn-preview' ? 'dn' : 'label';
+    setTimeout(() => {
+      void openDnLabelModal(dnNumber, { mode });
+    }, 150);
+  }, [openDnLabelModal, publicDnNumber, publicMode, publicView]);
 
   const updateLabelControl = (itemKey, field, value) => {
     setLabelModal((prev) => ({
@@ -873,35 +931,40 @@ const TabSupplierPortal = (props) => {
   }, [apiFetch, buildQuery, millsheetSearch]);
 
   useEffect(() => {
+    if (publicMode) return;
     if (activeView === 'po') {
       fetchPoList();
       fetchPrlList();
     }
-  }, [activeView, fetchPoList, fetchPrlList]);
+  }, [activeView, fetchPoList, fetchPrlList, publicMode]);
 
   useEffect(() => {
+    if (publicMode) return;
     if (activeView === 'schedule') {
       fetchScheduleList();
     }
-  }, [activeView, fetchScheduleList]);
+  }, [activeView, fetchScheduleList, publicMode]);
 
   useEffect(() => {
+    if (publicMode) return;
     if (activeView === 'dn') {
       fetchDnList();
     }
-  }, [activeView, fetchDnList]);
+  }, [activeView, fetchDnList, publicMode]);
 
   useEffect(() => {
+    if (publicMode) return;
     if (activeView === 'report') {
       fetchSupplierPerformance();
     }
-  }, [activeView, fetchSupplierPerformance]);
+  }, [activeView, fetchSupplierPerformance, publicMode]);
 
   useEffect(() => {
+    if (publicMode) return;
     if (activeView === 'millsheet') {
       fetchMillsheets();
     }
-  }, [activeView, fetchMillsheets]);
+  }, [activeView, fetchMillsheets, publicMode]);
 
   const applyPoFilters = () => {
     setPoFilters({ ...poDraft });
@@ -1510,13 +1573,27 @@ const TabSupplierPortal = (props) => {
   const scheduleTotalPages = Math.max(1, Math.ceil(scheduleTotal / schedulePageSize));
   const dnTotalPages = Math.max(1, Math.ceil(dnTotal / dnPageSize));
 
+  const handlePublicDnSubmit = (mode = 'label') => {
+    const dnNumber = String(publicDnInput || '').trim();
+    if (!dnNumber) {
+      alert('Masukkan nomor DN terlebih dahulu.');
+      return;
+    }
+    void openDnLabelModal(dnNumber, { mode: mode === 'dn' ? 'dn' : 'label' });
+  };
+
   return (
     <div className="p-6 space-y-6">
       <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div>
-          <div className="text-2xl font-bold text-slate-900">Supplier Portal</div>
-          <div className="text-sm text-slate-500">Pantau PO, jadwal, DN, label incoming, dan performa delivery.</div>
+          <div className="text-2xl font-bold text-slate-900">{publicMode ? 'Public DN Preview & Label' : 'Supplier Portal'}</div>
+          <div className="text-sm text-slate-500">
+            {publicMode
+              ? 'Buka preview DN atau setting label incoming hanya dengan nomor DN.'
+              : 'Pantau PO, jadwal, DN, label incoming, dan performa delivery.'}
+          </div>
         </div>
+        {!publicMode && (
         <div className="flex flex-wrap gap-2">
           <button
             className={`px-4 py-2 rounded-full text-sm font-semibold border ${activeView === 'guide' ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-200'}`}
@@ -1561,7 +1638,46 @@ const TabSupplierPortal = (props) => {
             Laporan
           </button>
         </div>
+        )}
       </div>
+
+      {publicMode && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+          <div className="grid gap-4 lg:grid-cols-[1fr_auto] lg:items-end">
+            <div>
+              <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">Nomor DN</label>
+              <input
+                className="mt-1 h-11 w-full rounded-xl border border-slate-200 px-3 text-sm text-slate-800 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-100"
+                placeholder="Contoh: 0006/ISTW/07/26"
+                value={publicDnInput}
+                onChange={(event) => setPublicDnInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') handlePublicDnSubmit(publicView === 'dn-preview' ? 'dn' : 'label');
+                }}
+              />
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => handlePublicDnSubmit('dn')}
+                className="inline-flex h-11 items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                <FileText size={16} /> Preview DN/PDF
+              </button>
+              <button
+                type="button"
+                onClick={() => handlePublicDnSubmit('label')}
+                className="inline-flex h-11 items-center gap-2 rounded-xl bg-slate-900 px-4 text-sm font-semibold text-white hover:bg-slate-800"
+              >
+                <Printer size={16} /> Setting Label
+              </button>
+            </div>
+          </div>
+          <div className="mt-3 text-xs leading-5 text-slate-500">
+            Link ini tidak memerlukan login supplier dan hanya membuka DN sesuai nomor yang dimasukkan.
+          </div>
+        </div>
+      )}
 
       {activeView === 'guide' && (
         <div className="space-y-4">
@@ -1626,7 +1742,7 @@ const TabSupplierPortal = (props) => {
         </div>
       )}
 
-      {activeView !== 'guide' && (
+      {!publicMode && activeView !== 'guide' && (
         <>
       <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm space-y-4">
         <div className="flex items-center gap-2 text-sm font-semibold text-slate-700">
@@ -3019,9 +3135,13 @@ const TabSupplierPortal = (props) => {
           >
             <div className="flex items-start justify-between gap-3 border-b border-slate-100 px-5 py-4 supplier-label-print-hidden">
               <div>
-                <div className="text-sm font-semibold text-slate-900">Label Incoming Supplier</div>
+                <div className="text-sm font-semibold text-slate-900">
+                  {labelModal.mode === 'dn' ? 'Preview DN / PDF' : 'Label Incoming Supplier'}
+                </div>
                 <div className="text-xs text-slate-500">
-                  DN {labelModal.dnNumber || '-'} - cover DN dan semua label package dicetak sekaligus.
+                  {labelModal.mode === 'dn'
+                    ? `DN ${labelModal.dnNumber || '-'} - preview dokumen DN tanpa login.`
+                    : `DN ${labelModal.dnNumber || '-'} - cover DN dan semua label package dicetak sekaligus.`}
                 </div>
               </div>
               <div className="flex items-center gap-2">
@@ -3029,9 +3149,10 @@ const TabSupplierPortal = (props) => {
                   type="button"
                   className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
                   onClick={() => window.print()}
-                  disabled={labelBuild.errors.length > 0 || labelBuild.labels.length === 0}
+                  disabled={labelModal.mode !== 'dn' && (labelBuild.errors.length > 0 || labelBuild.labels.length === 0)}
                 >
-                  <Printer size={14} /> Print DN + Label 1 DN ({labelBuild.labels.length})
+                  <Printer size={14} />
+                  {labelModal.mode === 'dn' ? 'Print/PDF DN' : `Print DN + Label 1 DN (${labelBuild.labels.length})`}
                 </button>
                 <button
                   type="button"
@@ -3045,6 +3166,7 @@ const TabSupplierPortal = (props) => {
             </div>
 
             <div className="overflow-y-auto bg-slate-50 p-5 supplier-label-print-wrap">
+              {labelModal.mode !== 'dn' && (
               <div className="mb-4 space-y-3 supplier-label-print-hidden">
                 <div className="rounded-xl border border-slate-200 bg-white p-3">
                   <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
@@ -3220,8 +3342,9 @@ const TabSupplierPortal = (props) => {
                   </table>
                 </div>
               </div>
+              )}
 
-              {(labelBuild.errors.length > 0 || labelBuild.warnings.length > 0) && (
+              {labelModal.mode !== 'dn' && (labelBuild.errors.length > 0 || labelBuild.warnings.length > 0) && (
                 <div className="mb-4 space-y-2 supplier-label-print-hidden">
                   {labelBuild.errors.map((message) => (
                     <div key={`label-error-${message}`} className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
@@ -3354,6 +3477,7 @@ const TabSupplierPortal = (props) => {
                 </div>
               </div>
 
+              {labelModal.mode !== 'dn' && (
               <div className="grid grid-cols-1 gap-4 supplier-label-grid md:grid-cols-2">
                 {labelBuild.labels.map((label) => {
                   const qtyText = formatQty(label.packageQty);
@@ -3430,6 +3554,7 @@ const TabSupplierPortal = (props) => {
                   </div>
                 )}
               </div>
+              )}
             </div>
           </div>
         </div>

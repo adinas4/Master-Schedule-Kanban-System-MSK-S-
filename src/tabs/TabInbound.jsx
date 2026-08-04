@@ -133,7 +133,12 @@ const TabInbound = (props) => {
     handleUnlockActual,
     handleUpdateActual,
     handleSendEmail,
+    handleSendFullScheduleEmail,
     handleSendEmailReminder,
+    inboundEmailNotice,
+    setInboundEmailNotice,
+    inboundFullEmailReport,
+    setInboundFullEmailReport,
     getPoLineRemainingAfterSchedule,
     handleEdit,
     handleDelete,
@@ -281,6 +286,7 @@ const TabInbound = (props) => {
   const [poExportLoading, setPoExportLoading] = useState(false);
   const [poPrintLoading, setPoPrintLoading] = useState(false);
   const [poSearch, setPoSearch] = useState('');
+  const [poCategoryTab, setPoCategoryTab] = useState('all');
   const [poTotal, setPoTotal] = useState(0);
   const initialPoMonthRange = useMemo(() => getCurrentMonthRange(), []);
   const [poFilterStart, setPoFilterStart] = useState(initialPoMonthRange.start);
@@ -1559,6 +1565,13 @@ const TabInbound = (props) => {
     return { label: 'Open', className: 'border-slate-200 bg-white text-slate-600', dot: 'bg-slate-400' };
   };
 
+  const poCategoryTabs = useMemo(() => ([
+    { key: 'all', label: 'All PO' },
+    { key: 'raw', label: 'Raw Material' },
+    { key: 'indirect', label: 'Indirect' },
+    { key: 'subcon', label: 'Subcon' },
+  ]), []);
+
   const resetPoForm = () => {
     setPoForm({
       poNumber: '',
@@ -1606,6 +1619,7 @@ const TabInbound = (props) => {
     perPage = poPerPage,
     start = poFilterStart,
     end = poFilterEnd,
+    category = poCategoryTab,
   } = {}) => {
     if (!apiFetch) return;
     setPoLoading(true);
@@ -1616,6 +1630,7 @@ const TabInbound = (props) => {
       if (end) params.set('end', end);
       if (start) params.set('start_date', start);
       if (end) params.set('end_date', end);
+      if (category && category !== 'all') params.set('category', category);
       params.set('limit', String(perPage));
       params.set('offset', String(Math.max(0, (page - 1) * perPage)));
       params.set('includeTotal', '1');
@@ -1637,7 +1652,7 @@ const TabInbound = (props) => {
     } finally {
       setPoLoading(false);
     }
-  }, [apiFetch, poFilterEnd, poFilterStart, poPage, poPerPage, poSearch, showToastMessage]);
+  }, [apiFetch, poCategoryTab, poFilterEnd, poFilterStart, poPage, poPerPage, poSearch, showToastMessage]);
 
   const fetchPoLines = useCallback(async (poNumber, { force = false } = {}) => {
     if (!poNumber || (!force && (poLineMap[poNumber] || poLineLoading[poNumber]))) return;
@@ -1658,10 +1673,10 @@ const TabInbound = (props) => {
   useEffect(() => {
     if (inboundSubTab !== 'master-po') return;
     const handle = setTimeout(() => {
-      fetchPoList({ search: poSearch, page: poPage, perPage: poPerPage, start: poFilterStart, end: poFilterEnd });
+      fetchPoList({ search: poSearch, page: poPage, perPage: poPerPage, start: poFilterStart, end: poFilterEnd, category: poCategoryTab });
     }, 350);
     return () => clearTimeout(handle);
-  }, [fetchPoList, inboundSubTab, poFilterEnd, poFilterStart, poPage, poPerPage, poSearch]);
+  }, [fetchPoList, inboundSubTab, poCategoryTab, poFilterEnd, poFilterStart, poPage, poPerPage, poSearch]);
 
   useEffect(() => {
     if (!inboundNav) return;
@@ -1671,7 +1686,7 @@ const TabInbound = (props) => {
     if (inboundNav.tab === 'master-po' && typeof inboundNav.poSearch === 'string') {
       setPoSearch(inboundNav.poSearch);
       setPoPage(1);
-      fetchPoList({ search: inboundNav.poSearch, page: 1, start: poFilterStart, end: poFilterEnd });
+      fetchPoList({ search: inboundNav.poSearch, page: 1, start: poFilterStart, end: poFilterEnd, category: poCategoryTab });
     }
     if (inboundNav.tab === 'master-po' && inboundNav.expandPo) {
       const poNumber = String(inboundNav.expandPo || '').trim();
@@ -1692,7 +1707,7 @@ const TabInbound = (props) => {
   useEffect(() => {
     if (inboundSubTab !== 'master-po') return;
     setPoPage(1);
-  }, [inboundSubTab, poFilterEnd, poFilterStart, poPerPage, poSearch]);
+  }, [inboundSubTab, poCategoryTab, poFilterEnd, poFilterStart, poPerPage, poSearch]);
 
   const handlePoPageChange = (nextPage) => {
     const safeTotal = Math.max(1, poTotalPages);
@@ -1813,7 +1828,7 @@ const TabInbound = (props) => {
         showToastMessage(`PO ${poNumber} berhasil diperbarui.`, '', null, 'info');
       }
       closePoEdit();
-      fetchPoList({ search: poSearch });
+      fetchPoList({ search: poSearch, category: poCategoryTab });
     } catch (error) {
       const message = error.message || 'Gagal memperbarui PO.';
       setPoEditError(message);
@@ -1845,7 +1860,7 @@ const TabInbound = (props) => {
         delete next[poNumber];
         return next;
       });
-      fetchPoList({ search: poSearch });
+      fetchPoList({ search: poSearch, category: poCategoryTab });
     } catch (error) {
       const message = error.message || 'Gagal menghapus PO.';
       if (showToastMessage) showToastMessage(message, '', null, 'error');
@@ -1888,7 +1903,7 @@ const TabInbound = (props) => {
         showToastMessage(`PO ${poNumber} - ${itemCode} berhasil diperbarui. Schedule terkait ikut disinkronkan.`, '', null, 'info');
       }
       await Promise.all([
-        fetchPoList({ search: poSearch, page: poPage, perPage: poPerPage, start: poFilterStart, end: poFilterEnd }),
+        fetchPoList({ search: poSearch, page: poPage, perPage: poPerPage, start: poFilterStart, end: poFilterEnd, category: poCategoryTab }),
         fetchPoLines(poNumber, { force: true }),
       ]);
       closePoLineEdit();
@@ -1943,7 +1958,7 @@ const TabInbound = (props) => {
       }
       resetPoForm();
       setPoFormVisible(false);
-      fetchPoList({ search: poSearch });
+      fetchPoList({ search: poSearch, category: poCategoryTab });
     } catch (error) {
       if (showToastMessage) {
         showToastMessage(error.message || 'Gagal membuat PO.', '', null, 'error');
@@ -2096,7 +2111,7 @@ const TabInbound = (props) => {
         const summary = `Import selesai. Berhasil: ${inserted}, Gagal: ${allErrors.length}.`;
         showToastMessage(summary, '', null, allErrors.length ? 'error' : 'info');
       }
-      fetchPoList({ search: poSearch });
+      fetchPoList({ search: poSearch, category: poCategoryTab });
     } catch (error) {
       if (showToastMessage) showToastMessage(error.message || 'Gagal import PO.', '', null, 'error');
     } finally {
@@ -3146,6 +3161,16 @@ const TabInbound = (props) => {
                                 className="w-full px-4 py-3 text-left hover:bg-slate-50 text-slate-700 flex items-center gap-2"
                               >
                                 <Printer size={16} /> Print
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  handleSendFullScheduleEmail?.();
+                                  setInboundActionOpen(false);
+                                }}
+                                className="w-full px-4 py-3 text-left hover:bg-slate-50 text-slate-700 flex items-center gap-2"
+                              >
+                                <Mail size={16} /> Kirim Full Schedule PDF
                               </button>
                               <button
                                 type="button"
@@ -4522,7 +4547,7 @@ const TabInbound = (props) => {
                     </div>
                     <button
                       type="button"
-                      onClick={() => fetchPoList({ search: poSearch, page: poPage, perPage: poPerPage, start: poFilterStart, end: poFilterEnd })}
+                      onClick={() => fetchPoList({ search: poSearch, page: poPage, perPage: poPerPage, start: poFilterStart, end: poFilterEnd, category: poCategoryTab })}
                       className="inline-flex h-10 items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 text-sm text-slate-600 shadow-sm transition hover:bg-slate-50"
                       disabled={poLoading}
                     >
@@ -4530,6 +4555,29 @@ const TabInbound = (props) => {
                       Refresh
                     </button>
                   </div>
+                </div>
+
+                <div className="mt-4 flex flex-wrap items-center gap-2">
+                  {poCategoryTabs.map((tab) => {
+                    const active = poCategoryTab === tab.key;
+                    return (
+                      <button
+                        key={tab.key}
+                        type="button"
+                        onClick={() => {
+                          setPoCategoryTab(tab.key);
+                          setPoPage(1);
+                        }}
+                        className={`rounded-2xl border px-3 py-2 text-xs font-semibold transition ${
+                          active
+                            ? 'border-slate-900 bg-slate-900 text-white'
+                            : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                        }`}
+                      >
+                        {tab.label}
+                      </button>
+                    );
+                  })}
                 </div>
 
                 <div className="mt-4 overflow-x-auto rounded-2xl border border-slate-200">
@@ -4842,6 +4890,209 @@ const TabInbound = (props) => {
                   </div>
                   <div className="mt-4 flex justify-end">
                     <button onClick={() => setPoImportErrorOpen(false)} className="px-4 py-2 rounded border text-sm">Tutup</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {inboundEmailNotice && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={() => setInboundEmailNotice(null)}>
+                <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
+                  <div className="border-b border-slate-100 bg-sky-50 px-5 py-4">
+                    <div className="flex items-start gap-3">
+                      <div className="rounded-full bg-sky-100 p-2 text-sky-700">
+                        <Mail size={18} />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm font-semibold text-sky-950">PDF inbound sudah pernah diemail</div>
+                        <div className="mt-1 text-sm leading-6 text-sky-800">
+                          Untuk supplier dan tanggal ini, gunakan Reminder jika hanya ingin mengingatkan pengiriman.
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setInboundEmailNotice(null)}
+                        className="rounded-lg p-1 text-slate-400 hover:bg-white/70 hover:text-slate-600"
+                        title="Tutup"
+                      >
+                        <XIcon size={16} />
+                      </button>
+                    </div>
+                  </div>
+                  <div className="space-y-3 px-5 py-4 text-sm">
+                    <div>
+                      <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Supplier</div>
+                      <div className="mt-1 font-semibold text-slate-900">{inboundEmailNotice.supplier || '-'}</div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Tanggal Schedule</div>
+                        <div className="mt-1 text-slate-800">{inboundEmailNotice.dateLabel || '-'}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Total Baris</div>
+                        <div className="mt-1 text-slate-800">{formatQty(inboundEmailNotice.totalRows || 0, '0')}</div>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Email Terakhir</div>
+                        <div className="mt-1 text-slate-800">{inboundEmailNotice.meta?.sentAtLabel || 'Belum tercatat'}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Status SMTP</div>
+                        <div className="mt-1 text-slate-800">
+                          {inboundEmailNotice.meta?.smtpStatus
+                            ? String(inboundEmailNotice.meta.smtpStatus).toUpperCase()
+                            : (inboundEmailNotice.meta?.sendCount ? 'ACCEPTED' : 'RIWAYAT LAMA')}
+                        </div>
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Penerima</div>
+                      <div className="mt-1 break-words text-slate-800">{inboundEmailNotice.meta?.to || 'Belum tercatat'}</div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Jumlah Kirim</div>
+                        <div className="mt-1 text-slate-800">{inboundEmailNotice.meta?.sendCount ? `${inboundEmailNotice.meta.sendCount}x` : 'Riwayat lama'}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Message ID</div>
+                        <div className="mt-1 truncate text-slate-800" title={inboundEmailNotice.meta?.messageId || ''}>{inboundEmailNotice.meta?.messageId || '-'}</div>
+                      </div>
+                    </div>
+                    {(inboundEmailNotice.meta?.rejectedTo || inboundEmailNotice.meta?.lastError) && (
+                      <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                        {inboundEmailNotice.meta?.lastError || `Penerima ditolak SMTP: ${inboundEmailNotice.meta.rejectedTo}`}
+                      </div>
+                    )}
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+                      Status ACCEPTED berarti SMTP sudah menerima email. Jika penerima belum menerima, cek Spam/Junk atau kemungkinan server penerima menahan email; bounce belakangan belum bisa dibaca otomatis oleh sistem.
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap justify-end gap-2 border-t border-slate-100 px-5 py-3">
+                    <button
+                      type="button"
+                      onClick={() => setInboundEmailNotice(null)}
+                      className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-50"
+                    >
+                      Tutup
+                    </button>
+                    {canEditSchedules && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const targetItem = inboundEmailNotice.item;
+                          setInboundEmailNotice(null);
+                          handleSendEmailReminder(targetItem);
+                        }}
+                        className="inline-flex items-center gap-2 rounded-lg bg-amber-600 px-4 py-2 text-sm font-semibold text-white hover:bg-amber-700"
+                      >
+                        <Bell size={14} /> Kirim Reminder
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {inboundFullEmailReport && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={() => setInboundFullEmailReport(null)}>
+                <div className="w-full max-w-4xl overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
+                  <div className="border-b border-slate-100 bg-slate-50 px-5 py-4">
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <div className="text-sm font-semibold text-slate-950">Laporan Kirim Full Schedule</div>
+                        <div className="mt-1 text-sm text-slate-600">
+                          {inboundFullEmailReport.periodLabel || '-'} • {formatQty(inboundFullEmailReport.totalSuppliers || 0, '0')} supplier • {formatQty(inboundFullEmailReport.totalRows || 0, '0')} baris
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setInboundFullEmailReport(null)}
+                        className="rounded-lg p-1 text-slate-400 hover:bg-white hover:text-slate-600"
+                        title="Tutup"
+                      >
+                        <XIcon size={16} />
+                      </button>
+                    </div>
+                  </div>
+                  <div className="max-h-[65vh] overflow-auto p-5">
+                    <div className="overflow-hidden rounded-xl border border-slate-200">
+                      <table className="min-w-full text-left text-xs">
+                        <thead className="bg-slate-100 text-slate-600">
+                          <tr>
+                            <th className="p-3">Supplier</th>
+                            <th className="p-3">Baris</th>
+                            <th className="p-3">Status</th>
+                            <th className="p-3">Email</th>
+                            <th className="p-3">Message ID / Error</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(inboundFullEmailReport.rows || []).map((row, rowIndex) => {
+                            const statusKey = String(row.status || '').toLowerCase();
+                            const badgeClass = statusKey === 'accepted'
+                              ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                              : statusKey === 'partial'
+                                ? 'border-amber-200 bg-amber-50 text-amber-700'
+                                : 'border-rose-200 bg-rose-50 text-rose-700';
+                            const recipients = Array.isArray(row.recipients) ? row.recipients : [];
+                            return (
+                              <tr key={`${row.supplier || rowIndex}`} className="border-t border-slate-200 align-top">
+                                <td className="p-3 font-semibold text-slate-800">{row.supplierLabel || row.supplier || '-'}</td>
+                                <td className="p-3 text-slate-700">{formatQty(row.rows || 0, '0')}</td>
+                                <td className="p-3">
+                                  <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold ${badgeClass}`}>
+                                    {String(row.status || 'unknown').toUpperCase()}
+                                  </span>
+                                </td>
+                                <td className="p-3">
+                                  {recipients.length > 0 ? (
+                                    <div className="space-y-1">
+                                      {recipients.map((recipient) => {
+                                        const recipientStatus = String(recipient.status || '').toLowerCase();
+                                        const recipientClass = recipientStatus === 'accepted'
+                                          ? 'text-emerald-700'
+                                          : recipientStatus === 'pending'
+                                            ? 'text-amber-700'
+                                            : recipientStatus === 'rejected'
+                                              ? 'text-rose-700'
+                                              : 'text-slate-500';
+                                        return (
+                                          <div key={recipient.email} className="flex flex-wrap items-center gap-2">
+                                            <span className="break-all text-slate-700">{recipient.email}</span>
+                                            <span className={`text-[10px] font-semibold uppercase ${recipientClass}`}>{recipient.status || 'unknown'}</span>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  ) : (
+                                    <div className="break-all text-slate-700">{row.to || '-'}</div>
+                                  )}
+                                </td>
+                                <td className="max-w-[280px] p-3">
+                                  <div className="truncate text-slate-700" title={row.messageId || row.error || ''}>{row.messageId || row.error || '-'}</div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+                      ACCEPTED berarti server SMTP menerima email dari aplikasi. Untuk bounce setelah email diterima SMTP, sistem masih perlu monitoring mailbox bounce/return-path.
+                    </div>
+                  </div>
+                  <div className="flex justify-end border-t border-slate-100 px-5 py-3">
+                    <button
+                      type="button"
+                      onClick={() => setInboundFullEmailReport(null)}
+                      className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+                    >
+                      Tutup
+                    </button>
                   </div>
                 </div>
               </div>

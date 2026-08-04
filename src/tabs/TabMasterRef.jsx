@@ -190,8 +190,17 @@ const TabMasterRef = (props) => {
     && String(a?.typePack ?? '') === String(b?.typePack ?? '')
     && String(a?.supplier ?? '') === String(b?.supplier ?? '')
     && String(a?.customer ?? '') === String(b?.customer ?? '')
+    && String(a?.status ?? '') === String(b?.status ?? '')
     && String(a?.model ?? '') === String(b?.model ?? '')
   );
+  const normalizeItemActiveStatus = (value) => {
+    const raw = String(value ?? '').trim().toLowerCase();
+    if (!raw) return 'active';
+    const compact = raw.replace(/[^a-z0-9]+/g, '');
+    return ['inactive', 'nonactive', 'nonaktif', 'tidakaktif', 'disabled', 'disable', '0', 'false'].includes(compact)
+      ? 'inactive'
+      : 'active';
+  };
   const locationTypeOptions = ['Production Line', 'Work Center', 'Warehouse'];
   const getStandardLocationType = (value) => {
     const raw = String(value || '').trim();
@@ -578,13 +587,20 @@ const TabMasterRef = (props) => {
     relation: 'border-teal-200 bg-teal-50/60 focus:border-teal-400 focus:ring-2 focus:ring-teal-100',
   };
   const getItemFieldClass = (tone = 'identity', extra = '') => (
-    `border rounded px-3 py-2 outline-none transition ${itemFieldToneClasses[tone] || itemFieldToneClasses.identity} ${extra}`.trim()
+    `h-8 w-full border rounded px-2.5 py-1.5 text-xs outline-none transition ${itemFieldToneClasses[tone] || itemFieldToneClasses.identity} ${extra}`.trim()
   );
   const getItemCompactFieldClass = (tone = 'identity', extra = '') => (
-    `border rounded px-2 py-1 outline-none transition ${itemFieldToneClasses[tone] || itemFieldToneClasses.identity} ${extra}`.trim()
+    `h-7 w-full border rounded px-2 py-1 text-xs outline-none transition ${itemFieldToneClasses[tone] || itemFieldToneClasses.identity} ${extra}`.trim()
   );
   const getSearchableControlClass = (tone = 'reference') => (
-    `rounded border ${itemFieldToneClasses[tone] || itemFieldToneClasses.reference}`
+    `min-h-8 rounded border text-xs ${itemFieldToneClasses[tone] || itemFieldToneClasses.reference}`
+  );
+  const itemFormLabelClass = 'mb-1 block text-[9px] font-semibold uppercase tracking-wide text-slate-400';
+  const renderItemFormGroup = (label, child, className = '') => (
+    <div className={`min-w-0 ${className}`.trim()}>
+      <label className={itemFormLabelClass}>{label}</label>
+      {child}
+    </div>
   );
 
   useEffect(() => {
@@ -1659,7 +1675,15 @@ const TabMasterRef = (props) => {
                         <option value="Delivery Note">Delivery Note</option>
                         <option value="Schedule">Schedule</option>
                       </select>
-                      <input className="border rounded px-3 py-2" placeholder="Email DN/Schedule, pisahkan koma" value={vendorForm.email} onChange={(e) => setVendorForm({ ...vendorForm, email: e.target.value })} />
+                      <div className="md:col-span-2">
+                        <textarea
+                          className="min-h-[70px] w-full resize-y rounded border px-3 py-2"
+                          placeholder="Email DN/Schedule: supplier1@email.com, supplier2@email.com"
+                          value={vendorForm.email}
+                          onChange={(e) => setVendorForm({ ...vendorForm, email: e.target.value })}
+                        />
+                        <div className="mt-1 text-[11px] text-slate-500">Bisa lebih dari 1 email. Pisahkan dengan koma, titik koma, atau baris baru.</div>
+                      </div>
                       <input
                         type="number"
                         min="0"
@@ -2426,100 +2450,155 @@ const TabMasterRef = (props) => {
                 </div>
                 {masterFormVisible.item && allowItemEdit && (
                   <>
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs mb-3 items-stretch">
-                      <input className={getItemFieldClass('identity')} placeholder="UNIQ" value={itemMasterForm.code} onChange={(e) => setItemMasterForm({ ...itemMasterForm, code: e.target.value })} />
-                      <input className={getItemFieldClass('identity')} placeholder="Part Name" value={itemMasterForm.name} onChange={(e) => setItemMasterForm({ ...itemMasterForm, name: e.target.value })} />
-                      <input className={getItemFieldClass('identity')} placeholder="Part No" value={itemMasterForm.partNo} onChange={(e) => setItemMasterForm({ ...itemMasterForm, partNo: e.target.value })} />
-                      <select
-                        className={getItemFieldClass('reference')}
-                        value={itemMasterForm.type}
-                        onChange={(e) => {
-                          const nextType = e.target.value;
-                          setItemMasterForm((prev) => ({
-                            ...prev,
-                            type: nextType,
-                            customers: isCustomerAllowedItemCategory(nextType) ? prev.customers : [],
-                            suppliers: isSupplierAllowedItemCategory(nextType) ? prev.suppliers : [],
-                          }));
-                        }}
-                      >
-                        {masterCategories.length > 0 ? masterCategories.map((category) => (
-                          <option key={category.code} value={category.code}>{category.code} - {category.name}</option>
-                        )) : masterCategoryOptions.map((category) => (
-                          <option key={category} value={category}>{category}</option>
+                    <div className="mb-4 space-y-3 text-xs">
+                      <div className="grid grid-cols-1 gap-2 rounded-lg border border-slate-200 bg-slate-50/50 p-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
+                        <div className="col-span-full text-[10px] font-semibold uppercase tracking-wide text-slate-500">Identitas & Status</div>
+                        {renderItemFormGroup('UNIQ', (
+                          <input className={getItemFieldClass('identity')} placeholder="UNIQ" value={itemMasterForm.code} onChange={(e) => setItemMasterForm({ ...itemMasterForm, code: e.target.value })} />
                         ))}
-                      </select>
-                      <select className={getItemFieldClass('reference')} value={itemMasterForm.unit || ''} onChange={(e) => setItemMasterForm({ ...itemMasterForm, unit: e.target.value })}>
-                        <option value="">Pilih Unit</option>
-                        {String(itemMasterForm.unit || '').trim() && !standardUnitOptions.includes(String(itemMasterForm.unit || '').trim()) && (
-                          <option value={String(itemMasterForm.unit || '').trim()}>{String(itemMasterForm.unit || '').trim()}</option>
-                        )}
-                        {standardUnitOptions.map((unit) => (
-                          <option key={unit} value={unit}>{unit}</option>
+                        {renderItemFormGroup('Part Name', (
+                          <input className={getItemFieldClass('identity')} placeholder="Part Name" value={itemMasterForm.name} onChange={(e) => setItemMasterForm({ ...itemMasterForm, name: e.target.value })} />
+                        ), 'lg:col-span-2')}
+                        {renderItemFormGroup('Part No', (
+                          <input className={getItemFieldClass('identity')} placeholder="Part No" value={itemMasterForm.partNo} onChange={(e) => setItemMasterForm({ ...itemMasterForm, partNo: e.target.value })} />
                         ))}
-                      </select>
-                      <SearchableSelectDropdown
-                        value={itemMasterForm.typePack || ''}
-                        options={itemPackingOptions}
-                        onChange={(value) => setItemMasterForm((prev) => ({ ...prev, typePack: String(value || '').trim() }))}
-                        placeholder="Pilih Type Pack"
-                        searchPlaceholder="Ketik kode / nama packing"
-                        emptyText="Master packing belum tersedia."
-                        getOptionValue={(option) => String(option?.value || '').trim()}
-                        getOptionLabel={(option) => option?.label || option?.value || ''}
-                        controlClassName={getSearchableControlClass('packing')}
-                      />
-                      <input
-                        type="number"
-                        className={getItemFieldClass('packing')}
-                        placeholder="SNP / Pack Qty"
-                        value={itemMasterForm.packQty || ''}
-                        onChange={(e) => setItemMasterForm({ ...itemMasterForm, packQty: e.target.value })}
-                      />
-                      <input
-                        type="number"
-                        className={getItemFieldClass('packing')}
-                        placeholder="Order Lot Size"
-                        value={itemMasterForm.orderLotSize || ''}
-                        onChange={(e) => setItemMasterForm({ ...itemMasterForm, orderLotSize: e.target.value })}
-                      />
-                      <input
-                        type="number"
-                        className={getItemFieldClass('packing')}
-                        placeholder="Max Delivery / Rit"
-                        value={itemMasterForm.maxDeliveryPerRit || ''}
-                        onChange={(e) => setItemMasterForm({ ...itemMasterForm, maxDeliveryPerRit: e.target.value })}
-                      />
-                      <input
-                        type="number"
-                        className={getItemFieldClass('identity')}
-                        placeholder="Berat Part (Kg)"
-                        value={itemMasterForm.weight || ''}
-                        onChange={(e) => setItemMasterForm({ ...itemMasterForm, weight: e.target.value })}
-                      />
-                      <SearchableSelectDropdown
-                        value={itemMasterForm.locationId || ''}
-                        options={itemWarehouseOptions}
-                        onChange={handleItemWarehouseChange}
-                        placeholder="Pilih Master Ord Warehouse"
-                        searchPlaceholder="Ketik kode / nama warehouse"
-                        emptyText="Master warehouse belum tersedia."
-                        getOptionValue={(option) => String(option?.value || '').trim()}
-                        getOptionLabel={(option) => option?.label || option?.value || ''}
-                        controlClassName={getSearchableControlClass('reference')}
-                      />
-                      <SearchableSelectDropdown
-                        value={itemMasterForm.lineProduction || ''}
-                        options={processWorkCenterOptions}
-                        onChange={handleItemLineProductionChange}
-                        placeholder="Pilih Line Produksi / Work Center"
-                        searchPlaceholder="Ketik line / work center / proses"
-                        emptyText="Master location line/work center belum tersedia."
-                        getOptionValue={(option) => String(option?.value || '').trim()}
-                        getOptionLabel={(option) => option?.label || option?.value || ''}
-                        controlClassName={getSearchableControlClass('process')}
-                      />
-                      <div className="md:col-span-3 rounded border border-violet-200 bg-violet-50/40 p-3 space-y-3">
+                        {renderItemFormGroup('Category', (
+                          <select
+                            className={getItemFieldClass('reference')}
+                            value={itemMasterForm.type}
+                            onChange={(e) => {
+                              const nextType = e.target.value;
+                              setItemMasterForm((prev) => ({
+                                ...prev,
+                                type: nextType,
+                                customers: isCustomerAllowedItemCategory(nextType) ? prev.customers : [],
+                                suppliers: isSupplierAllowedItemCategory(nextType) ? prev.suppliers : [],
+                              }));
+                            }}
+                          >
+                            {masterCategories.length > 0 ? masterCategories.map((category) => (
+                              <option key={category.code} value={category.code}>{category.code} - {category.name}</option>
+                            )) : masterCategoryOptions.map((category) => (
+                              <option key={category} value={category}>{category}</option>
+                            ))}
+                          </select>
+                        ))}
+                        {renderItemFormGroup('Status', (
+                          <select
+                            className={getItemFieldClass('reference')}
+                            value={normalizeItemActiveStatus(itemMasterForm.itemStatus ?? itemMasterForm.item_status)}
+                            onChange={(e) => {
+                              const nextStatus = normalizeItemActiveStatus(e.target.value);
+                              setItemMasterForm({
+                                ...itemMasterForm,
+                                itemStatus: nextStatus,
+                                inactiveRemarks: nextStatus === 'inactive' ? (itemMasterForm.inactiveRemarks || '') : '',
+                              });
+                            }}
+                          >
+                            <option value="active">Active</option>
+                            <option value="inactive">Non Aktif</option>
+                          </select>
+                        ))}
+                        {normalizeItemActiveStatus(itemMasterForm.itemStatus ?? itemMasterForm.item_status) === 'inactive' && renderItemFormGroup('Remarks Non Aktif', (
+                          <input
+                            className={getItemFieldClass('reference')}
+                            placeholder="Alasan item non aktif"
+                            value={itemMasterForm.inactiveRemarks || ''}
+                            onChange={(e) => setItemMasterForm({ ...itemMasterForm, inactiveRemarks: e.target.value })}
+                          />
+                        ), 'lg:col-span-2')}
+                      </div>
+
+                      <div className="grid grid-cols-1 gap-2 rounded-lg border border-slate-200 bg-white p-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
+                        <div className="col-span-full text-[10px] font-semibold uppercase tracking-wide text-slate-500">Packing, Quantity & Location</div>
+                        {renderItemFormGroup('Unit', (
+                          <select className={getItemFieldClass('reference')} value={itemMasterForm.unit || ''} onChange={(e) => setItemMasterForm({ ...itemMasterForm, unit: e.target.value })}>
+                            <option value="">Pilih Unit</option>
+                            {String(itemMasterForm.unit || '').trim() && !standardUnitOptions.includes(String(itemMasterForm.unit || '').trim()) && (
+                              <option value={String(itemMasterForm.unit || '').trim()}>{String(itemMasterForm.unit || '').trim()}</option>
+                            )}
+                            {standardUnitOptions.map((unit) => (
+                              <option key={unit} value={unit}>{unit}</option>
+                            ))}
+                          </select>
+                        ))}
+                        {renderItemFormGroup('Type Pack', (
+                          <SearchableSelectDropdown
+                            value={itemMasterForm.typePack || ''}
+                            options={itemPackingOptions}
+                            onChange={(value) => setItemMasterForm((prev) => ({ ...prev, typePack: String(value || '').trim() }))}
+                            placeholder="Pilih Type Pack"
+                            searchPlaceholder="Ketik kode / nama packing"
+                            emptyText="Master packing belum tersedia."
+                            getOptionValue={(option) => String(option?.value || '').trim()}
+                            getOptionLabel={(option) => option?.label || option?.value || ''}
+                            controlClassName={getSearchableControlClass('packing')}
+                          />
+                        ))}
+                        {renderItemFormGroup('SNP / Pack Qty', (
+                          <input
+                            type="number"
+                            className={getItemFieldClass('packing')}
+                            placeholder="SNP / Pack Qty"
+                            value={itemMasterForm.packQty || ''}
+                            onChange={(e) => setItemMasterForm({ ...itemMasterForm, packQty: e.target.value })}
+                          />
+                        ))}
+                        {renderItemFormGroup('Order Lot Size', (
+                          <input
+                            type="number"
+                            className={getItemFieldClass('packing')}
+                            placeholder="Order Lot Size"
+                            value={itemMasterForm.orderLotSize || ''}
+                            onChange={(e) => setItemMasterForm({ ...itemMasterForm, orderLotSize: e.target.value })}
+                          />
+                        ))}
+                        {renderItemFormGroup('Max Delivery / Rit', (
+                          <input
+                            type="number"
+                            className={getItemFieldClass('packing')}
+                            placeholder="Max Delivery / Rit"
+                            value={itemMasterForm.maxDeliveryPerRit || ''}
+                            onChange={(e) => setItemMasterForm({ ...itemMasterForm, maxDeliveryPerRit: e.target.value })}
+                          />
+                        ))}
+                        {renderItemFormGroup('Berat Part (Kg)', (
+                          <input
+                            type="number"
+                            className={getItemFieldClass('identity')}
+                            placeholder="Berat Part (Kg)"
+                            value={itemMasterForm.weight || ''}
+                            onChange={(e) => setItemMasterForm({ ...itemMasterForm, weight: e.target.value })}
+                          />
+                        ))}
+                        {renderItemFormGroup('Master Ord Warehouse', (
+                          <SearchableSelectDropdown
+                            value={itemMasterForm.locationId || ''}
+                            options={itemWarehouseOptions}
+                            onChange={handleItemWarehouseChange}
+                            placeholder="Pilih Master Ord Warehouse"
+                            searchPlaceholder="Ketik kode / nama warehouse"
+                            emptyText="Master warehouse belum tersedia."
+                            getOptionValue={(option) => String(option?.value || '').trim()}
+                            getOptionLabel={(option) => option?.label || option?.value || ''}
+                            controlClassName={getSearchableControlClass('reference')}
+                          />
+                        ), 'lg:col-span-2')}
+                        {renderItemFormGroup('Line / Work Center', (
+                          <SearchableSelectDropdown
+                            value={itemMasterForm.lineProduction || ''}
+                            options={processWorkCenterOptions}
+                            onChange={handleItemLineProductionChange}
+                            placeholder="Pilih Line Produksi / Work Center"
+                            searchPlaceholder="Ketik line / work center / proses"
+                            emptyText="Master location line/work center belum tersedia."
+                            getOptionValue={(option) => String(option?.value || '').trim()}
+                            getOptionLabel={(option) => option?.label || option?.value || ''}
+                            controlClassName={getSearchableControlClass('process')}
+                          />
+                        ), 'lg:col-span-2')}
+                        <div className="col-span-full rounded border border-violet-200 bg-violet-50/40 p-2.5">
                         <div className="flex items-center justify-between gap-3">
                           <div>
                             <div className="text-[11px] font-semibold text-slate-700">Routing Proses</div>
@@ -2533,10 +2612,10 @@ const TabMasterRef = (props) => {
                             <span>Tambah Proses</span>
                           </button>
                         </div>
-                        <div className="space-y-2">
+                          <div className="space-y-1.5">
                           {itemProcessRoutingRows.map((row, index) => (
-                            <div key={`item-routing-${index}`} className="grid grid-cols-1 md:grid-cols-12 gap-2 items-center">
-                              <div className="md:col-span-7">
+                              <div key={`item-routing-${index}`} className="grid grid-cols-1 items-center gap-2 md:grid-cols-12">
+                                <div className="md:col-span-7">
                                 <SearchableSelectDropdown
                                   value={row.processCode || ''}
                                   options={itemProcessOptions}
@@ -2549,7 +2628,7 @@ const TabMasterRef = (props) => {
                                   controlClassName={getSearchableControlClass('process')}
                                 />
                               </div>
-                              <div className="md:col-span-4">
+                                <div className="md:col-span-4">
                                 <input
                                   type="number"
                                   step="0.01"
@@ -2559,7 +2638,7 @@ const TabMasterRef = (props) => {
                                   onChange={(e) => updateItemProcessRoutingRow(index, { cycleTimeSeconds: e.target.value })}
                                 />
                               </div>
-                              <div className="md:col-span-1 flex md:justify-end">
+                                <div className="md:col-span-1 flex md:justify-end">
                                 <button
                                   type="button"
                                   onClick={() => removeItemProcessRoutingRow(index)}
@@ -2569,33 +2648,37 @@ const TabMasterRef = (props) => {
                                   <span>Hapus</span>
                                 </button>
                               </div>
-                            </div>
+                              </div>
                           ))}
+                          </div>
                         </div>
-                      </div>
-                      <input
-                        type="number"
-                        className={getItemFieldClass('timing')}
-                        placeholder="Lead Time (hari)"
-                        value={itemMasterForm.leadTimeDays || ''}
-                        onChange={(e) => setItemMasterForm({ ...itemMasterForm, leadTimeDays: e.target.value })}
-                      />
-                      <input
-                        type="number"
-                        className={getItemFieldClass('timing')}
-                        placeholder="Shelf Life (hari)"
-                        value={itemMasterForm.shelfLifeDays || ''}
-                        onChange={(e) => setItemMasterForm({ ...itemMasterForm, shelfLifeDays: e.target.value })}
-                      />
-                      <label className="border border-emerald-200 rounded px-3 py-2 flex items-center gap-2 text-[11px] font-semibold text-emerald-700 bg-emerald-50/70">
-                        <input
-                          type="checkbox"
-                          checked={!!itemMasterForm.isSeasonal}
-                          onChange={(e) => setItemMasterForm({ ...itemMasterForm, isSeasonal: e.target.checked })}
-                        />
-                        Seasonal Override
-                      </label>
-                        <div>
+                        {renderItemFormGroup('Lead Time (hari)', (
+                          <input
+                            type="number"
+                            className={getItemFieldClass('timing')}
+                            placeholder="Lead Time (hari)"
+                            value={itemMasterForm.leadTimeDays || ''}
+                            onChange={(e) => setItemMasterForm({ ...itemMasterForm, leadTimeDays: e.target.value })}
+                          />
+                        ))}
+                        {renderItemFormGroup('Shelf Life (hari)', (
+                          <input
+                            type="number"
+                            className={getItemFieldClass('timing')}
+                            placeholder="Shelf Life (hari)"
+                            value={itemMasterForm.shelfLifeDays || ''}
+                            onChange={(e) => setItemMasterForm({ ...itemMasterForm, shelfLifeDays: e.target.value })}
+                          />
+                        ))}
+                        <label className="mt-4 flex h-8 items-center gap-2 rounded border border-emerald-200 bg-emerald-50/70 px-3 text-[11px] font-semibold text-emerald-700">
+                          <input
+                            type="checkbox"
+                            checked={!!itemMasterForm.isSeasonal}
+                            onChange={(e) => setItemMasterForm({ ...itemMasterForm, isSeasonal: e.target.checked })}
+                          />
+                          Seasonal Override
+                        </label>
+                        <div className="lg:col-span-2">
                           <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Model / Spesifikasi</label>
                           <div className="flex flex-wrap gap-1 min-h-[32px]">
                             {itemMasterForm.modelCodes?.length ? (
@@ -2694,7 +2777,7 @@ const TabMasterRef = (props) => {
                           )}
                         </div>
                         {isProductionOutputItemCategory(itemMasterForm?.type) && (
-                          <div className="md:col-span-3 rounded-lg border border-indigo-200 bg-indigo-50/40 p-3">
+                          <div className="col-span-full rounded-lg border border-indigo-200 bg-indigo-50/40 p-3">
                             <div className="mb-2 flex items-center justify-between gap-2">
                               <div>
                                 <div className="text-[11px] font-semibold text-slate-700">Production Source</div>
@@ -2725,7 +2808,7 @@ const TabMasterRef = (props) => {
                           </div>
                         )}
                     </div>
-                    <div className="border border-sky-200 rounded p-3 text-xs mb-4 bg-sky-50/30">
+                    <div className="rounded-lg border border-sky-200 bg-sky-50/30 p-2.5 text-xs">
                       <div className="flex items-center justify-between">
                         <div className="font-semibold text-slate-700">Gambar Item</div>
                         <button
@@ -2738,7 +2821,7 @@ const TabMasterRef = (props) => {
                         </button>
                       </div>
                       <div className="mt-2 flex flex-wrap items-center gap-3">
-                        <div className="h-20 w-20 rounded-lg border bg-slate-50 overflow-hidden flex items-center justify-center text-[10px] text-slate-400">
+                        <div className="flex h-14 w-14 items-center justify-center overflow-hidden rounded-lg border bg-slate-50 text-[10px] text-slate-400">
                           {itemImagePreview ? (
                             <img
                               src={itemImagePreview}
@@ -2766,6 +2849,7 @@ const TabMasterRef = (props) => {
                         accept="image/*"
                         onChange={handleItemImageUpload}
                       />
+                    </div>
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs mb-4">
                       <div className={`border rounded p-3 ${isItemSupplierEnabled ? 'border-teal-200 bg-teal-50/40' : 'bg-slate-100 border-slate-200 text-slate-400'}`}>
@@ -2944,6 +3028,7 @@ const TabMasterRef = (props) => {
                       <th className="text-left p-2">Part No</th>
                       <th className="text-left p-2">Part Name</th>
                       <th className="text-left p-2">Category</th>
+                      <th className="text-left p-2">Status</th>
                       <th className="text-left p-2">Unit</th>
                       <th className="text-left p-2">Type Pack</th>
                       <th className="text-left p-2">Location</th>
@@ -2956,7 +3041,7 @@ const TabMasterRef = (props) => {
                       <th className="text-left p-2">Actions</th>
                     </tr>
                     <tr className="bg-white text-[10px] text-slate-500">
-                      <th className="p-1 text-left" colSpan={15}>
+                      <th className="p-1 text-left" colSpan={16}>
                         <label className="inline-flex items-center gap-2">
                           <input
                             type="checkbox"
@@ -3005,6 +3090,17 @@ const TabMasterRef = (props) => {
                           )) : masterCategoryOptions.map((category) => (
                             <option key={category} value={category}>{category}</option>
                           ))}
+                        </select>
+                      </th>
+                      <th className="p-1">
+                        <select
+                          className="border rounded px-2 py-1 w-full"
+                          value={localItemFilters.status || ''}
+                          onChange={(e) => setLocalItemFilters({ ...localItemFilters, status: e.target.value })}
+                        >
+                          <option value="">All</option>
+                          <option value="active">Active</option>
+                          <option value="inactive">Non Aktif</option>
                         </select>
                       </th>
                       <th className="p-1">
@@ -3103,6 +3199,8 @@ const TabMasterRef = (props) => {
                               ? 'Seasonal'
                               : '-';
                       const isProductionOutputItem = isProductionOutputItemCategory(item.type);
+                      const activeStatusValue = normalizeItemActiveStatus(item.item_status || item.itemStatus);
+                      const inactiveRemarksText = String(item.inactive_remarks || item.inactiveRemarks || '').trim();
                       return (
                         <tr key={item.code} className="border-t">
                           <td className="p-2 text-center">
@@ -3137,6 +3235,16 @@ const TabMasterRef = (props) => {
                           </td>
                           <td className="p-2 max-w-[240px] truncate">{item.name}</td>
                           <td className="p-2">{getItemCategoryCode(item.type)}</td>
+                          <td className="p-2 max-w-[180px]">
+                            <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold ${activeStatusValue === 'inactive' ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-emerald-200 bg-emerald-50 text-emerald-700'}`}>
+                              {activeStatusValue === 'inactive' ? 'Non Aktif' : 'Active'}
+                            </span>
+                            {activeStatusValue === 'inactive' && inactiveRemarksText && (
+                              <div className="mt-1 text-[10px] leading-snug text-slate-500 whitespace-normal break-words">
+                                {inactiveRemarksText}
+                              </div>
+                            )}
+                          </td>
                           <td className="p-2">{item.unit || '-'}</td>
                           <td className="p-2">{getItemPackingCode(item.type_pack)}</td>
                           <td className="p-2">{item.location_id || '-'}</td>
@@ -3185,12 +3293,14 @@ const TabMasterRef = (props) => {
                                       isSeasonal: !!(item.is_seasonal || item.isSeasonal),
                                       suppliers: itemSupplierMap.get(item.code) || [],
                                       customers: itemCustomerMap.get(item.code) || [],
-                                      modelCodes: parseModelCodes(item.model || ''),
-                                      weight: item.weight || '',
-                                      locationId: item.location_id || '',
-                                      locationName: item.location_name || buildWarehouseLabel((masterWarehouses || []).find((warehouse) => String(warehouse.id || '').trim() === String(item.location_id || '').trim())) || '',
-                                      lineProduction: matchedItemProcess?.work_center || itemLineProductionValue || '',
-                                      processRouting: Array.isArray(item.process_routing) && item.process_routing.length > 0
+                                       modelCodes: parseModelCodes(item.model || ''),
+                                       weight: item.weight || '',
+                                       locationId: item.location_id || '',
+                                       locationName: item.location_name || buildWarehouseLabel((masterWarehouses || []).find((warehouse) => String(warehouse.id || '').trim() === String(item.location_id || '').trim())) || '',
+                                       lineProduction: matchedItemProcess?.work_center || itemLineProductionValue || '',
+                                      itemStatus: normalizeItemActiveStatus(item.item_status || item.itemStatus),
+                                      inactiveRemarks: item.inactive_remarks || item.inactiveRemarks || '',
+                                       processRouting: Array.isArray(item.process_routing) && item.process_routing.length > 0
                                         ? item.process_routing.map((step, index) => ({
                                           processCode: String(step.code || step.processCode || '').trim(),
                                           processName: String(step.name || step.processName || '').trim(),
@@ -3491,6 +3601,21 @@ const TabMasterRef = (props) => {
                       </div>
                       <input className="border rounded px-3 py-2 w-full bg-slate-50" value={masterConfig.requestIdFormat} readOnly />
                       <div className="flex-1" />
+                    </div>
+                    <div className="border rounded p-3 space-y-2 flex flex-col h-full">
+                      <div className="flex items-center justify-between">
+                        <div className="font-semibold text-slate-700">Kanban Request Supply Source</div>
+                        {allowMasterEdit && (
+                          <button type="button" onClick={() => openConfigModal('kanbanRequestSupplySource')} className="text-indigo-600" title="Edit"><Edit size={14} /></button>
+                        )}
+                      </div>
+                      <select className="border rounded px-3 py-2 w-full bg-slate-50" value={masterConfig.kanbanRequestSupplySource || 'po_master'} disabled>
+                        <option value="po_master">PO Master</option>
+                        <option value="prl">PRL</option>
+                      </select>
+                      <div className="text-[11px] text-slate-500">
+                        PO Master: request divalidasi ke sisa PO aktif bulan berjalan. PRL: request divalidasi ke sisa PRL bulan berjalan.
+                      </div>
                     </div>
                     <div className="border rounded p-3 space-y-2 flex flex-col h-full">
                       <div className="flex items-center justify-between">

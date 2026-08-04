@@ -74,9 +74,12 @@ const formatNumberFallback = (value) => Number(value || 0).toLocaleString('id-ID
 
 const applyMonitoringDateFilter = (dateKey, handlers = {}) => {
   if (!dateKey) return;
-  const { setFilterStart, setFilterEnd, setMainTab } = handlers;
+  const { setFilterStart, setFilterEnd, setMainTab, setSearchQuery, setFilterStatus, setFilterSupplier } = handlers;
   if (typeof setFilterStart === 'function') setFilterStart(dateKey);
   if (typeof setFilterEnd === 'function') setFilterEnd(dateKey);
+  if (typeof setSearchQuery === 'function') setSearchQuery('');
+  if (typeof setFilterStatus === 'function') setFilterStatus('All');
+  if (typeof setFilterSupplier === 'function') setFilterSupplier('All');
   if (typeof setMainTab === 'function') setMainTab('monitoring');
 };
 
@@ -88,6 +91,9 @@ const TabDashboard = (props) => {
     setKanbanSubTab,
     setFilterStart,
     setFilterEnd,
+    setSearchQuery,
+    setFilterStatus,
+    setFilterSupplier,
     setPrlFilters,
     canEditSchedules,
     canViewMaster,
@@ -170,7 +176,7 @@ const TabDashboard = (props) => {
     if (normalized === 'kanban') {
       if (typeof setMainTab === 'function') setMainTab('kanban');
       if (typeof setKanbanView === 'function') setKanbanView('board');
-      if (typeof setKanbanSubTab === 'function') setKanbanSubTab('scan');
+      if (typeof setKanbanSubTab === 'function') setKanbanSubTab(isProductionUser ? 'scan' : 'requests');
       return;
     }
     if (normalized === 'dashboard') {
@@ -250,7 +256,7 @@ const TabDashboard = (props) => {
   const scheduleStats = dashboardStats || stats;
   const rowsWithDates = scheduleRows.filter((row) => row?.requestDate);
   const yesterdayRows = sortByTime(
-    rowsWithDates.filter((row) => row.requestDate < todayKey && resolveStatusLabel(row) !== 'Received'),
+    rowsWithDates.filter((row) => row.requestDate === yesterdayKey && resolveStatusLabel(row) !== 'Received'),
   );
   const todayRows = sortByTime(rowsWithDates.filter((row) => row.requestDate === todayKey));
   const tomorrowRows = sortByTime(rowsWithDates.filter((row) => row.requestDate === tomorrowKey));
@@ -735,7 +741,7 @@ const TabDashboard = (props) => {
                         <button
                           type="button"
                           key={`${row.id || row.poNumber}-${idx}`}
-                          onClick={() => applyMonitoringDateFilter(row.requestDate, { setFilterStart, setFilterEnd, setMainTab })}
+                          onClick={() => applyMonitoringDateFilter(row.requestDate, { setFilterStart, setFilterEnd, setSearchQuery, setFilterStatus, setFilterSupplier, setMainTab })}
                           className="w-full bg-white rounded-2xl border border-slate-100/80 p-3 text-left shadow-sm hover:shadow-md transition"
                         >
                           <div className="text-[11px] font-semibold text-slate-700">
@@ -759,7 +765,7 @@ const TabDashboard = (props) => {
                   <button
                     type="button"
                     className="mt-3 text-[11px] text-indigo-600 hover:text-indigo-800 text-left"
-                    onClick={() => applyMonitoringDateFilter(column.dateKey, { setFilterStart, setFilterEnd, setMainTab })}
+                    onClick={() => applyMonitoringDateFilter(column.dateKey, { setFilterStart, setFilterEnd, setSearchQuery, setFilterStatus, setFilterSupplier, setMainTab })}
                   >
                     Lihat Detail ({column.rows.length - 5} lagi)
                   </button>

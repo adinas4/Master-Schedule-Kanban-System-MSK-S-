@@ -134,6 +134,8 @@ export const useScheduleStore = ({
   const [scheduleEditForm, setScheduleEditForm] = useState(DEFAULT_EDIT_FORM);
   const [scheduleEditSaving, setScheduleEditSaving] = useState(false);
   const [scheduleEditError, setScheduleEditError] = useState('');
+  const [inboundEmailNotice, setInboundEmailNotice] = useState(null);
+  const [inboundFullEmailReport, setInboundFullEmailReport] = useState(null);
 
   const refreshAllSchedules = async () => {
     if (schedulesLoadRef.current) return schedulesLoadRef.current;
@@ -168,6 +170,23 @@ export const useScheduleStore = ({
   const ensureSchedulesLoaded = async () => {
     if (schedulesLoaded) return schedules;
     return refreshAllSchedules();
+  };
+
+  const fetchAllFilteredSchedules = async () => {
+    const pageSize = 1000;
+    let page = 1;
+    let total = null;
+    const rows = [];
+    while (total === null || rows.length < total) {
+      const query = buildScheduleQuery(page, pageSize);
+      const data = await apiFetch(`/api/schedules?${query}`);
+      const pageRows = Array.isArray(data) ? data : (data?.rows || []);
+      total = Number(data?.total ?? pageRows.length ?? 0);
+      rows.push(...pageRows);
+      if (pageRows.length < pageSize || rows.length >= total) break;
+      page += 1;
+    }
+    return rows;
   };
 
   const buildScheduleQuery = (pageValue, perPageValue) => {
@@ -666,6 +685,36 @@ export const useScheduleStore = ({
   const getTimeStatus = (row) => getDeliveryMetrics(row).status;
 
   const getKpiStatus = (row) => getTimeStatus(row);
+
+  const isInboundEmailSent = (row) => (
+    Boolean(row?.inboundEmailSentAt || row?.inbound_email_sent_at)
+    || Number(row?.inboundEmailSendCount ?? row?.inbound_email_send_count ?? 0) > 0
+  );
+
+  const getInboundEmailSentMeta = (rows, fallbackItem = null) => {
+    const sentRow = (Array.isArray(rows) ? rows : []).find((row) => isInboundEmailSent(row)) || fallbackItem || {};
+    const sentAtRaw = sentRow.inboundEmailSentAt || sentRow.inbound_email_sent_at || '';
+    const sentAtLabel = sentAtRaw
+      ? new Date(sentAtRaw).toLocaleString('id-ID', {
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      })
+      : 'Belum tercatat';
+    return {
+      sentAt: sentAtRaw,
+      sentAtLabel,
+      to: sentRow.inboundEmailSentTo || sentRow.inbound_email_sent_to || '',
+      subject: sentRow.inboundEmailLastSubject || sentRow.inbound_email_last_subject || '',
+      sendCount: Number(sentRow.inboundEmailSendCount ?? sentRow.inbound_email_send_count ?? 0),
+      smtpStatus: sentRow.inboundEmailSmtpStatus || sentRow.inbound_email_smtp_status || '',
+      messageId: sentRow.inboundEmailMessageId || sentRow.inbound_email_message_id || '',
+      rejectedTo: sentRow.inboundEmailRejectedTo || sentRow.inbound_email_rejected_to || '',
+      lastError: sentRow.inboundEmailLastError || sentRow.inbound_email_last_error || '',
+    };
+  };
 
   const getSupplierMeta = useCallback((row) => {
     const supplierId = String(
@@ -1710,6 +1759,17 @@ export const useScheduleStore = ({
       alert('Tidak ada data schedule untuk dikirim.');
       return;
     }
+    if (dailyItems.some((row) => isInboundEmailSent(row))) {
+      setInboundEmailNotice({
+        item,
+        supplier: item.supplierName || item.supplier_name || targetSupplier,
+        requestDate: targetDate,
+        dateLabel: formatDateID(targetDate),
+        totalRows: dailyItems.length,
+        meta: getInboundEmailSentMeta(dailyItems, item),
+      });
+      return;
+    }
 
     const { jsPDF, autoTable } = await loadPdfModules();
     if (!jsPDF || !autoTable) {
@@ -1726,6 +1786,7 @@ export const useScheduleStore = ({
     const pageWidth = doc.internal.pageSize.getWidth();
     const supplierLabel = String(targetSupplier || '-').trim();
     const dateLabel = formatDateID(targetDate);
+    const senderLabel = user?.username ? `Logistics Team - ${user.username}` : 'Logistics Team';
     const summary = dailyItems.reduce((acc, row) => {
       const planQty = Number(row.requestQty || 0);
       const actualQty = Number(row.receivedQty || 0);
@@ -1750,6 +1811,7 @@ export const useScheduleStore = ({
       112,
     );
     doc.text(`Print Date: ${new Date().toLocaleDateString('id-ID')}`, pageWidth - margin, 64, { align: 'right' });
+    doc.text(`Pengirim: ${senderLabel}`, pageWidth - margin, 80, { align: 'right' });
 
     autoTable(doc, {
       startY: 132,
@@ -1759,6 +1821,7 @@ export const useScheduleStore = ({
         'No',
         'No PO',
         'Item',
+        'Part Name',
         'Jam Kirim',
         'No SJ',
         'Qty Plan',
@@ -1770,6 +1833,7 @@ export const useScheduleStore = ({
         index + 1,
         row.poNumber || '-',
         row.item || '-',
+        row.itemName || row.item_name || '-',
         row.deliveryTime || '-',
         row.doNumber || '-',
         Number(row.requestQty || 0).toLocaleString('id-ID'),
@@ -1792,14 +1856,15 @@ export const useScheduleStore = ({
       },
       columnStyles: {
         0: { cellWidth: 28, halign: 'center' },
-        1: { cellWidth: 92 },
-        2: { cellWidth: 176 },
-        3: { cellWidth: 72, halign: 'center' },
-        4: { cellWidth: 84 },
-        5: { cellWidth: 66, halign: 'right' },
-        6: { cellWidth: 66, halign: 'right' },
-        7: { cellWidth: 70, halign: 'center' },
-        8: { cellWidth: 'auto' },
+        1: { cellWidth: 86 },
+        2: { cellWidth: 72 },
+        3: { cellWidth: 144 },
+        4: { cellWidth: 72, halign: 'center' },
+        5: { cellWidth: 70 },
+        6: { cellWidth: 62, halign: 'right' },
+        7: { cellWidth: 62, halign: 'right' },
+        8: { cellWidth: 64, halign: 'center' },
+        9: { cellWidth: 'auto' },
       },
     });
 
@@ -1832,21 +1897,277 @@ export const useScheduleStore = ({
       } else {
         alert(successMessage);
       }
+      const emailPatch = {
+        inboundEmailSentAt: result?.emailSentAt || new Date().toISOString(),
+        inboundEmailSentTo: result?.emailSentTo || result?.to || '',
+        inboundEmailLastSubject: result?.emailLastSubject || result?.subject || '',
+        inboundEmailSendCount: Number(result?.emailSendCount || 1),
+        inboundEmailLastError: result?.emailLastError || '',
+        inboundEmailSmtpStatus: result?.smtpStatus || '',
+        inboundEmailMessageId: result?.messageId || '',
+        inboundEmailRejectedTo: result?.rejectedTo || '',
+      };
+      const applyEmailPatch = (row) => (
+        row?.supplier === targetSupplier && row?.requestDate === targetDate
+          ? { ...row, ...emailPatch }
+          : row
+      );
+      setSchedules((prev) => prev.map(applyEmailPatch));
+      setFilteredSchedules((prev) => prev.map(applyEmailPatch));
     } catch (error) {
       alert(`Gagal mengirim PDF schedule: ${error.message || 'Unknown error'}`);
     }
   };
 
-  const handleSendEmailReminder = async (item) => {
-    if (!item?.supplier || !item?.requestDate) {
-      alert("Supplier dan tanggal jadwal wajib diisi.");
+  const handleSendFullScheduleEmail = async () => {
+    const allRows = await fetchAllFilteredSchedules();
+    const rows = (Array.isArray(allRows) ? allRows : [])
+      .filter((row) => row?.id && row?.supplier && row?.requestDate);
+    if (rows.length === 0) {
+      alert('Tidak ada data schedule sesuai filter untuk dikirim.');
       return;
     }
+    const { jsPDF, autoTable } = await loadPdfModules();
+    if (!jsPDF || !autoTable) {
+      alert('Modul PDF belum siap. Jalankan: npm install jspdf jspdf-autotable');
+      return;
+    }
+    if (showToastMessage) {
+      showToastMessage('Menyiapkan full schedule dan mengirim email per supplier...', '', null, 'info');
+    }
+
+    const supplierGroups = new Map();
+    rows.forEach((row) => {
+      const key = String(row.supplier || '').trim();
+      if (!key) return;
+      if (!supplierGroups.has(key)) supplierGroups.set(key, []);
+      supplierGroups.get(key).push(row);
+    });
+
+    const reportRows = [];
+    for (const [supplier, groupRowsRaw] of supplierGroups.entries()) {
+      const groupRows = [...groupRowsRaw].sort((a, b) => (
+        String(a.requestDate || '').localeCompare(String(b.requestDate || ''))
+        || String(a.deliveryTime || '').localeCompare(String(b.deliveryTime || ''))
+        || String(a.poNumber || '').localeCompare(String(b.poNumber || ''))
+        || String(a.item || '').localeCompare(String(b.item || ''))
+      ));
+      const supplierLabel = groupRows.find((row) => row.supplierName || row.supplier_name)?.supplierName
+        || groupRows.find((row) => row.supplier_name)?.supplier_name
+        || supplier;
+      const dateValues = groupRows.map((row) => String(row.requestDate || '').trim()).filter(Boolean).sort();
+      const dateStart = filterStart || dateValues[0] || '';
+      const dateEnd = filterEnd || dateValues[dateValues.length - 1] || dateStart;
+      const periodLabel = dateStart && dateEnd ? `${formatDateID(dateStart)} - ${formatDateID(dateEnd)}` : 'Periode terfilter';
+      const senderLabel = user?.username ? `Logistics Team - ${user.username}` : 'Logistics Team';
+      const summary = groupRows.reduce((acc, row) => {
+        const planQty = Number(row.requestQty || 0);
+        const actualQty = Number(row.receivedQty || 0);
+        acc.plan += planQty;
+        acc.actual += actualQty;
+        if (String(row.status || '').toLowerCase() === 'pending') acc.pending += 1;
+        if (actualQty > 0 && actualQty < planQty) acc.partial += 1;
+        return acc;
+      }, { plan: 0, actual: 0, pending: 0, partial: 0 });
+
+      const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+      const margin = 34;
+      const pageWidth = doc.internal.pageSize.getWidth();
+      doc.setFillColor(15, 23, 42);
+      doc.rect(0, 0, pageWidth, 72, 'F');
+      doc.setTextColor(255, 255, 255);
+      doc.setFontSize(18);
+      doc.text('FULL INBOUND SCHEDULE', margin, 32);
+      doc.setFontSize(9);
+      doc.text(`Supplier: ${supplierLabel}`, margin, 52);
+      doc.text(`Periode: ${periodLabel}`, pageWidth - margin, 32, { align: 'right' });
+      doc.text(`Pengirim: ${senderLabel}`, pageWidth - margin, 52, { align: 'right' });
+
+      const cardY = 88;
+      const cards = [
+        ['Total Baris', groupRows.length],
+        ['Qty Plan', summary.plan.toLocaleString('id-ID')],
+        ['Qty Actual', summary.actual.toLocaleString('id-ID')],
+        ['Pending', summary.pending],
+        ['Partial', summary.partial],
+      ];
+      cards.forEach(([label, value], index) => {
+        const x = margin + index * 150;
+        doc.setFillColor(248, 250, 252);
+        doc.roundedRect(x, cardY, 132, 42, 5, 5, 'F');
+        doc.setTextColor(100, 116, 139);
+        doc.setFontSize(7);
+        doc.text(String(label).toUpperCase(), x + 10, cardY + 14);
+        doc.setTextColor(15, 23, 42);
+        doc.setFontSize(12);
+        doc.text(String(value), x + 10, cardY + 31);
+      });
+
+      autoTable(doc, {
+        startY: 146,
+        margin: { left: margin, right: margin, bottom: 34 },
+        theme: 'grid',
+        head: [[
+          'No',
+          'Tanggal',
+          'Jam',
+          'No PO',
+          'Item',
+          'Part Name',
+          'Qty Plan',
+          'Qty Actual',
+          'Sisa',
+          'Status',
+          'Catatan',
+        ]],
+        body: groupRows.map((row, index) => {
+          const planQty = Number(row.requestQty || 0);
+          const actualQty = Number(row.receivedQty || 0);
+          return [
+            index + 1,
+            formatDateID(row.requestDate),
+            row.deliveryTime || '-',
+            row.poNumber || '-',
+            row.item || '-',
+            row.itemName || row.item_name || '-',
+            planQty.toLocaleString('id-ID'),
+            actualQty.toLocaleString('id-ID'),
+            Math.max(planQty - actualQty, 0).toLocaleString('id-ID'),
+            row.status || 'Pending',
+            row.notes || '-',
+          ];
+        }),
+        styles: {
+          fontSize: 7,
+          cellPadding: 3.5,
+          lineWidth: 0.2,
+          lineColor: [203, 213, 225],
+          textColor: [15, 23, 42],
+          valign: 'middle',
+        },
+        headStyles: {
+          fillColor: [226, 232, 240],
+          textColor: [15, 23, 42],
+          fontStyle: 'bold',
+        },
+        alternateRowStyles: { fillColor: [248, 250, 252] },
+        columnStyles: {
+          0: { cellWidth: 24, halign: 'center' },
+          1: { cellWidth: 58, halign: 'center' },
+          2: { cellWidth: 64, halign: 'center' },
+          3: { cellWidth: 82 },
+          4: { cellWidth: 58 },
+          5: { cellWidth: 150 },
+          6: { cellWidth: 58, halign: 'right' },
+          7: { cellWidth: 58, halign: 'right' },
+          8: { cellWidth: 50, halign: 'right' },
+          9: { cellWidth: 64, halign: 'center' },
+          10: { cellWidth: 'auto' },
+        },
+      });
+
+      const pdfBlob = doc.output('blob');
+      const pdfBase64 = await blobToBase64(pdfBlob);
+      const fileName = `FULL_INBOUND_SCHEDULE_${sanitizeFilenamePart(supplierLabel)}_${sanitizeFilenamePart(dateStart)}_${sanitizeFilenamePart(dateEnd)}.pdf`;
+      try {
+        const result = await apiFetch('/api/schedules/send-full-pdf-email', {
+          method: 'POST',
+          body: JSON.stringify({
+            supplier,
+            scheduleIds: groupRows.map((row) => row.id).filter(Boolean),
+            dateStart,
+            dateEnd,
+            fileName,
+            pdfBase64,
+            summary: {
+              totalRows: groupRows.length,
+              planQty: summary.plan,
+              actualQty: summary.actual,
+              pendingCount: summary.pending,
+              partialCount: summary.partial,
+            },
+          }),
+        });
+        reportRows.push({
+          supplier,
+          supplierLabel,
+          status: result?.smtpStatus || 'accepted',
+          to: result?.to || '',
+          rows: groupRows.length,
+          messageId: result?.messageId || '',
+          error: result?.emailLastError || result?.notice || '',
+          recipients: Array.isArray(result?.recipients) ? result.recipients : [],
+        });
+        const emailPatch = {
+          inboundEmailSentAt: result?.emailSentAt || new Date().toISOString(),
+          inboundEmailSentTo: result?.emailSentTo || result?.to || '',
+          inboundEmailLastSubject: result?.emailLastSubject || result?.subject || '',
+          inboundEmailSendCount: Number(result?.emailSendCount || 1),
+          inboundEmailLastError: result?.emailLastError || '',
+          inboundEmailSmtpStatus: result?.smtpStatus || '',
+          inboundEmailMessageId: result?.messageId || '',
+          inboundEmailRejectedTo: result?.rejectedTo || '',
+        };
+        const ids = new Set(groupRows.map((row) => row.id));
+        const applyEmailPatch = (row) => (ids.has(row?.id) ? { ...row, ...emailPatch } : row);
+        setSchedules((prev) => prev.map(applyEmailPatch));
+        setFilteredSchedules((prev) => prev.map(applyEmailPatch));
+      } catch (error) {
+        reportRows.push({
+          supplier,
+          supplierLabel,
+          status: 'failed',
+          to: '',
+          rows: groupRows.length,
+          messageId: '',
+          error: error.message || 'Gagal mengirim email.',
+          recipients: [],
+        });
+      }
+    }
+
+    setInboundFullEmailReport({
+      createdAt: new Date().toISOString(),
+      periodLabel: filterStart && filterEnd ? `${formatDateID(filterStart)} - ${formatDateID(filterEnd)}` : 'Periode terfilter',
+      totalSuppliers: supplierGroups.size,
+      totalRows: rows.length,
+      rows: reportRows,
+    });
+    const failed = reportRows.filter((row) => String(row.status || '').toLowerCase() === 'failed').length;
+    if (showToastMessage) {
+      showToastMessage(
+        failed > 0
+          ? `Full schedule selesai dengan ${failed} supplier gagal.`
+          : 'Full schedule berhasil dikirim.',
+        '',
+        null,
+        failed > 0 ? 'error' : 'success',
+      );
+    }
+  };
+
+  const handleSendEmailReminder = async (item) => {
+    if (!item?.supplier || !item?.requestDate) {
+      if (showToastMessage) {
+        showToastMessage('Supplier dan tanggal jadwal wajib diisi.', '', null, 'error');
+      } else {
+        alert("Supplier dan tanggal jadwal wajib diisi.");
+      }
+      return;
+    }
+    const targetSupplier = item.supplier;
+    const targetDate = item.requestDate;
     try {
+      if (showToastMessage) {
+        showToastMessage('Mengirim reminder inbound schedule...', '', null, 'info');
+      }
       const result = await apiFetch('/api/schedules/reminder-email', {
         method: 'POST',
-        body: JSON.stringify({ supplier: item.supplier, requestDate: item.requestDate }),
+        body: JSON.stringify({ supplier: targetSupplier, requestDate: targetDate }),
       });
+      const successMessage = result?.sent
+        ? (result?.notice || `Email reminder berhasil dikirim ke ${result.to || targetSupplier}.`)
+        : (result?.notice || 'Email reminder siap dikirim.');
       if (result?.html) {
         const preview = window.open('', '_blank', 'noopener');
         if (preview) {
@@ -1854,20 +2175,52 @@ export const useScheduleStore = ({
           preview.document.write(result.html);
           preview.document.close();
         }
-        alert(result.sent
-          ? `Email reminder terkirim ke ${result.to || item.supplier}.`
-          : (result.notice || 'Email reminder siap dikirim.'));
+        if (showToastMessage) {
+          showToastMessage(successMessage, '', null, result?.sent ? 'success' : 'info');
+        } else {
+          alert(successMessage);
+        }
         return;
       }
       if (result?.sent) {
-        alert(`Email reminder terkirim ke ${result.to || item.supplier}.`);
+        if (showToastMessage) {
+          showToastMessage(successMessage, '', null, 'success');
+        } else {
+          alert(successMessage);
+        }
+        const emailPatch = {
+          inboundEmailSentAt: result?.emailSentAt || new Date().toISOString(),
+          inboundEmailSentTo: result?.emailSentTo || result?.to || '',
+          inboundEmailLastSubject: result?.emailLastSubject || result?.subject || '',
+          inboundEmailSendCount: Number(result?.emailSendCount || 1),
+          inboundEmailLastError: result?.emailLastError || '',
+          inboundEmailSmtpStatus: result?.smtpStatus || '',
+          inboundEmailMessageId: result?.messageId || '',
+          inboundEmailRejectedTo: result?.rejectedTo || '',
+        };
+        const applyEmailPatch = (row) => (
+          row?.supplier === targetSupplier && row?.requestDate === targetDate
+            ? { ...row, ...emailPatch }
+            : row
+        );
+        setSchedules((prev) => prev.map(applyEmailPatch));
+        setFilteredSchedules((prev) => prev.map(applyEmailPatch));
         return;
       }
       if (result?.notice) {
-        alert(result.notice);
+        if (showToastMessage) {
+          showToastMessage(result.notice, '', null, 'info');
+        } else {
+          alert(result.notice);
+        }
       }
     } catch (error) {
-      alert(`Gagal kirim reminder: ${error.message || 'Unknown error'}`);
+      const message = `Gagal kirim reminder: ${error.message || 'Unknown error'}`;
+      if (showToastMessage) {
+        showToastMessage(message, '', null, 'error');
+      } else {
+        alert(message);
+      }
     }
   };
   return {
@@ -1909,6 +2262,10 @@ export const useScheduleStore = ({
     setShowInboundPrint,
     inboundPrintOrientation,
     setInboundPrintOrientation,
+    inboundEmailNotice,
+    setInboundEmailNotice,
+    inboundFullEmailReport,
+    setInboundFullEmailReport,
     scheduleEditOpen,
     scheduleEditForm,
     setScheduleEditForm,
@@ -1939,6 +2296,7 @@ export const useScheduleStore = ({
     handleImportExcel,
     handleExportExcel,
     handleSendEmail,
+    handleSendFullScheduleEmail,
     handleSendEmailReminder,
   };
 };

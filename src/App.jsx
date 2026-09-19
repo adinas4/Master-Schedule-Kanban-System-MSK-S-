@@ -11,6 +11,7 @@ import {
   Play, Pause, Eye, EyeOff, Check, X as XIcon, Coins, ListChecks, HelpCircle,
   ShieldCheck
 } from 'lucide-react';
+import LoginScreen from './components/LoginScreen';
 import logoMatra from './assets/logo-matra.png';
 import logoPrl from './assets/kop-mrp.png';
 import {
@@ -807,114 +808,9 @@ const buildKanbanIdRegex = (format) => {
 // ==========================================
 // 1. KOMPONEN LOGIN PAGE
 // ==========================================
-const LoginPage = ({ onLogin, notice = '' }) => {
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setIsLoading(true);
-    setError('');
-
-    try {
-      const data = await apiRequest('/api/auth/login', {
-        method: 'POST',
-        body: JSON.stringify({ username, password }),
-      });
-      onLogin(data.token, data.user);
-    } catch (err) {
-      setError(err.message || 'Username atau Password salah!');
-      setIsLoading(false);
-    }
-  };
-
-  return (
-    <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4 font-sans text-slate-800">
-      <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md border border-slate-200">
-        <div className="flex justify-center mb-6">
-          <img src="/logo.png" alt="Logo MSKS" className="h-24 w-24 object-contain drop-shadow-sm" />
-        </div>
-        
-        <h2 className="text-2xl font-bold text-center text-slate-800 mb-2">Selamat Datang</h2>
-        <p className="text-center text-slate-500 mb-8 text-sm">Master Schedule &amp; Kanban System (MSK-S)</p>
-
-        {notice && (
-          <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
-            {notice}
-          </div>
-        )}
-
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase">Username</label>
-            <div className="relative">
-              <User className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 w-5 h-5" />
-              <input 
-                type="text" 
-                className="w-full pl-10 pr-4 py-3 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all"
-                placeholder="Masukkan username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                required
-              />
-            </div>
-          </div>
-          
-          <div>
-            <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase">Password</label>
-            <div className="relative">
-              <Lock className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 w-5 h-5" />
-              <input 
-                type="password" 
-                className="w-full pl-10 pr-4 py-3 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all"
-                placeholder="Masukkan password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-              />
-            </div>
-            <div className="mt-2 text-right">
-              {ADMIN_WHATSAPP_LINK ? (
-                <a
-                  href={ADMIN_WHATSAPP_LINK}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-xs font-medium text-emerald-700 hover:text-emerald-800 hover:underline"
-                >
-                  Lupa password? Hubungi Admin
-                </a>
-              ) : (
-                <span className="text-xs text-slate-400">
-                  Lupa password? Hubungi Admin
-                </span>
-              )}
-            </div>
-          </div>
-
-          {error && (
-            <div className="bg-red-50 text-red-600 text-sm p-3 rounded-lg flex items-center gap-2 animate-pulse">
-              <AlertTriangle size={16} /> {error}
-            </div>
-          )}
-
-          <button 
-            type="submit" 
-            disabled={isLoading}
-            className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 rounded-lg shadow-lg hover:shadow-indigo-500/30 transition-all flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed"
-          >
-            {isLoading ? <Loader2 className="animate-spin" size={20} /> : 'Masuk Sistem'}
-          </button>
-        </form>
-        
-        <div className="mt-8 text-center text-xs text-slate-400">
-          &copy; 2024 Logistik Corp. Versi Final
-        </div>
-      </div>
-    </div>
-  );
-};
+const LoginPage = ({ onLogin, notice = '' }) => (
+  <LoginScreen onLogin={onLogin} notice={notice} request={apiRequest} adminWhatsappLink={ADMIN_WHATSAPP_LINK} />
+);
 
 const publicFormatNumber0 = (value) => {
   const num = Number(value);

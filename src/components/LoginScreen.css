@@ -39,7 +39,7 @@
 .login-quote-controls button:hover { background: #ffffff15; }
 .login-quote-progress { height: 2px; background: #ffffff08; margin: 0 -25px; }
 .login-quote-progress span { display: block; height: 100%; background: #baddab; transform: scaleX(0); transform-origin: left; }
-.login-quote-progress .is-running { animation: login-quote-timer 15s linear forwards; }
+.login-quote-progress .is-running { animation: login-quote-timer var(--quote-duration) linear forwards; }
 .login-workflow { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: auto 0 0; padding-top: 6px; }
 .login-workflow span { display: flex; align-items: center; gap: 7px; font-size: 10px; color: #c0d2cf; white-space: nowrap; }
 .login-workflow svg { color: #baddab; }

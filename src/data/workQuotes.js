@@ -51,7 +51,7 @@ export const WORK_QUOTES = [
   ...ADDITIONAL_WORK_QUOTES,
 ];
 
-export const QUOTE_INTERVAL_MS = 15000;
+export const QUOTE_INTERVAL_MS = 30000;
 
 export function createQuoteOrder(previousId) {
   const order = WORK_QUOTES.map((_, index) => index);

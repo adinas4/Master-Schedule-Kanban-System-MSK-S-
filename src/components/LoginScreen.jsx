@@ -54,10 +54,10 @@ function InspirationPanel() {
           <span className="login-translation">Terjemahan bahasa Indonesia</span>
         </div>
         <div className="login-quote-controls">
-          <span>{paused ? 'Pergantian dijeda' : 'Inspirasi baru setiap 15 detik'}</span>
+          <span>{paused ? 'Pergantian dijeda' : `Inspirasi baru setiap ${QUOTE_INTERVAL_MS / 1000} detik`}</span>
           <div><button type="button" onClick={() => setPaused((value) => !value)} aria-label={paused ? 'Lanjutkan pergantian kutipan' : 'Jeda pergantian kutipan'} title={paused ? 'Lanjutkan' : 'Jeda'}>{paused ? <Play size={16} /> : <Pause size={16} />}</button><button type="button" onClick={nextQuote} aria-label="Tampilkan kutipan berikutnya" title="Kutipan berikutnya"><RefreshCw size={16} /></button></div>
         </div>
-        <div className="login-quote-progress" aria-hidden="true"><span key={`${selection.revision}-${paused}-${visible}`} className={!paused && visible ? 'is-running' : ''} /></div>
+        <div className="login-quote-progress" style={{ '--quote-duration': `${QUOTE_INTERVAL_MS}ms` }} aria-hidden="true"><span key={`${selection.revision}-${paused}-${visible}`} className={!paused && visible ? 'is-running' : ''} /></div>
       </div>
       <div className="login-workflow" aria-label="Alur operasional"><span><CalendarDays size={17} />Rencanakan</span><i /><span><Layers3 size={17} />Koordinasikan</span><i /><span><Truck size={17} />Wujudkan</span></div>
       <div className="login-hero-footer"><span className="login-footer-rule" />Kerja terarah. Kolaborasi lebih mudah.</div>

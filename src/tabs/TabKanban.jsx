@@ -96,6 +96,9 @@ const TabKanban = (props) => {
     dnPrintMode,
     dnEmailSendingId,
     dnStatusFlowList,
+    emptyKanbanConfirm,
+    emptyKanbanConfirmLoading,
+    emptyKanbanConfirmSubmitting,
     emptyKanbanForm,
     extractAreaNote,
     extractKanbanIdNote,
@@ -120,6 +123,8 @@ const TabKanban = (props) => {
     handleCreateSchedule,
     handleDeleteDn,
     handleDeleteKanbanRequest,
+    closeEmptyKanbanConfirm,
+    confirmEmptyKanbanManualPost,
     handleDnDetailSave,
     handleForceCloseDn,
     handleDnEmail,
@@ -258,6 +263,7 @@ const TabKanban = (props) => {
     setSelectedRequestIds,
     setShowBatchModal,
     setShowConsumeModal,
+    updateEmptyKanbanConfirm,
     setShowDnModal,
     setShowKanbanCardModal,
     setShowKanbanEdit,
@@ -595,6 +601,7 @@ const TabKanban = (props) => {
   const [localRnSearch, setLocalRnSearch] = useState(rnSearch || '');
   const [kanbanAnalysisRow, setKanbanAnalysisRow] = useState(null);
   const deliveryUploadInputRef = useRef(null);
+  const deliveryUploadInFlightRef = useRef(false);
   const [deliveryUploads, setDeliveryUploads] = useState([]);
   const [deliveryUploadsLoading, setDeliveryUploadsLoading] = useState(false);
   const [deliveryUploadsError, setDeliveryUploadsError] = useState('');
@@ -3596,11 +3603,13 @@ const TabKanban = (props) => {
   };
 
   const handleDeliveryUpload = async () => {
+    if (deliveryUploadInFlightRef.current) return;
     const file = deliveryUploadInputRef.current?.files?.[0] || null;
     if (!file) {
       setDeliveryUploadError('Pilih file foto / PDF DN terlebih dahulu.');
       return;
     }
+    deliveryUploadInFlightRef.current = true;
     setDeliveryUploadLoading(true);
     setDeliveryUploadError('');
     try {
@@ -3619,6 +3628,7 @@ const TabKanban = (props) => {
     } catch (error) {
       setDeliveryUploadError(error.message || 'Gagal upload DN.');
     } finally {
+      deliveryUploadInFlightRef.current = false;
       setDeliveryUploadLoading(false);
     }
   };
@@ -5883,8 +5893,8 @@ ${reasons.join('\n')}`);
             {/* Kanban Board */}
             {mainTab === 'kanban' && (
               <>
-                <div className={`space-y-4 ${(showDnPrintModal || showRnPrintModal) ? 'kanban-print-host' : ''}`}>
-              <div className="flex flex-col gap-2">
+                <div className={`kanban-mobile-layout space-y-4 ${(showDnPrintModal || showRnPrintModal) ? 'kanban-print-host' : ''}`}>
+              <div className="kanban-page-heading flex flex-col gap-2">
                 <div>
                   <div className="text-2xl font-bold text-slate-900">
                     {kanbanView === 'master'
@@ -5901,7 +5911,7 @@ ${reasons.join('\n')}`);
                         : 'Pantau alur request, DN, receiving, dan kanban kosong.'}
                   </div>
                 </div>
-                <div className="flex gap-2 text-xs">
+                <div className="kanban-view-switcher flex gap-2 text-xs">
                   {!isProductionUser && (
                     <button
                       onClick={() => setKanbanView('master')}
@@ -6565,7 +6575,7 @@ ${reasons.join('\n')}`);
 
               {['board', 'planning'].includes(kanbanView) && (
               <div className="space-y-4">
-                <div className="bg-white rounded-xl border p-3 flex flex-wrap gap-2 text-xs">
+                <div className="kanban-subnav bg-white rounded-xl border p-3 flex flex-wrap gap-2 text-xs">
                   {(kanbanView === 'planning' ? planningTabs : kanbanBoardTabs).map((tab) => (
                     <button
                       key={tab.key}
@@ -7043,7 +7053,7 @@ ${reasons.join('\n')}`);
                       }, 0);
                       if (criticalCount === 0) return null;
                       return (
-                        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-700 flex items-start gap-2">
+                        <div className="kanban-critical-alert bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-700 flex items-start gap-2">
                           <AlertTriangle size={18} />
                           <div>
                             <div className="font-semibold">Attention:</div>
@@ -7055,14 +7065,14 @@ ${reasons.join('\n')}`);
                       );
                     })()}
 
-                    <div className="bg-white rounded-xl border p-4">
+                    <div className="kanban-request-panel bg-white rounded-xl border p-4">
                       <div className="flex flex-col gap-3 mb-3">
-                        <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="kanban-request-header flex flex-wrap items-center justify-between gap-3">
                           <div>
                             <div className="text-sm font-semibold">Kanban Request Log</div>
                             <div className="text-xs text-slate-500">Aging, overdue, dan Over PRL request dipantau langsung dari board.</div>
                           </div>
-                          <div className="flex items-center gap-2">
+                          <div className="kanban-request-actions flex items-center gap-2">
                             <select
                               className="px-3 py-1.5 text-xs border rounded bg-white"
                               value={kanbanRequestStatusFilter}
@@ -7099,7 +7109,7 @@ ${reasons.join('\n')}`);
                             </button>
                           </div>
                         </div>
-                        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div className="kanban-request-summary grid grid-cols-1 md:grid-cols-3 gap-3">
                           <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
                             <div className="text-[11px] uppercase tracking-wide text-amber-700">Overdue</div>
                             <div className="mt-1 text-xl font-bold text-amber-700">{kanbanRequestHealthSummary.overdue}</div>
@@ -7113,7 +7123,7 @@ ${reasons.join('\n')}`);
                             <div className="mt-1 text-xl font-bold text-orange-700">{kanbanRequestHealthSummary.stockGap}</div>
                           </div>
                         </div>
-                        <div className="flex flex-wrap items-center gap-2">
+                        <div className="kanban-request-quick-filters flex flex-wrap items-center gap-2">
                           {requestQuickFilterOptions.map((option) => (
                             <button
                               key={option.value}
@@ -7274,7 +7284,7 @@ ${reasons.join('\n')}`);
                           </div>
                         )}
                       </div>
-                      <div className="overflow-x-auto">
+                      <div className="kanban-request-table overflow-x-auto">
                         <table className="min-w-full text-xs">
                           <thead className="bg-slate-100 text-slate-500">
                             <tr>
@@ -9278,9 +9288,9 @@ ${reasons.join('\n')}`);
                           <button
                             type="submit"
                             className={`w-full bg-slate-900 text-white rounded flex items-center justify-center gap-2 disabled:opacity-60 ${isProductionUser ? 'py-4 text-sm font-semibold' : 'py-2 text-xs'}`}
-                            disabled={isStockOpnameLocked}
+                            disabled={isStockOpnameLocked || emptyKanbanConfirmLoading}
                           >
-                            <QrCode size={14} /> Catat Kanban Kosong
+                            <QrCode size={14} /> {emptyKanbanConfirmLoading ? 'Memuat Konfirmasi...' : 'Input Manual / Konfirmasi'}
                           </button>
                         </form>
                       </div>
@@ -12796,6 +12806,122 @@ ${reasons.join('\n')}`);
                           )}
                         </div>
                       </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {emptyKanbanConfirm && (
+                <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+                  <div className="bg-white rounded-2xl w-full max-w-xl overflow-hidden shadow-xl">
+                    <div className="flex items-start justify-between gap-3 border-b px-5 py-4">
+                      <div>
+                        <div className="text-sm font-semibold text-slate-900">Konfirmasi Kanban Kosong Manual</div>
+                        <div className="mt-1 text-xs text-slate-500">Pastikan qty dan supplier sesuai sebelum stok dipotong.</div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={closeEmptyKanbanConfirm}
+                        disabled={emptyKanbanConfirmSubmitting}
+                        className="rounded-lg border border-slate-200 p-2 text-slate-500 hover:bg-slate-50 disabled:opacity-60"
+                      >
+                        <X size={16} />
+                      </button>
+                    </div>
+                    <div className="space-y-4 px-5 py-4 text-sm">
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                        <div className="rounded-xl border bg-slate-50 p-3">
+                          <div className="text-[10px] uppercase text-slate-400">Kanban / Uniq</div>
+                          <div className="mt-1 font-semibold text-slate-900">{emptyKanbanConfirm.kanbanId || '-'}</div>
+                        </div>
+                        <div className="rounded-xl border bg-slate-50 p-3">
+                          <div className="text-[10px] uppercase text-slate-400">Area/Lini</div>
+                          <div className="mt-1 font-semibold text-slate-900">{emptyKanbanConfirm.areaLabel || '-'}</div>
+                        </div>
+                        <div className="rounded-xl border bg-slate-50 p-3 sm:col-span-2">
+                          <div className="text-[10px] uppercase text-slate-400">Item</div>
+                          <div className="mt-1 font-semibold text-slate-900">{emptyKanbanConfirm.itemCode || '-'} - {emptyKanbanConfirm.itemName || '-'}</div>
+                          {emptyKanbanConfirm.partNo && <div className="mt-1 text-xs text-slate-500">{emptyKanbanConfirm.partNo}</div>}
+                        </div>
+                        <div className="rounded-xl border bg-slate-50 p-3 sm:col-span-2">
+                          <div className="text-[10px] uppercase text-slate-400">Type Packing</div>
+                          <div className="mt-1 font-semibold text-slate-900">
+                            {emptyKanbanConfirm.typePacking || emptyKanbanConfirm.typePackName || emptyKanbanConfirm.typePack || '-'}
+                          </div>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] uppercase text-slate-400 mb-1">Qty Aktual</label>
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="number"
+                              min="0"
+                              step="0.001"
+                              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                              value={emptyKanbanConfirm.qty || ''}
+                              onChange={(e) => updateEmptyKanbanConfirm?.({ qty: e.target.value })}
+                              disabled={emptyKanbanConfirmSubmitting}
+                            />
+                            {emptyKanbanConfirm.unit && (
+                              <span className="rounded-lg border bg-slate-50 px-3 py-2 text-xs font-semibold uppercase text-slate-600">
+                                {emptyKanbanConfirm.unit}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] uppercase text-slate-400 mb-1">Supplier / Owner Master</label>
+                          {Array.isArray(emptyKanbanConfirm.supplierOptions) && emptyKanbanConfirm.supplierOptions.length > 1 ? (
+                            <select
+                              className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                              value={emptyKanbanConfirm.supplier || ''}
+                              onChange={(e) => updateEmptyKanbanConfirm?.({ supplier: e.target.value })}
+                              disabled={emptyKanbanConfirmSubmitting}
+                            >
+                              <option value="">Pilih supplier</option>
+                              {emptyKanbanConfirm.supplierOptions.map((supplier) => (
+                                <option key={supplier.supplier || supplier.supplierCode || supplier.supplierName} value={supplier.supplier || supplier.supplierCode || supplier.supplierName}>
+                                  {supplier.label || supplier.supplier || supplier.supplierCode || supplier.supplierName}
+                                </option>
+                              ))}
+                            </select>
+                          ) : (
+                            <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-900">
+                              {emptyKanbanConfirm.supplierOptions?.[0]?.label || emptyKanbanConfirm.supplier || '-'}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      {Number(emptyKanbanConfirm.qty || 0) !== Number(emptyKanbanConfirm.qtyMaster || emptyKanbanConfirm.qty || 0) && (
+                        <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                          Qty aktual berbeda dari qty standar master. Pastikan ini memang pemakaian aktual sebelum konfirmasi.
+                        </div>
+                      )}
+                      {Array.isArray(emptyKanbanConfirm.scanWarnings) && emptyKanbanConfirm.scanWarnings.length > 0 && (
+                        <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                          {emptyKanbanConfirm.scanWarnings.join(' ')}
+                        </div>
+                      )}
+                      <div className="rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
+                        Jika supplier/owner tidak sesuai, batalkan dan koreksi Master Item/Kanban dulu. Konfirmasi akan memotong stok sesuai qty aktual.
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap justify-end gap-2 border-t bg-slate-50 px-5 py-4">
+                      <button
+                        type="button"
+                        onClick={closeEmptyKanbanConfirm}
+                        disabled={emptyKanbanConfirmSubmitting}
+                        className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-60"
+                      >
+                        Batal
+                      </button>
+                      <button
+                        type="button"
+                        onClick={confirmEmptyKanbanManualPost}
+                        disabled={emptyKanbanConfirmSubmitting || !(Number(emptyKanbanConfirm.qty || 0) > 0) || (Array.isArray(emptyKanbanConfirm.supplierOptions) && emptyKanbanConfirm.supplierOptions.length > 0 && !emptyKanbanConfirm.supplier)}
+                        className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
+                      >
+                        {emptyKanbanConfirmSubmitting ? 'Memproses...' : 'Konfirmasi & Posting'}
+                      </button>
                     </div>
                   </div>
                 </div>

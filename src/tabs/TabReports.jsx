@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Bar,
   CartesianGrid,
+  Cell,
   ComposedChart,
   LabelList,
   Line,
@@ -103,7 +104,20 @@ const TabReports = (props) => {
     stockCoverageRows,
     stockCoverageDays,
     setStockCoverageDays,
+    customerCategoryStockRows,
+    customerCategoryStockSummary,
+    customerCategoryStockDays,
+    setCustomerCategoryStockDays,
+    customerCategoryStockCategory,
+    setCustomerCategoryStockCategory,
+    customerCategoryStockCustomer,
+    setCustomerCategoryStockCustomer,
+    customerCategoryStockDetailRows,
+    customerCategoryStockRecoveryTarget,
+    setCustomerCategoryStockRecoveryTarget,
     slowMovingRows,
+    itemSummaryReportRows,
+    itemSummaryReportSummary,
     inboundPerformanceRows,
     fifoViolationRows,
     inventoryValueRows,
@@ -131,6 +145,10 @@ const TabReports = (props) => {
     rawMaterialLedgerLoading,
     rawMaterialLedgerError,
     rawMaterialLedgerMeta,
+    receiveNoteReportRows,
+    receiveNoteReportSummary,
+    masterPoReportRows,
+    masterPoReportSummary,
     outstandingPrlRows,
     allMutationStart,
     setAllMutationStart,
@@ -172,8 +190,12 @@ const TabReports = (props) => {
     calculateSupplierPerformance,
     scorecardSchedulesLoading,
     fetchStockCoverageReport,
+    fetchCustomerCategoryStockReport,
     fetchSlowMovingReport,
+    fetchItemSummaryReport,
     fetchInboundPerformanceReport,
+    fetchReceiveNoteReport,
+    fetchMasterPoReport,
     fetchFifoViolationReport,
     fetchInventoryValueReport,
     fetchSupplierShortageReport,
@@ -182,8 +204,12 @@ const TabReports = (props) => {
     fetchOutstandingPrlReport,
     handleExportRawMaterialLedgerExcel,
     handleExportStockCoverageExcel,
+    handleExportCustomerCategoryStockExcel,
     handleExportSlowMovingExcel,
+    handleExportItemSummaryReportExcel,
     handleExportInboundPerformanceExcel,
+    handleExportReceiveNoteReportExcel,
+    handleExportMasterPoReportExcel,
     handleExportFifoViolationExcel,
     handleExportInventoryValueExcel,
     handleExportSupplierShortageExcel,
@@ -192,6 +218,7 @@ const TabReports = (props) => {
     ensureXlsx,
     masterAreas,
     masterCategories,
+    masterCustomers,
     masterLocations,
     masterModelsMap,
     masterProcesses,
@@ -220,6 +247,12 @@ const TabReports = (props) => {
   const formatQuantity = (value) => Number(value || 0).toLocaleString('id-ID', { maximumFractionDigits: 2 });
   const formatCount = (value) => Number(value || 0).toLocaleString('id-ID');
   const formatPercent = (value) => `${Number(value || 0).toFixed(1)}%`;
+  const getRatioPercent = (numerator, denominator) => {
+    const top = Number(numerator || 0);
+    const bottom = Number(denominator || 0);
+    if (!Number.isFinite(top) || !Number.isFinite(bottom) || bottom <= 0) return null;
+    return Math.max(0, (top / bottom) * 100);
+  };
   const getModelCodeText = (value) => {
     const parsed = typeof parseModelCodes === 'function' ? parseModelCodes(value) : [];
     const formatted = typeof formatModelCodes === 'function' ? formatModelCodes(masterModelsMap, parsed) : '';
@@ -255,6 +288,98 @@ const TabReports = (props) => {
     ...(Array.isArray(masterAreas) ? masterAreas.flatMap((row) => [row.name, row.id]).filter(Boolean) : []),
     ...(Array.isArray(masterProcesses) ? masterProcesses.flatMap((row) => [row.name, row.code]).filter(Boolean) : []),
   ])).sort((a, b) => String(a).localeCompare(String(b)));
+  const rnReportRows = Array.isArray(receiveNoteReportRows) ? receiveNoteReportRows : [];
+  const rnReportSummary = receiveNoteReportSummary || {};
+  const masterPoRows = Array.isArray(masterPoReportRows) ? masterPoReportRows : [];
+  const masterPoSummary = masterPoReportSummary || {};
+  const [masterPoSupplierModalKey, setMasterPoSupplierModalKey] = useState('');
+  const getMasterPoSupplierKey = (row) => {
+    const supplierCode = String(row?.supplierCode || '').trim();
+    const supplierName = String(row?.supplierName || supplierCode || 'UNKNOWN').trim();
+    return (supplierCode || supplierName || 'UNKNOWN').toLowerCase();
+  };
+  const masterPoSupplierMatrixRows = useMemo(() => {
+    const supplierMap = new Map();
+
+    masterPoRows.forEach((row) => {
+      const supplierCode = String(row.supplierCode || '').trim();
+      const supplierName = String(row.supplierName || supplierCode || 'UNKNOWN').trim();
+      const supplierKey = getMasterPoSupplierKey(row);
+
+      if (!supplierMap.has(supplierKey)) {
+        supplierMap.set(supplierKey, {
+          supplierKey,
+          supplierCode,
+          supplierName,
+          poNumbers: new Set(),
+          rnNumbers: new Set(),
+          doNumbers: new Set(),
+          itemCodes: new Set(),
+          lineCount: 0,
+          qtyOrder: 0,
+          qtyReceived: 0,
+          qtyRemaining: 0,
+          scheduledQty: 0,
+          scheduleCount: 0,
+          openLines: 0,
+          partialLines: 0,
+          closedLines: 0,
+          lastReceivedDate: '',
+        });
+      }
+
+      const bucket = supplierMap.get(supplierKey);
+      if (row.poNumber) bucket.poNumbers.add(row.poNumber);
+      if (row.itemCode) bucket.itemCodes.add(row.itemCode);
+      String(row.rnNumbers || '').split(',').map((value) => value.trim()).filter(Boolean).forEach((value) => bucket.rnNumbers.add(value));
+      String(row.doNumbers || '').split(',').map((value) => value.trim()).filter(Boolean).forEach((value) => bucket.doNumbers.add(value));
+      bucket.lineCount += 1;
+      bucket.qtyOrder += Number(row.qtyOrder || 0);
+      bucket.qtyReceived += Number(row.qtyReceived || 0);
+      bucket.qtyRemaining += Number(row.qtyRemaining || 0);
+      bucket.scheduledQty += Number(row.scheduledQty || 0);
+      bucket.scheduleCount += Number(row.scheduleCount || 0);
+      const status = String(row.status || '').toLowerCase();
+      if (status === 'open') bucket.openLines += 1;
+      if (status === 'partial') bucket.partialLines += 1;
+      if (status === 'closed' || status === 'short closed') bucket.closedLines += 1;
+      const receivedDate = row.lastReceivedDate ? String(row.lastReceivedDate).slice(0, 10) : '';
+      if (receivedDate && (!bucket.lastReceivedDate || receivedDate > bucket.lastReceivedDate)) {
+        bucket.lastReceivedDate = receivedDate;
+      }
+    });
+
+    return Array.from(supplierMap.values()).map((row) => ({
+      ...row,
+      poCount: row.poNumbers.size,
+      itemCount: row.itemCodes.size,
+      rnCount: row.rnNumbers.size,
+      doCount: row.doNumbers.size,
+      fillRate: row.qtyOrder > 0 ? (row.qtyReceived / row.qtyOrder) * 100 : 0,
+      rnPreview: Array.from(row.rnNumbers).slice(0, 2).join(', '),
+      doPreview: Array.from(row.doNumbers).slice(0, 2).join(', '),
+    })).sort((a, b) => (
+      b.qtyRemaining - a.qtyRemaining
+      || String(a.supplierName).localeCompare(String(b.supplierName), 'id')
+    ));
+  }, [masterPoRows]);
+  const masterPoDetailRows = useMemo(() => (
+    [...masterPoRows].sort((a, b) => (
+      String(a.supplierName || a.supplierCode || '').localeCompare(String(b.supplierName || b.supplierCode || ''), 'id')
+      || String(a.poNumber || '').localeCompare(String(b.poNumber || ''), 'id')
+      || Number(a.lineNo || 0) - Number(b.lineNo || 0)
+    ))
+  ), [masterPoRows]);
+  const selectedMasterPoSupplier = useMemo(() => (
+    masterPoSupplierMatrixRows.find((row) => row.supplierKey === masterPoSupplierModalKey) || null
+  ), [masterPoSupplierMatrixRows, masterPoSupplierModalKey]);
+  const selectedMasterPoDetailRows = useMemo(() => (
+    selectedMasterPoSupplier
+      ? masterPoDetailRows.filter((row) => getMasterPoSupplierKey(row) === selectedMasterPoSupplier.supplierKey)
+      : []
+  ), [masterPoDetailRows, selectedMasterPoSupplier]);
+  const itemSummaryRows = Array.isArray(itemSummaryReportRows) ? itemSummaryReportRows : [];
+  const itemSummary = itemSummaryReportSummary || {};
   const reportMenuGroups = useMemo(() => {
     const groups = [
       {
@@ -274,7 +399,9 @@ const TabReports = (props) => {
         icon: Coins,
         reports: [
           { key: 'stock-coverage', label: 'Stock Coverage', icon: BarChart3, access: canViewReport },
+          { key: 'stock-by-customer', label: 'Stok per Customer', icon: BarChart3, access: canViewReport },
           { key: 'slow-moving', label: 'Slow & Dead Stock', icon: TrendingDown, access: canViewReport },
+          { key: 'item-summary', label: 'Laporan per Barang', icon: FileText, access: canViewReport },
           { key: 'fifo-violations', label: 'FIFO Violation', icon: AlertTriangle, access: canViewReport },
           { key: 'inventory-value', label: 'Inventory Value', icon: Coins, access: canViewReport },
           { key: 'all-mutations', label: 'All Mutasi', icon: FileText, access: canViewReport },
@@ -285,6 +412,8 @@ const TabReports = (props) => {
         label: 'Inbound',
         icon: Truck,
         reports: [
+          { key: 'rn-report', label: 'Laporan per RN', icon: FileText, access: canViewReport },
+          { key: 'master-po-report', label: 'Master PO', icon: FileText, access: canViewReport },
           { key: 'inbound-performance', label: 'Inbound Performance', icon: ArrowDownUp, access: canViewReport },
           { key: 'inbound-matrix', label: 'Delivery Matrix', icon: Truck, access: canViewReport },
         ],
@@ -567,6 +696,104 @@ const TabReports = (props) => {
     ];
   }, [masterCategories]);
 
+  const customerStockCategoryOptions = useMemo(() => (
+    allMutationCategoryOptions.map((option, index) => (
+      index === 0 && option.value === '' ? { ...option, value: 'all' } : option
+    ))
+  ), [allMutationCategoryOptions]);
+  const customerStockCustomerOptions = useMemo(() => {
+    const rows = Array.isArray(masterCustomers) ? masterCustomers : [];
+    const options = rows
+      .map((customer) => {
+        const id = String(customer?.id || '').trim();
+        const name = String(customer?.name || '').trim();
+        const value = id || name;
+        if (!value) return null;
+        return { value, label: id && name && id !== name ? `${id} - ${name}` : (name || id) };
+      })
+      .filter(Boolean)
+      .sort((left, right) => left.label.localeCompare(right.label, 'id'));
+    return [
+      { value: '', label: 'ALL - Semua Customer' },
+      ...options,
+    ];
+  }, [masterCustomers]);
+
+  const getCustomerStockIndicatorClass = (indicator) => {
+    const normalized = String(indicator || '').toUpperCase();
+    if (normalized === 'AMAN') return 'bg-emerald-100 text-emerald-700 border-emerald-200';
+    if (normalized === 'AWAS') return 'bg-amber-100 text-amber-700 border-amber-200';
+    if (normalized === 'BAHAYA') return 'bg-rose-100 text-rose-700 border-rose-200';
+    return 'bg-slate-100 text-slate-600 border-slate-200';
+  };
+  const getCustomerStockIndicatorColor = (indicator) => {
+    const normalized = String(indicator || '').toUpperCase();
+    if (normalized === 'AMAN') return '#10b981';
+    if (normalized === 'AWAS') return '#f59e0b';
+    if (normalized === 'BAHAYA') return '#ef4444';
+    return '#94a3b8';
+  };
+  const customerStockChartRows = useMemo(() => {
+    const rank = { BAHAYA: 0, AWAS: 1, AMAN: 2 };
+    return (Array.isArray(customerCategoryStockRows) ? customerCategoryStockRows : [])
+      .map((row) => {
+        const coverage = row.coverageDays === null || row.coverageDays === undefined ? null : Number(row.coverageDays || 0);
+        const stockQty = Number(row.stockQty || 0);
+        const coveragePlot = coverage === null ? (stockQty > 0 ? 10 : 0) : Math.min(10, Math.max(0, coverage));
+        const category = String(row.category || '-');
+        const customer = String(row.customer || '-');
+        const label = `${category} / ${customer}`;
+        return {
+          ...row,
+          label: label.length > 42 ? `${label.slice(0, 39)}...` : label,
+          fullLabel: label,
+          coveragePlot,
+          coverageLabel: coverage === null ? '-' : coverage > 10 ? '10+' : coverage.toFixed(1),
+          fill: getCustomerStockIndicatorColor(row.indicator),
+          sortRank: rank[String(row.indicator || '').toUpperCase()] ?? 9,
+        };
+      })
+      .sort((left, right) => left.sortRank - right.sortRank
+        || left.coveragePlot - right.coveragePlot
+        || String(left.fullLabel).localeCompare(String(right.fullLabel), 'id'))
+      .slice(0, 12)
+      .reverse();
+  }, [customerCategoryStockRows]);
+  const customerStockDetailRows = useMemo(() => (
+    (Array.isArray(customerCategoryStockDetailRows) ? customerCategoryStockDetailRows : [])
+      .map((row, index) => ({
+        ...row,
+        no: row.no || index + 1,
+        stockDayValue: row.stockDay === null || row.stockDay === undefined ? null : Number(row.stockDay || 0),
+        safetyDayValue: Number(row.safetyDay || customerCategoryStockDays || 2),
+        qtyPrlValue: Number(row.qtyPrl || 0),
+      }))
+  ), [customerCategoryStockDetailRows, customerCategoryStockDays]);
+  const customerStockControlRows = customerStockDetailRows.slice(0, 32);
+  const customerStockHeaderCustomer = useMemo(() => {
+    const selected = customerStockCustomerOptions.find((option) => option.value === customerCategoryStockCustomer)?.label || '';
+    if (customerCategoryStockCustomer && selected) return selected.replace(/^[^-]+ - /, '');
+    const uniqueCustomers = Array.from(new Set(customerStockDetailRows.map((row) => String(row.customer || '').trim()).filter(Boolean)));
+    if (uniqueCustomers.length === 1) return uniqueCustomers[0];
+    return 'ALL CUSTOMER';
+  }, [customerCategoryStockCustomer, customerStockCustomerOptions, customerStockDetailRows]);
+  const getStockDayCellClass = (value) => {
+    const numberValue = Number(value || 0);
+    if (numberValue >= 2) return 'bg-[#9cff9c]';
+    if (numberValue >= 1) return 'bg-[#ffff00]';
+    return 'bg-[#f4a3b5]';
+  };
+  const formatControlNumber = (value, digits = 0) => {
+    const numberValue = Number(value || 0);
+    if (!Number.isFinite(numberValue)) return '-';
+    if (digits > 0) return numberValue.toLocaleString('id-ID', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+    return numberValue === 0 ? '-' : numberValue.toLocaleString('id-ID', { maximumFractionDigits: 0 });
+  };
+  const reportDate = new Date();
+  const controlPeriodLabel = reportDate.toLocaleDateString('id-ID', { month: 'long' }).toUpperCase();
+  const controlDateLabel = reportDate.toLocaleDateString('id-ID').replace(/\//g, '.');
+  const controlTimeLabel = `${reportDate.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', hour12: false })} WIB`;
+
   const masterSupplierOptions = useMemo(() => {
     const seen = new Set();
     const vendorRows = Array.isArray(masterVendors) ? masterVendors : [];
@@ -633,17 +860,19 @@ const TabReports = (props) => {
 
   const handlePrintReport = (orientationOverride) => {
     if (typeof window === 'undefined') return;
+    const explicitOrientation = typeof orientationOverride === 'string' ? orientationOverride : '';
+    const selectedOrientation = explicitOrientation || reportPrintOrientation;
+    const isLandscape = selectedOrientation === 'landscape';
     if (typeof document !== 'undefined') {
       const existingStyle = document.querySelector('style[data-report-page]');
       if (existingStyle) existingStyle.remove();
       const style = document.createElement('style');
       style.setAttribute('data-report-page', 'true');
-      const orientation = orientationOverride || (reportPrintOrientation === 'landscape' ? 'landscape' : 'portrait');
-      style.innerHTML = orientation === 'landscape'
+      style.innerHTML = isLandscape
         ? `
         @media print {
           @page {
-            size: 297mm 210mm;
+            size: A4 landscape;
             margin: 10mm 12mm 12mm 12mm;
           }
         }
@@ -651,7 +880,7 @@ const TabReports = (props) => {
         : `
         @media print {
           @page {
-            size: 210mm 297mm;
+            size: A4 portrait;
             margin: 15mm;
             margin-bottom: 25mm;
           }
@@ -661,8 +890,8 @@ const TabReports = (props) => {
     }
     if (typeof document !== 'undefined') {
       document.body.classList.add('report-print-active');
-      document.body.classList.toggle('report-print-landscape', (orientationOverride || reportPrintOrientation) === 'landscape');
-      if ((orientationOverride || reportPrintOrientation) === 'landscape') {
+      document.body.classList.toggle('report-print-landscape', isLandscape);
+      if (isLandscape) {
         document.documentElement.classList.add('report-print-landscape-root');
       } else {
         document.documentElement.classList.remove('report-print-landscape-root');
@@ -684,7 +913,6 @@ const TabReports = (props) => {
         window.print();
       });
     });
-    setTimeout(cleanup, 800);
   };
 
   const monthOptions = [
@@ -1009,6 +1237,15 @@ const TabReports = (props) => {
     }).sort((left, right) => right.weightedScore - left.weightedScore || String(left.supplierLabel).localeCompare(String(right.supplierLabel), 'id'));
   }, [reportRows]);
 
+  const reportDnSummary = (Array.isArray(reportRows) ? reportRows : []).reduce((acc, supplierReport) => {
+    const itemSummary = supplierReport?.summary || {};
+    acc.dnDocQty += Number(itemSummary.dnDocQty || 0);
+    acc.dnReceivedQty += Number(itemSummary.dnReceivedQty || 0);
+    acc.dnDiffQty += Number(itemSummary.dnDiffQty || 0);
+    return acc;
+  }, { dnDocQty: 0, dnReceivedQty: 0, dnDiffQty: 0 });
+  reportDnSummary.dnFulfillmentScore = getRatioPercent(reportDnSummary.dnReceivedQty, reportDnSummary.dnDocQty);
+
   const monthOptionIndexMap = monthOptions.reduce((map, month, index) => ({
     ...map,
     [month.key]: index + 1,
@@ -1302,7 +1539,7 @@ const TabReports = (props) => {
                       <button onClick={handlePrintReport} className="bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded text-xs">PDF</button>
                     </div>
                   </div>
-                  <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4 print:hidden">
+                  <div className="grid grid-cols-1 md:grid-cols-5 gap-3 mb-4 print:hidden">
                     <div>
                       <label className="text-xs font-semibold text-gray-500">Start</label>
                       <input type="date" className="border p-2 rounded w-full text-sm" value={reportStart} onChange={(e) => setReportStart(e.target.value)} />
@@ -1339,21 +1576,35 @@ const TabReports = (props) => {
                     )}
                     {!reportLoading && reportRows.length > 0 && (
                       <>
-                        <div className="report-summary-kpi-grid grid grid-cols-1 gap-3 lg:grid-cols-4">
+                        <div className="report-summary-kpi-grid grid grid-cols-1 gap-3 lg:grid-cols-5">
                           {[
                             { label: 'Total Score', value: `${Math.round(Number(reportSummary?.weightedScore || 0))}%`, icon: Trophy, tone: 'text-indigo-700 bg-indigo-50' },
                             { label: 'Ketepatan Waktu', value: `${Math.round(Number(reportSummary?.timeScore || 0))}%`, icon: Clock3, tone: 'text-sky-700 bg-sky-50' },
-                            { label: 'Fulfillment Qty', value: `${Math.round(Number(reportSummary?.qtyScore || 0))}%`, icon: BarChart3, tone: 'text-emerald-700 bg-emerald-50' },
+                            {
+                              label: 'Fulfillment Jadwal',
+                              value: `${Math.round(Number(reportSummary?.qtyScore || 0))}%`,
+                              note: 'Qty diterima vs qty jadwal',
+                              icon: BarChart3,
+                              tone: 'text-emerald-700 bg-emerald-50',
+                            },
+                            {
+                              label: 'DN Fulfillment',
+                              value: reportDnSummary.dnFulfillmentScore === null ? '-' : `${Math.round(reportDnSummary.dnFulfillmentScore)}%`,
+                              note: 'Qty diterima vs qty DN/SJ',
+                              icon: Truck,
+                              tone: 'text-orange-700 bg-orange-50',
+                            },
                             { label: 'QC + Line Claim', value: `${Math.round(Number(reportSummary?.qcScore || 0))}%`, icon: ShieldCheck, tone: 'text-violet-700 bg-violet-50' },
                           ].map((tile) => {
                             const TileIcon = tile.icon;
                             return (
-                              <div key={tile.label} className="report-summary-kpi-card rounded-xl border border-slate-200 bg-white p-4">
+                              <div key={tile.label} className="report-summary-kpi-card rounded-xl border border-slate-200 bg-white p-4" title={tile.note || tile.label}>
                                 <div className={`inline-flex h-9 w-9 items-center justify-center rounded-lg ${tile.tone}`}>
                                   <TileIcon size={18} />
                                 </div>
                                 <div className="mt-3 text-xs font-semibold uppercase text-slate-400">{tile.label}</div>
                                 <div className="mt-1 text-2xl font-bold text-slate-900">{tile.value}</div>
+                                {tile.note && <div className="mt-1 text-[11px] text-slate-500">{tile.note}</div>}
                               </div>
                             );
                           })}
@@ -1370,6 +1621,10 @@ const TabReports = (props) => {
                           const deliveryNotes = Array.isArray(supplierReport.deliveryNotes) ? supplierReport.deliveryNotes : [];
                           const schedules = Array.isArray(supplierReport.schedules) ? supplierReport.schedules : [];
                           const supplierCategory = supplierInfo.category || 'Schedule';
+                          const dnFulfillmentScore = getRatioPercent(summary.dnReceivedQty, summary.dnDocQty);
+                          const dnDiffQty = Number.isFinite(Number(summary.dnDiffQty))
+                            ? Number(summary.dnDiffQty || 0)
+                            : Number(summary.dnDocQty || 0) - Number(summary.dnReceivedQty || 0);
                           return (
                             <div key={supplierKey} className="rounded-xl border border-slate-200 bg-white p-4">
                               <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -1443,7 +1698,7 @@ const TabReports = (props) => {
                                             const trendBars = [
                                               { label: 'Score', value: score, color: 'bg-indigo-500', text: `${Math.round(score)}%` },
                                               { label: 'Tepat Waktu', value: timeScore, color: 'bg-emerald-500', text: `${Math.round(timeScore)}%` },
-                                              { label: 'Fulfillment / SNP', value: fulfillmentScore, color: 'bg-sky-500', text: `${Math.round(fulfillmentScore)}%` },
+                                              { label: 'Fulfillment Jadwal', value: fulfillmentScore, color: 'bg-sky-500', text: `${Math.round(fulfillmentScore)}%` },
                                               { label: 'Late Qty', value: lateRate, color: 'bg-rose-500', text: `${Math.round(lateRate)}%` },
                                             ];
                                             return (
@@ -1470,7 +1725,7 @@ const TabReports = (props) => {
                                                 </div>
                                                 <div className="mt-2 grid grid-cols-3 gap-2 text-[11px]">
                                                   <div className="rounded bg-white px-2 py-1">
-                                                    <div className="font-semibold text-slate-400">Order</div>
+                                                    <div className="font-semibold text-slate-400">Jadwal</div>
                                                     <div className="font-bold text-slate-900">{formatQuantity(requestQty)}</div>
                                                   </div>
                                                   <div className="rounded bg-white px-2 py-1">
@@ -1499,20 +1754,26 @@ const TabReports = (props) => {
                                           ['Completed', summary.dnCompleted],
                                           ['Pending', summary.dnPending],
                                           ['Selisih/Reject', summary.dnIssue],
-                                          ['Qty DN', summary.dnDocQty],
-                                          ['Qty Diterima', summary.dnReceivedQty],
+                                          ['DN Fulfillment', dnFulfillmentScore === null ? '-' : `${Math.round(dnFulfillmentScore)}%`],
+                                          ['Selisih Qty DN', dnDiffQty],
+                                          ['Qty DN/SJ', summary.dnDocQty],
+                                          ['Qty Terima RN', summary.dnReceivedQty],
                                         ].map(([label, value]) => {
                                           const tone = label === 'Completed'
                                             ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
-                                            : label === 'Selisih/Reject'
+                                            : label === 'Selisih/Reject' || label === 'Selisih Qty DN'
                                               ? 'border-rose-200 bg-rose-50 text-rose-700'
-                                              : label === 'Pending'
-                                                ? 'border-amber-200 bg-amber-50 text-amber-700'
+                                            : label === 'Pending'
+                                              ? 'border-amber-200 bg-amber-50 text-amber-700'
+                                              : label === 'DN Fulfillment'
+                                                ? 'border-orange-200 bg-orange-50 text-orange-700'
                                                 : 'border-sky-200 bg-sky-50 text-sky-700';
                                           return (
                                           <div key={label} className={`rounded-lg border p-3 ${tone}`}>
                                             <div className="text-[11px] font-bold uppercase tracking-wide opacity-80">{label}</div>
-                                            <div className="mt-1 text-xl font-black text-slate-950">{formatQuantity(value)}</div>
+                                            <div className="mt-1 text-xl font-black text-slate-950">
+                                              {typeof value === 'string' ? value : formatQuantity(value)}
+                                            </div>
                                           </div>
                                           );
                                         })}
@@ -1532,8 +1793,8 @@ const TabReports = (props) => {
                                             <th className="p-2 text-left">Item</th>
                                             <th className="p-2 text-left">Tgl Rencana</th>
                                             <th className="p-2 text-left">Tgl Tiba</th>
-                                            <th className="p-2 text-right">Qty Rencana</th>
-                                            <th className="p-2 text-right">Qty Tiba</th>
+                                            <th className="p-2 text-right">Qty Jadwal</th>
+                                            <th className="p-2 text-right">Qty Terima Jadwal</th>
                                             <th className="p-2 text-left">Status</th>
                                           </tr>
                                         </thead>
@@ -1572,22 +1833,27 @@ const TabReports = (props) => {
                                             <th className="p-2 text-right">Qty DN</th>
                                             <th className="p-2 text-right">Qty Terima</th>
                                             <th className="p-2 text-right">Selisih</th>
+                                            <th className="p-2 text-right">DN Fulfillment</th>
                                           </tr>
                                         </thead>
                                         <tbody>
-                                          {deliveryNotes.slice(0, 100).map((row) => (
-                                            <tr key={`${supplierKey}-${row.dnNumber}-${row.plannedDate}`} className="border-t border-slate-100">
-                                              <td className="p-2 font-semibold text-slate-800">{row.dnNumber || '-'}</td>
-                                              <td className="p-2">{formatPrintDate(row.plannedDate)}</td>
-                                              <td className="p-2">{row.sourceCategory || supplierCategory}</td>
-                                              <td className="p-2">{row.trackingStatus || '-'}</td>
-                                              <td className="p-2 text-right">{formatQuantity(row.docQty)}</td>
-                                              <td className="p-2 text-right">{formatQuantity(row.receivedQty)}</td>
-                                              <td className="p-2 text-right">{formatQuantity(row.diffQty)}</td>
-                                            </tr>
-                                          ))}
+                                          {deliveryNotes.slice(0, 100).map((row) => {
+                                            const rowDnFulfillment = getRatioPercent(row.receivedQty, row.docQty);
+                                            return (
+                                              <tr key={`${supplierKey}-${row.dnNumber}-${row.plannedDate}`} className="border-t border-slate-100">
+                                                <td className="p-2 font-semibold text-slate-800">{row.dnNumber || '-'}</td>
+                                                <td className="p-2">{formatPrintDate(row.plannedDate)}</td>
+                                                <td className="p-2">{row.sourceCategory || supplierCategory}</td>
+                                                <td className="p-2">{row.trackingStatus || '-'}</td>
+                                                <td className="p-2 text-right">{formatQuantity(row.docQty)}</td>
+                                                <td className="p-2 text-right">{formatQuantity(row.receivedQty)}</td>
+                                                <td className="p-2 text-right">{formatQuantity(row.diffQty)}</td>
+                                                <td className="p-2 text-right">{rowDnFulfillment === null ? '-' : `${Math.round(rowDnFulfillment)}%`}</td>
+                                              </tr>
+                                            );
+                                          })}
                                           {deliveryNotes.length === 0 && (
-                                            <tr><td colSpan={7} className="p-4 text-center text-slate-500">Tidak ada DN/SJ pada periode ini.</td></tr>
+                                            <tr><td colSpan={8} className="p-4 text-center text-slate-500">Tidak ada DN/SJ pada periode ini.</td></tr>
                                           )}
                                         </tbody>
                                       </table>
@@ -2008,6 +2274,336 @@ const TabReports = (props) => {
                 </div>
               )}
 
+              {reportTab === 'stock-by-customer' && canViewReport && (
+                <div className="bg-white rounded-xl shadow-sm border p-4 report-print-scope master-po-print-scope">
+                  <div className="hidden">{renderReportHeader('LAPORAN STOK PER CATEGORY PER CUSTOMER', reportStart, reportEnd)}</div>
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="font-bold text-slate-900 flex items-center gap-2"><BarChart3 size={18}/> Stok per Category per Customer</h3>
+                    <div className="flex gap-2 items-center print:hidden">
+                      <button onClick={fetchCustomerCategoryStockReport} className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1 rounded text-xs">Refresh</button>
+                      <button onClick={handleExportCustomerCategoryStockExcel} className="bg-emerald-500 hover:bg-emerald-600 text-white px-3 py-1 rounded text-xs">Excel</button>
+                      <select
+                        className="border rounded px-2 py-1 text-xs text-slate-700"
+                        value={reportPrintOrientation}
+                        onChange={(e) => setReportPrintOrientation(e.target.value)}
+                      >
+                        <option value="portrait">Portrait</option>
+                        <option value="landscape">Landscape</option>
+                      </select>
+                      <button onClick={handlePrintReport} className="bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded text-xs">PDF</button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 gap-3 mb-4 print:hidden lg:grid-cols-[120px_minmax(180px,1fr)_minmax(220px,1fr)_minmax(220px,1fr)_120px] lg:items-end">
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Target Hari Safety</label>
+                      <input
+                        type="number"
+                        min="1"
+                        max="365"
+                        className="border p-2 rounded w-full text-sm"
+                        value={customerCategoryStockDays}
+                        onChange={(e) => setCustomerCategoryStockDays(Number(e.target.value || 0))}
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Kategori</label>
+                      <select
+                        className="border p-2 rounded w-full text-sm"
+                        value={customerCategoryStockCategory}
+                        onChange={(e) => setCustomerCategoryStockCategory(e.target.value)}
+                      >
+                        {customerStockCategoryOptions.map((option) => (
+                          <option key={option.value || 'all'} value={option.value} disabled={option.disabled}>{option.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Customer</label>
+                      <select
+                        className="border p-2 rounded w-full text-sm"
+                        value={customerCategoryStockCustomer}
+                        onChange={(e) => setCustomerCategoryStockCustomer(e.target.value)}
+                      >
+                        {customerStockCustomerOptions.map((option) => (
+                          <option key={option.value || 'all'} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Recovery Stock Target</label>
+                      <input
+                        className="border p-2 rounded w-full text-sm"
+                        value={customerCategoryStockRecoveryTarget}
+                        onChange={(e) => setCustomerCategoryStockRecoveryTarget(e.target.value)}
+                        placeholder="Ketik manual"
+                      />
+                    </div>
+                    <div className="flex items-end">
+                      <button onClick={fetchCustomerCategoryStockReport} className="h-10 w-full rounded bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700">Terapkan</button>
+                    </div>
+                  </div>
+                  <div className="overflow-x-auto bg-white pb-2">
+                    <div className="w-[1180px] border-2 border-black bg-white text-black">
+                      <table className="w-full table-fixed border-collapse">
+                        <tbody>
+                          <tr className="h-[76px]">
+                            <td className="w-[84px] border-r-2 border-black p-1 text-center align-middle">
+                              <img src={logoPrl} alt="MRP" className="mx-auto h-12 w-12 object-contain" />
+                            </td>
+                            <td className="w-[265px] border-r-2 border-black px-3 align-middle">
+                              <div className="text-[17px] font-black tracking-tight">DATA STOCK FG PT. MRP</div>
+                              <div className="mt-1 text-[8px] font-bold uppercase tracking-wide text-slate-600">Finish Good Stock Control</div>
+                            </td>
+                            <td className="w-[260px] border-r-2 border-black p-0 align-top">
+                              <table className="h-full w-full table-fixed border-collapse text-[10px]">
+                                <tbody>
+                                  <tr>
+                                    <td className="w-[92px] border-b border-r border-black bg-[#d9eaf7] px-1 font-black">NAME CUSTOMER</td>
+                                    <td className="border-b border-black px-2 text-[12px] font-black leading-tight">{customerStockHeaderCustomer}</td>
+                                  </tr>
+                                  <tr>
+                                    <td className="border-r border-black bg-[#d9eaf7] px-1 font-black">REPORT TYPE</td>
+                                    <td className="px-2 font-bold">CONTROL STOCK FG</td>
+                                  </tr>
+                                </tbody>
+                              </table>
+                            </td>
+                            <td className="w-[165px] border-r-2 border-black p-1 align-middle">
+                              <table className="w-full table-fixed border-collapse border border-black text-[11px]">
+                                <tbody>
+                                  <tr><td className="border-b border-r border-black bg-[#9cff9c] py-0.5 text-center font-bold">&gt; 2</td><td className="border-b border-black py-0.5 text-center">AMAN</td></tr>
+                                  <tr><td className="border-b border-r border-black bg-[#ffff00] py-0.5 text-center font-bold">1 - 1,99</td><td className="border-b border-black py-0.5 text-center">AWAS</td></tr>
+                                  <tr><td className="border-r border-black bg-[#f4a3b5] py-0.5 text-center font-bold">&lt; 1</td><td className="py-0.5 text-center">BAHAYA</td></tr>
+                                </tbody>
+                              </table>
+                            </td>
+                            <td className="w-[185px] border-r-2 border-black p-0 align-top">
+                              <table className="h-full w-full table-fixed border-collapse text-[11px] font-black">
+                                <tbody>
+                                  <tr><td className="w-[68px] border-b border-r border-black px-1">PERIODE</td><td className="border-b border-black px-2">{controlPeriodLabel}</td></tr>
+                                  <tr><td className="border-b border-r border-black bg-[#ffff00] px-1">TANGGAL</td><td className="border-b border-black bg-[#ffff00] px-2">{controlDateLabel}</td></tr>
+                                  <tr><td className="border-r border-black bg-[#ffff00] px-1">WAKTU</td><td className="bg-[#ffff00] px-2">{controlTimeLabel}</td></tr>
+                                </tbody>
+                              </table>
+                            </td>
+                            <td className="w-[220px] p-0 align-top">
+                              <table className="h-full w-full table-fixed border-collapse text-[6px]">
+                                <tbody>
+                                  <tr>
+                                    {['APPROVED', 'CHECKED', 'PREPARED'].map((label, index) => (
+                                      <td key={label} className={`${index < 2 ? 'border-r border-black' : ''} p-0 text-center align-top`}>
+                                        <div className="border-b border-black py-0.5 font-black">{label}</div>
+                                        <div className="flex h-9 items-center justify-center text-[12px] italic">TTD</div>
+                                        <div className="border-t border-black py-0.5 text-[6px] font-bold leading-tight">{index === 0 ? 'Beverly Mark M.' : index === 1 ? 'Muhtadin' : 'Mawar A'}</div>
+                                      </td>
+                                    ))}
+                                  </tr>
+                                </tbody>
+                              </table>
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
+                      <div className="grid grid-cols-[930px_1fr]">
+                        <div>
+                          <table className="w-full table-fixed border-collapse text-[7px]">
+                            <thead>
+                              <tr className="bg-[#bfbfbf] text-center font-black">
+                                <th rowSpan="2" className="w-[58px] border border-black">Uniq</th>
+                                <th rowSpan="2" className="w-[98px] border border-black">Part No</th>
+                                <th rowSpan="2" className="w-[185px] border border-black">Part Name</th>
+                                <th rowSpan="2" className="w-[72px] border border-black">Model</th>
+                                <th rowSpan="2" className="w-[96px] border border-black">PLANT ROSES</th>
+                                <th rowSpan="2" className="w-[60px] border border-black">Qty PRL</th>
+                                <th colSpan="2" className="border border-black">Qty Stock (Supplier)</th>
+                                <th colSpan="2" className="border border-black">Safety Stock</th>
+                                <th rowSpan="2" className="w-[118px] border border-black">Recovery Stock Target</th>
+                              </tr>
+                              <tr className="bg-[#bfbfbf] text-center font-black">
+                                <th className="w-[54px] border border-black">Pcs</th>
+                                <th className="w-[54px] border border-black">Day</th>
+                                <th className="w-[54px] border border-black">Pcs</th>
+                                <th className="w-[42px] border border-black">Day</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {reportLoading && (
+                                <tr><td colSpan="11" className="h-8 border border-black text-center">Memuat...</td></tr>
+                              )}
+                              {!reportLoading && customerStockControlRows.length === 0 && (
+                                <tr><td colSpan="11" className="h-8 border border-black text-center">Tidak ada data.</td></tr>
+                              )}
+                              {!reportLoading && customerStockControlRows.map((row) => (
+                                <tr key={`${row.customer}-${row.uniq}-${row.no}`} className="h-[24px]">
+                                  <td className="border border-black text-center text-[10px] font-bold">{row.uniq}</td>
+                                  <td className="border border-black px-1 text-[9px] font-semibold">{row.partNo || '-'}</td>
+                                  <td className="border border-black px-1 text-[8px] font-semibold">{row.partName || row.itemName || '-'}</td>
+                                  <td className="border border-black text-center">{row.model || '-'}</td>
+                                  <td className="border border-black text-center font-bold">{row.plantProcess || '-'}</td>
+                                  <td className="border border-black pr-1 text-right font-bold">{formatControlNumber(row.qtyPrlValue)}</td>
+                                  <td className="border border-black bg-[#ffff00] pr-1 text-right text-[11px] font-bold text-red-600">{formatControlNumber(row.stockQty)}</td>
+                                  <td className={`border border-black pr-1 text-right text-[11px] font-bold ${getStockDayCellClass(row.stockDayValue)}`}>{row.stockDayValue === null ? '0.00' : formatControlNumber(row.stockDayValue, 2)}</td>
+                                  <td className="border border-black pr-1 text-right text-[11px]">{formatControlNumber(row.safetyStock)}</td>
+                                  <td className="border border-black pr-1 text-right text-[11px] font-bold text-red-600">{formatControlNumber(row.safetyDayValue, 1)}</td>
+                                  <td className="border border-black text-center font-bold">{customerCategoryStockRecoveryTarget || ''}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                        <div className="border-l-2 border-black">
+                          <div className="h-[38px] border-b border-black px-1 pt-1">
+                            <div className="flex justify-between text-[5px] text-slate-500">
+                              {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((tick) => <span key={tick}>{tick.toFixed(1)}</span>)}
+                            </div>
+                            <div className="mt-1 flex justify-center gap-3 text-[5px]">
+                              <span><span className="mr-1 inline-block h-1.5 w-5 bg-[#4472c4]" />Safety Stock</span>
+                              <span><span className="mr-1 inline-block h-1.5 w-5 bg-[#ed7d31]" />Qty Stock (Supplier)</span>
+                            </div>
+                          </div>
+                          <div>
+                            {!reportLoading && customerStockControlRows.map((row) => {
+                              const safetyWidth = Math.min(100, (Number(row.safetyDayValue || 0) / 10) * 100);
+                              const stockWidth = Math.min(100, (Number(row.stockDayValue || 0) / 10) * 100);
+                              return (
+                                <div key={`chart-${row.customer}-${row.uniq}-${row.no}`} className="relative h-[24px] border-b border-black px-2 py-[3px]">
+                                  <div className="h-[7px] bg-[#4472c4]" style={{ width: `${safetyWidth}%` }} />
+                                  <div className="mt-[2px] h-[7px] bg-[#ed7d31]" style={{ width: `${stockWidth}%` }} />
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  {false && (
+                  <div>
+                  <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mb-4">
+                    <div className="rounded-lg border bg-slate-50 p-3">
+                      <div className="text-[10px] uppercase text-slate-400">Group</div>
+                      <div className="text-lg font-bold text-slate-900">{formatCount(customerCategoryStockSummary?.totalGroups)}</div>
+                    </div>
+                    <div className="rounded-lg border bg-emerald-50 p-3">
+                      <div className="text-[10px] uppercase text-emerald-600">Aman</div>
+                      <div className="text-lg font-bold text-emerald-700">{formatCount(customerCategoryStockSummary?.amanGroups)}</div>
+                    </div>
+                    <div className="rounded-lg border bg-amber-50 p-3">
+                      <div className="text-[10px] uppercase text-amber-600">Awas</div>
+                      <div className="text-lg font-bold text-amber-700">{formatCount(customerCategoryStockSummary?.awasGroups)}</div>
+                    </div>
+                    <div className="rounded-lg border bg-rose-50 p-3">
+                      <div className="text-[10px] uppercase text-rose-600">Bahaya</div>
+                      <div className="text-lg font-bold text-rose-700">{formatCount(customerCategoryStockSummary?.bahayaGroups)}</div>
+                    </div>
+                    <div className="rounded-lg border bg-white p-3">
+                      <div className="text-[10px] uppercase text-slate-400">Total Stock</div>
+                      <div className="text-lg font-bold text-slate-900">{formatQuantity(customerCategoryStockSummary?.totalStockQty)}</div>
+                    </div>
+                    <div className="rounded-lg border bg-white p-3">
+                      <div className="text-[10px] uppercase text-slate-400">Need / Day</div>
+                      <div className="text-lg font-bold text-slate-900">{formatQuantity(customerCategoryStockSummary?.totalDailyConsumption)}</div>
+                    </div>
+                  </div>
+                  <div className="mb-3 rounded-lg border border-slate-200 bg-slate-50 px-4 py-2 text-[11px] text-slate-600">
+                    Ringkasan ini tidak menampilkan data mentah item. Level stock dihitung seperti PDF: Qty Stock dibagi Safety Stock per hari. Target default 2 hari; AMAN jika minimal 2 hari, AWAS 1 sampai 1,99 hari, BAHAYA di bawah 1 hari.
+                  </div>
+                  <div className="mb-4 rounded-lg border bg-white p-4">
+                    <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="text-sm font-bold text-slate-900">Grafik Level Stock Daily</div>
+                        <div className="text-[11px] text-slate-500">Top 12 group prioritas. Skala 0 sampai 10 hari seperti kontrol stok PDF.</div>
+                      </div>
+                      <div className="flex flex-wrap gap-2 text-[10px] font-semibold">
+                        <span className="rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-rose-700">BAHAYA &lt; 1</span>
+                        <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-amber-700">AWAS 1 - 1.99</span>
+                        <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-emerald-700">AMAN &gt;= 2</span>
+                      </div>
+                    </div>
+                    <div className="h-[360px]">
+                      {reportLoading ? (
+                        <div className="flex h-full items-center justify-center text-sm text-slate-400">Memuat grafik...</div>
+                      ) : customerStockChartRows.length === 0 ? (
+                        <div className="flex h-full items-center justify-center text-sm text-slate-400">Tidak ada data grafik.</div>
+                      ) : (
+                        <SafeResponsiveContainer>
+                          <ComposedChart data={customerStockChartRows} layout="vertical" margin={{ top: 8, right: 44, bottom: 20, left: 116 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                            <XAxis
+                              type="number"
+                              domain={[0, 10]}
+                              ticks={[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]}
+                              tick={{ fontSize: 10 }}
+                              label={{ value: 'Level Stock (Daily)', position: 'insideBottom', offset: -12, fontSize: 11, fill: '#475569' }}
+                            />
+                            <YAxis type="category" dataKey="label" width={112} tick={{ fontSize: 10 }} />
+                            <Tooltip
+                              formatter={(value, name, payload) => {
+                                if (name === 'coveragePlot') return [payload?.payload?.coverageLabel || value, 'Level Stock'];
+                                return [value, name];
+                              }}
+                              labelFormatter={(label, payload) => payload?.[0]?.payload?.fullLabel || label}
+                            />
+                            <ReferenceLine x={1} stroke="#ef4444" strokeDasharray="4 4" label={{ value: '1', position: 'top', fill: '#ef4444', fontSize: 10 }} />
+                            <ReferenceLine x={2} stroke="#10b981" strokeDasharray="4 4" label={{ value: '2', position: 'top', fill: '#059669', fontSize: 10 }} />
+                            <Bar dataKey="coveragePlot" name="Level Stock" radius={[0, 4, 4, 0]} barSize={18}>
+                              {customerStockChartRows.map((entry) => (
+                                <Cell key={`${entry.fullLabel}-${entry.indicator}`} fill={entry.fill} />
+                              ))}
+                              <LabelList dataKey="coverageLabel" position="right" fontSize={10} fill="#0f172a" />
+                            </Bar>
+                          </ComposedChart>
+                        </SafeResponsiveContainer>
+                      )}
+                    </div>
+                  </div>
+                  <div className="bg-white rounded-lg border overflow-x-auto">
+                    <table className="min-w-full text-sm">
+                      <thead className="bg-slate-100">
+                        <tr>
+                          <th className="text-left p-3">Category</th>
+                          <th className="text-left p-3">Customer</th>
+                          <th className="text-right p-3">Group Item</th>
+                          <th className="text-right p-3">Qty Stock</th>
+                          <th className="text-right p-3">Safety Stock</th>
+                          <th className="text-right p-3">Need / Day</th>
+                          <th className="text-right p-3">Coverage</th>
+                          <th className="text-center p-3">Indikator</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {reportLoading && (
+                          <tr><td colSpan="8" className="p-4 text-center text-gray-400">Memuat...</td></tr>
+                        )}
+                        {!reportLoading && customerCategoryStockRows.length === 0 && (
+                          <tr><td colSpan="8" className="p-4 text-center text-gray-400">Tidak ada data.</td></tr>
+                        )}
+                        {!reportLoading && customerCategoryStockRows.map((row, idx) => (
+                          <tr key={`${row.category}-${row.customer}-${idx}`} className="border-t">
+                            <td className="p-3 font-semibold text-slate-900">{row.category || '-'}</td>
+                            <td className="p-3">{row.customer || '-'}</td>
+                            <td className="p-3 text-right">{formatCount(row.itemCount)}</td>
+                            <td className="p-3 text-right">{formatQuantity(row.stockQty)}</td>
+                            <td className="p-3 text-right">{formatQuantity(row.safetyStock)}</td>
+                            <td className="p-3 text-right">{formatQuantity(row.avgDailyConsumption)}</td>
+                            <td className="p-3 text-right">{row.coverageDays === null ? '-' : Number(row.coverageDays || 0).toFixed(1)}</td>
+                            <td className="p-3 text-center">
+                              <span className={`inline-flex min-w-[70px] justify-center rounded-full border px-2 py-0.5 text-[10px] font-bold ${getCustomerStockIndicatorClass(row.indicator)}`}>
+                                {row.indicator || '-'}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  </div>
+                  )}
+                  <div className="hidden">{renderReportSignatures()}</div>
+                  <div className="report-page-footer print-only" />
+                </div>
+              )}
+
               {reportTab === 'slow-moving' && canViewReport && (
                 <div className="bg-white rounded-xl shadow-sm border p-4 report-print-scope">
                   {renderReportHeader('LAPORAN SLOW & DEAD STOCK', reportStart, reportEnd)}
@@ -2064,6 +2660,506 @@ const TabReports = (props) => {
                       </tbody>
                     </table>
                   </div>
+                  {renderReportSignatures()}
+                  <div className="report-page-footer print-only" />
+                </div>
+              )}
+
+              {reportTab === 'item-summary' && canViewReport && (
+                <div className="bg-white rounded-xl shadow-sm border p-4 report-print-scope">
+                  {renderReportHeader('LAPORAN PER BARANG', reportStart, reportEnd)}
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between print:hidden">
+                    <div>
+                      <h3 className="font-bold text-slate-900 flex items-center gap-2"><FileText size={18} /> Laporan per Barang</h3>
+                      <p className="text-xs text-slate-500">Rekap per item dari PO, incoming RN, pending QC, release QC, stok saat ini, dan sisa PO.</p>
+                    </div>
+                    <div className="flex flex-wrap gap-2 items-center">
+                      <button onClick={fetchItemSummaryReport} className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1 rounded text-xs">Refresh</button>
+                      <button onClick={handleExportItemSummaryReportExcel} className="bg-emerald-500 hover:bg-emerald-600 text-white px-3 py-1 rounded text-xs">Excel</button>
+                      <select
+                        className="border rounded px-2 py-1 text-xs text-slate-700"
+                        value={reportPrintOrientation}
+                        onChange={(e) => setReportPrintOrientation(e.target.value)}
+                      >
+                        <option value="portrait">Portrait</option>
+                        <option value="landscape">Landscape</option>
+                      </select>
+                      <button onClick={handlePrintReport} className="bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded text-xs">PDF</button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-3 my-4 print:hidden">
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Tanggal awal</label>
+                      <input type="date" className="border p-2 rounded w-full text-sm" value={reportStart} onChange={(e) => setReportStart(e.target.value)} />
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Tanggal akhir</label>
+                      <input type="date" className="border p-2 rounded w-full text-sm" value={reportEnd} onChange={(e) => setReportEnd(e.target.value)} />
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Supplier</label>
+                      <SearchableSelectDropdown
+                        value={reportSupplier}
+                        options={masterSupplierOptions}
+                        placeholder="Semua supplier"
+                        searchPlaceholder="Ketik kode / nama supplier"
+                        emptyText="Supplier tidak ditemukan."
+                        onChange={(nextValue) => setReportSupplier(nextValue || '')}
+                      />
+                    </div>
+                    <div className="flex items-end">
+                      <button onClick={fetchItemSummaryReport} className="bg-indigo-600 text-white px-4 py-2 rounded w-full text-sm">Terapkan Filter</button>
+                    </div>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6 mb-4">
+                    <div className="rounded-lg border bg-slate-50 p-3">
+                      <div className="text-xs font-semibold uppercase text-slate-500">Total Barang</div>
+                      <div className="mt-1 text-2xl font-bold text-slate-900">{formatCount(itemSummary.itemCount)}</div>
+                    </div>
+                    <div className="rounded-lg border bg-sky-50 p-3">
+                      <div className="text-xs font-semibold uppercase text-sky-600">Qty PO</div>
+                      <div className="mt-1 text-2xl font-bold text-slate-900">{formatQuantity(itemSummary.qtyOrder)}</div>
+                    </div>
+                    <div className="rounded-lg border bg-indigo-50 p-3">
+                      <div className="text-xs font-semibold uppercase text-indigo-600">Qty Incoming</div>
+                      <div className="mt-1 text-2xl font-bold text-slate-900">{formatQuantity(itemSummary.receivedQty)}</div>
+                    </div>
+                    <div className="rounded-lg border bg-amber-50 p-3">
+                      <div className="text-xs font-semibold uppercase text-amber-700">Pending QC</div>
+                      <div className="mt-1 text-2xl font-bold text-slate-900">{formatQuantity(itemSummary.pendingQcQty)}</div>
+                    </div>
+                    <div className="rounded-lg border bg-emerald-50 p-3">
+                      <div className="text-xs font-semibold uppercase text-emerald-600">Release QC</div>
+                      <div className="mt-1 text-2xl font-bold text-slate-900">{formatQuantity(itemSummary.releasedQty)}</div>
+                    </div>
+                    <div className="rounded-lg border bg-violet-50 p-3">
+                      <div className="text-xs font-semibold uppercase text-violet-600">Stock</div>
+                      <div className="mt-1 text-2xl font-bold text-slate-900">{formatQuantity(itemSummary.stockQty)}</div>
+                    </div>
+                  </div>
+                  <div className="bg-white rounded-lg border overflow-x-auto">
+                    <table className="min-w-[1500px] w-full text-xs">
+                      <thead className="bg-slate-100 text-slate-600">
+                        <tr>
+                          <th className="p-2 text-left">Item</th>
+                          <th className="p-2 text-left">Kategori</th>
+                          <th className="p-2 text-left">Lokasi</th>
+                          <th className="p-2 text-right">PO</th>
+                          <th className="p-2 text-right">Qty PO</th>
+                          <th className="p-2 text-right">Incoming RN</th>
+                          <th className="p-2 text-right">Pending QC</th>
+                          <th className="p-2 text-right">Release QC</th>
+                          <th className="p-2 text-right">Sisa PO</th>
+                          <th className="p-2 text-right">Stock</th>
+                          <th className="p-2 text-left">Last Incoming</th>
+                          <th className="p-2 text-center">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {reportLoading && <tr><td colSpan="12" className="p-4 text-center text-gray-400">Memuat...</td></tr>}
+                        {!reportLoading && itemSummaryRows.length === 0 && <tr><td colSpan="12" className="p-4 text-center text-gray-400">Tidak ada data barang.</td></tr>}
+                        {!reportLoading && itemSummaryRows.map((row, idx) => (
+                          <tr key={`item-summary-${row.itemCode || idx}`} className="border-t">
+                            <td className="p-2">
+                              <div className="font-semibold text-slate-900">{row.itemCode || '-'}</div>
+                              <div className="text-[11px] text-slate-500">{row.itemName || '-'}</div>
+                              <div className="text-[11px] text-slate-400">{row.partNo || '-'} / {row.unit || '-'}</div>
+                            </td>
+                            <td className="p-2">{row.category || '-'}</td>
+                            <td className="p-2">{row.location || '-'}</td>
+                            <td className="p-2 text-right">{formatCount(row.poCount)}</td>
+                            <td className="p-2 text-right">{formatQuantity(row.qtyOrder)}</td>
+                            <td className="p-2 text-right font-semibold text-indigo-700">{formatQuantity(row.receivedQty)}</td>
+                            <td className="p-2 text-right font-semibold text-amber-700">{formatQuantity(row.pendingQcQty)}</td>
+                            <td className="p-2 text-right">{formatQuantity(row.releasedQty)}</td>
+                            <td className="p-2 text-right">{formatQuantity(row.qtyRemainingPo)}</td>
+                            <td className="p-2 text-right">{formatQuantity(row.stockQty)}</td>
+                            <td className="p-2">{formatPrintDate(row.lastIncomingDate)}</td>
+                            <td className="p-2 text-center">
+                              <span className={`inline-flex min-w-[78px] justify-center rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
+                                row.status === 'PENDING QC'
+                                  ? 'border-amber-200 bg-amber-100 text-amber-700'
+                                  : row.status === 'OPEN PO'
+                                    ? 'border-sky-200 bg-sky-100 text-sky-700'
+                                    : row.status === 'NO STOCK'
+                                      ? 'border-rose-200 bg-rose-100 text-rose-700'
+                                      : 'border-emerald-200 bg-emerald-100 text-emerald-700'
+                              }`}>
+                                {row.status || '-'}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {renderReportSignatures()}
+                  <div className="report-page-footer print-only" />
+                </div>
+              )}
+
+              {reportTab === 'rn-report' && canViewReport && (
+                <div className="bg-white rounded-xl shadow-sm border p-4 report-print-scope">
+                  {renderReportHeader('LAPORAN PER RN', reportStart, reportEnd)}
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between print:hidden">
+                    <div>
+                      <h3 className="font-bold text-slate-900 flex items-center gap-2"><FileText size={18} /> Laporan per RN</h3>
+                      <p className="text-xs text-slate-500">Detail penerimaan per RN, PO, SJ/DO, item, qty dokumen, qty incoming, dan qty release QC.</p>
+                    </div>
+                    <div className="flex flex-wrap gap-2 items-center">
+                      <button onClick={fetchReceiveNoteReport} className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1 rounded text-xs">Refresh</button>
+                      <button onClick={handleExportReceiveNoteReportExcel} className="bg-emerald-500 hover:bg-emerald-600 text-white px-3 py-1 rounded text-xs">Excel</button>
+                      <select
+                        className="border rounded px-2 py-1 text-xs text-slate-700"
+                        value={reportPrintOrientation}
+                        onChange={(e) => setReportPrintOrientation(e.target.value)}
+                      >
+                        <option value="portrait">Portrait</option>
+                        <option value="landscape">Landscape</option>
+                      </select>
+                      <button onClick={handlePrintReport} className="bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded text-xs">PDF</button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-3 my-4 print:hidden">
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Tanggal awal</label>
+                      <input type="date" className="border p-2 rounded w-full text-sm" value={reportStart} onChange={(e) => setReportStart(e.target.value)} />
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Tanggal akhir</label>
+                      <input type="date" className="border p-2 rounded w-full text-sm" value={reportEnd} onChange={(e) => setReportEnd(e.target.value)} />
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Supplier</label>
+                      <SearchableSelectDropdown
+                        value={reportSupplier}
+                        options={masterSupplierOptions}
+                        placeholder="Semua supplier"
+                        searchPlaceholder="Ketik kode / nama supplier"
+                        emptyText="Supplier tidak ditemukan."
+                        onChange={(nextValue) => setReportSupplier(nextValue || '')}
+                      />
+                    </div>
+                    <div className="flex items-end">
+                      <button onClick={fetchReceiveNoteReport} className="bg-indigo-600 text-white px-4 py-2 rounded w-full text-sm">Terapkan Filter</button>
+                    </div>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4 mb-4">
+                    <div className="rounded-lg border bg-slate-50 p-3">
+                      <div className="text-xs font-semibold uppercase text-slate-500">Total RN</div>
+                      <div className="mt-1 text-2xl font-bold text-slate-900">{formatCount(rnReportSummary.rnCount)}</div>
+                    </div>
+                    <div className="rounded-lg border bg-sky-50 p-3">
+                      <div className="text-xs font-semibold uppercase text-sky-600">Qty Dokumen</div>
+                      <div className="mt-1 text-2xl font-bold text-slate-900">{formatQuantity(rnReportSummary.docQty)}</div>
+                    </div>
+                    <div className="rounded-lg border bg-indigo-50 p-3">
+                      <div className="text-xs font-semibold uppercase text-indigo-600">Qty Incoming</div>
+                      <div className="mt-1 text-2xl font-bold text-slate-900">{formatQuantity(rnReportSummary.receivedQty)}</div>
+                    </div>
+                    <div className="rounded-lg border bg-emerald-50 p-3">
+                      <div className="text-xs font-semibold uppercase text-emerald-600">Qty Release QC</div>
+                      <div className="mt-1 text-2xl font-bold text-slate-900">{formatQuantity(rnReportSummary.postedQty)}</div>
+                    </div>
+                  </div>
+                  <div className="bg-white rounded-lg border overflow-x-auto">
+                    <table className="min-w-[1300px] w-full text-xs">
+                      <thead className="bg-slate-100 text-slate-600">
+                        <tr>
+                          <th className="p-2 text-left">RN</th>
+                          <th className="p-2 text-left">Tanggal</th>
+                          <th className="p-2 text-left">Supplier</th>
+                          <th className="p-2 text-left">PO</th>
+                          <th className="p-2 text-left">SJ / DO</th>
+                          <th className="p-2 text-left">Item</th>
+                          <th className="p-2 text-right">Doc Qty</th>
+                          <th className="p-2 text-right">Incoming</th>
+                          <th className="p-2 text-right">Release QC</th>
+                          <th className="p-2 text-center">QC</th>
+                          <th className="p-2 text-center">Status</th>
+                          <th className="p-2 text-left">Lot</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {reportLoading && <tr><td colSpan="12" className="p-4 text-center text-gray-400">Memuat...</td></tr>}
+                        {!reportLoading && rnReportRows.length === 0 && <tr><td colSpan="12" className="p-4 text-center text-gray-400">Tidak ada data RN.</td></tr>}
+                        {!reportLoading && rnReportRows.map((row, idx) => (
+                          <tr key={`rn-report-${row.lineId || idx}`} className="border-t">
+                            <td className="p-2 font-semibold text-slate-900">{row.rnNumber || '-'}</td>
+                            <td className="p-2">{formatPrintDate(row.receivedDate)}</td>
+                            <td className="p-2">
+                              <div className="font-medium">{row.supplierName || '-'}</div>
+                              <div className="text-[11px] text-slate-400">{row.supplierCode || '-'}</div>
+                            </td>
+                            <td className="p-2">{row.poNumber || '-'}</td>
+                            <td className="p-2">{row.doNumber || '-'}</td>
+                            <td className="p-2">
+                              <div className="font-medium">{row.itemCode || '-'}</div>
+                              <div className="text-[11px] text-slate-500">{row.itemName || '-'}</div>
+                            </td>
+                            <td className="p-2 text-right">{formatQuantity(row.docQty)}</td>
+                            <td className="p-2 text-right font-semibold text-indigo-700">{formatQuantity(row.receivedQty)}</td>
+                            <td className="p-2 text-right">{formatQuantity(row.postedQty)}</td>
+                            <td className="p-2 text-center">{String(row.qcStatus || '-').toUpperCase()}</td>
+                            <td className="p-2 text-center">{row.lineStatus || '-'}</td>
+                            <td className="p-2">{row.supplierLotNo || '-'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {renderReportSignatures()}
+                  <div className="report-page-footer print-only" />
+                </div>
+              )}
+
+              {reportTab === 'master-po-report' && canViewReport && (
+                <div className="bg-white rounded-xl shadow-sm border p-4 report-print-scope">
+                  {renderReportHeader('LAPORAN MASTER PO', reportStart, reportEnd)}
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between print:hidden">
+                    <div>
+                      <h3 className="font-bold text-slate-900 flex items-center gap-2"><FileText size={18} /> Laporan Master PO</h3>
+                      <p className="text-xs text-slate-500">Rekap line PO dengan qty order, incoming RN, sisa PO, schedule, RN, dan SJ/DO terkait.</p>
+                    </div>
+                    <div className="flex flex-wrap gap-2 items-center">
+                      <button onClick={fetchMasterPoReport} className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1 rounded text-xs">Refresh</button>
+                      <button onClick={handleExportMasterPoReportExcel} className="bg-emerald-500 hover:bg-emerald-600 text-white px-3 py-1 rounded text-xs">Excel</button>
+                      <select
+                        className="border rounded px-2 py-1 text-xs text-slate-700"
+                        value={reportPrintOrientation}
+                        onChange={(e) => setReportPrintOrientation(e.target.value)}
+                      >
+                        <option value="portrait">Portrait</option>
+                        <option value="landscape">Landscape</option>
+                      </select>
+                      <button onClick={handlePrintReport} className="bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded text-xs">PDF</button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-3 my-4 print:hidden">
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Tanggal PO awal</label>
+                      <input type="date" className="border p-2 rounded w-full text-sm" value={reportStart} onChange={(e) => setReportStart(e.target.value)} />
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Tanggal PO akhir</label>
+                      <input type="date" className="border p-2 rounded w-full text-sm" value={reportEnd} onChange={(e) => setReportEnd(e.target.value)} />
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500">Supplier</label>
+                      <SearchableSelectDropdown
+                        value={reportSupplier}
+                        options={masterSupplierOptions}
+                        placeholder="Semua supplier"
+                        searchPlaceholder="Ketik kode / nama supplier"
+                        emptyText="Supplier tidak ditemukan."
+                        onChange={(nextValue) => setReportSupplier(nextValue || '')}
+                      />
+                    </div>
+                    <div className="flex items-end">
+                      <button onClick={fetchMasterPoReport} className="bg-indigo-600 text-white px-4 py-2 rounded w-full text-sm">Terapkan Filter</button>
+                    </div>
+                  </div>
+                  <div className="master-po-summary-grid grid grid-cols-5 gap-3 mb-4">
+                    <div className="master-po-summary-card min-w-0 rounded-lg border bg-slate-50 p-3">
+                      <div className="truncate whitespace-nowrap text-xs font-semibold uppercase text-slate-500">Total PO</div>
+                      <div className="mt-1 truncate whitespace-nowrap text-2xl font-bold text-slate-900">{formatCount(masterPoSummary.poCount)}</div>
+                    </div>
+                    <div className="master-po-summary-card min-w-0 rounded-lg border bg-sky-50 p-3">
+                      <div className="truncate whitespace-nowrap text-xs font-semibold uppercase text-sky-600">Qty PO</div>
+                      <div className="mt-1 truncate whitespace-nowrap text-2xl font-bold text-slate-900">{formatQuantity(masterPoSummary.qtyOrder)}</div>
+                    </div>
+                    <div className="master-po-summary-card min-w-0 rounded-lg border bg-indigo-50 p-3">
+                      <div className="truncate whitespace-nowrap text-xs font-semibold uppercase text-indigo-600">Qty Incoming</div>
+                      <div className="mt-1 truncate whitespace-nowrap text-2xl font-bold text-slate-900">{formatQuantity(masterPoSummary.qtyReceived)}</div>
+                    </div>
+                    <div className="master-po-summary-card min-w-0 rounded-lg border bg-amber-50 p-3">
+                      <div className="truncate whitespace-nowrap text-xs font-semibold uppercase text-amber-700">Qty Sisa</div>
+                      <div className="mt-1 truncate whitespace-nowrap text-2xl font-bold text-slate-900">{formatQuantity(masterPoSummary.qtyRemaining)}</div>
+                    </div>
+                    <div className="master-po-summary-card min-w-0 rounded-lg border bg-emerald-50 p-3">
+                      <div className="truncate whitespace-nowrap text-xs font-semibold uppercase text-emerald-600">Line Closed</div>
+                      <div className="mt-1 truncate whitespace-nowrap text-2xl font-bold text-slate-900">{formatCount(masterPoSummary.closedLines)}</div>
+                    </div>
+                  </div>
+                  <div className="mb-4">
+                    <div className="mb-2 flex items-center justify-between">
+                      <div>
+                        <h4 className="text-sm font-bold text-slate-900">Matrix Supplier</h4>
+                        <p className="text-xs text-slate-500">Rekap Master PO dibaca per supplier, termasuk RN dan SJ/DO terkait.</p>
+                      </div>
+                      <div className="text-xs font-semibold text-slate-500">{formatCount(masterPoSupplierMatrixRows.length)} supplier</div>
+                    </div>
+                    <div className="master-po-matrix-wrap bg-white rounded-lg border overflow-x-auto">
+                      <table className="master-po-matrix-table min-w-[1600px] w-full text-xs">
+                        <colgroup>
+                          <col className="master-po-col-supplier" />
+                          <col className="master-po-col-count" />
+                          <col className="master-po-col-count" />
+                          <col className="master-po-col-count" />
+                          <col className="master-po-col-qty" />
+                          <col className="master-po-col-qty" />
+                          <col className="master-po-col-qty" />
+                          <col className="master-po-col-schedule" />
+                          <col className="master-po-col-status" />
+                          <col className="master-po-col-fill" />
+                          <col className="master-po-col-doc" />
+                          <col className="master-po-col-doc" />
+                          <col className="master-po-col-date" />
+                        </colgroup>
+                        <thead className="bg-slate-100 text-slate-600">
+                          <tr>
+                            <th className="p-2 text-left">Supplier</th>
+                            <th className="p-2 text-right">PO</th>
+                            <th className="p-2 text-right">Line</th>
+                            <th className="p-2 text-right">Item</th>
+                            <th className="p-2 text-right">Qty PO</th>
+                            <th className="p-2 text-right">Incoming</th>
+                            <th className="p-2 text-right">Sisa</th>
+                            <th className="p-2 text-right">Sched</th>
+                            <th className="p-2 text-center">Status</th>
+                            <th className="p-2 text-right">Fill %</th>
+                            <th className="p-2 text-left">RN</th>
+                            <th className="p-2 text-left">SJ / DO</th>
+                            <th className="p-2 text-left">Last In</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {reportLoading && <tr><td colSpan="13" className="p-4 text-center text-gray-400">Memuat...</td></tr>}
+                          {!reportLoading && masterPoSupplierMatrixRows.length === 0 && <tr><td colSpan="13" className="p-4 text-center text-gray-400">Tidak ada data supplier.</td></tr>}
+                          {!reportLoading && masterPoSupplierMatrixRows.map((row) => (
+                            <tr
+                              key={`master-po-supplier-${row.supplierKey}`}
+                              className="border-t cursor-pointer transition hover:bg-indigo-50/60 focus:bg-indigo-50/60"
+                              role="button"
+                              tabIndex={0}
+                              onClick={() => setMasterPoSupplierModalKey(row.supplierKey)}
+                              onKeyDown={(event) => {
+                                if (event.key === 'Enter' || event.key === ' ') {
+                                  event.preventDefault();
+                                  setMasterPoSupplierModalKey(row.supplierKey);
+                                }
+                              }}
+                            >
+                              <td className="master-po-supplier-cell p-2">
+                                <div className="font-semibold text-slate-900">{row.supplierName || '-'}</div>
+                                <div className="text-[11px] text-slate-400">{row.supplierCode || '-'}</div>
+                              </td>
+                              <td className="p-2 text-right">{formatCount(row.poCount)}</td>
+                              <td className="p-2 text-right">{formatCount(row.lineCount)}</td>
+                              <td className="p-2 text-right">{formatCount(row.itemCount)}</td>
+                              <td className="p-2 text-right">{formatQuantity(row.qtyOrder)}</td>
+                              <td className="p-2 text-right font-semibold text-indigo-700">{formatQuantity(row.qtyReceived)}</td>
+                              <td className="p-2 text-right font-semibold text-amber-700">{formatQuantity(row.qtyRemaining)}</td>
+                              <td className="p-2 text-right">
+                                <div>{formatQuantity(row.scheduledQty)}</div>
+                                <div className="text-[11px] text-slate-400">{formatCount(row.scheduleCount)} schedule</div>
+                              </td>
+                              <td className="p-2 text-center">
+                                <span className="text-[11px] text-slate-600">O:{formatCount(row.openLines)} P:{formatCount(row.partialLines)} C:{formatCount(row.closedLines)}</span>
+                              </td>
+                              <td className="p-2 text-right">{formatPercent(row.fillRate)}</td>
+                              <td className="master-po-doc-cell p-2">
+                                <div className="font-semibold text-slate-700">{formatCount(row.rnCount)} RN</div>
+                                <div className="text-[11px] text-slate-500">{row.rnPreview || '-'}</div>
+                                {row.rnCount > 2 && <div className="text-[11px] text-slate-400">+{formatCount(row.rnCount - 2)} RN</div>}
+                              </td>
+                              <td className="master-po-doc-cell p-2">
+                                <div className="font-semibold text-slate-700">{formatCount(row.doCount)} SJ/DO</div>
+                                <div className="text-[11px] text-slate-500">{row.doPreview || '-'}</div>
+                                {row.doCount > 2 && <div className="text-[11px] text-slate-400">+{formatCount(row.doCount - 2)} SJ/DO</div>}
+                              </td>
+                              <td className="p-2">{formatPrintDate(row.lastReceivedDate)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                  {selectedMasterPoSupplier && (
+                    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 print:hidden" onClick={() => setMasterPoSupplierModalKey('')}>
+                      <div className="flex max-h-[88vh] w-full max-w-6xl flex-col rounded-xl border bg-white shadow-2xl" onClick={(event) => event.stopPropagation()}>
+                        <div className="flex items-start justify-between gap-4 border-b p-4">
+                          <div>
+                            <div className="text-xs font-semibold uppercase text-slate-500">Detail Master PO Supplier</div>
+                            <h4 className="mt-1 text-lg font-bold text-slate-900">{selectedMasterPoSupplier.supplierName || '-'}</h4>
+                            <div className="text-xs text-slate-500">{selectedMasterPoSupplier.supplierCode || '-'} | {formatCount(selectedMasterPoSupplier.poCount)} PO | {formatCount(selectedMasterPoSupplier.lineCount)} line</div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setMasterPoSupplierModalKey('')}
+                            className="rounded-lg border border-slate-200 p-2 text-slate-500 hover:bg-slate-50 hover:text-slate-900"
+                            aria-label="Tutup detail supplier"
+                          >
+                            <X size={18} />
+                          </button>
+                        </div>
+                        <div className="grid gap-3 border-b bg-slate-50 p-4 sm:grid-cols-2 lg:grid-cols-5">
+                          <div>
+                            <div className="text-[11px] font-semibold uppercase text-slate-500">Qty PO</div>
+                            <div className="text-lg font-bold text-slate-900">{formatQuantity(selectedMasterPoSupplier.qtyOrder)}</div>
+                          </div>
+                          <div>
+                            <div className="text-[11px] font-semibold uppercase text-slate-500">Incoming RN</div>
+                            <div className="text-lg font-bold text-indigo-700">{formatQuantity(selectedMasterPoSupplier.qtyReceived)}</div>
+                          </div>
+                          <div>
+                            <div className="text-[11px] font-semibold uppercase text-slate-500">Sisa PO</div>
+                            <div className="text-lg font-bold text-amber-700">{formatQuantity(selectedMasterPoSupplier.qtyRemaining)}</div>
+                          </div>
+                          <div>
+                            <div className="text-[11px] font-semibold uppercase text-slate-500">Schedule</div>
+                            <div className="text-lg font-bold text-slate-900">{formatQuantity(selectedMasterPoSupplier.scheduledQty)}</div>
+                          </div>
+                          <div>
+                            <div className="text-[11px] font-semibold uppercase text-slate-500">Fill</div>
+                            <div className="text-lg font-bold text-emerald-700">{formatPercent(selectedMasterPoSupplier.fillRate)}</div>
+                          </div>
+                        </div>
+                        <div className="overflow-x-auto overflow-y-auto p-4">
+                          <table className="min-w-[1500px] w-full text-xs">
+                            <thead className="sticky top-0 bg-slate-100 text-slate-600">
+                              <tr>
+                                <th className="p-2 text-left">PO</th>
+                                <th className="p-2 text-left">Tanggal</th>
+                                <th className="p-2 text-left">Item</th>
+                                <th className="p-2 text-right">Qty PO</th>
+                                <th className="p-2 text-right">Incoming</th>
+                                <th className="p-2 text-right">Sisa</th>
+                                <th className="p-2 text-right">Terjadwal</th>
+                                <th className="p-2 text-center">Status</th>
+                                <th className="p-2 text-left">SJ / DO</th>
+                                <th className="p-2 text-left">RN</th>
+                                <th className="p-2 text-left">Last Incoming</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {selectedMasterPoDetailRows.length === 0 && (
+                                <tr><td colSpan="11" className="p-4 text-center text-gray-400">Tidak ada detail PO.</td></tr>
+                              )}
+                              {selectedMasterPoDetailRows.map((row, idx) => (
+                                <tr key={`master-po-modal-${row.poLineId || idx}`} className="border-t">
+                                  <td className="p-2 font-semibold text-slate-900">{row.poNumber || '-'}</td>
+                                  <td className="p-2">{formatPrintDate(row.poDate)}</td>
+                                  <td className="p-2">
+                                    <div className="font-medium">{row.itemCode || '-'}</div>
+                                    <div className="text-[11px] text-slate-500">{row.itemName || '-'}</div>
+                                  </td>
+                                  <td className="p-2 text-right">{formatQuantity(row.qtyOrder)}</td>
+                                  <td className="p-2 text-right font-semibold text-indigo-700">{formatQuantity(row.qtyReceived)}</td>
+                                  <td className="p-2 text-right">{formatQuantity(row.qtyRemaining)}</td>
+                                  <td className="p-2 text-right">{formatQuantity(row.scheduledQty)}</td>
+                                  <td className="p-2 text-center">{row.status || '-'}</td>
+                                  <td className="p-2">{row.doNumbers || '-'}</td>
+                                  <td className="p-2">{row.rnNumbers || '-'}</td>
+                                  <td className="p-2">{formatPrintDate(row.lastReceivedDate)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                   {renderReportSignatures()}
                   <div className="report-page-footer print-only" />
                 </div>
@@ -2869,6 +3965,8 @@ const TabReports = (props) => {
                           <th className="p-2 text-left">Nama Item</th>
                           <th className="p-2 text-left">Kategori Item</th>
                           <th className="p-2 text-left">Lokasi</th>
+                          <th className="p-2 text-left">Sumber</th>
+                          <th className="p-2 text-left">Dokumen</th>
                           <th className="p-2 text-right">Saldo Awal</th>
                           <th className="p-2 text-right">Qty Masuk (In)</th>
                           <th className="p-2 text-right">Qty Keluar (Out)</th>
@@ -2878,12 +3976,12 @@ const TabReports = (props) => {
                       <tbody>
                         {allMutationLoading && (
                           <tr>
-                            <td colSpan="9" className="p-3 text-center text-gray-400">Memuat...</td>
+                            <td colSpan="11" className="p-3 text-center text-gray-400">Memuat...</td>
                           </tr>
                         )}
                         {!allMutationLoading && allMutationRows.length === 0 && (
                           <tr>
-                            <td colSpan="9" className="p-3 text-center text-gray-400">Belum ada data mutasi.</td>
+                            <td colSpan="11" className="p-3 text-center text-gray-400">Belum ada data mutasi.</td>
                           </tr>
                         )}
                         {!allMutationLoading && allMutationRows.map((row, idx) => (
@@ -2893,6 +3991,8 @@ const TabReports = (props) => {
                             <td className="p-2">{row.itemName || '-'}</td>
                             <td className="p-2">{row.category || '-'}</td>
                             <td className="p-2">{row.location || '-'}</td>
+                            <td className="p-2">{row.sourceType === 'incoming_rn_pending' ? 'Incoming RN' : (row.sourceType || '-')}</td>
+                            <td className="p-2">{row.sourceDoc || '-'}</td>
                             <td className="p-2 text-right">{Number(row.openingBalance || 0).toLocaleString('id-ID')}</td>
                             <td className="p-2 text-right">{Number(row.qtyIn || 0).toLocaleString('id-ID')}</td>
                             <td className="p-2 text-right">{Number(row.qtyOut || 0).toLocaleString('id-ID')}</td>

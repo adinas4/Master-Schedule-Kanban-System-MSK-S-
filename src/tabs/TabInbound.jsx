@@ -2648,10 +2648,7 @@ const TabInbound = (props) => {
 
   function resolvePoLifecycleMeta(row) {
     const status = String(row?.status || '').trim().toLowerCase();
-    const remainingRaw = Number(row?.total_qty_remaining);
-    const hasRemaining = Number.isFinite(remainingRaw);
-    const isClosedLike = ['closed', 'rejected', 'cancelled', 'canceled', 'close'].includes(status)
-      || (hasRemaining ? remainingRaw <= 0 : false);
+    const isClosedLike = ['closed', 'rejected', 'cancelled', 'canceled', 'close'].includes(status);
     if (isClosedLike) {
       return { label: 'CLOSED', className: 'border-slate-200 bg-slate-100 text-slate-600', dot: 'bg-slate-400' };
     }
@@ -2711,7 +2708,7 @@ const TabInbound = (props) => {
             {/* Monitoring Supplier */}
             {mainTab === 'monitoring' && (
             <div className="space-y-6 inbound-apple">
-            <div className="bg-white/90 rounded-2xl border border-slate-200/70 px-4 shadow-sm print:hidden">
+            <div className="inbound-top-tabs bg-white/90 rounded-2xl border border-slate-200/70 px-4 shadow-sm print:hidden">
               <div className="flex flex-wrap items-center gap-6 text-sm">
                 {[
                   { key: 'schedule', label: 'Inbound Schedule' },
@@ -3009,7 +3006,7 @@ const TabInbound = (props) => {
             )}
 
             {/* Search & Filter */}
-            <div className="relative z-30 overflow-visible rounded-2xl border border-slate-200/70 bg-white/85 shadow-[0_14px_40px_-32px_rgba(15,23,42,0.45)] backdrop-blur print:hidden">
+            <div className="inbound-filter-panel relative z-30 overflow-visible rounded-2xl border border-slate-200/70 bg-white/85 shadow-[0_14px_40px_-32px_rgba(15,23,42,0.45)] backdrop-blur print:hidden">
               <div className="pointer-events-none absolute -right-24 -top-24 h-44 w-44 rounded-full bg-gradient-to-br from-sky-200/40 to-transparent blur-2xl" />
               <div className="pointer-events-none absolute left-8 -bottom-24 h-44 w-44 rounded-full bg-gradient-to-tr from-emerald-200/35 to-transparent blur-2xl" />
               <div className="relative z-10 flex flex-col gap-3 p-3">
@@ -3018,7 +3015,7 @@ const TabInbound = (props) => {
                   <span className="text-[11px] normal-case tracking-normal text-slate-500">Cari PO cepat</span>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-2 lg:flex-nowrap">
+                <div className="inbound-filter-grid flex flex-wrap items-center gap-2 lg:flex-nowrap">
                   <div className="relative flex-1 min-w-[220px]">
                     <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
                     <input
@@ -3299,7 +3296,11 @@ const TabInbound = (props) => {
 
             {/* Main Table */}
             <div className="relative z-0 bg-white/90 rounded-3xl shadow-[0_20px_60px_-40px_rgba(15,23,42,0.6)] border border-slate-200/70 inbound-schedule-table-wrapper print:hidden">
-              <div className="overflow-x-auto">
+              <div className="inbound-mobile-scroll-hint hidden items-center justify-between border-b border-slate-100 bg-slate-50/80 px-3 py-2 text-[11px] text-slate-500">
+                <span>Geser tabel untuk melihat detail</span>
+                <span aria-hidden="true">&#8596;</span>
+              </div>
+              <div className="inbound-schedule-scroller overflow-x-auto">
                 <div className="min-w-[1120px] text-sm text-left inbound-schedule-print-table">
                   <div
                     className="bg-slate-50/80 text-slate-500 uppercase font-semibold text-[11px] tracking-[0.18em] grid items-center box-border"

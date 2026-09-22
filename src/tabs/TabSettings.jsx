@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Eye, EyeOff, Key, RefreshCw, Save } from 'lucide-react';
+import { Eye, EyeOff, Key, Mail, RefreshCw, Save } from 'lucide-react';
 
 const TabSettings = ({ apiFetch, user, aiConfigured, aiStatusLoading, refreshAiConfigStatus }) => {
   const isAdmin = user?.role === 'admin';
@@ -20,6 +20,19 @@ const TabSettings = ({ apiFetch, user, aiConfigured, aiStatusLoading, refreshAiC
   const [error, setError] = useState('');
   const [statusMessage, setStatusMessage] = useState('');
   const [showKey, setShowKey] = useState(false);
+  const [emailSettings, setEmailSettings] = useState({
+    smtpHost: '',
+    smtpPort: '587',
+    smtpUser: '',
+    smtpPass: '',
+    smtpFrom: '',
+    smtpSecure: false,
+  });
+  const [emailLoading, setEmailLoading] = useState(false);
+  const [emailSaving, setEmailSaving] = useState(false);
+  const [emailError, setEmailError] = useState('');
+  const [emailStatus, setEmailStatus] = useState('');
+  const [showSmtpPass, setShowSmtpPass] = useState(false);
 
   const loadSettings = useCallback(async () => {
     if (!isAdmin) return;
@@ -45,11 +58,37 @@ const TabSettings = ({ apiFetch, user, aiConfigured, aiStatusLoading, refreshAiC
       const data = await apiFetch('/api/settings/ai/models');
       const models = Array.isArray(data?.models) ? data.models : [];
       setModelOptions(models);
+      if (data?.notice) setModelsError(data.notice);
+      if (data?.latestModel && geminiModel && geminiModel !== data.latestModel) {
+        setStatusMessage(`Model terbaru tersedia: ${data.latestModel}.`);
+      }
     } catch (err) {
       setModelOptions([]);
       setModelsError(err.message || 'Gagal memuat daftar model AI.');
     } finally {
       setModelsLoading(false);
+    }
+  }, [apiFetch, geminiModel, isAdmin]);
+
+  const loadEmailSettings = useCallback(async () => {
+    if (!isAdmin) return;
+    setEmailLoading(true);
+    setEmailError('');
+    setEmailStatus('');
+    try {
+      const data = await apiFetch('/api/settings/email');
+      setEmailSettings({
+        smtpHost: data?.smtpHost || '',
+        smtpPort: data?.smtpPort || '587',
+        smtpUser: data?.smtpUser || '',
+        smtpPass: data?.smtpPass || '',
+        smtpFrom: data?.smtpFrom || '',
+        smtpSecure: Boolean(data?.smtpSecure),
+      });
+    } catch (err) {
+      setEmailError(err.message || 'Gagal memuat pengaturan email.');
+    } finally {
+      setEmailLoading(false);
     }
   }, [apiFetch, isAdmin]);
 
@@ -60,6 +99,10 @@ const TabSettings = ({ apiFetch, user, aiConfigured, aiStatusLoading, refreshAiC
   useEffect(() => {
     loadModels();
   }, [loadModels]);
+
+  useEffect(() => {
+    loadEmailSettings();
+  }, [loadEmailSettings]);
 
   const modelDropdownOptions = useMemo(() => {
     const list = Array.isArray(modelOptions) ? [...modelOptions] : [];
@@ -100,6 +143,33 @@ const TabSettings = ({ apiFetch, user, aiConfigured, aiStatusLoading, refreshAiC
     if (refreshAiConfigStatus) {
       const configured = await refreshAiConfigStatus();
       setStatusMessage(configured ? 'Status AI: Aktif.' : 'Status AI: Belum dikonfigurasi.');
+    }
+  };
+
+  const handleSaveEmailSettings = async (event) => {
+    event.preventDefault();
+    if (!isAdmin) return;
+    setEmailSaving(true);
+    setEmailError('');
+    setEmailStatus('');
+    try {
+      const data = await apiFetch('/api/settings/email', {
+        method: 'PUT',
+        body: JSON.stringify(emailSettings),
+      });
+      setEmailSettings({
+        smtpHost: data?.smtpHost || '',
+        smtpPort: data?.smtpPort || '587',
+        smtpUser: data?.smtpUser || '',
+        smtpPass: data?.smtpPass || '',
+        smtpFrom: data?.smtpFrom || '',
+        smtpSecure: Boolean(data?.smtpSecure),
+      });
+      setEmailStatus('Pengaturan email pengirim berhasil disimpan.');
+    } catch (err) {
+      setEmailError(err.message || 'Gagal menyimpan pengaturan email.');
+    } finally {
+      setEmailSaving(false);
     }
   };
 
@@ -223,6 +293,131 @@ const TabSettings = ({ apiFetch, user, aiConfigured, aiStatusLoading, refreshAiC
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <div className="text-sm font-semibold text-slate-800 flex items-center gap-2">
+              <Mail size={16} /> Pengaturan Email Pengirim
+            </div>
+            <div className="text-xs text-slate-500 mt-1">
+              Dipakai untuk Kirim PDF, Reminder Inbound, DN, dan notifikasi email sistem.
+            </div>
+          </div>
+          <span className={`rounded-full px-3 py-1 text-xs ${emailSettings.smtpHost ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
+            {emailSettings.smtpHost ? 'SMTP Terisi' : 'Belum Diisi'}
+          </span>
+        </div>
+
+        <form onSubmit={handleSaveEmailSettings} className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-6">
+          <div className="lg:col-span-2">
+            <label className="block text-xs font-semibold text-slate-600 mb-2 uppercase">SMTP Host</label>
+            <input
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              value={emailSettings.smtpHost}
+              onChange={(e) => setEmailSettings((prev) => ({ ...prev, smtpHost: e.target.value }))}
+              disabled={emailLoading || emailSaving}
+              placeholder="smtp.domain.com"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-slate-600 mb-2 uppercase">Port</label>
+            <input
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              value={emailSettings.smtpPort}
+              onChange={(e) => setEmailSettings((prev) => ({ ...prev, smtpPort: e.target.value }))}
+              disabled={emailLoading || emailSaving}
+              placeholder="587"
+            />
+          </div>
+          <div className="lg:col-span-2">
+            <label className="block text-xs font-semibold text-slate-600 mb-2 uppercase">SMTP User</label>
+            <input
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              value={emailSettings.smtpUser}
+              onChange={(e) => setEmailSettings((prev) => ({ ...prev, smtpUser: e.target.value }))}
+              disabled={emailLoading || emailSaving}
+              placeholder="user@email.com"
+            />
+          </div>
+          <div className="flex items-end">
+            <label className="inline-flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700">
+              <input
+                type="checkbox"
+                checked={emailSettings.smtpSecure}
+                onChange={(e) => setEmailSettings((prev) => ({ ...prev, smtpSecure: e.target.checked }))}
+                disabled={emailLoading || emailSaving}
+              />
+              Secure
+            </label>
+          </div>
+
+          <div className="lg:col-span-3">
+            <label className="block text-xs font-semibold text-slate-600 mb-2 uppercase">SMTP Password</label>
+            <div className="flex items-center gap-2">
+              <input
+                type={showSmtpPass ? 'text' : 'password'}
+                className="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                value={emailSettings.smtpPass}
+                onChange={(e) => setEmailSettings((prev) => ({ ...prev, smtpPass: e.target.value }))}
+                disabled={emailLoading || emailSaving}
+                placeholder="Password / app password"
+              />
+              <button
+                type="button"
+                onClick={() => setShowSmtpPass((prev) => !prev)}
+                className="px-3 py-2 border rounded-lg text-slate-600 hover:bg-slate-50"
+                title={showSmtpPass ? 'Sembunyikan' : 'Lihat'}
+              >
+                {showSmtpPass ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </div>
+          </div>
+          <div className="lg:col-span-3">
+            <label className="block text-xs font-semibold text-slate-600 mb-2 uppercase">Email From</label>
+            <input
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              value={emailSettings.smtpFrom}
+              onChange={(e) => setEmailSettings((prev) => ({ ...prev, smtpFrom: e.target.value }))}
+              disabled={emailLoading || emailSaving}
+              placeholder="no-reply@domain.com"
+            />
+          </div>
+
+          {emailError && (
+            <div className="lg:col-span-6 rounded-lg bg-red-50 border border-red-100 px-3 py-2 text-xs text-red-600">
+              {emailError}
+            </div>
+          )}
+          {emailStatus && (
+            <div className="lg:col-span-6 rounded-lg bg-emerald-50 border border-emerald-100 px-3 py-2 text-xs text-emerald-700">
+              {emailStatus}
+            </div>
+          )}
+
+          <div className="lg:col-span-6 flex flex-wrap items-center gap-2">
+            <button
+              type="submit"
+              disabled={emailLoading || emailSaving}
+              className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow hover:bg-indigo-700 disabled:opacity-60"
+            >
+              <Save size={16} />
+              {emailSaving ? 'Menyimpan...' : 'Simpan Email'}
+            </button>
+            <button
+              type="button"
+              onClick={loadEmailSettings}
+              disabled={emailLoading || emailSaving}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-200 px-4 py-2 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-60"
+            >
+              <RefreshCw size={16} />
+              {emailLoading ? 'Memuat...' : 'Muat Ulang'}
+            </button>
+          </div>
+        </form>
+      </div>
+      )}
+
+      {isAdmin && (
+      <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-semibold text-slate-800 flex items-center gap-2">
               <Key size={16} /> Pengaturan AI
             </div>
             <div className="text-xs text-slate-500 mt-1">
@@ -279,7 +474,7 @@ const TabSettings = ({ apiFetch, user, aiConfigured, aiStatusLoading, refreshAiC
                 )}
                 {modelDropdownOptions.map((model) => (
                   <option key={model.name} value={model.name}>
-                    {model.displayName || model.name}
+                    {model.displayName || model.name}{model.recommended ? ' (terbaru)' : ''}
                   </option>
                 ))}
               </select>
@@ -288,13 +483,13 @@ const TabSettings = ({ apiFetch, user, aiConfigured, aiStatusLoading, refreshAiC
                 onClick={loadModels}
                 disabled={modelsLoading || saving}
                 className="px-3 py-2 border rounded-lg text-slate-600 hover:bg-slate-50"
-                title="Muat daftar model"
+                title="Cek update model Gemini"
               >
                 <RefreshCw size={16} />
               </button>
             </div>
             <div className="text-[11px] text-slate-500 mt-2">
-              Hanya menampilkan model yang mendukung generateContent.
+              Klik refresh untuk cek update model Gemini. Jika API key belum aktif, sistem memakai daftar rekomendasi bawaan.
             </div>
             {modelsError && (
               <div className="mt-2 text-[11px] text-rose-600">{modelsError}</div>

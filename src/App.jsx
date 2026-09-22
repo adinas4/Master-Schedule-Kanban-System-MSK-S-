@@ -9,7 +9,7 @@ import {
   Minimize2, FileText, Mail, Truck, GitFork, LogOut, Lock, User, Rocket,
   QrCode, BarChart3, ArrowDownUp, MapPin, TrendingDown, TrendingUp, Scissors,
   Play, Pause, Eye, EyeOff, Check, X as XIcon, Coins, ListChecks, HelpCircle,
-  ShieldCheck
+  ShieldCheck, Menu as MenuIcon
 } from 'lucide-react';
 import LoginScreen from './components/LoginScreen';
 import logoMatra from './assets/logo-matra.png';
@@ -42,6 +42,7 @@ const TabQuality = React.lazy(() => import('./tabs/TabQuality'));
 const TabSettings = React.lazy(() => import('./tabs/TabSettings'));
 const TabSupplierPortal = React.lazy(() => import('./tabs/TabSupplierPortal'));
 const TabAuditLogs = React.lazy(() => import('./tabs/TabAuditLogs'));
+const TabAndon = React.lazy(() => import('./tabs/TabAndon'));
 
 const NOTIFICATION_MODULE_OPTIONS = [
   { value: 'all', label: 'Semua Modul' },
@@ -59,7 +60,11 @@ const HELP_REPORT_LABELS = {
   rekap: 'Report Rekap Supplier/PO',
   scorecard: 'Rapor Kinerja Supplier',
   'stock-coverage': 'Stock Coverage',
+  'stock-by-customer': 'Stok per Customer',
   'slow-moving': 'Slow & Dead Stock',
+  'item-summary': 'Laporan per Barang',
+  'rn-report': 'Laporan per RN',
+  'master-po-report': 'Laporan Master PO',
   'inbound-performance': 'Inbound Performance',
   'inbound-matrix': 'Delivery Matrix Inbound',
   'fifo-violations': 'FIFO Violation Log',
@@ -77,10 +82,14 @@ const REPORT_CATEGORY_BY_TAB = {
   scorecard: 'supplier',
   'supplier-shortage': 'supplier',
   'stock-coverage': 'inventory',
+  'stock-by-customer': 'inventory',
   'slow-moving': 'inventory',
+  'item-summary': 'inventory',
   'fifo-violations': 'inventory',
   'inventory-value': 'inventory',
   'all-mutations': 'inventory',
+  'rn-report': 'inbound',
+  'master-po-report': 'inbound',
   'inbound-performance': 'inbound',
   'inbound-matrix': 'inbound',
   'sasaran-mutu': 'supplier',
@@ -113,6 +122,107 @@ const HELP_KANBAN_LABELS = {
   empty: 'Kanban Kosong',
   production: 'Production',
   scan: 'Scan QR',
+};
+
+const QUALITY_TAB_PATHS = {
+  incoming: 'incoming-rn',
+  production: 'production-ng',
+  material: 'material-ng-line',
+  return: 'delivery-return',
+  millsheet: 'mill-sheet',
+  cases: 'qc-check-log',
+};
+
+const QUALITY_PATH_TABS = Object.fromEntries(Object.entries(QUALITY_TAB_PATHS).map(([key, value]) => [value, key]));
+
+const INVENTORY_TAB_PATHS = {
+  overview: 'overview',
+  stock: 'kartu-stok',
+  lot: 'kartu-stok-lot',
+  opname: 'stock-opname',
+};
+
+const INVENTORY_PATH_TABS = {
+  overview: 'overview',
+  stock: 'stock',
+  'kartu-stok': 'stock',
+  lot: 'lot',
+  'kartu-stok-lot': 'lot',
+  opname: 'opname',
+  'stock-opname': 'opname',
+};
+
+const normalizeAppPathSegment = (value) => String(value || '').trim().toLowerCase().replace(/_/g, '-');
+
+const parseAppRouteFromLocation = () => {
+  if (typeof window === 'undefined') return { mainTab: 'dashboard' };
+  const normalizedPath = String(window.location.pathname || '/')
+    .replace(/\/+/g, '/')
+    .replace(/\/$/, '');
+  const [, firstRaw = '', secondRaw = ''] = normalizedPath.split('/');
+  const first = normalizeAppPathSegment(firstRaw);
+  const second = normalizeAppPathSegment(secondRaw);
+  if (!first) return { mainTab: 'dashboard' };
+  if (['dashboard', 'home'].includes(first)) return { mainTab: 'dashboard' };
+  if (['inbound', 'inbound-schedule', 'monitoring'].includes(first)) return { mainTab: 'monitoring' };
+  if (first === 'quality' || first === 'qc') {
+    const qualityTab = QUALITY_PATH_TABS[second] || (Object.prototype.hasOwnProperty.call(QUALITY_TAB_PATHS, second) ? second : 'incoming');
+    return { mainTab: 'quality', qualityTab };
+  }
+  if (first === 'inventory') {
+    return { mainTab: 'inventory', inventoryTab: INVENTORY_PATH_TABS[second] || 'overview' };
+  }
+  if (first === 'kanban') {
+    const kanbanSubTab = second || 'requests';
+    return {
+      mainTab: 'kanban',
+      kanbanView: kanbanSubTab === 'master' ? 'master' : 'board',
+      kanbanSubTab: kanbanSubTab === 'master' ? 'items' : kanbanSubTab,
+    };
+  }
+  if (['fifo', 'management-fifo'].includes(first)) return { mainTab: 'fifo' };
+  if (first === 'prl') return { mainTab: 'prl' };
+  if (first === 'production' && ['andon', 'andon-tv', 'tv'].includes(second)) return { mainTab: 'andon' };
+  if (first === 'subcon') return { mainTab: 'subcon' };
+  if (['supplier', 'supplier-portal'].includes(first)) return { mainTab: 'supplier' };
+  if (['master-reference', 'master-referensi', 'masterref'].includes(first)) {
+    return { mainTab: 'masterref', masterRefTab: second || 'org' };
+  }
+  if (['reports', 'laporan'].includes(first)) return { mainTab: 'reports', reportTab: second || 'rekap' };
+  if (first === 'settings' || first === 'pengaturan') return { mainTab: 'settings' };
+  if (first === 'audit') return { mainTab: 'audit' };
+  return { mainTab: 'dashboard' };
+};
+
+const buildAppPathFromState = ({
+  mainTab,
+  activeInventoryHelpTab,
+  activeQualityHelpTab,
+  kanbanView,
+  kanbanSubTab,
+  masterRefTab,
+  reportTab,
+}) => {
+  const tab = String(mainTab || 'dashboard');
+  if (tab === 'dashboard') return '/dashboard';
+  if (tab === 'monitoring') return '/inbound';
+  if (tab === 'quality') return `/quality/${QUALITY_TAB_PATHS[activeQualityHelpTab] || 'incoming-rn'}`;
+  if (tab === 'inventory') return `/inventory/${INVENTORY_TAB_PATHS[activeInventoryHelpTab] || 'overview'}`;
+  if (tab === 'kanban') {
+    return kanbanView === 'master'
+      ? '/kanban/master'
+      : `/kanban/${normalizeAppPathSegment(kanbanSubTab) || 'requests'}`;
+  }
+  if (tab === 'fifo') return '/fifo';
+  if (tab === 'prl') return '/prl';
+  if (tab === 'andon') return '/production/andon';
+  if (tab === 'subcon') return '/subcon';
+  if (tab === 'supplier') return '/supplier';
+  if (tab === 'masterref') return `/master-reference/${normalizeAppPathSegment(masterRefTab) || 'org'}`;
+  if (tab === 'reports') return `/reports/${normalizeAppPathSegment(reportTab) || 'rekap'}`;
+  if (tab === 'settings') return '/settings';
+  if (tab === 'audit') return '/audit';
+  return '/dashboard';
 };
 
 const HELP_CONTENT = {
@@ -368,6 +478,198 @@ const HELP_CONTENT = {
   },
 };
 
+const HELP_INVENTORY_TAB_CONTENT = {
+  overview: {
+    title: 'Inventory Overview',
+    subtitle: 'Pantau saldo item, reserved, available, status min/max, aging, dan risiko stok.',
+    sop: [
+      'Gunakan pencarian item dan filter health untuk menemukan stok kritis, overstock, slow moving, atau item dengan available minus.',
+      'Baca On Hand sebagai saldo sistem, Reserved sebagai kebutuhan request aktif, dan Available sebagai On Hand dikurangi Reserved.',
+      'Jika Available minus, telusuri request aktif di Kanban Board sebelum menganggap stok fisik bermasalah.',
+      'Klik detail atau analytics item untuk melihat sumber saldo, aging, supplier/customer/model, dan rekomendasi tindak lanjut.',
+      'Cek batch QC Hold/Reject sebelum item dipakai produksi karena saldo tersebut tidak boleh dianggap bebas pakai.',
+      'Jika saldo tidak cocok, lanjutkan pengecekan ke Kartu Stok, Kartu Stok per Lot, dan Laporan Mutasi.',
+    ],
+    links: [
+      { label: 'Kartu Stok (Main Warehouse)', description: 'Telusuri histori masuk/keluar per item.', mainTab: 'inventory', inventoryTab: 'stock' },
+      { label: 'Kartu Stok per Lot', description: 'Cek batch, FIFO, No. SJ/DO, dan label lot.', mainTab: 'inventory', inventoryTab: 'lot' },
+      { label: 'Stock Opname', description: 'Cocokkan stok sistem dengan hasil hitung fisik.', mainTab: 'inventory', inventoryTab: 'opname' },
+      { label: 'Kanban Board', description: 'Cek request aktif yang membentuk reserved.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'requests' },
+      { label: 'Laporan Mutasi', description: 'Audit transaksi masuk/keluar secara lengkap.', mainTab: 'reports', reportTab: 'all-mutations' },
+      { label: 'Master Item', description: 'Validasi kategori, lokasi, min/max, supplier, dan model.', mainTab: 'masterref', masterRefTab: 'item' },
+    ],
+  },
+  stock: {
+    title: 'Kartu Stok (Main Warehouse)',
+    subtitle: 'Telusuri histori mutasi main warehouse per item dan periode.',
+    sop: [
+      'Pilih item dan periode sebelum memuat kartu stok agar histori yang tampil sesuai kebutuhan audit.',
+      'Gunakan kartu stok untuk membaca urutan transaksi masuk, keluar, adjustment, receiving, issue, dan koreksi.',
+      'Bandingkan saldo awal, qty masuk, qty keluar, dan saldo akhir dengan Inventory Overview.',
+      'Jika ada transaksi tidak dikenal, catat nomor dokumen, tanggal, user, dan sumber transaksi untuk ditelusuri di Laporan Mutasi.',
+      'Untuk validasi batch fisik, lanjutkan ke Kartu Stok per Lot karena kartu stok main warehouse hanya merangkum item.',
+      'Jangan melakukan koreksi manual sebelum sumber selisih dari RN, kanban, QC, atau stock opname dikonfirmasi.',
+    ],
+    links: [
+      { label: 'Inventory Overview', description: 'Bandingkan saldo akhir item dengan ringkasan inventory.', mainTab: 'inventory', inventoryTab: 'overview' },
+      { label: 'Kartu Stok per Lot', description: 'Cek batch yang membentuk saldo item.', mainTab: 'inventory', inventoryTab: 'lot' },
+      { label: 'Laporan Mutasi', description: 'Telusuri dokumen transaksi lintas modul.', mainTab: 'reports', reportTab: 'all-mutations' },
+      { label: 'Kanban Board', description: 'Cek konsumsi/request yang membuat mutasi keluar atau reserved.', mainTab: 'kanban', kanbanView: 'board', kanbanSubTab: 'requests' },
+    ],
+  },
+  lot: {
+    title: 'Kartu Stok per Lot',
+    subtitle: 'Pantau batch, sisa qty lot, FIFO, expiry, No. SJ/DO, dan label lot/part.',
+    sop: [
+      'Pilih item untuk memuat daftar batch, lalu pilih batch yang perlu diaudit atau dicetak labelnya.',
+      'Validasi batch no, tanggal datang, No. SJ/DO, supplier, qty awal, sisa qty, expiry, dan status QC.',
+      'Cetak QR Label Lot/Part dari batch yang benar lalu tempelkan ke barang fisik agar scan opname dan FIFO konsisten.',
+      'Saat mengambil material, pakai lot paling tua atau expiry terdekat sesuai metode FIFO item.',
+      'Jika lot berstatus Hold atau Reject, tahan penggunaan sampai QC memberi disposition final.',
+      'Jika qty fisik lot berbeda dari sistem, lanjutkan ke Stock Opname atau adjustment sesuai approval.',
+    ],
+    links: [
+      { label: 'Inventory Overview', description: 'Lihat dampak batch terhadap saldo item.', mainTab: 'inventory', inventoryTab: 'overview' },
+      { label: 'Management FIFO', description: 'Cek urutan lot dan potensi pelanggaran FIFO.', mainTab: 'fifo' },
+      { label: 'Quality Control', description: 'Cek batch hold/reject dan disposition QC.', mainTab: 'quality' },
+      { label: 'Stock Opname', description: 'Cocokkan batch fisik dengan saldo sistem.', mainTab: 'inventory', inventoryTab: 'opname' },
+      { label: 'Laporan Mutasi', description: 'Telusuri histori transaksi batch/item.', mainTab: 'reports', reportTab: 'all-mutations' },
+    ],
+  },
+  opname: {
+    title: 'Stock Opname',
+    subtitle: 'Hitung fisik, scan label lot, review selisih, dan tutup opname dengan koreksi terkontrol.',
+    sop: [
+      'Pastikan hanya satu sesi opname yang open dan koordinasikan penghentian sementara transaksi receiving/produksi selama hitung fisik.',
+      'Gunakan QR Label Lot/Part untuk mencocokkan item dan batch fisik dengan data sistem.',
+      'Input hasil hitung fisik per item/lot, lalu review selisih plus/minus sebelum finalisasi.',
+      'Investigasi selisih besar dengan membandingkan Kartu Stok, Kartu Stok per Lot, QC Hold/Reject, dan Laporan Mutasi.',
+      'Tambahkan catatan penyebab koreksi agar audit trail jelas dan bisa ditindaklanjuti.',
+      'Tutup sesi opname hanya setelah supervisor menyetujui hasil hitung dan koreksi yang diperlukan.',
+    ],
+    links: [
+      { label: 'Inventory Overview', description: 'Cek saldo sistem sebelum dan sesudah opname.', mainTab: 'inventory', inventoryTab: 'overview' },
+      { label: 'Kartu Stok per Lot', description: 'Validasi batch dan label yang dipakai saat hitung fisik.', mainTab: 'inventory', inventoryTab: 'lot' },
+      { label: 'Kartu Stok (Main Warehouse)', description: 'Telusuri histori item penyebab selisih.', mainTab: 'inventory', inventoryTab: 'stock' },
+      { label: 'Laporan Mutasi', description: 'Audit koreksi dan transaksi terkait opname.', mainTab: 'reports', reportTab: 'all-mutations' },
+      { label: 'Management FIFO', description: 'Cek indikasi lot fisik tidak sesuai urutan FIFO.', mainTab: 'fifo' },
+      { label: 'Master Item', description: 'Validasi lokasi, satuan, kategori, dan parameter item.', mainTab: 'masterref', masterRefTab: 'item' },
+    ],
+  },
+};
+
+const HELP_QUALITY_TAB_CONTENT = {
+  incoming: {
+    title: 'Incoming RN',
+    subtitle: 'Inspeksi material dari receiving/RN sebelum stok dipakai produksi.',
+    sop: [
+      'Buka baris Incoming RN berdasarkan tanggal, item, supplier, RN, atau No. SJ/DO yang diterima.',
+      'Cocokkan fisik barang dengan RN, PO, No. SJ/DO, label supplier, qty datang, dan dokumen Mill Sheet bila wajib.',
+      'Isi catatan QC untuk hasil sampling, defect, dokumen kurang, atau koreksi penerimaan yang perlu ditindaklanjuti.',
+      'Klik Release jika hasil inspeksi OK agar stok bisa dipakai produksi.',
+      'Klik Hold jika perlu investigasi lanjutan; batch harus tetap ditahan sampai keputusan final.',
+      'Klik Reject atau Return jika material NG dikembalikan/ditolak supplier, jangan batalkan RN untuk kasus defect aktual.',
+      'Jika RN sudah reversal karena salah input item, qty, tanggal, atau SJ/DO, tutup dengan Close Review setelah alasan koreksi jelas.',
+    ],
+    links: [
+      { label: 'Inbound Schedule', description: 'Cek PO, jadwal datang, RN, dan No. SJ/DO sumber QC.', mainTab: 'monitoring' },
+      { label: 'Kartu Stok per Lot', description: 'Cek batch, sisa qty, dan status QC lot hasil receiving.', mainTab: 'inventory', inventoryTab: 'lot' },
+      { label: 'Mill Sheet', description: 'Review dokumen material yang wajib mill sheet.', mainTab: 'quality', qualityTab: 'millsheet' },
+      { label: 'Laporan QC', description: 'Pantau Qty OK/NG, case, defect, dan PPM supplier.', mainTab: 'reports', reportTab: 'qc-report' },
+    ],
+  },
+  production: {
+    title: 'Production NG',
+    subtitle: 'Catat NG produksi yang muncul dari proses produksi internal.',
+    sop: [
+      'Gunakan tab ini untuk NG yang terjadi pada proses produksi, bukan NG raw material dari receiving.',
+      'Cari case berdasarkan item, dokumen, line, defect, atau status untuk memastikan duplikasi tidak dibuat.',
+      'Review qty NG, defect, severity, proses, operator/shift, dan catatan penyebab sebelum tindakan lanjutan.',
+      'Gunakan catatan QC untuk keputusan sortir, rework, scrap, use as is, atau tindak lanjut produksi.',
+      'Jika penyebabnya material supplier yang baru ditemukan di line, catat lewat Material NG Line agar performa supplier ikut terbaca.',
+      'Tutup case hanya setelah disposition dan koreksi stok/proses sudah selesai.',
+    ],
+    links: [
+      { label: 'Material NG Line', description: 'Catat NG raw material yang ditemukan setelah release ke line.', mainTab: 'quality', qualityTab: 'material' },
+      { label: 'Inventory', description: 'Cek dampak hold/reject terhadap available stock.', mainTab: 'inventory' },
+      { label: 'Laporan QC', description: 'Cek rekap NG, defect, dan PPM.', mainTab: 'reports', reportTab: 'qc-report' },
+      { label: 'Master Item', description: 'Validasi item, model, supplier, dan kategori material.', mainTab: 'masterref', masterRefTab: 'item' },
+    ],
+  },
+  material: {
+    title: 'Material NG Line',
+    subtitle: 'Catat raw material NG yang baru ditemukan di line setelah incoming QC release.',
+    sop: [
+      'Pilih item NG lalu pilih batch FIFO/RN yang benar agar klaim mengarah ke lot dan supplier yang tepat.',
+      'Isi qty NG, line, proses, operator/shift, kategori defect, severity, dan deskripsi masalah.',
+      'Pastikan qty NG tidak melebihi sisa batch dan batch yang dipilih memang material fisik yang ditemukan di line.',
+      'Simpan case untuk menahan stok batch terkait dan membuat histori kualitas supplier.',
+      'Gunakan disposition Sortir, Return, Scrap, Rework, atau Use As Is sesuai keputusan QC.',
+      'Jangan mengembalikan kasus ini ke Incoming RN karena barang sebelumnya sudah release dan masalah ditemukan setelah dipakai line.',
+    ],
+    links: [
+      { label: 'Kartu Stok per Lot', description: 'Validasi batch FIFO/RN dan sisa qty sebelum membuat case.', mainTab: 'inventory', inventoryTab: 'lot' },
+      { label: 'Management FIFO', description: 'Cek apakah lot yang dipakai sesuai urutan FIFO.', mainTab: 'fifo' },
+      { label: 'Incoming RN', description: 'Telusuri RN awal jika perlu melihat dokumen penerimaan.', mainTab: 'quality', qualityTab: 'incoming' },
+      { label: 'Laporan QC', description: 'Pantau Line Claim dan performa supplier.', mainTab: 'reports', reportTab: 'qc-report' },
+    ],
+  },
+  return: {
+    title: 'Delivery Return',
+    subtitle: 'Catat return delivery/customer/supplier yang perlu review QC.',
+    sop: [
+      'Gunakan tab ini untuk barang return yang perlu dicatat sebagai case QC, bukan koreksi salah input RN.',
+      'Isi sumber dokumen, item, qty return, customer atau supplier terkait, kategori defect, severity, dan deskripsi.',
+      'Validasi qty dan dokumen return agar tidak dobel dengan case Incoming RN atau Material NG Line.',
+      'Putuskan disposition material return: sort, rework, scrap, return supplier, atau use as is sesuai approval.',
+      'Pastikan efek stok return/hold/reject ditelusuri di Inventory dan laporan mutasi.',
+      'Tutup case setelah disposition, catatan penyebab, dan tindak lanjut dokumen sudah lengkap.',
+    ],
+    links: [
+      { label: 'Inventory', description: 'Cek saldo dan status stok barang return.', mainTab: 'inventory' },
+      { label: 'Kartu Stok (Main Warehouse)', description: 'Telusuri mutasi return dan adjustment terkait.', mainTab: 'inventory', inventoryTab: 'stock' },
+      { label: 'Laporan Mutasi', description: 'Audit transaksi return/adjustment lintas modul.', mainTab: 'reports', reportTab: 'all-mutations' },
+      { label: 'Laporan QC', description: 'Cek dampak return terhadap case QC dan PPM.', mainTab: 'reports', reportTab: 'qc-report' },
+    ],
+  },
+  millsheet: {
+    title: 'Mill Sheet',
+    subtitle: 'Review kelengkapan dan status dokumen Mill Sheet material.',
+    sop: [
+      'Cek daftar RN yang belum lengkap Mill Sheet dan dokumen yang menunggu review QC.',
+      'Cocokkan dokumen Mill Sheet dengan RN, item, heat/lot, supplier, spesifikasi material, dan No. SJ/DO.',
+      'Approve jika dokumen sesuai dan bisa menjadi bukti kelengkapan material.',
+      'Reject jika dokumen salah, tidak terbaca, tidak cocok dengan item/lot, atau tidak memenuhi syarat.',
+      'Gunakan catatan review agar supplier/admin tahu kekurangan dokumen yang harus diperbaiki.',
+      'Jika Mill Sheet wajib tetapi belum ada, jangan release incoming QC sebelum risiko dokumen diputuskan sesuai approval.',
+    ],
+    links: [
+      { label: 'Incoming RN', description: 'Release/Hold incoming setelah kelengkapan dokumen jelas.', mainTab: 'quality', qualityTab: 'incoming' },
+      { label: 'Inbound Schedule', description: 'Cek RN, supplier, dan No. SJ/DO sumber dokumen.', mainTab: 'monitoring' },
+      { label: 'Supplier Portal', description: 'Area supplier untuk upload dan cek dokumen pengiriman.', mainTab: 'supplier' },
+      { label: 'Laporan QC', description: 'Pantau case dokumen dan dampaknya ke QC.', mainTab: 'reports', reportTab: 'qc-report' },
+    ],
+  },
+  cases: {
+    title: 'QC Check Log',
+    subtitle: 'Log case QC untuk audit status, defect, disposition, dan tindak lanjut.',
+    sop: [
+      'Gunakan pencarian untuk menemukan case berdasarkan item, dokumen, supplier/customer, defect, atau status.',
+      'Review sumber case: Incoming RN, Production NG, Material NG Line, Delivery Return, atau Mill Sheet.',
+      'Pastikan setiap case memiliki qty, severity, defect, catatan QC, status, dan disposition yang jelas.',
+      'Prioritaskan case open/hold/reject yang memblokir stok atau pengiriman.',
+      'Cocokkan case dengan Inventory dan Kartu Stok per Lot untuk memastikan batch hold/reject tidak dipakai.',
+      'Gunakan log ini sebagai bukti audit sebelum membaca ringkasan PPM dan performa supplier di Laporan QC.',
+    ],
+    links: [
+      { label: 'Incoming RN', description: 'Buka sumber case receiving/incoming.', mainTab: 'quality', qualityTab: 'incoming' },
+      { label: 'Material NG Line', description: 'Buka sumber case line claim material.', mainTab: 'quality', qualityTab: 'material' },
+      { label: 'Kartu Stok per Lot', description: 'Cek batch yang tertahan atau reject.', mainTab: 'inventory', inventoryTab: 'lot' },
+      { label: 'Laporan QC', description: 'Lihat rekap PPM, defect, dan status case.', mainTab: 'reports', reportTab: 'qc-report' },
+    ],
+  },
+};
+
 const normalizeNotificationPayload = (payload) => {
   if (!payload) return {};
   if (typeof payload === 'object' && !Array.isArray(payload)) return payload;
@@ -453,7 +755,7 @@ const resolveNotificationTarget = (item) => {
   }
 
   if (moduleKey.includes('inbound')) return { mainTab: 'monitoring' };
-  if (moduleKey.includes('stock opname')) return { mainTab: 'inventory' };
+  if (moduleKey.includes('stock opname')) return { mainTab: 'inventory', inventoryTab: 'opname' };
   if (moduleKey.includes('bom') || moduleKey.includes('master')) return { mainTab: 'masterref' };
   if (moduleKey.includes('prl')) return { mainTab: 'prl', prl: { search: itemCode } };
   return { mainTab: 'dashboard' };
@@ -829,6 +1131,7 @@ const publicFormatDateID = (dateString) => {
 // 2. KOMPONEN DASHBOARD (INTI APLIKASI)
 // ==========================================
 const Dashboard = ({ onLogout, token, user }) => {
+  const initialRoute = useMemo(() => parseAppRouteFromLocation(), []);
   // --- STATE MANAGEMENT ---
   const [toast, setToast] = useState({
     open: false,
@@ -846,6 +1149,14 @@ const Dashboard = ({ onLogout, token, user }) => {
   const globalSearchRequestRef = useRef(0);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [activeInventoryHelpTab, setActiveInventoryHelpTab] = useState(initialRoute.inventoryTab || 'overview');
+  const [activeQualityHelpTab, setActiveQualityHelpTab] = useState(initialRoute.qualityTab || 'incoming');
+  const [inventoryNav, setInventoryNav] = useState(() => (
+    initialRoute.inventoryTab ? { tab: initialRoute.inventoryTab, nonce: Date.now() } : null
+  ));
+  const [qualityNav, setQualityNav] = useState(() => (
+    initialRoute.qualityTab ? { tab: initialRoute.qualityTab, nonce: Date.now() } : null
+  ));
   const [notificationRecords, setNotificationRecords] = useState([]);
   const [notificationLoading, setNotificationLoading] = useState(false);
   const [notificationError, setNotificationError] = useState('');
@@ -976,8 +1287,29 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [reportLoading, setReportLoading] = useState(false);
   const [stockCoverageRows, setStockCoverageRows] = useState([]);
   const [stockCoverageDays, setStockCoverageDays] = useState(30);
+  const [customerCategoryStockRows, setCustomerCategoryStockRows] = useState([]);
+  const [customerCategoryStockDetailRows, setCustomerCategoryStockDetailRows] = useState([]);
+  const [customerCategoryStockSummary, setCustomerCategoryStockSummary] = useState({
+    totalGroups: 0,
+    amanGroups: 0,
+    awasGroups: 0,
+    bahayaGroups: 0,
+    totalStockQty: 0,
+    totalSafetyStock: 0,
+    totalDailyConsumption: 0,
+  });
+  const [customerCategoryStockDays, setCustomerCategoryStockDays] = useState(2);
+  const [customerCategoryStockCategory, setCustomerCategoryStockCategory] = useState('all');
+  const [customerCategoryStockCustomer, setCustomerCategoryStockCustomer] = useState('');
+  const [customerCategoryStockRecoveryTarget, setCustomerCategoryStockRecoveryTarget] = useState('');
   const [slowMovingRows, setSlowMovingRows] = useState([]);
+  const [itemSummaryReportRows, setItemSummaryReportRows] = useState([]);
+  const [itemSummaryReportSummary, setItemSummaryReportSummary] = useState(null);
   const [inboundPerformanceRows, setInboundPerformanceRows] = useState([]);
+  const [receiveNoteReportRows, setReceiveNoteReportRows] = useState([]);
+  const [receiveNoteReportSummary, setReceiveNoteReportSummary] = useState(null);
+  const [masterPoReportRows, setMasterPoReportRows] = useState([]);
+  const [masterPoReportSummary, setMasterPoReportSummary] = useState(null);
   const [fifoViolationRows, setFifoViolationRows] = useState([]);
   const [inventoryValueRows, setInventoryValueRows] = useState([]);
   const [inventoryValueTotal, setInventoryValueTotal] = useState(0);
@@ -1103,7 +1435,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [userLoading, setUserLoading] = useState(false);
   const [userError, setUserError] = useState('');
   const [userResettingId, setUserResettingId] = useState(null);
-  const [mainTab, setMainTab] = useState('dashboard');
+  const [mainTab, setMainTab] = useState(initialRoute.mainTab || 'dashboard');
   const [tabReloadNonce, setTabReloadNonce] = useState(0);
   const handleTabRetry = useCallback(() => setTabReloadNonce((prev) => prev + 1), []);
   const [inboundNav, setInboundNav] = useState(null);
@@ -1128,7 +1460,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [rnDateStart, setRnDateStart] = useState(rnDefaultRange.start);
   const [rnDateEnd, setRnDateEnd] = useState(rnDefaultRange.end);
   const [rnStatus, setRnStatus] = useState('all');
-  const [kanbanView, setKanbanView] = useState('master');
+  const [kanbanView, setKanbanView] = useState(initialRoute.kanbanView || 'master');
   const [kanbanRequestStatusFilter, setKanbanRequestStatusFilter] = useState('all');
   const [kanbanRequestQuickFilter, setKanbanRequestQuickFilter] = useState('all');
   const [kanbanRequestCategoryFilter, setKanbanRequestCategoryFilter] = useState('all');
@@ -1172,7 +1504,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   }, [kanbanSettings]);
   const [showKanbanEdit, setShowKanbanEdit] = useState(false);
   const [kanbanEditMode, setKanbanEditMode] = useState('edit');
-  const [kanbanSubTab, setKanbanSubTab] = useState('items');
+  const [kanbanSubTab, setKanbanSubTab] = useState(initialRoute.kanbanSubTab || 'items');
   const [kanbanSearch, setKanbanSearch] = useState('');
   const [kanbanCategoryFilter, setKanbanCategoryFilter] = useState('all');
   const [kanbanDashboardCategoryFilter, setKanbanDashboardCategoryFilter] = useState('all');
@@ -1261,6 +1593,9 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [qrPayload, setQrPayload] = useState('');
   const [qrTitle, setQrTitle] = useState('');
   const [emptyKanbanForm, setEmptyKanbanForm] = useState({ area: '', kanbanId: '' });
+  const [emptyKanbanConfirm, setEmptyKanbanConfirm] = useState(null);
+  const [emptyKanbanConfirmLoading, setEmptyKanbanConfirmLoading] = useState(false);
+  const [emptyKanbanConfirmSubmitting, setEmptyKanbanConfirmSubmitting] = useState(false);
   useEffect(() => {
     document.body.classList.toggle(
       'kanban-print-active',
@@ -1397,7 +1732,7 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [prlMenuOpen, setPrlMenuOpen] = useState(false);
   const [prlFlowOpen, setPrlFlowOpen] = useState(false);
   const prlImportRef = useRef(null);
-  const [masterRefTab, setMasterRefTab] = useState('org');
+  const [masterRefTab, setMasterRefTab] = useState(initialRoute.masterRefTab || 'org');
   const [masterLoading, setMasterLoading] = useState(false);
   const [masterError, setMasterError] = useState('');
   const [masterPlants, setMasterPlants] = useState([]);
@@ -1638,6 +1973,11 @@ const Dashboard = ({ onLogout, token, user }) => {
 
     setNotificationsOpen(false);
     setMainTab(target.mainTab || 'dashboard');
+
+    if (target.mainTab === 'inventory' && target.inventoryTab) {
+      setActiveInventoryHelpTab(target.inventoryTab);
+      setInventoryNav({ tab: target.inventoryTab, nonce: Date.now() });
+    }
 
     if (target.mainTab === 'prl') {
       setPrlFilters((prev) => ({
@@ -2064,7 +2404,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       .map((value) => value.trim().toUpperCase())
       .filter(Boolean)
   ), [masterConfig.dnStatusFlow]);
-    const isPrimaryTab = ['dashboard', 'monitoring', 'kanban', 'fifo', 'inventory', 'prl', 'subcon', 'supplier'].includes(mainTab);
+    const isPrimaryTab = ['dashboard', 'monitoring', 'kanban', 'fifo', 'inventory', 'prl', 'subcon', 'supplier', 'andon'].includes(mainTab);
   const isDashboardTab = ['dashboard', 'dash-prl', 'dash-kanban', 'dash-inventory', 'dash-masterref', 'dash-schedule'].includes(mainTab);
   const hasPrimaryCache = Boolean(
     dataCacheRef.current.itemsLoaded ||
@@ -2106,12 +2446,13 @@ const Dashboard = ({ onLogout, token, user }) => {
   ]);
   const [editingProductionId, setEditingProductionId] = useState(null);
   const [editingProductionQty, setEditingProductionQty] = useState('');
-  const [reportTab, setReportTab] = useState('rekap');
+  const [reportTab, setReportTab] = useState(initialRoute.reportTab || 'rekap');
   const [reportCategory, setReportCategory] = useState('supplier');
   const [reportMenuCategory, setReportMenuCategory] = useState('supplier');
   const [reportMenuOpen, setReportMenuOpen] = useState(false);
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
   const [incomingMenuOpen, setIncomingMenuOpen] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [incomingQuickAction, setIncomingQuickAction] = useState(null);
   const isAdmin = user?.role === 'admin';
   const isSupplier = user?.role === 'supplier';
@@ -2151,8 +2492,70 @@ const Dashboard = ({ onLogout, token, user }) => {
   const canProduction = can('production') || isProductionUser;
   const canQuality = can('quality');
   const canOpenReportMenu = canViewReport || canViewScorecard;
+  const applyRouteFromLocation = useCallback(() => {
+    const route = parseAppRouteFromLocation();
+    setMainTab(route.mainTab || 'dashboard');
+    if (route.inventoryTab) {
+      setActiveInventoryHelpTab(route.inventoryTab);
+      setInventoryNav({ tab: route.inventoryTab, nonce: Date.now() });
+    }
+    if (route.qualityTab) {
+      setActiveQualityHelpTab(route.qualityTab);
+      setQualityNav({ tab: route.qualityTab, nonce: Date.now() });
+    }
+    if (route.kanbanView) setKanbanView(route.kanbanView);
+    if (route.kanbanSubTab) setKanbanSubTab(route.kanbanSubTab);
+    if (route.masterRefTab) setMasterRefTab(route.masterRefTab);
+    if (route.reportTab) setReportTab(route.reportTab);
+  }, [
+    setActiveInventoryHelpTab,
+    setActiveQualityHelpTab,
+    setKanbanSubTab,
+    setKanbanView,
+    setMainTab,
+    setMasterRefTab,
+    setReportTab,
+  ]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+    window.addEventListener('popstate', applyRouteFromLocation);
+    return () => window.removeEventListener('popstate', applyRouteFromLocation);
+  }, [applyRouteFromLocation]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const nextPath = buildAppPathFromState({
+      mainTab,
+      activeInventoryHelpTab,
+      activeQualityHelpTab,
+      kanbanView,
+      kanbanSubTab,
+      masterRefTab,
+      reportTab,
+    });
+    const currentPath = String(window.location.pathname || '/').replace(/\/+/g, '/').replace(/\/$/, '') || '/';
+    if (currentPath !== nextPath || window.location.pathname !== nextPath) {
+      window.history.replaceState({}, '', nextPath);
+    }
+  }, [
+    activeInventoryHelpTab,
+    activeQualityHelpTab,
+    kanbanSubTab,
+    kanbanView,
+    mainTab,
+    masterRefTab,
+    reportTab,
+  ]);
+
   const activeHelpContent = useMemo(() => {
-    const base = HELP_CONTENT[mainTab] || HELP_CONTENT.dashboard;
+    let base = HELP_CONTENT[mainTab] || HELP_CONTENT.dashboard;
+    if (mainTab === 'inventory') {
+      base = HELP_INVENTORY_TAB_CONTENT[activeInventoryHelpTab] || HELP_CONTENT.inventory;
+    }
+    if (mainTab === 'quality') {
+      base = HELP_QUALITY_TAB_CONTENT[activeQualityHelpTab] || HELP_CONTENT.quality;
+    }
     let detailLabel = '';
     if (mainTab === 'reports') detailLabel = HELP_REPORT_LABELS[reportTab] || '';
     if (mainTab === 'masterref') detailLabel = HELP_MASTER_REF_LABELS[masterRefTab] || '';
@@ -2161,12 +2564,18 @@ const Dashboard = ({ onLogout, token, user }) => {
         ? HELP_KANBAN_LABELS.master
         : HELP_KANBAN_LABELS[kanbanSubTab] || '';
     }
+    const links = (base.links || []).filter((link) => !(
+      link?.mainTab === 'inventory'
+      && link?.inventoryTab === 'opname'
+      && !canManageItems
+    ));
     return {
       ...base,
+      links,
       detailLabel,
       title: detailLabel ? `${base.title} - ${detailLabel}` : base.title,
     };
-  }, [kanbanSubTab, kanbanView, mainTab, masterRefTab, reportTab]);
+  }, [activeInventoryHelpTab, activeQualityHelpTab, canManageItems, kanbanSubTab, kanbanView, mainTab, masterRefTab, reportTab]);
   const reportMenuGroups = useMemo(() => {
     const groups = [
       {
@@ -2187,6 +2596,7 @@ const Dashboard = ({ onLogout, token, user }) => {
         reports: [
           { key: 'stock-coverage', label: 'Stock Coverage', icon: BarChart3, access: canViewReport },
           { key: 'slow-moving', label: 'Slow & Dead Stock', icon: TrendingDown, access: canViewReport },
+          { key: 'item-summary', label: 'Laporan per Barang', icon: Package, access: canViewReport },
           { key: 'fifo-violations', label: 'FIFO Violation Log', icon: AlertTriangle, access: canViewReport },
           { key: 'inventory-value', label: 'Inventory Value', icon: Coins, access: canViewReport },
           { key: 'all-mutations', label: 'All Laporan Mutasi', icon: FileText, access: canViewReport },
@@ -2197,6 +2607,8 @@ const Dashboard = ({ onLogout, token, user }) => {
         label: 'Inbound',
         icon: Truck,
         reports: [
+          { key: 'rn-report', label: 'Laporan per RN', icon: FileText, access: canViewReport },
+          { key: 'master-po-report', label: 'Master PO', icon: FileText, access: canViewReport },
           { key: 'inbound-performance', label: 'Inbound Performance', icon: ArrowDownUp, access: canViewReport },
           { key: 'inbound-matrix', label: 'Delivery Matrix Inbound', icon: FileSpreadsheet, access: canViewReport },
         ],
@@ -2272,16 +2684,24 @@ const Dashboard = ({ onLogout, token, user }) => {
       .map((item) => {
         const stock = Number(fifoTotalsByItemCode.get(item.code) ?? 0);
         const min = Number(item.safety_stock ?? 0);
+        const lineCode = String(item.line_production || item.lineProduction || '').trim();
+        const lineMaster = lineCode ? masterProcessesByCode.get(lineCode) : null;
+        const lineLabel = String(lineMaster?.name || item.line_production_name || lineCode || item.location_name || item.locationName || '-').trim();
         return {
           code: item.code,
           name: item.name,
           stock,
           min,
+          shortage: Math.max(0, min - stock),
+          coverage: min > 0 ? Math.max(0, (stock / min) * 100) : 100,
+          unit: item.unit || item.uom || 'PCS',
+          line: lineLabel || '-',
+          supplier: item.supplier_name || item.supplierName || item.vendor_name || item.vendorName || '-',
         };
       })
       .filter((row) => row.min > 0 && row.stock < row.min)
       .sort((a, b) => (a.stock - a.min) - (b.stock - b.min));
-  }, [masterItems, fifoTotalsByItemCode]);
+  }, [masterItems, fifoTotalsByItemCode, masterProcessesByCode]);
   const expiringSoonRows = useMemo(() => {
     const now = new Date();
     const thresholdDays = 14;
@@ -2693,6 +3113,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     if (normalized === 'kanban') return 'Anda tidak memiliki akses Kanban Board.';
     if (normalized === 'subcon') return 'Anda tidak memiliki akses Subcon.';
     if (normalized === 'quality') return 'Anda tidak memiliki akses Quality Control.';
+    if (normalized === 'production') return 'Anda tidak memiliki akses Produksi / Andon TV.';
     if (normalized === 'prl') return 'Anda tidak memiliki akses PRL.';
     if (normalized === 'masterref') return 'Anda tidak memiliki akses Master Referensi.';
     if (normalized === 'reports') return 'Anda tidak memiliki akses Laporan.';
@@ -2707,6 +3128,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       (targetTab === 'kanban' && !canEditSchedules && !isProductionUser)
       || (targetTab === 'quality' && !canQuality)
       || (targetTab === 'subcon' && !canSubcon)
+      || (targetTab === 'inventory' && link?.inventoryTab === 'opname' && !canManageItems)
       || (targetTab === 'prl' && !canViewPrl)
       || (targetTab === 'masterref' && !canViewMaster)
       || (targetTab === 'reports' && !canOpenReportMenu)
@@ -2723,12 +3145,21 @@ const Dashboard = ({ onLogout, token, user }) => {
     setReportMenuOpen(false);
     setShowForm(false);
     setMainTab(targetTab);
+    if (link?.inventoryTab) {
+      setActiveInventoryHelpTab(link.inventoryTab);
+      setInventoryNav({ tab: link.inventoryTab, nonce: Date.now() });
+    }
+    if (link?.qualityTab) {
+      setActiveQualityHelpTab(link.qualityTab);
+      setQualityNav({ tab: link.qualityTab, nonce: Date.now() });
+    }
     if (link?.reportTab) setReportTab(link.reportTab);
     if (link?.masterRefTab) setMasterRefTab(link.masterRefTab);
     if (link?.kanbanView) setKanbanView(link.kanbanView);
     if (link?.kanbanSubTab) setKanbanSubTab(link.kanbanSubTab);
   }, [
     canEditSchedules,
+    canManageItems,
     canOpenReportMenu,
     canQuality,
     canSubcon,
@@ -2737,6 +3168,7 @@ const Dashboard = ({ onLogout, token, user }) => {
     getMainNavAccessMessage,
     isAdmin,
     isProductionUser,
+    setActiveQualityHelpTab,
     showToastMessage,
   ]);
 
@@ -5402,6 +5834,7 @@ const Dashboard = ({ onLogout, token, user }) => {
         body: JSON.stringify(payload),
       });
       await fetchPrlRows(prlFilters.year);
+      await fetchMasterReferences();
       await fetchPrlImportHistory();
       const summary = {
         open: true,
@@ -5414,6 +5847,9 @@ const Dashboard = ({ onLogout, token, user }) => {
         status: (Number(result.inserted || 0) + Number(result.updated || 0)) > 0 ? 'success' : 'failed',
         message: result.message || `Inserted: ${result.inserted ?? result.saved ?? 0}, Updated: ${result.updated ?? 0}, Duplicate: ${result.duplicate ?? 0}, Skipped: ${result.skipped ?? 0}.`,
       };
+      if (Number(result.seasonalActivated || 0) > 0) {
+        summary.message = `${summary.message} Master Item aktif seasonal: ${result.seasonalActivated}.`;
+      }
       setPrlImportSummary({
         ...summary,
         detailRows: [
@@ -5464,12 +5900,14 @@ const Dashboard = ({ onLogout, token, user }) => {
         body: JSON.stringify(payload),
       });
       await fetchPrlRows(prlFilters.year);
+      await fetchMasterReferences();
       await fetchKanbanSettings({ silent: true });
       const parts = [`${result.updated || 0} item aktif`];
       if (Number(result.zeroQtyReleased || 0) > 0) parts.push(`${result.zeroQtyReleased} qty 0 ikut aktif`);
       if (Number(result.autoDraftReleased || 0) > 0) parts.push(`${result.autoDraftReleased} auto draft diproses`);
       if (Number(result.alreadyActive || 0) > 0) parts.push(`${result.alreadyActive} sudah aktif`);
       if (Number(result.kanbanCalculated || 0) > 0) parts.push(`${result.kanbanCalculated} kanban dihitung ulang`);
+      if (Number(result.seasonalActivated || 0) > 0) parts.push(`${result.seasonalActivated} master item aktif seasonal`);
       if (Number(result.workingDays || 0) > 0) parts.push(`${result.workingDays} hari kerja`);
       showToastMessage(
         `Rilis Kanban ${prlMonthLabel(prlFilters.month)} ${prlFilters.year}: ${parts.join(', ')}.`,
@@ -6615,8 +7053,13 @@ const Dashboard = ({ onLogout, token, user }) => {
 
   const handleDeleteMaster = async (path) => {
     if (!window.confirm('Hapus data ini?')) return;
-    await apiFetch(path, { method: 'DELETE' });
-    await fetchMasterReferences();
+    try {
+      await apiFetch(path, { method: 'DELETE' });
+      await fetchMasterReferences();
+      showToastMessage('Data berhasil dihapus.', '', null, 'success');
+    } catch (error) {
+      showToastMessage(error.message || 'Data tidak bisa dihapus.', '', null, 'error');
+    }
   };
 
   const handleApproveKanban = async (row) => {
@@ -7872,6 +8315,27 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
     return trimmed;
   }
 
+  function isLikelyKanbanCardInput(value) {
+    const trimmed = extractKanbanIdToken(value);
+    if (!trimmed) return false;
+    if (/[:|,;]/.test(String(value || ''))) return true;
+    const format = requireConfigFormat(masterConfig.kanbanIdFormat || standardKanbanCardIdFormat, 'Kanban ID format');
+    const regex = format ? buildKanbanIdRegex(format) : null;
+    if (regex && trimmed.match(regex)) return true;
+    const resolvedCode = resolveKanbanItemCode(trimmed);
+    if (!resolvedCode) return false;
+    return trimmed.toLowerCase() !== String(resolvedCode || '').trim().toLowerCase();
+  }
+
+  function isManualUniqKanbanInput(value) {
+    const trimmed = extractKanbanIdToken(value);
+    if (!trimmed || isLikelyKanbanCardInput(value)) return false;
+    const resolvedCode = resolveKanbanItemCode(trimmed);
+    if (!resolvedCode) return false;
+    return masterItemsByCode.has(resolvedCode)
+      && trimmed.toLowerCase() === String(resolvedCode || '').trim().toLowerCase();
+  }
+
   const extractAreaNote = (notes) => {
     if (!notes) return '-';
     const match = String(notes).match(/area:\s*([^|]+)/i);
@@ -8140,7 +8604,10 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
       return { ok: false, reason };
     }
     const knownItemCode = masterItemsByCode.has(code) || kanbanSettingsByCode.has(code);
-    const qty = knownItemCode ? resolveKanbanTransactionQty(code) : 0;
+    const requestedQty = Number(options.requestQty);
+    const qty = Number.isFinite(requestedQty) && requestedQty > 0
+      ? requestedQty
+      : (knownItemCode ? resolveKanbanTransactionQty(code) : 0);
     if (knownItemCode && !qty) {
       const reason = 'Kanban qty belum diatur di master item/kanban.';
       showToastMessage(reason, '', null, 'warning');
@@ -8154,6 +8621,9 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
           requestQty: qty || undefined,
           area: selectedArea || null,
           kanbanId: kanbanInput || null,
+          supplier: options.supplier || null,
+          source: options.source || null,
+          manualInput: options.source === 'manual_confirm',
         }),
       });
       const consumedQty = Number(result?.consumedQty ?? qty);
@@ -8185,16 +8655,146 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
     }
   };
 
+  const openEmptyKanbanManualConfirm = async (rawValue, selectedArea = emptyKanbanForm.area, options = {}) => {
+    const kanbanInput = extractKanbanIdToken(rawValue);
+    const previewFromOptions = options.preview || null;
+    const code = previewFromOptions?.itemCode || resolveKanbanItemCode(kanbanInput);
+    if (!code) {
+      showToastMessage('Kanban ID wajib diisi.', '', null, 'warning');
+      return { ok: false };
+    }
+    if (selectedArea && !masterAreas.some((area) => area.id === selectedArea)) {
+      showToastMessage('Area tidak valid. Pilih dari Master Referensi.', '', null, 'warning');
+      return { ok: false };
+    }
+    setEmptyKanbanConfirmLoading(true);
+    try {
+      const preview = previewFromOptions || await apiFetch('/api/kanban/scan-preview', {
+        method: 'POST',
+        body: JSON.stringify({
+          kanbanId: kanbanInput || null,
+          itemCode: code || '',
+          area: selectedArea || null,
+        }),
+      });
+      const item = masterItemsByCode.get(preview?.itemCode || code) || {};
+      const localSupplierOptions = (itemSupplierMap.get(preview?.itemCode || code) || []).map((row) => {
+        const vendor = masterVendorsById.get(row.vendorId) || masterVendors.find((vendorRow) => String(vendorRow.name || '').trim().toLowerCase() === String(row.vendorName || row.vendorId || '').trim().toLowerCase());
+        const codeValue = String(vendor?.id || row.vendorId || '').trim();
+        const nameValue = String(vendor?.name || row.vendorName || '').trim();
+        return {
+          supplier: codeValue || nameValue,
+          supplierCode: codeValue,
+          supplierName: nameValue,
+          label: nameValue && codeValue && nameValue !== codeValue ? `${codeValue} - ${nameValue}` : codeValue || nameValue || '-',
+          sharePercent: Number(row.sharePercent || 0),
+        };
+      }).filter((row) => row.supplier);
+      const supplierOptions = Array.isArray(preview?.supplierOptions) && preview.supplierOptions.length > 0
+        ? preview.supplierOptions
+        : localSupplierOptions;
+      const supplier = supplierOptions.length > 1
+        ? ''
+        : (preview?.supplier || supplierOptions[0]?.supplier || item.vendor_id || item.vendorId || item.supplier_name || item.supplierName || '');
+      const typePackCode = preview?.typePack || item.type_pack || item.typePack || '';
+      const typePackName = preview?.typePackName || packingNameByCode.get(typePackCode) || item.type_pack_name || item.typePackName || '';
+      const displayKanbanId = (preview?.isManualUniqInput || preview?.inputMode === 'manual_uniq')
+        ? (preview?.itemCode || code)
+        : (preview?.kanbanId || kanbanInput || code);
+      setEmptyKanbanConfirm({
+        ...preview,
+        area: selectedArea || '',
+        areaLabel: selectedArea
+          ? `${selectedArea}${masterAreas.find((area) => area.id === selectedArea)?.name ? ` - ${masterAreas.find((area) => area.id === selectedArea).name}` : ''}`
+          : '-',
+        kanbanId: displayKanbanId,
+        qty: String(preview?.qty || resolveKanbanTransactionQty(code) || ''),
+        qtyMaster: Number(preview?.qty || resolveKanbanTransactionQty(code) || 0),
+        supplier,
+        supplierOptions,
+        typePack: typePackCode,
+        typePackName,
+        typePacking: preview?.typePacking || typePackName || typePackCode || '',
+        unit: item.unit || item.uom || preview?.unit || '',
+      });
+      return { ok: true };
+    } catch (error) {
+      showToastMessage(`Gagal preview kanban kosong: ${error.message || 'Unknown error'}`, '', null, 'error');
+      return { ok: false, reason: error.message || 'Unknown error' };
+    } finally {
+      setEmptyKanbanConfirmLoading(false);
+    }
+  };
+
   const handleEmptyKanbanSubmit = async (e) => {
     e.preventDefault();
-    const outcome = await processEmptyKanbanValue(emptyKanbanForm.kanbanId, { area: emptyKanbanForm.area });
+    await openEmptyKanbanManualConfirm(emptyKanbanForm.kanbanId, emptyKanbanForm.area);
+  };
+
+  const closeEmptyKanbanConfirm = () => {
+    if (emptyKanbanConfirmSubmitting) return;
+    setEmptyKanbanConfirm(null);
+  };
+
+  const updateEmptyKanbanConfirm = (patch) => {
+    setEmptyKanbanConfirm((prev) => (prev ? { ...prev, ...patch } : prev));
+  };
+
+  const confirmEmptyKanbanManualPost = async () => {
+    if (!emptyKanbanConfirm) return;
+    const qtyValue = Number(emptyKanbanConfirm.qty);
+    if (!Number.isFinite(qtyValue) || qtyValue <= 0) {
+      showToastMessage('Qty aktual wajib lebih dari 0.', '', null, 'warning');
+      return;
+    }
+    if (Array.isArray(emptyKanbanConfirm.supplierOptions) && emptyKanbanConfirm.supplierOptions.length > 0 && !emptyKanbanConfirm.supplier) {
+      showToastMessage('Pilih supplier dari Master Item.', '', null, 'warning');
+      return;
+    }
+    setEmptyKanbanConfirmSubmitting(true);
+    const outcome = await processEmptyKanbanValue(emptyKanbanConfirm.kanbanId || emptyKanbanForm.kanbanId, {
+      area: emptyKanbanConfirm.area || emptyKanbanForm.area,
+      requestQty: qtyValue,
+      supplier: emptyKanbanConfirm.supplier || '',
+      source: 'manual_confirm',
+    });
+    setEmptyKanbanConfirmSubmitting(false);
     if (outcome?.ok) {
+      setEmptyKanbanConfirm(null);
       setEmptyKanbanForm({ area: '', kanbanId: '' });
     }
   };
 
   const handleEmptyKanbanScanValue = async (value) => {
-    const outcome = await processEmptyKanbanValue(value, { area: emptyKanbanForm.area, source: 'scanner' });
+    const selectedArea = emptyKanbanForm.area;
+    if (selectedArea && !masterAreas.some((area) => area.id === selectedArea)) {
+      const reason = 'Area tidak valid. Pilih dari Master Referensi.';
+      showToastMessage(reason, '', null, 'warning');
+      return { ok: false, reason };
+    }
+    const kanbanInput = extractKanbanIdToken(value);
+    const code = resolveKanbanItemCode(kanbanInput);
+    setEmptyKanbanConfirmLoading(true);
+    try {
+      const preview = await apiFetch('/api/kanban/scan-preview', {
+        method: 'POST',
+        body: JSON.stringify({
+          kanbanId: kanbanInput || null,
+          itemCode: code || '',
+          area: selectedArea || null,
+        }),
+      });
+      if (preview?.isManualUniqInput || preview?.inputMode === 'manual_uniq' || isManualUniqKanbanInput(value)) {
+        return await openEmptyKanbanManualConfirm(value, selectedArea, { preview });
+      }
+    } catch (_error) {
+      if (isManualUniqKanbanInput(value)) {
+        return await openEmptyKanbanManualConfirm(value, selectedArea);
+      }
+    } finally {
+      setEmptyKanbanConfirmLoading(false);
+    }
+    const outcome = await processEmptyKanbanValue(value, { area: selectedArea, source: 'scanner' });
     if (outcome?.ok) {
       setEmptyKanbanForm((prev) => ({ ...prev, kanbanId: '' }));
     }
@@ -9991,6 +10591,73 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     XLSX.writeFile(wb, `Stock_Coverage_${new Date().toISOString().split('T')[0]}.xlsx`);
   };
 
+  const fetchCustomerCategoryStockReport = async () => {
+    setReportLoading(true);
+    try {
+      const params = new URLSearchParams();
+      params.set('targetDays', String(customerCategoryStockDays || 2));
+      if (customerCategoryStockCategory && customerCategoryStockCategory !== 'all') {
+        params.set('category', customerCategoryStockCategory);
+      }
+      if (customerCategoryStockCustomer) {
+        params.set('customer', customerCategoryStockCustomer);
+      }
+      const data = await apiFetch(`/api/reports/customer-category-stock?${params.toString()}`);
+      setCustomerCategoryStockRows(Array.isArray(data?.rows) ? data.rows : []);
+      setCustomerCategoryStockDetailRows(Array.isArray(data?.detailRows) ? data.detailRows : []);
+      setCustomerCategoryStockSummary({
+        totalGroups: Number(data?.summary?.totalGroups || 0),
+        amanGroups: Number(data?.summary?.amanGroups || 0),
+        awasGroups: Number(data?.summary?.awasGroups || 0),
+        bahayaGroups: Number(data?.summary?.bahayaGroups || 0),
+        totalStockQty: Number(data?.summary?.totalStockQty || 0),
+        totalSafetyStock: Number(data?.summary?.totalSafetyStock || 0),
+        totalDailyConsumption: Number(data?.summary?.totalDailyConsumption || 0),
+      });
+      if (Number.isFinite(Number(data?.targetDays ?? data?.days))) {
+        setCustomerCategoryStockDays(Number(data.targetDays ?? data.days));
+      }
+    } catch (error) {
+      setCustomerCategoryStockRows([]);
+      setCustomerCategoryStockDetailRows([]);
+      setCustomerCategoryStockSummary({
+        totalGroups: 0,
+        amanGroups: 0,
+        awasGroups: 0,
+        bahayaGroups: 0,
+        totalStockQty: 0,
+        totalSafetyStock: 0,
+        totalDailyConsumption: 0,
+      });
+      alert('Gagal memuat laporan stok per customer.');
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
+  const handleExportCustomerCategoryStockExcel = async () => {
+    const XLSX = await ensureXlsx();
+    if (!XLSX) return;
+    const rows = customerCategoryStockDetailRows.map((row) => ({
+      Uniq: row.uniq,
+      'Part No': row.partNo || '',
+      'Part Name': row.partName || row.itemName || '',
+      Model: row.model,
+      'PLANT ROSES': row.plantProcess,
+      'Qty PRL': row.qtyPrl || 0,
+      'Qty Stock (Pcs)': row.stockQty,
+      'Qty Stock (Day)': row.stockDay === null ? '-' : Number(row.stockDay || 0),
+      'Safety Stock (Pcs)': row.safetyStock,
+      'Safety Stock (Day)': row.safetyDay,
+      'Recovery Stock Target': customerCategoryStockRecoveryTarget || '',
+      Indicator: row.indicator,
+    }));
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Stok per Customer');
+    XLSX.writeFile(wb, `Stok_per_Customer_${new Date().toISOString().split('T')[0]}.xlsx`);
+  };
+
   const fetchSlowMovingReport = async () => {
     setReportLoading(true);
     try {
@@ -10020,6 +10687,48 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Slow Moving');
     XLSX.writeFile(wb, `Slow_Moving_${new Date().toISOString().split('T')[0]}.xlsx`);
+  };
+
+  const fetchItemSummaryReport = async () => {
+    setReportLoading(true);
+    try {
+      const query = buildReportQuery();
+      const data = await apiFetch(`/api/reports/item-summary${query}`);
+      setItemSummaryReportRows(Array.isArray(data?.rows) ? data.rows : []);
+      setItemSummaryReportSummary(data?.summary || null);
+    } catch (error) {
+      alert('Gagal memuat laporan per barang.');
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
+  const handleExportItemSummaryReportExcel = async () => {
+    const XLSX = await ensureXlsx();
+    if (!XLSX) return;
+    const rows = itemSummaryReportRows.map((row) => ({
+      'Item Code': row.itemCode,
+      'Item Name': row.itemName,
+      'Part No': row.partNo || '-',
+      Kategori: row.category || '-',
+      Unit: row.unit || '-',
+      Lokasi: row.location || '-',
+      Supplier: row.defaultSupplier || '-',
+      'PO Count': row.poCount,
+      'Qty PO': row.qtyOrder,
+      'Qty Incoming RN': row.receivedQty,
+      'Qty Release QC': row.releasedQty,
+      'Pending QC': row.pendingQcQty,
+      'Sisa PO': row.qtyRemainingPo,
+      'Stock Saat Ini': row.stockQty,
+      'RN Terakhir': row.rnNumbers || '-',
+      'Last Incoming': row.lastIncomingDate || '-',
+      Status: row.status,
+    }));
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Per Barang');
+    XLSX.writeFile(wb, `Laporan_Per_Barang_${new Date().toISOString().split('T')[0]}.xlsx`);
   };
 
   const fetchInboundPerformanceReport = async () => {
@@ -10053,6 +10762,162 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Inbound Performance');
     XLSX.writeFile(wb, `Inbound_Performance_${new Date().toISOString().split('T')[0]}.xlsx`);
+  };
+
+  const fetchReceiveNoteReport = async () => {
+    setReportLoading(true);
+    try {
+      const query = buildReportQuery();
+      const data = await apiFetch(`/api/reports/receive-notes${query}`);
+      setReceiveNoteReportRows(Array.isArray(data?.rows) ? data.rows : []);
+      setReceiveNoteReportSummary(data?.summary || null);
+    } catch (error) {
+      alert('Gagal memuat laporan RN.');
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
+  const handleExportReceiveNoteReportExcel = async () => {
+    const XLSX = await ensureXlsx();
+    if (!XLSX) return;
+    const rows = receiveNoteReportRows.map((row) => ({
+      RN: row.rnNumber,
+      Tanggal: row.receivedDate || '-',
+      Supplier: [row.supplierCode, row.supplierName].filter(Boolean).join(' - ') || '-',
+      PO: row.poNumber || '-',
+      'SJ / DO': row.doNumber || '-',
+      Line: row.lineNo,
+      Item: row.itemCode,
+      'Item Name': row.itemName,
+      Unit: row.unit || '-',
+      'Doc Qty': row.docQty,
+      'Received Qty': row.receivedQty,
+      'Released Qty': row.postedQty,
+      QC: row.qcStatus,
+      Status: row.lineStatus,
+      Lot: row.supplierLotNo || '-',
+    }));
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Laporan RN');
+    XLSX.writeFile(wb, `Laporan_RN_${new Date().toISOString().split('T')[0]}.xlsx`);
+  };
+
+  const fetchMasterPoReport = async () => {
+    setReportLoading(true);
+    try {
+      const query = buildReportQuery();
+      const data = await apiFetch(`/api/reports/master-po${query}`);
+      setMasterPoReportRows(Array.isArray(data?.rows) ? data.rows : []);
+      setMasterPoReportSummary(data?.summary || null);
+    } catch (error) {
+      alert('Gagal memuat laporan master PO.');
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
+  const handleExportMasterPoReportExcel = async () => {
+    const XLSX = await ensureXlsx();
+    if (!XLSX) return;
+    const supplierMap = new Map();
+
+    masterPoReportRows.forEach((row) => {
+      const supplierCode = String(row.supplierCode || '').trim();
+      const supplierName = String(row.supplierName || supplierCode || 'UNKNOWN').trim();
+      const supplierKey = (supplierCode || supplierName || 'UNKNOWN').toLowerCase();
+
+      if (!supplierMap.has(supplierKey)) {
+        supplierMap.set(supplierKey, {
+          supplierCode,
+          supplierName,
+          poNumbers: new Set(),
+          rnNumbers: new Set(),
+          doNumbers: new Set(),
+          itemCodes: new Set(),
+          lineCount: 0,
+          qtyOrder: 0,
+          qtyReceived: 0,
+          qtyRemaining: 0,
+          scheduledQty: 0,
+          scheduleCount: 0,
+          openLines: 0,
+          partialLines: 0,
+          closedLines: 0,
+          lastReceivedDate: '',
+        });
+      }
+
+      const bucket = supplierMap.get(supplierKey);
+      if (row.poNumber) bucket.poNumbers.add(row.poNumber);
+      if (row.itemCode) bucket.itemCodes.add(row.itemCode);
+      String(row.rnNumbers || '').split(',').map((value) => value.trim()).filter(Boolean).forEach((value) => bucket.rnNumbers.add(value));
+      String(row.doNumbers || '').split(',').map((value) => value.trim()).filter(Boolean).forEach((value) => bucket.doNumbers.add(value));
+      bucket.lineCount += 1;
+      bucket.qtyOrder += Number(row.qtyOrder || 0);
+      bucket.qtyReceived += Number(row.qtyReceived || 0);
+      bucket.qtyRemaining += Number(row.qtyRemaining || 0);
+      bucket.scheduledQty += Number(row.scheduledQty || 0);
+      bucket.scheduleCount += Number(row.scheduleCount || 0);
+      const status = String(row.status || '').toLowerCase();
+      if (status === 'open') bucket.openLines += 1;
+      if (status === 'partial') bucket.partialLines += 1;
+      if (status === 'closed') bucket.closedLines += 1;
+      const receivedDate = row.lastReceivedDate ? String(row.lastReceivedDate).slice(0, 10) : '';
+      if (receivedDate && (!bucket.lastReceivedDate || receivedDate > bucket.lastReceivedDate)) {
+        bucket.lastReceivedDate = receivedDate;
+      }
+    });
+
+    const matrixRows = Array.from(supplierMap.values()).map((row) => ({
+      Supplier: [row.supplierCode, row.supplierName].filter(Boolean).join(' - ') || '-',
+      PO: row.poNumbers.size,
+      Line: row.lineCount,
+      Item: row.itemCodes.size,
+      'Qty PO': row.qtyOrder,
+      'Incoming RN': row.qtyReceived,
+      'Sisa PO': row.qtyRemaining,
+      Schedule: row.scheduledQty,
+      'Schedule Count': row.scheduleCount,
+      'Open Line': row.openLines,
+      'Partial Line': row.partialLines,
+      'Closed Line': row.closedLines,
+      'Fill %': row.qtyOrder > 0 ? (row.qtyReceived / row.qtyOrder) * 100 : 0,
+      'RN Terkait': Array.from(row.rnNumbers).join(', ') || '-',
+      'SJ / DO Terkait': Array.from(row.doNumbers).join(', ') || '-',
+      'Last Incoming': row.lastReceivedDate || '-',
+    })).sort((a, b) => (
+      Number(b['Sisa PO'] || 0) - Number(a['Sisa PO'] || 0)
+      || String(a.Supplier).localeCompare(String(b.Supplier), 'id')
+    ));
+
+    const detailRows = [...masterPoReportRows].sort((a, b) => (
+      String(a.supplierName || a.supplierCode || '').localeCompare(String(b.supplierName || b.supplierCode || ''), 'id')
+      || String(a.poNumber || '').localeCompare(String(b.poNumber || ''), 'id')
+      || Number(a.lineNo || 0) - Number(b.lineNo || 0)
+    )).map((row) => ({
+      PO: row.poNumber,
+      'Tanggal PO': row.poDate || '-',
+      Supplier: [row.supplierCode, row.supplierName].filter(Boolean).join(' - ') || '-',
+      Status: row.status,
+      Line: row.lineNo,
+      Item: row.itemCode,
+      'Item Name': row.itemName,
+      Unit: row.unit || '-',
+      'Qty PO': row.qtyOrder,
+      'Qty Incoming': row.qtyReceived,
+      'Qty Sisa': row.qtyRemaining,
+      'Qty Terjadwal': row.scheduledQty,
+      'Schedule Count': row.scheduleCount,
+      'RN Terkait': row.rnNumbers || '-',
+      'SJ / DO Terkait': row.doNumbers || '-',
+      'Last Incoming': row.lastReceivedDate || '-',
+    }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(matrixRows), 'Matrix Supplier');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(detailRows), 'Detail Line PO');
+    XLSX.writeFile(wb, `Laporan_Master_PO_${new Date().toISOString().split('T')[0]}.xlsx`);
   };
 
   const fetchFifoViolationReport = async () => {
@@ -10725,6 +11590,54 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
   }, [mainTab, reportTab]);
 
   useEffect(() => {
+    if (!user || isProductionUser) return;
+    if (mainTab !== 'reports') return;
+    if (reportTab !== 'rn-report') return;
+    fetchReceiveNoteReport();
+    if (!masterVendors.length && canViewMaster) {
+      fetchMasterReferences({ silent: true });
+    }
+  }, [mainTab, reportTab]);
+
+  useEffect(() => {
+    if (!user || isProductionUser) return;
+    if (mainTab !== 'reports') return;
+    if (reportTab !== 'master-po-report') return;
+    fetchMasterPoReport();
+    if (!masterVendors.length && canViewMaster) {
+      fetchMasterReferences({ silent: true });
+    }
+  }, [mainTab, reportTab]);
+
+  useEffect(() => {
+    if (!user || isProductionUser) return;
+    if (mainTab !== 'reports') return;
+    if (reportTab !== 'stock-by-customer') return;
+    fetchCustomerCategoryStockReport();
+    if (!masterCustomers.length && canViewMaster) {
+      fetchMasterReferences({ silent: true });
+    }
+  }, [
+    mainTab,
+    reportTab,
+    customerCategoryStockDays,
+    customerCategoryStockCategory,
+    customerCategoryStockCustomer,
+    masterCustomers.length,
+    canViewMaster,
+  ]);
+
+  useEffect(() => {
+    if (!user || isProductionUser) return;
+    if (mainTab !== 'reports') return;
+    if (reportTab !== 'item-summary') return;
+    fetchItemSummaryReport();
+    if (!masterVendors.length && canViewMaster) {
+      fetchMasterReferences({ silent: true });
+    }
+  }, [mainTab, reportTab]);
+
+  useEffect(() => {
     if (mainTab !== 'reports') return;
     if (reportTab !== 'capacity-planning') return;
     fetchCapacityPlanningReport();
@@ -10831,12 +11744,16 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
   useEffect(() => {
     if (!user) return;
     if (isProductionUser) {
-      if (mainTab !== 'kanban') {
+      if (!['kanban', 'andon'].includes(mainTab)) {
         setMainTab('kanban');
       }
-      if (!['dashboard', 'scan', 'empty'].includes(kanbanSubTab)) {
+      if (mainTab === 'kanban' && !['dashboard', 'scan', 'empty', 'production'].includes(kanbanSubTab)) {
         setKanbanSubTab('scan');
       }
+      return;
+    }
+    if (mainTab === 'andon' && !canProduction) {
+      setMainTab('dashboard');
       return;
     }
     if (!canViewPrl && mainTab === 'prl') {
@@ -13499,6 +14416,9 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     dnPrintMode,
     dnEmailSendingId,
     dnStatusFlowList,
+    emptyKanbanConfirm,
+    emptyKanbanConfirmLoading,
+    emptyKanbanConfirmSubmitting,
     emptyKanbanForm,
     expiringSoonRows,
     extractAreaNote,
@@ -13512,8 +14432,12 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     fetchReport,
     fetchQualityObjectivesReport,
     fetchStockCoverageReport,
+    fetchCustomerCategoryStockReport,
     fetchSlowMovingReport,
+    fetchItemSummaryReport,
     fetchInboundPerformanceReport,
+    fetchReceiveNoteReport,
+    fetchMasterPoReport,
       fetchFifoViolationReport,
       fetchInventoryValueReport,
       fetchSupplierShortageReport,
@@ -13605,6 +14529,9 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     handleScheduleEditSave,
     handleGenerateReport,
     handleDeleteKanbanRequest,
+    closeEmptyKanbanConfirm,
+    confirmEmptyKanbanManualPost,
+    updateEmptyKanbanConfirm,
     handleDeleteMaster,
     handleDeleteModel,
     handleDeleteProcess,
@@ -13626,8 +14553,12 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     handleExportReportExcel,
     handleExportQualityObjectivesExcel,
     handleExportStockCoverageExcel,
+    handleExportCustomerCategoryStockExcel,
     handleExportSlowMovingExcel,
+    handleExportItemSummaryReportExcel,
     handleExportInboundPerformanceExcel,
+    handleExportReceiveNoteReportExcel,
+    handleExportMasterPoReportExcel,
     handleExportFifoViolationExcel,
     handleExportInventoryValueExcel,
     handleExportSupplierShortageExcel,
@@ -13640,6 +14571,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     handleManualRequest,
     manualRequestQueue,
     setManualRequestQueue,
+    setActiveInventoryHelpTab,
     queueManualRequestFromForm,
     closeManualRequestModal,
     updateManualRequestQueueRow,
@@ -13693,6 +14625,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     inventoryHealthSummary,
     inventoryHeatmapData,
     inventoryItems,
+    inventoryNav,
     inventoryShowKanban,
     isEditing,
     itemBulkCategory,
@@ -13820,6 +14753,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     prlShortageSummary,
     productionTodaySummary,
     qcStatusOptions,
+    qualityNav,
+    setActiveQualityHelpTab,
     qrPayload,
     qrTitle,
     receiveForm,
@@ -13853,8 +14788,21 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     qualityObjectivesData,
     stockCoverageDays,
     stockCoverageRows,
+    customerCategoryStockCategory,
+    customerCategoryStockCustomer,
+    customerCategoryStockDays,
+    customerCategoryStockDetailRows,
+    customerCategoryStockRecoveryTarget,
+    customerCategoryStockRows,
+    customerCategoryStockSummary,
     slowMovingRows,
+    itemSummaryReportRows,
+    itemSummaryReportSummary,
     inboundPerformanceRows,
+    receiveNoteReportRows,
+    receiveNoteReportSummary,
+    masterPoReportRows,
+    masterPoReportSummary,
     fifoViolationRows,
     inventoryValueRows,
     inventoryValueTotal,
@@ -14021,6 +14969,10 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     setReportCategory,
     setReportTab,
     setStockCoverageDays,
+    setCustomerCategoryStockCategory,
+    setCustomerCategoryStockCustomer,
+    setCustomerCategoryStockDays,
+    setCustomerCategoryStockRecoveryTarget,
     setOutstandingPrlMonth,
     setOutstandingPrlYear,
     setScanCameraEnabled,
@@ -14079,13 +15031,159 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     rnStatus,
   };
 
+  const mobileNavItems = isSupplier
+    ? [
+        {
+          key: 'supplier',
+          label: 'Portal',
+          icon: Package,
+          active: mainTab === 'supplier',
+          onSelect: () => setMainTab('supplier'),
+        },
+      ]
+    : isProductionUser
+      ? [
+          {
+            key: 'kanban-dashboard',
+            label: 'Kanban',
+            icon: BarChart3,
+            active: mainTab === 'kanban' && kanbanSubTab === 'dashboard',
+            onSelect: () => {
+              setMainTab('kanban');
+              setKanbanView('board');
+              setKanbanSubTab('dashboard');
+            },
+          },
+          {
+            key: 'kanban-scan',
+            label: 'Scan QR',
+            icon: QrCode,
+            active: mainTab === 'kanban' && kanbanSubTab === 'scan',
+            onSelect: () => {
+              setMainTab('kanban');
+              setKanbanView('board');
+              setKanbanSubTab('scan');
+            },
+          },
+          {
+            key: 'kanban-empty',
+            label: 'Kosong',
+            icon: Package,
+            active: mainTab === 'kanban' && kanbanSubTab === 'empty',
+            onSelect: () => {
+              setMainTab('kanban');
+              setKanbanView('board');
+              setKanbanSubTab('empty');
+            },
+          },
+          {
+            key: 'kanban-production',
+            label: 'Produksi',
+            icon: Play,
+            active: mainTab === 'kanban' && kanbanSubTab === 'production',
+            onSelect: () => {
+              setMainTab('kanban');
+              setKanbanView('board');
+              setKanbanSubTab('production');
+            },
+          },
+          {
+            key: 'andon',
+            label: 'Andon TV',
+            icon: AlertTriangle,
+            active: mainTab === 'andon',
+            onSelect: () => setMainTab('andon'),
+          },
+        ]
+      : [
+          {
+            key: 'dashboard',
+            label: 'Beranda',
+            icon: BarChart3,
+            active: mainTab === 'dashboard',
+            onSelect: () => setMainTab('dashboard'),
+          },
+          {
+            key: 'monitoring',
+            label: 'Inbound',
+            icon: Truck,
+            active: mainTab === 'monitoring',
+            onSelect: () => setMainTab('monitoring'),
+          },
+          ...(canQuality
+            ? [{
+                key: 'quality',
+                label: 'Quality',
+                icon: ShieldCheck,
+                active: mainTab === 'quality',
+                onSelect: () => setMainTab('quality'),
+              }]
+            : []),
+          ...(canEditSchedules
+            ? [{
+                key: 'kanban',
+                label: 'Kanban',
+                icon: ListChecks,
+                active: mainTab === 'kanban',
+                onSelect: () => {
+                  setMainTab('kanban');
+                  setKanbanView('board');
+                  setKanbanSubTab('requests');
+                },
+              }]
+            : []),
+          {
+            key: 'fifo',
+            label: 'FIFO',
+            icon: ArrowDownUp,
+            active: mainTab === 'fifo',
+            onSelect: () => setMainTab('fifo'),
+          },
+          {
+            key: 'inventory',
+            label: 'Inventory',
+            icon: Package,
+            active: mainTab === 'inventory',
+            onSelect: () => setMainTab('inventory'),
+          },
+          ...(canProduction
+            ? [{ key: 'andon', label: 'Andon TV', icon: AlertTriangle, active: mainTab === 'andon', onSelect: () => setMainTab('andon') }]
+            : []),
+          ...(canSubcon
+            ? [{ key: 'subcon', label: 'Subcon', icon: GitFork, active: mainTab === 'subcon', onSelect: () => setMainTab('subcon') }]
+            : []),
+          ...(canViewPrl
+            ? [{ key: 'prl', label: 'PRL', icon: FileText, active: mainTab === 'prl', onSelect: () => setMainTab('prl') }]
+            : []),
+          ...(canViewMaster
+            ? [{ key: 'masterref', label: 'Master Data', icon: FileSpreadsheet, active: mainTab === 'masterref', onSelect: () => setMainTab('masterref') }]
+            : []),
+          { key: 'settings', label: 'Pengaturan', icon: User, active: mainTab === 'settings', onSelect: () => setMainTab('settings') },
+          ...(isAdmin
+            ? [{ key: 'audit', label: 'Audit Trail', icon: Eye, active: mainTab === 'audit', onSelect: () => setMainTab('audit') }]
+            : []),
+          ...(canOpenReportMenu
+            ? [{ key: 'reports', label: 'Laporan', icon: FileSpreadsheet, active: mainTab === 'reports', onSelect: () => setMainTab('reports') }]
+            : []),
+        ];
+
+  const mobilePrimaryNavItems = mobileNavItems.slice(0, 4);
+  const mobileMenuIsActive = mobileMenuOpen || mobileNavItems.slice(4).some((item) => item.active);
+  const selectMobileNavItem = (item) => {
+    item.onSelect();
+    setMobileMenuOpen(false);
+    setSettingsMenuOpen(false);
+    setReportMenuOpen(false);
+    setIncomingMenuOpen(false);
+  };
+
   return (
     <>
-      <div className="min-h-screen bg-slate-50 p-4 font-sans text-slate-800 print:bg-white print:p-0 app-container">
-        <div className="max-w-7xl mx-auto content-wrapper">
+      <div className={`min-h-screen bg-slate-50 font-sans text-slate-800 print:bg-white print:p-0 app-container ${mainTab === 'andon' ? 'p-0' : 'p-4'}`}>
+        <div className={`${mainTab === 'andon' ? 'max-w-none' : 'mx-auto app-shell-content'} content-wrapper`}>
         {/* HEADER SECTION */}
-        <div className={showScorecard ? 'print:hidden' : ''}>
-            <header className="mb-8 flex flex-col md:flex-row md:items-center justify-between gap-4 print:mb-4 print:hidden">
+        <div className={`${showScorecard ? 'print:hidden' : ''} ${mainTab === 'andon' ? 'hidden' : ''}`}>
+            <header className="app-header mb-8 flex flex-col md:flex-row md:items-center justify-between gap-4 print:mb-4 print:hidden">
               <div>
                 <h1 className="text-2xl font-bold flex items-center gap-3 text-indigo-900 print:text-black">
                   <img src="/logo.png" alt="Logo Sistem" className="h-9 w-9 object-contain" />
@@ -14243,7 +15341,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
             )}
 
             {isSupplier ? (
-              <div className="mb-6 flex flex-wrap gap-3 print:hidden">
+              <div className="app-main-nav mb-6 flex flex-wrap gap-3 print:hidden">
                 <div className="flex flex-wrap items-center gap-1.5 rounded-full border border-slate-200 bg-white/80 p-1 shadow-sm backdrop-blur">
                   <button
                     onClick={() => setMainTab('supplier')}
@@ -14254,8 +15352,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                 </div>
               </div>
             ) : isProductionUser ? (
-              <div className="mb-6 flex flex-wrap gap-3 print:hidden">
-                <div className="flex flex-wrap items-center gap-1.5 rounded-full border border-slate-200 bg-white/80 p-1 shadow-sm backdrop-blur">
+              <div className="app-main-nav mb-6 flex flex-wrap gap-3 print:hidden">
+                <div className="app-main-nav-track flex flex-wrap items-center gap-1.5 rounded-full border border-slate-200 bg-white/80 p-1 shadow-sm backdrop-blur">
                   <button
                     onClick={() => {
                       setMainTab('kanban');
@@ -14286,11 +15384,27 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                   >
                     Kanban Kosong
                   </button>
+                  <button
+                    onClick={() => {
+                      setMainTab('kanban');
+                      setKanbanView('board');
+                      setKanbanSubTab('production');
+                    }}
+                    className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'kanban' && kanbanSubTab === 'production' ? 'bg-indigo-600 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
+                  >
+                    Produksi
+                  </button>
+                  <button
+                    onClick={() => setMainTab('andon')}
+                    className={`px-4 py-2 rounded-full text-sm transition ${mainTab === 'andon' ? 'bg-rose-600 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
+                  >
+                    Andon TV
+                  </button>
                 </div>
               </div>
             ) : (
-              <div className="relative z-40 mb-6 flex flex-wrap gap-3 overflow-visible print:hidden">
-                <div className="relative z-40 flex flex-nowrap items-center gap-1.5 overflow-visible rounded-full border border-slate-200 bg-white/80 p-1 shadow-sm backdrop-blur">
+              <div className="app-main-nav relative z-40 mb-6 overflow-visible print:hidden">
+                <div className="app-main-nav-track relative z-40 flex w-full flex-nowrap items-center gap-1 overflow-visible rounded-2xl border border-slate-200 bg-white/90 p-1.5 shadow-sm backdrop-blur">
                   <button
                     onClick={() => setMainTab('dashboard')}
                     className={`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'dashboard' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
@@ -14301,7 +15415,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                     onClick={() => setMainTab('monitoring')}
                     className={`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'monitoring' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                   >
-                    Inbound Schedule
+                    Inbound
                   </button>
                   <button
                     type="button"
@@ -14313,7 +15427,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                     title={canQuality ? 'Buka Quality Control' : getMainNavAccessMessage('quality')}
                     className={getMainNavButtonClassName(`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'quality' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canQuality)}
                   >
-                    Quality Control
+                    Quality
                   </button>
                   <button
                     type="button"
@@ -14333,13 +15447,25 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                     onClick={() => setMainTab('fifo')}
                     className={`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'fifo' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                   >
-                    Management FIFO
+                    FIFO
                   </button>
                   <button
                     onClick={() => setMainTab('inventory')}
                     className={`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'inventory' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                   >
                     Inventory
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!canProduction) return;
+                      setMainTab('andon');
+                    }}
+                    disabled={!canProduction}
+                    title={canProduction ? 'Buka Andon TV Produksi' : getMainNavAccessMessage('production')}
+                    className={getMainNavButtonClassName(`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'andon' ? 'bg-rose-600 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canProduction)}
+                  >
+                    Andon TV
                   </button>
                   <button
                     type="button"
@@ -14375,17 +15501,17 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                     title={canViewMaster ? 'Buka Master Referensi' : getMainNavAccessMessage('masterref')}
                     className={getMainNavButtonClassName(`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'masterref' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canViewMaster)}
                   >
-                    Master Referensi
+                    Master Data
                   </button>
                   {isAdmin ? (
-                    <div className={`relative ${settingsMenuOpen ? 'z-[100]' : 'z-10'}`}>
+                    <div className={`app-nav-dropdown relative ${settingsMenuOpen ? 'z-[100]' : 'z-10'}`}>
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
                           setReportMenuOpen(false);
                           setSettingsMenuOpen((prev) => !prev);
                         }}
-                        className={`shrink-0 px-3.5 py-2 rounded-full text-sm border transition flex items-center gap-2 ${(mainTab === 'settings' || mainTab === 'audit') ? 'bg-slate-900 text-white border-slate-900 shadow' : 'bg-white/80 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
+                        className={`shrink-0 px-3.5 py-2 rounded-full text-sm transition flex items-center gap-1.5 ${(mainTab === 'settings' || mainTab === 'audit') ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                       >
                         Pengaturan
                         <ChevronDown size={14} />
@@ -14416,21 +15542,21 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                   ) : (
                     <button
                       onClick={() => setMainTab('settings')}
-                      className={`shrink-0 px-3.5 py-2 rounded-full text-sm border transition ${(mainTab === 'settings') ? 'bg-slate-900 text-white border-slate-900 shadow' : 'bg-white/80 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
+                      className={`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${(mainTab === 'settings') ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                     >
                       Pengaturan
                     </button>
                   )}
 
                 {canOpenReportMenu ? (
-                  <div className={`relative shrink-0 ${reportMenuOpen ? 'z-[100]' : 'z-10'}`}>
+                  <div className={`app-nav-dropdown relative shrink-0 ${reportMenuOpen ? 'z-[100]' : 'z-10'}`}>
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
                         setSettingsMenuOpen(false);
                         setReportMenuOpen((prev) => !prev);
                       }}
-                      className={`px-3.5 py-2 rounded-full text-sm border transition flex items-center gap-2 ${mainTab === 'reports' ? 'bg-slate-900 text-white border-slate-900 shadow' : 'bg-white/80 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
+                      className={`px-3.5 py-2 rounded-full text-sm transition flex items-center gap-1.5 ${mainTab === 'reports' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                     >
                       Laporan
                       <ChevronDown size={14} />
@@ -14520,6 +15646,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                 {mainTab === 'subcon' && <TabSubcon {...tabProps} />}
                 {mainTab === 'audit' && <TabAuditLogs {...tabProps} />}
                 {mainTab === 'settings' && <TabSettings {...tabProps} />}
+                {mainTab === 'andon' && <TabAndon {...tabProps} />}
               </Suspense>
             </TabErrorBoundary>
                     {/* MODALS */}
@@ -15684,7 +16811,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
 
         {/* AI Chat Widget */}
         {canUseAI && (
-        <div className="fixed bottom-6 right-6 z-50 flex flex-col items-end gap-2 print:hidden">
+        <div className="app-chat-widget fixed bottom-6 right-6 z-50 flex flex-col items-end gap-2 print:hidden">
           {isChatOpen && (
             <div className="bg-white rounded-xl shadow-2xl w-80 h-96 flex flex-col border border-gray-200 mb-2 overflow-hidden animate-fade-in-up">
               <div className="bg-indigo-600 p-3 flex justify-between items-center text-white">
@@ -15728,7 +16855,89 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
         
         <div className="mt-4 text-xs text-gray-400 text-center print:mt-8"><span> @2026 PT. MRP | Sistem Informasi Master Schedule & Kanban System [MSKS] . (ERP) </span></div>
       </div>
-    </div>
+      </div>
+      {mainTab !== 'andon' && (
+        <>
+          {mobileMenuOpen && (
+            <div className="mobile-menu-layer fixed inset-0 z-[60] md:hidden print:hidden" role="dialog" aria-modal="true" aria-label="Menu aplikasi">
+              <button
+                type="button"
+                className="absolute inset-0 bg-slate-950/35 backdrop-blur-[2px]"
+                onClick={() => setMobileMenuOpen(false)}
+                aria-label="Tutup menu"
+              />
+              <div id="mobile-app-menu" className="mobile-menu-sheet absolute inset-x-3 bottom-[calc(76px+env(safe-area-inset-bottom))] max-h-[min(70dvh,560px)] overflow-y-auto rounded-3xl border border-slate-200 bg-white p-4 shadow-2xl">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-bold text-slate-900">Semua menu</div>
+                    <div className="text-xs text-slate-500">Pilih halaman yang ingin dibuka</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setMobileMenuOpen(false)}
+                    className="grid h-10 w-10 place-items-center rounded-full bg-slate-100 text-slate-600"
+                    aria-label="Tutup menu"
+                  >
+                    <X size={19} />
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {mobileNavItems.map((item) => {
+                    const MobileItemIcon = item.icon;
+                    return (
+                      <button
+                        key={item.key}
+                        type="button"
+                        onClick={() => selectMobileNavItem(item)}
+                        className={`flex min-h-14 items-center gap-3 rounded-2xl border px-3 py-3 text-left text-sm font-semibold transition ${item.active ? 'border-indigo-200 bg-indigo-50 text-indigo-700' : 'border-slate-200 bg-white text-slate-700 active:bg-slate-100'}`}
+                        aria-current={item.active ? 'page' : undefined}
+                      >
+                        <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-xl ${item.active ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-500'}`}>
+                          <MobileItemIcon size={19} strokeWidth={1.8} />
+                        </span>
+                        <span className="min-w-0 leading-tight">{item.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+
+          <nav className="mobile-bottom-navigation fixed inset-x-0 bottom-0 z-[70] border-t border-slate-200 bg-white/95 shadow-[0_-8px_28px_rgba(15,23,42,0.10)] backdrop-blur-xl md:hidden print:hidden" aria-label="Navigasi utama mobile">
+            <div
+              className="mx-auto grid max-w-lg items-stretch px-1 pt-1"
+              style={{ gridTemplateColumns: `repeat(${mobilePrimaryNavItems.length + 1}, minmax(0, 1fr))` }}
+            >
+              {mobilePrimaryNavItems.map((item) => {
+                const MobileItemIcon = item.icon;
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => selectMobileNavItem(item)}
+                    className={`mobile-bottom-navigation__item ${item.active ? 'is-active' : ''}`}
+                    aria-current={item.active ? 'page' : undefined}
+                  >
+                    <MobileItemIcon size={21} strokeWidth={item.active ? 2.25 : 1.75} />
+                    <span>{item.label}</span>
+                  </button>
+                );
+              })}
+              <button
+                type="button"
+                onClick={() => setMobileMenuOpen((open) => !open)}
+                className={`mobile-bottom-navigation__item ${mobileMenuIsActive ? 'is-active' : ''}`}
+                aria-expanded={mobileMenuOpen}
+                aria-controls="mobile-app-menu"
+              >
+                <MenuIcon size={22} strokeWidth={mobileMenuIsActive ? 2.25 : 1.75} />
+                <span>Menu</span>
+              </button>
+            </div>
+          </nav>
+        </>
+      )}
             {inboundPrintPortal}
           </>
           );

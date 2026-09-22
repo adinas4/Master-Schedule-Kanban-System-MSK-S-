@@ -2980,6 +2980,21 @@ export default function BOMManager({
         return Number(b.revisionNo || 0) - Number(a.revisionNo || 0);
       });
   }, [bomRelations, activeBomRelationIds, itemsByCode, whereUsedTargetCode]);
+  const whereUsedSummary = useMemo(() => {
+    const activeRows = whereUsedRows.filter((row) => row.isActive);
+    const revisionRows = whereUsedRows.filter((row) => !row.isActive);
+    const countUniqueParents = (rows) => new Set(
+      rows
+        .map((row) => String(row.parentCode || '').trim())
+        .filter(Boolean),
+    ).size;
+    return {
+      activeCount: activeRows.length,
+      revisionCount: revisionRows.length,
+      activeParentCount: countUniqueParents(activeRows),
+      revisionParentCount: countUniqueParents(revisionRows),
+    };
+  }, [whereUsedRows]);
   const buildBomHeaderPayload = (headerState, parentCodeValue, extra = {}) => {
     const normalizedRevision = Number(headerState?.revisionNo || 1) || 1;
     return {
@@ -6223,8 +6238,21 @@ export default function BOMManager({
               </div>
             ) : (
               <div className="space-y-3">
-                <div className="text-xs text-slate-500">
-                  <span className="font-semibold text-slate-700">{whereUsedTargetCode}</span> dipakai di {whereUsedRows.length} baris BOM.
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                  <span className="text-slate-500">
+                    <span className="font-semibold text-slate-700">{whereUsedTargetCode}</span>{' '}
+                    {whereUsedSummary.activeCount > 0
+                      ? `dipakai aktif di ${whereUsedSummary.activeCount} baris BOM`
+                      : 'tidak dipakai di BOM aktif'}
+                    {whereUsedSummary.activeParentCount > 0 ? ` (${whereUsedSummary.activeParentCount} parent aktif)` : ''}.
+                  </span>
+                  <span className="rounded-full bg-slate-100 px-2 py-0.5 font-semibold text-slate-600">
+                    Revisi: {whereUsedSummary.revisionCount} baris
+                    {whereUsedSummary.revisionParentCount > 0 ? ` / ${whereUsedSummary.revisionParentCount} parent` : ''}
+                  </span>
+                  <span className="rounded-full bg-slate-50 px-2 py-0.5 font-semibold text-slate-500">
+                    Total tabel: {whereUsedRows.length} baris
+                  </span>
                 </div>
                 <div className="overflow-x-auto">
                   <table className="w-full text-xs">

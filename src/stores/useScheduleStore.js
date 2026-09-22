@@ -111,6 +111,7 @@ export const useScheduleStore = ({
   const [scheduleLoading, setScheduleLoading] = useState(false);
   const scheduleFetchRef = useRef(null);
   const schedulesLoadRef = useRef(null);
+  const inboundReminderSendRef = useRef(new Set());
   const [schedulesLoading, setSchedulesLoading] = useState(false);
   const inboundActive = isInboundActive !== false;
   const shouldPrefetchSchedules = prefetchAllSchedules !== false;
@@ -323,13 +324,105 @@ export const useScheduleStore = ({
     return `${po}||${itemCode}`;
   };
 
+  const getScheduleUniqueParts = (row) => {
+    const po = String(row?.poNumber || row?.po_number || '').trim();
+    const supplier = String(row?.supplier || row?.supplierId || row?.supplier_id || '').trim();
+    const item = String(row?.itemCode || row?.item_code || row?.item || '').trim();
+    const date = String(row?.requestDate || row?.request_date || '').trim();
+    const time = String(row?.deliveryTime || row?.delivery_time || '').trim();
+    return { po, supplier, item, date, time };
+  };
+
   const getScheduleUniqueKey = (row) => {
-    const po = String(row?.poNumber || '').trim().toLowerCase();
-    const supplier = String(row?.supplier || '').trim().toLowerCase();
-    const item = String(row?.item || '').trim().toLowerCase();
-    const date = String(row?.requestDate || '').trim();
-    const time = String(row?.deliveryTime || '').trim().toLowerCase();
-    return `${po}||${supplier}||${item}||${date}||${time}`;
+    const { po, supplier, item, date, time } = getScheduleUniqueParts(row);
+    if (!po || !supplier || !item || !date || !time) return '';
+    return [
+      po.toLowerCase(),
+      supplier.toLowerCase(),
+      item.toLowerCase(),
+      date,
+      time.toLowerCase(),
+    ].join('||');
+  };
+
+  const formatScheduleDuplicateDate = (value) => {
+    if (!value) return '-';
+    return typeof formatDateID === 'function' ? formatDateID(value) : String(value);
+  };
+
+  const buildScheduleDuplicateLine = ({ existing, incoming, rowNumber }) => {
+    const source = existing || incoming || {};
+    const parts = getScheduleUniqueParts(source);
+    const itemName = String(source?.itemName || source?.item_name || '').trim();
+    const qty = Number(source?.requestQty ?? source?.request_qty);
+    const prefix = existing?.id
+      ? (rowNumber ? `Baris input ${rowNumber} -> Schedule #${existing.id}` : `Schedule #${existing.id}`)
+      : (source?.__rowNumber ? `Baris input ${source.__rowNumber}` : (rowNumber ? `Baris input ${rowNumber}` : 'Baris input'));
+    const itemLabel = itemName ? `${parts.item} - ${itemName}` : parts.item;
+    const qtyLabel = Number.isFinite(qty) ? `, Qty ${formatQtyLabel(qty)}` : '';
+    return `- ${prefix}: PO ${parts.po || '-'}, Supplier ${parts.supplier || '-'}, Item ${itemLabel || '-'}, Tanggal ${formatScheduleDuplicateDate(parts.date)}, Jam ${parts.time || '-'}${qtyLabel}.`;
+  };
+
+  const buildScheduleDuplicateMessage = (conflicts) => {
+    const rows = Array.isArray(conflicts) ? conflicts.filter(Boolean) : [];
+    const lines = [
+      'Jadwal duplikat terdeteksi (PO, Supplier, Item, Tanggal, Jam).',
+      'Duplikat dengan jadwal berikut:',
+      ...rows.slice(0, 6).map(buildScheduleDuplicateLine),
+    ];
+    if (rows.length > 6) {
+      lines.push(`- Dan ${rows.length - 6} duplikat lainnya.`);
+    }
+    return lines.join('\n');
+  };
+
+  const getScheduleDuplicateMessageFromError = (error) => {
+    if (error?.response?.code !== 'DUPLICATE_SCHEDULE') return '';
+    const duplicateSchedule = error?.response?.duplicateSchedule;
+    if (!duplicateSchedule) return error?.message || '';
+    return buildScheduleDuplicateMessage([{
+      existing: duplicateSchedule,
+      rowNumber: Number(error?.response?.rowNumber || 0) || undefined,
+    }]);
+  };
+
+  const findDuplicateSchedule = (candidate, ignoreId = null) => {
+    const key = getScheduleUniqueKey(candidate);
+    if (!key) return null;
+    return schedules.find((row) => {
+      if (row.isSplitResult) return false;
+      if (ignoreId != null && row.id === ignoreId) return false;
+      return getScheduleUniqueKey(row) === key;
+    }) || null;
+  };
+
+  const findScheduleDuplicateConflicts = (rows, ignoreId = null) => {
+    const existingByKey = new Map();
+    schedules.forEach((row) => {
+      if (row?.isSplitResult) return;
+      if (ignoreId != null && row.id === ignoreId) return;
+      const key = getScheduleUniqueKey(row);
+      if (key && !existingByKey.has(key)) existingByKey.set(key, row);
+    });
+    const batchByKey = new Map();
+    const conflicts = [];
+    (Array.isArray(rows) ? rows : []).forEach((row, index) => {
+      const key = getScheduleUniqueKey(row);
+      if (!key) return;
+      const rowNumber = index + 1;
+      const existing = existingByKey.get(key);
+      if (existing) {
+        conflicts.push({ existing, incoming: row, rowNumber });
+        return;
+      }
+      const firstBatch = batchByKey.get(key);
+      if (firstBatch) {
+        conflicts.push({ existing: firstBatch.row, incoming: row, rowNumber });
+        return;
+      }
+      batchByKey.set(key, { row: { ...row, __rowNumber: rowNumber }, rowNumber });
+    });
+    return conflicts;
   };
 
   const mergeScheduleRow = (prevRow, nextRow) => {
@@ -384,7 +477,9 @@ export const useScheduleStore = ({
   };
 
   const handleCreateScheduleError = async (error, label) => {
-    const message = error?.message || 'Gagal menyimpan data ke database.';
+    const message = getScheduleDuplicateMessageFromError(error)
+      || error?.message
+      || 'Gagal menyimpan data ke database.';
     if (!/melebihi sisa po|duplikat|tidak ditemukan|wajib diisi/i.test(message)) {
       console.error(label, error);
     }
@@ -486,15 +581,6 @@ export const useScheduleStore = ({
     const num = Number(raw);
     if (!Number.isFinite(num) || num <= 0) return null;
     return Math.trunc(num);
-  };
-
-  const isDuplicateSchedule = (candidate, ignoreId = null) => {
-    const key = getScheduleUniqueKey(candidate);
-    return schedules.some((row) => {
-      if (row.isSplitResult) return false;
-      if (ignoreId != null && row.id === ignoreId) return false;
-      return getScheduleUniqueKey(row) === key;
-    });
   };
 
   const scheduleSourceRows = schedulesLoaded ? schedules : filteredSchedules;
@@ -962,8 +1048,9 @@ export const useScheduleStore = ({
           requestDate: newPlan.requestDate,
           deliveryTime: newPlan.deliveryTime,
         };
-        if (isDuplicateSchedule(candidate, editingId)) {
-          alert("Jadwal duplikat terdeteksi (PO, Supplier, Item, Tanggal, Jam).");
+        const duplicateSchedule = findDuplicateSchedule(candidate, editingId);
+        if (duplicateSchedule) {
+          alert(buildScheduleDuplicateMessage([{ existing: duplicateSchedule, incoming: candidate }]));
           return;
         }
         let newStatus = existing.status;
@@ -1083,16 +1170,9 @@ export const useScheduleStore = ({
           alert("Tidak ada item valid untuk dijadwalkan.");
           return;
         }
-        const existingKeys = new Set(schedules.filter((row) => !row.isSplitResult).map(getScheduleUniqueKey));
-        const batchKeys = new Set();
-        const hasDuplicate = payloadLines.some((item) => {
-          const key = getScheduleUniqueKey(item);
-          if (existingKeys.has(key) || batchKeys.has(key)) return true;
-          batchKeys.add(key);
-          return false;
-        });
-        if (hasDuplicate) {
-          alert("Jadwal duplikat terdeteksi (PO, Supplier, Item, Tanggal, Jam).");
+        const duplicateConflicts = findScheduleDuplicateConflicts(payloadLines);
+        if (duplicateConflicts.length > 0) {
+          alert(buildScheduleDuplicateMessage(duplicateConflicts));
           return;
         }
         try {
@@ -1153,16 +1233,9 @@ export const useScheduleStore = ({
           currentDate.setDate(currentDate.getDate() + cycle);
           currentDate = getNextBusinessDay(currentDate);
         }
-        const existingKeys = new Set(schedules.filter((row) => !row.isSplitResult).map(getScheduleUniqueKey));
-        const batchKeys = new Set();
-        const hasDuplicate = newItems.some((item) => {
-          const key = getScheduleUniqueKey(item);
-          if (existingKeys.has(key) || batchKeys.has(key)) return true;
-          batchKeys.add(key);
-          return false;
-        });
-        if (hasDuplicate) {
-          alert("Jadwal duplikat terdeteksi (PO, Supplier, Item, Tanggal, Jam).");
+        const duplicateConflicts = findScheduleDuplicateConflicts(newItems);
+        if (duplicateConflicts.length > 0) {
+          alert(buildScheduleDuplicateMessage(duplicateConflicts));
           return;
         }
         try {
@@ -1202,8 +1275,9 @@ export const useScheduleStore = ({
           actualLocked: false,
         };
         try {
-          if (isDuplicateSchedule(candidate)) {
-            alert("Jadwal duplikat terdeteksi (PO, Supplier, Item, Tanggal, Jam).");
+          const duplicateSchedule = findDuplicateSchedule(candidate);
+          if (duplicateSchedule) {
+            alert(buildScheduleDuplicateMessage([{ existing: duplicateSchedule, incoming: candidate }]));
             return;
           }
           const createdItem = await createSchedule(candidate);
@@ -1709,8 +1783,9 @@ export const useScheduleStore = ({
     }
     const deliveryTime = String(scheduleEditForm.deliveryTime || existing.deliveryTime || '08:00 (Cycle 1)').trim();
     const candidate = { ...existing, requestDate, deliveryTime };
-    if (isDuplicateSchedule(candidate, existing.id)) {
-      setScheduleEditError('Jadwal duplikat terdeteksi (PO, Supplier, Item, Tanggal, Jam).');
+    const duplicateSchedule = findDuplicateSchedule(candidate, existing.id);
+    if (duplicateSchedule) {
+      setScheduleEditError(buildScheduleDuplicateMessage([{ existing: duplicateSchedule, incoming: candidate }]));
       return;
     }
     let newStatus = existing.status;
@@ -1739,7 +1814,8 @@ export const useScheduleStore = ({
       }
       closeScheduleEdit();
     } catch (error) {
-      setScheduleEditError(`Gagal update data: ${error.message || 'Unknown error'}`);
+      const duplicateMessage = getScheduleDuplicateMessageFromError(error);
+      setScheduleEditError(duplicateMessage || `Gagal update data: ${error.message || 'Unknown error'}`);
     } finally {
       setScheduleEditSaving(false);
     }
@@ -2157,16 +2233,63 @@ export const useScheduleStore = ({
     }
     const targetSupplier = item.supplier;
     const targetDate = item.requestDate;
-    try {
+    const reminderKey = `${String(targetSupplier || '').trim().toLowerCase()}|${String(targetDate || '').trim()}`;
+    if (inboundReminderSendRef.current.has(reminderKey)) {
       if (showToastMessage) {
-        showToastMessage('Mengirim reminder inbound schedule...', '', null, 'info');
+        showToastMessage('Reminder inbound schedule sedang diproses. Tunggu sampai selesai.', '', null, 'info');
+      }
+      return;
+    }
+    const existingReminderCount = Math.max(0, ...schedules
+      .filter((row) => row?.supplier === targetSupplier && row?.requestDate === targetDate)
+      .map((row) => Number(row?.inboundReminderSendCount || 0)));
+    if (existingReminderCount >= 3) {
+      const message = `Reminder inbound schedule untuk ${targetSupplier} tanggal ${formatDateID(targetDate)} sudah mencapai Level 3. Tidak bisa kirim reminder lagi.`;
+      if (showToastMessage) {
+        showToastMessage(message, '', null, 'info');
+      } else {
+        alert(message);
+      }
+      return;
+    }
+    try {
+      inboundReminderSendRef.current.add(reminderKey);
+      if (showToastMessage) {
+        showToastMessage(`Mengirim reminder inbound schedule Level ${existingReminderCount + 1}...`, '', null, 'info');
       }
       const result = await apiFetch('/api/schedules/reminder-email', {
         method: 'POST',
         body: JSON.stringify({ supplier: targetSupplier, requestDate: targetDate }),
       });
+      if (result?.alreadySent) {
+        const emailPatch = {
+          inboundReminderSentAt: result?.emailSentAt || new Date().toISOString(),
+          inboundReminderSentTo: result?.emailSentTo || result?.to || '',
+          inboundReminderLastSubject: result?.emailLastSubject || result?.subject || '',
+          inboundReminderSendCount: Number(result?.emailSendCount || 1),
+          inboundReminderLastError: result?.emailLastError || '',
+          inboundReminderSmtpStatus: result?.smtpStatus || '',
+          inboundReminderMessageId: result?.messageId || '',
+          inboundReminderRejectedTo: result?.rejectedTo || '',
+        };
+        const applyReminderPatch = (row) => (
+          row?.supplier === targetSupplier && row?.requestDate === targetDate
+            ? { ...row, ...emailPatch }
+            : row
+        );
+        setSchedules((prev) => prev.map(applyReminderPatch));
+        setFilteredSchedules((prev) => prev.map(applyReminderPatch));
+        const notice = result?.notice || `Reminder inbound schedule untuk ${targetSupplier} tanggal ${formatDateID(targetDate)} sudah pernah dikirim.`;
+        if (showToastMessage) {
+          showToastMessage(notice, '', null, 'info');
+        } else {
+          alert(notice);
+        }
+        return;
+      }
+      const nextLevelLabel = result?.reminderLevel ? ` Level ${result.reminderLevel}` : '';
       const successMessage = result?.sent
-        ? (result?.notice || `Email reminder berhasil dikirim ke ${result.to || targetSupplier}.`)
+        ? (result?.notice || `Email reminder${nextLevelLabel} berhasil dikirim ke ${result.to || targetSupplier}.`)
         : (result?.notice || 'Email reminder siap dikirim.');
       if (result?.html) {
         const preview = window.open('', '_blank', 'noopener');
@@ -2197,6 +2320,14 @@ export const useScheduleStore = ({
           inboundEmailSmtpStatus: result?.smtpStatus || '',
           inboundEmailMessageId: result?.messageId || '',
           inboundEmailRejectedTo: result?.rejectedTo || '',
+          inboundReminderSentAt: result?.reminderSentAt || result?.emailSentAt || new Date().toISOString(),
+          inboundReminderSentTo: result?.reminderSentTo || result?.emailSentTo || result?.to || '',
+          inboundReminderLastSubject: result?.reminderLastSubject || result?.emailLastSubject || result?.subject || '',
+          inboundReminderSendCount: Number(result?.reminderSendCount || result?.emailSendCount || 1),
+          inboundReminderLastError: result?.reminderLastError || result?.emailLastError || '',
+          inboundReminderSmtpStatus: result?.reminderSmtpStatus || result?.smtpStatus || '',
+          inboundReminderMessageId: result?.reminderMessageId || result?.messageId || '',
+          inboundReminderRejectedTo: result?.reminderRejectedTo || result?.rejectedTo || '',
         };
         const applyEmailPatch = (row) => (
           row?.supplier === targetSupplier && row?.requestDate === targetDate
@@ -2221,6 +2352,8 @@ export const useScheduleStore = ({
       } else {
         alert(message);
       }
+    } finally {
+      inboundReminderSendRef.current.delete(reminderKey);
     }
   };
   return {

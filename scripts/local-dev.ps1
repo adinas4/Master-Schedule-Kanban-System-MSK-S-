@@ -53,9 +53,52 @@ function Get-HttpPostStatusCode {
   }
 }
 
+function Ensure-PostgresAvailable {
+  $listener = Get-NetTCPConnection -LocalPort 5432 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($listener) {
+    return
+  }
+
+  $service = Get-CimInstance Win32_Service -Filter "Name='postgresql-x64-17'" -ErrorAction SilentlyContinue
+  if (-not $service -or -not $service.PathName) {
+    Write-Host "PostgreSQL service tidak ditemukan. Lewati auto-start database."
+    return
+  }
+
+  try {
+    Start-Service -Name $service.Name -ErrorAction Stop
+    Start-Sleep -Seconds 3
+  } catch {
+    Write-Host ("Start-Service PostgreSQL gagal, coba pg_ctl manual: " + $_.Exception.Message)
+  }
+
+  $listener = Get-NetTCPConnection -LocalPort 5432 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($listener) {
+    return
+  }
+
+  $exeMatch = [regex]::Match([string]$service.PathName, '^(.*?pg_ctl\.exe)')
+  $dataMatch = [regex]::Match([string]$service.PathName, '-D\s+"([^"]+)"')
+  if (-not $exeMatch.Success -or -not $dataMatch.Success) {
+    Write-Host "Command PostgreSQL service tidak bisa dibaca untuk pg_ctl fallback."
+    return
+  }
+
+  $pgCtl = $exeMatch.Groups[1].Value.Trim('"')
+  $dataDir = $dataMatch.Groups[1].Value
+  $logFile = Join-Path $repoRoot "logs\postgres-start.log"
+  Write-Host "Menyalakan PostgreSQL via pg_ctl..."
+  & $pgCtl start -D $dataDir -l $logFile -w
+}
+
 function Test-Pm2AppExists {
   param([string]$Name)
-  & pm2 describe $Name *> $null
+  # PM2 writes the normal "doesn't exist" result to stderr. With
+  # $ErrorActionPreference = "Stop", invoking pm2.ps1 directly turns that
+  # expected result into a terminating NativeCommandError before we can read
+  # the exit code. Run the probe through cmd so a missing app simply returns
+  # a non-zero status and Ensure-Pm2App can create it.
+  & cmd.exe /d /c "pm2 describe `"$Name`" >NUL 2>&1"
   return ($LASTEXITCODE -eq 0)
 }
 
@@ -107,10 +150,12 @@ if (-not (Test-CommandAvailable -Name "pm2")) {
 
 switch ($Action) {
   "restart-backend" {
+    Ensure-PostgresAvailable
     Ensure-Pm2App -Name $apiName -ScriptPath (Join-Path $repoRoot "server/index.js") -Cwd (Join-Path $repoRoot "server")
     Show-Status
   }
   "restart-all" {
+    Ensure-PostgresAvailable
     Ensure-Pm2App -Name $apiName -ScriptPath (Join-Path $repoRoot "server/index.js") -Cwd (Join-Path $repoRoot "server")
     Ensure-Pm2App -Name $uiName -ScriptPath (Join-Path $repoRoot "pm2-runner.js") -Cwd $repoRoot
     & pm2 save

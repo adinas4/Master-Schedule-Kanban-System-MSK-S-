@@ -1,12 +1,33 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, CheckCircle, Eye, EyeOff, FileSpreadsheet, Play, Printer, Sparkles, Upload } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { AlertTriangle, CheckCircle, ChevronDown, Eye, EyeOff, FileSpreadsheet, Plus, Play, Printer, Sparkles, Upload } from 'lucide-react';
 import logoPrl from '../assets/kop-mrp.png';
+
+const STOCK_OPNAME_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+const buildStockOpnamePeriodValue = (year, monthIndex) => `${STOCK_OPNAME_MONTHS[monthIndex] || 'Jan'}-${year}`;
 
 const buildDefaultPeriod = () => {
   const now = new Date();
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  const label = months[now.getMonth()] || 'Jan';
-  return `${label}-${now.getFullYear()}`;
+  return buildStockOpnamePeriodValue(now.getFullYear(), now.getMonth());
+};
+
+const parseStockOpnamePeriod = (value) => {
+  const match = String(value || '').trim().match(/^([A-Za-z]{3})-(\d{4})$/);
+  if (!match) return null;
+  const monthIndex = STOCK_OPNAME_MONTHS.findIndex((month) => month.toLowerCase() === match[1].toLowerCase());
+  if (monthIndex < 0) return null;
+  return { monthIndex, year: Number(match[2]) };
+};
+
+const getPeriodIndex = ({ year, monthIndex }) => year * 12 + monthIndex;
+
+const isStockOpnamePeriodPast = (value, referenceDate = new Date()) => {
+  const parsed = parseStockOpnamePeriod(value);
+  if (!parsed) return false;
+  return getPeriodIndex(parsed) < getPeriodIndex({
+    year: referenceDate.getFullYear(),
+    monthIndex: referenceDate.getMonth(),
+  });
 };
 
 const normalizeStockOpnameMode = (value) => {
@@ -29,6 +50,12 @@ const getStockOpnameStatusLabel = (value) => {
   return normalized.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
 };
 
+const ALL_STOCK_OPNAME_LOCATION_ID = 'ALL_PLANT';
+const ALL_STOCK_OPNAME_LOCATION_LABEL = 'Semua Plant / Semua Lokasi';
+const isAllStockOpnameLocation = (value) => (
+  String(value || '').trim().toUpperCase() === ALL_STOCK_OPNAME_LOCATION_ID
+);
+
 const TabStockOpname = (props) => {
   const {
     apiFetch,
@@ -37,6 +64,7 @@ const TabStockOpname = (props) => {
     formatRupiah,
     masterLocations = [],
     masterWarehouses = [],
+    masterItems = [],
     ensureAiConfigured,
     canUseAI,
     showToastMessage,
@@ -49,7 +77,7 @@ const TabStockOpname = (props) => {
   const [selectedSession, setSelectedSession] = useState(null);
   const [periodInput, setPeriodInput] = useState(buildDefaultPeriod());
   const [sessionModeInput, setSessionModeInput] = useState('blind_count');
-  const [sessionLocationId, setSessionLocationId] = useState('');
+  const [sessionLocationId, setSessionLocationId] = useState(ALL_STOCK_OPNAME_LOCATION_ID);
   const [stockOpnameOpenSession, setStockOpnameOpenSession] = useState(null);
 
   const [itemsLoading, setItemsLoading] = useState(false);
@@ -64,10 +92,18 @@ const TabStockOpname = (props) => {
   const [blankoTarget, setBlankoTarget] = useState('');
   const [tallyScope, setTallyScope] = useState('warehouse');
   const [tallyTarget, setTallyTarget] = useState('');
+  const [manualItemCode, setManualItemCode] = useState('');
   const [aiModalOpen, setAiModalOpen] = useState(false);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState('');
   const [aiResult, setAiResult] = useState(null);
+  const periodPickerRef = useRef(null);
+  const currentPeriodDate = useMemo(() => new Date(), []);
+  const parsedPeriodInput = parseStockOpnamePeriod(periodInput);
+  const [periodPickerOpen, setPeriodPickerOpen] = useState(false);
+  const [periodPickerYear, setPeriodPickerYear] = useState(
+    parsedPeriodInput?.year || currentPeriodDate.getFullYear(),
+  );
   const normalizeValue = (value) => String(value ?? '').trim().toLowerCase();
   const getProcessLocationTypeLabel = (location) => {
     const raw = String(location?.line_description || location?.lineDescription || '').trim();
@@ -108,7 +144,33 @@ const TabStockOpname = (props) => {
     const locationName = String(location.name || location.location_name || location.line_description || location.lineDescription || '').trim();
     return [locationId, locationName].filter(Boolean).join(' - ');
   };
+  const getStockOpnameScopeLabel = (value, fallbackName = '') => {
+    if (isAllStockOpnameLocation(value)) return ALL_STOCK_OPNAME_LOCATION_LABEL;
+    const location = masterLocationById.get(normalizeValue(value));
+    return location ? getSessionLocationLabel(location) : (fallbackName || value || '-');
+  };
   const getSessionPeriodLabel = (session) => String(session?.opnamePeriod || session?.period || '').trim();
+  const masterItemOptions = useMemo(() => (
+    (masterItems || [])
+      .map((item) => ({
+        code: String(item.code || item.item_code || '').trim(),
+        name: String(item.name || item.item_name || '').trim(),
+        partNo: String(item.part_no || item.partNo || '').trim(),
+        unit: String(item.unit || item.uom || '').trim(),
+        snp: Number(item.pack_qty ?? item.packQty ?? item.snp ?? item.lot_qty ?? 0),
+        qtyOnHand: Number(item.qty_on_hand ?? item.qtyOnHand ?? 0),
+        locationId: String(item.location_id || item.locationId || '').trim(),
+        locationName: String(item.location_name || item.locationName || item.line_production || item.lineProduction || '').trim(),
+        lineProduction: String(item.line_production || item.lineProduction || '').trim(),
+      }))
+      .filter((item) => item.code)
+      .sort((left, right) => left.code.localeCompare(right.code, 'id'))
+  ), [masterItems]);
+  const masterItemByCode = useMemo(() => {
+    const map = new Map();
+    masterItemOptions.forEach((item) => map.set(normalizeValue(item.code), item));
+    return map;
+  }, [masterItemOptions]);
   const masterLocationById = useMemo(() => {
     const map = new Map();
     (masterLocations || []).forEach((location) => {
@@ -119,11 +181,47 @@ const TabStockOpname = (props) => {
   }, [masterLocations]);
   useEffect(() => {
     if (sessionLocationId) return;
-    const firstLocation = (masterLocations || [])[0];
-    if (firstLocation?.id) {
-      setSessionLocationId(String(firstLocation.id));
+    setSessionLocationId(ALL_STOCK_OPNAME_LOCATION_ID);
+  }, [sessionLocationId]);
+
+  useEffect(() => {
+    const parsed = parseStockOpnamePeriod(periodInput);
+    if (parsed?.year) {
+      setPeriodPickerYear(parsed.year);
     }
-  }, [masterLocations, sessionLocationId]);
+  }, [periodInput]);
+
+  useEffect(() => {
+    if (!periodPickerOpen || typeof document === 'undefined') return undefined;
+    const handlePointerDown = (event) => {
+      if (periodPickerRef.current?.contains(event.target)) return;
+      setPeriodPickerOpen(false);
+    };
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') setPeriodPickerOpen(false);
+    };
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [periodPickerOpen]);
+
+  const handleSelectPeriodMonth = (monthIndex) => {
+    const value = buildStockOpnamePeriodValue(periodPickerYear, monthIndex);
+    if (isStockOpnamePeriodPast(value, currentPeriodDate)) return;
+    setPeriodInput(value);
+    setPeriodPickerOpen(false);
+  };
+
+  const handleSelectCurrentPeriod = () => {
+    const value = buildDefaultPeriod();
+    setPeriodPickerYear(currentPeriodDate.getFullYear());
+    setPeriodInput(value);
+    setPeriodPickerOpen(false);
+  };
+
   const matchAnyValue = (sourceValue, candidates = []) => {
     const normalizedSource = normalizeValue(sourceValue);
     if (!normalizedSource) return false;
@@ -199,9 +297,11 @@ const TabStockOpname = (props) => {
     if (!targetValue) return rowsSource;
     const selectedValue = String(targetValue || '').trim();
     if (!selectedValue) return rowsSource;
+    const matchesManualTarget = (row) => row.manual && String(row.targetValue || '').trim() === selectedValue;
     if (selectedValue.startsWith('warehouse:')) {
       const warehouseId = selectedValue.replace('warehouse:', '');
       return rowsSource.filter((row) => {
+        if (matchesManualTarget(row)) return true;
         const directLocation = resolveRowLocation(row);
         if (matchAnyValue(row.locationId, [warehouseId])) return true;
         if (matchAnyValue(row.locationName, [warehouseId])) return true;
@@ -215,6 +315,7 @@ const TabStockOpname = (props) => {
       if (!selectedLocation) return rowsSource;
       const selectedLabel = getProcessLocationLabel(selectedLocation);
       return rowsSource.filter((row) => {
+        if (matchesManualTarget(row)) return true;
         const rowValue = normalizeValue(row.lineProduction || row.locationName || row.locationId || '');
         const signatures = [
           selectedLocation.id,
@@ -232,6 +333,7 @@ const TabStockOpname = (props) => {
     const locationId = selectedValue.replace('location:', '');
     const selectedLocation = masterLocationById.get(normalizeValue(locationId));
     return rowsSource.filter((row) => {
+      if (matchesManualTarget(row)) return true;
       if (matchAnyValue(row.locationId, [locationId])) return true;
       if (matchAnyValue(row.locationName, [locationId])) return true;
       if (!selectedLocation) return false;
@@ -253,7 +355,7 @@ const TabStockOpname = (props) => {
   );
   const printTitle = printMode === 'blanko' ? 'BLANKO STOCK OPNAME' : 'LAPORAN HITUNGAN FISIK';
   const printScopeLabel = printMode === 'blanko'
-    ? (blankoScope === 'wip' ? 'SO WIP' : 'SO Gudang')
+    ? (blankoScope === 'wip' ? 'SO WIP / Line / Work Center' : 'SO Gudang')
     : '';
   const printTargetLabel = printMode === 'blanko' ? (selectedBlankoTarget?.label || '') : '';
 
@@ -290,14 +392,14 @@ const TabStockOpname = (props) => {
       const data = await apiFetch(`/api/stock-opname/sessions/${sessionId}/lines`);
       const mapped = (Array.isArray(data) ? data : []).map((row) => ({
         id: row.id,
-        itemCode: row.item_code,
+        itemCode: row.itemCode || row.item_code,
         itemName: row.item_name || row.itemName || '',
-        partNo: row.part_no || '-',
+        partNo: row.partNo || row.part_no || '-',
         locationName: row.location_name || row.locationName || row.line_production || row.lineProduction || row.location_id || row.locationId || '',
-        locationId: row.location_id || '',
+        locationId: row.locationId || row.location_id || '',
         lineProduction: row.line_production || row.lineProduction || '',
         unit: row.unit || '',
-        snp: Number(row.snapshot_qty ?? row.snapshotQty ?? row.snp ?? 0),
+        snp: Number(row.snp ?? row.pack_qty ?? row.lot_qty ?? 0),
         price: Number(row.price || 0),
         bookQty: Number(row.snapshot_qty ?? row.snapshotQty ?? row.book_qty ?? row.bookQty ?? 0),
         inputBox: Number(row.input_box || row.inputBox || 0),
@@ -467,6 +569,35 @@ const TabStockOpname = (props) => {
     [tallyRows],
   );
   const filteredBlankoRows = printMode === 'blanko' ? blankoRows : computedRows;
+  const notifyActionBlocked = (message) => {
+    setItemsError(message);
+    if (showToastMessage) {
+      showToastMessage(message, '', null, 'error');
+    } else if (typeof window !== 'undefined') {
+      window.alert(message);
+    }
+    return false;
+  };
+  const getActionBlockedMessage = (actionLabel = 'Menu ini') => {
+    if (!selectedSessionId) {
+      return `${actionLabel} belum bisa digunakan. Syaratnya: Start Stock Opname atau pilih session SO terlebih dahulu.`;
+    }
+    if (itemsLoading) {
+      return `${actionLabel} belum bisa digunakan. Tunggu daftar item selesai dimuat di tabel Tally Input.`;
+    }
+    return `${actionLabel} belum bisa digunakan karena daftar item belum muncul. Syaratnya: session SO harus punya item di tabel Tally Input. Klik Start Stock Opname dengan Scope "Semua Plant / Semua Lokasi", lalu gunakan tombol ini setelah daftar item tampil.`;
+  };
+  const guardActionRowsReady = (actionLabel) => {
+    if (!selectedSessionId || itemsLoading || computedRows.length === 0) {
+      return notifyActionBlocked(getActionBlockedMessage(actionLabel));
+    }
+    return true;
+  };
+  const getToolbarActionClassName = (blocked = false) => (
+    `px-3 py-1.5 text-xs border rounded flex items-center gap-2 ${
+      blocked ? 'border-slate-200 bg-slate-50 text-slate-400 hover:border-amber-300 hover:bg-amber-50 hover:text-amber-700' : ''
+    }`
+  );
   const blankoSectionRows = useMemo(() => {
     if (printMode !== 'blanko') return [];
     const grouped = new Map();
@@ -499,6 +630,10 @@ const TabStockOpname = (props) => {
       setSessionError('Period wajib diisi.');
       return;
     }
+    if (isStockOpnamePeriodPast(period)) {
+      setSessionError('Periode yang sudah lewat tidak bisa dipilih untuk Start Stock Opname.');
+      return;
+    }
     if (!locationId) {
       setSessionError('Location wajib dipilih.');
       return;
@@ -506,12 +641,15 @@ const TabStockOpname = (props) => {
     setSessionError('');
     try {
       const selectedLocation = (masterLocations || []).find((location) => String(location.id || '').trim() === locationId) || null;
+      const isAllPlantScope = isAllStockOpnameLocation(locationId);
       const result = await apiFetch('/api/stock-opname/sessions', {
         method: 'POST',
         body: JSON.stringify({
           period,
           locationId,
-          locationName: selectedLocation?.name || selectedLocation?.location_name || '',
+          locationName: isAllPlantScope
+            ? ALL_STOCK_OPNAME_LOCATION_LABEL
+            : selectedLocation?.name || selectedLocation?.location_name || selectedLocation?.line_description || '',
           mode: sessionModeInput,
         }),
       });
@@ -586,26 +724,39 @@ const TabStockOpname = (props) => {
     }
   };
 
-  const handleFinalize = async () => {
-    if (!selectedSessionId) return;
+  const handleFinalize = async (sessionIdOverride = null) => {
+    const targetSessionId = sessionIdOverride || selectedSessionId;
+    if (!targetSessionId) return;
     if (finalizing) return;
-    if (hasRowValidationIssues) {
+    const isCurrentSelectedSession = String(targetSessionId) === String(selectedSessionId || '');
+    if (isCurrentSelectedSession && hasRowValidationIssues) {
       setItemsError('Lengkapi validasi baris terlebih dahulu sebelum finalize.');
       if (showToastMessage) {
         showToastMessage('Lengkapi validasi baris terlebih dahulu sebelum finalize.');
       }
       return;
     }
-    const ok = window.confirm('Finalize & Post? Stok akan disesuaikan.');
+    const targetSession = sessions.find((session) => String(session.id) === String(targetSessionId)) || selectedSession;
+    const lineCount = Number(targetSession?.lineCount || targetSession?.line_count || 0);
+    const confirmMessage = lineCount > 0
+      ? 'Selesai & Post Stock Opname? Selisih stok akan diposting sebagai adjustment.'
+      : 'Selesai & Post Stock Opname tanpa item? Session akan ditutup dan tidak ada adjustment stok.';
+    const ok = window.confirm(confirmMessage);
     if (!ok) return;
     setFinalizing(true);
     setItemsError('');
     try {
-      await apiFetch(`/api/stock-opname/sessions/${selectedSessionId}/post`, { method: 'POST' });
+      await apiFetch(`/api/stock-opname/sessions/${targetSessionId}/post`, { method: 'POST' });
       await loadSessions();
       await loadOpenSession();
-      await loadItems(selectedSessionId);
-      alert('Stock Opname POSTED.');
+      if (String(targetSessionId) === String(selectedSessionId || '')) {
+        await loadItems(targetSessionId);
+      }
+      if (showToastMessage) {
+        showToastMessage('Stock Opname selesai dan sudah diposting.', '', null, 'success');
+      } else {
+        alert('Stock Opname selesai dan sudah diposting.');
+      }
     } catch (error) {
       setItemsError(error.message || 'Gagal finalize SO.');
       if (showToastMessage) {
@@ -616,10 +767,104 @@ const TabStockOpname = (props) => {
     }
   };
 
+  const handleCancelSession = async (sessionId) => {
+    if (!sessionId) return;
+    const ok = window.confirm('Batalkan session Stock Opname ini? Gunakan ini hanya jika session salah atau tidak perlu diposting.');
+    if (!ok) return;
+    setItemsError('');
+    try {
+      await apiFetch(`/api/stock-opname/sessions/${sessionId}`, { method: 'DELETE' });
+      await loadSessions();
+      await loadOpenSession();
+      if (String(sessionId) === String(selectedSessionId || '')) {
+        setSelectedSessionId(null);
+        setRows([]);
+      }
+      if (showToastMessage) {
+        showToastMessage('Session Stock Opname dibatalkan.', '', null, 'success');
+      }
+    } catch (error) {
+      setItemsError(error.message || 'Gagal membatalkan session SO.');
+      if (showToastMessage) {
+        showToastMessage(error.message || 'Gagal membatalkan session SO.');
+      }
+    }
+  };
+
   const handleRowChange = (id, key, value) => {
     setRows((prev) => prev.map((row) => (
       row.id === id ? { ...row, [key]: value } : row
     )));
+  };
+
+  const handleAddManualTallyItem = () => {
+    if (!selectedSessionId) {
+      notifyActionBlocked('Tambah Part belum bisa digunakan. Pilih session SO terlebih dahulu.');
+      return;
+    }
+    if (!selectedTallyTarget) {
+      notifyActionBlocked('Tambah Part belum bisa digunakan. Pilih Target line/work center atau warehouse terlebih dahulu.');
+      return;
+    }
+    const itemCode = String(manualItemCode || '').split(' - ')[0].trim();
+    if (!itemCode) {
+      notifyActionBlocked('Pilih part/item yang ditemukan di target terlebih dahulu.');
+      return;
+    }
+    const item = masterItemByCode.get(normalizeValue(itemCode));
+    if (!item) {
+      notifyActionBlocked(`Item ${itemCode} tidak ditemukan di Master Item.`);
+      return;
+    }
+    const duplicate = rows.some((row) => (
+      !row.hidden
+      && normalizeValue(row.itemCode) === normalizeValue(item.code)
+      && normalizeValue(row.targetValue) === normalizeValue(selectedTallyTarget.value)
+      && row.manual
+    ));
+    if (duplicate) {
+      notifyActionBlocked(`Item ${item.code} sudah ditambahkan manual untuk target ini.`);
+      return;
+    }
+    const targetSource = selectedTallyTarget.source || {};
+    const targetLocationId = selectedTallyTarget.value.startsWith('location:')
+      ? selectedTallyTarget.value.replace('location:', '')
+      : item.locationId || selectedTallyTarget.value.replace('warehouse:', '');
+    const targetLocationName = tallyScope === 'wip'
+      ? selectedTallyTarget.label
+      : item.locationName || selectedTallyTarget.label;
+    const id = `manual-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setRows((prev) => [
+      ...prev,
+      {
+        id,
+        itemCode: item.code,
+        itemName: item.name || '',
+        partNo: item.partNo || '-',
+        locationName: targetLocationName,
+        locationId: targetLocationId,
+        lineProduction: tallyScope === 'wip' ? selectedTallyTarget.label : item.lineProduction || '',
+        unit: item.unit || '',
+        snp: Number(item.snp || 0),
+        price: 0,
+        bookQty: 0,
+        inputBox: 0,
+        inputLoose: 0,
+        countedQty: 0,
+        lotNo: '',
+        scanMode: sessionMode,
+        scanSource: 'manual_add',
+        scanValue: '',
+        reason: `Tambahan fisik ${selectedTallyTarget.label}`,
+        hidden: false,
+        manual: true,
+        targetValue: selectedTallyTarget.value,
+        targetLabel: selectedTallyTarget.label,
+        targetType: selectedTallyTarget.type || '',
+        targetSourceId: targetSource.id || '',
+      },
+    ]);
+    setManualItemCode('');
   };
 
   const normalizeAiList = (value) => {
@@ -629,7 +874,8 @@ const TabStockOpname = (props) => {
   };
 
   const handleAnalyzeVariance = async () => {
-    if (!selectedSessionId || aiLoading) return;
+    if (aiLoading) return;
+    if (!guardActionRowsReady('Analisis AI')) return;
     if (!canUseAI) {
       if (showToastMessage) {
         showToastMessage('Anda tidak memiliki akses AI.');
@@ -640,9 +886,7 @@ const TabStockOpname = (props) => {
     if (!ready) return;
     const varianceRows = computedRows.filter((row) => Number(row.difference || 0) !== 0);
     if (varianceRows.length === 0) {
-      if (showToastMessage) {
-        showToastMessage('Tidak ada selisih untuk dianalisis.');
-      }
+      notifyActionBlocked('Analisis AI membutuhkan minimal 1 item yang memiliki selisih. Isi hasil hitung fisik dulu sampai muncul variance.');
       return;
     }
     setAiModalOpen(true);
@@ -708,6 +952,7 @@ const TabStockOpname = (props) => {
   };
 
   const handleExportBlankoExcel = async () => {
+    if (!guardActionRowsReady('Export Excel Blanko')) return;
     const exportSourceRows = selectedBlankoTarget ? blankoRows : computedRows;
     if (!exportSourceRows.length) {
       setItemsError('Tidak ada item untuk diexport.');
@@ -770,7 +1015,37 @@ const TabStockOpname = (props) => {
     XLSX.writeFile(wb, `Stock_Opname_${scopeTag}_${periodTag}_${dateTag}.xlsx`);
   };
 
+  const handleOpenPrintReport = () => {
+    if (!guardActionRowsReady('Print Laporan')) return;
+    setPrintMode('report');
+    setShowPrint(true);
+  };
+
+  const handleOpenPrintBlanko = () => {
+    if (!guardActionRowsReady('Print Blanko')) return;
+    setPrintMode('blanko');
+    setBlankoScope('warehouse');
+    setBlankoTarget('');
+    setShowPrint(true);
+  };
+
+  const handleOpenPrintBlankoFromTallyTarget = () => {
+    if (!guardActionRowsReady('Print Blanko Target')) return;
+    if (!selectedTallyTarget) {
+      notifyActionBlocked('Print Blanko Target belum bisa digunakan. Pilih Kategori SO lalu pilih Target line/work center atau warehouse terlebih dahulu.');
+      return;
+    }
+    setPrintMode('blanko');
+    setBlankoScope(tallyScope);
+    setBlankoTarget(selectedTallyTarget.value);
+    setShowPrint(true);
+  };
+
   const handlePrintCurrentView = () => {
+    if (printMode === 'blanko' && !selectedBlankoTarget) {
+      notifyActionBlocked('Pilih target terlebih dahulu: pilih Kategori SO, lalu pilih Warehouse/Location untuk SO Gudang atau Production Line/Work Center untuk SO WIP / Line / Work Center.');
+      return;
+    }
     if (typeof document === 'undefined') return;
     if (!document.getElementById('stockopname-print-page-style')) {
       const pageStyle = document.createElement('style');
@@ -792,8 +1067,32 @@ const TabStockOpname = (props) => {
       </div>
 
       {stockOpnameOpenSession && (
-        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
-          Stock Opname sedang OPEN ({getSessionPeriodLabel(stockOpnameOpenSession)}). Hindari input produksi/receiving sampai selesai.
+        <div className="flex flex-col gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700 md:flex-row md:items-center md:justify-between">
+          <div>
+            Stock Opname sedang OPEN ({getSessionPeriodLabel(stockOpnameOpenSession)}). Hindari input produksi/receiving sampai selesai.
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedSessionId(stockOpnameOpenSession.id);
+                handleFinalize(stockOpnameOpenSession.id);
+              }}
+              className="rounded bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700"
+              disabled={finalizing}
+              title="Tutup session dan posting selisih stock opname"
+            >
+              {finalizing ? 'Posting...' : 'Selesai & Post'}
+            </button>
+            <button
+              type="button"
+              onClick={() => handleCancelSession(stockOpnameOpenSession.id)}
+              className="rounded border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold text-amber-700 hover:bg-amber-100"
+              title="Batalkan session jika session salah atau tidak perlu diposting"
+            >
+              Batalkan
+            </button>
+          </div>
         </div>
       )}
 
@@ -801,22 +1100,99 @@ const TabStockOpname = (props) => {
         <div className="text-sm font-semibold">Start Session</div>
         <div className="grid grid-cols-1 md:grid-cols-[1fr_1fr_1fr_auto] gap-3 items-end">
           <div>
-            <label className="block text-[10px] uppercase text-slate-400 mb-1">Period</label>
-            <input
-              className="border p-2 rounded w-full text-sm"
-              placeholder="Feb-2026"
-              value={periodInput}
-              onChange={(e) => setPeriodInput(e.target.value)}
-            />
+            <div className="mb-1 flex items-center gap-2">
+              <label className="block text-[10px] uppercase text-slate-400">Period</label>
+              <span className="ml-auto truncate text-[10px] normal-case text-slate-500">
+                Periode lewat tampil abu-abu dan tidak bisa dipilih.
+              </span>
+            </div>
+            <div ref={periodPickerRef} className="relative">
+              <button
+                type="button"
+                className="flex w-full items-center justify-between rounded border bg-white px-3 py-2 text-left text-sm"
+                onClick={() => setPeriodPickerOpen((prev) => !prev)}
+              >
+                <span className={periodInput ? 'text-slate-900' : 'text-slate-400'}>
+                  {periodInput || 'Pilih periode'}
+                </span>
+                <ChevronDown size={15} className="text-slate-500" />
+              </button>
+              {periodPickerOpen && (
+                <div className="absolute left-0 top-[calc(100%+4px)] z-50 w-[232px] rounded border border-slate-200 bg-white p-2 shadow-xl">
+                  <div className="mb-2 grid grid-cols-[28px_1fr_28px] items-center bg-slate-100 px-1 py-1 text-sm font-semibold text-slate-800">
+                    <button
+                      type="button"
+                      className="rounded px-1 py-0.5 text-slate-500 hover:bg-white disabled:text-slate-300 disabled:hover:bg-transparent"
+                      disabled={periodPickerYear <= currentPeriodDate.getFullYear()}
+                      onClick={() => setPeriodPickerYear((prev) => Math.max(currentPeriodDate.getFullYear(), prev - 1))}
+                    >
+                      {'<'}
+                    </button>
+                    <div className="text-center">{periodPickerYear}</div>
+                    <button
+                      type="button"
+                      className="rounded px-1 py-0.5 text-slate-500 hover:bg-white"
+                      onClick={() => setPeriodPickerYear((prev) => prev + 1)}
+                    >
+                      {'>'}
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-4 gap-x-2 gap-y-2 px-1">
+                    {STOCK_OPNAME_MONTHS.map((month, monthIndex) => {
+                      const value = buildStockOpnamePeriodValue(periodPickerYear, monthIndex);
+                      const disabled = isStockOpnamePeriodPast(value, currentPeriodDate);
+                      const selected = parsedPeriodInput?.year === periodPickerYear
+                        && parsedPeriodInput?.monthIndex === monthIndex;
+                      return (
+                        <button
+                          key={month}
+                          type="button"
+                          disabled={disabled}
+                          onClick={() => handleSelectPeriodMonth(monthIndex)}
+                          className={`h-8 rounded text-xs ${
+                            selected
+                              ? 'bg-blue-600 font-semibold text-white ring-2 ring-blue-800'
+                              : disabled
+                                ? 'cursor-not-allowed text-slate-300'
+                                : 'text-slate-900 hover:bg-blue-50 hover:text-blue-700'
+                          }`}
+                        >
+                          {month}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="mt-3 flex items-center justify-between px-1 text-xs">
+                    <button
+                      type="button"
+                      className="text-blue-600 hover:underline"
+                      onClick={() => {
+                        setPeriodInput('');
+                        setPeriodPickerOpen(false);
+                      }}
+                    >
+                      Clear
+                    </button>
+                    <button
+                      type="button"
+                      className="text-blue-600 hover:underline"
+                      onClick={handleSelectCurrentPeriod}
+                    >
+                      This month
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
           <div>
-            <label className="block text-[10px] uppercase text-slate-400 mb-1">Location</label>
+            <label className="block text-[10px] uppercase text-slate-400 mb-1">Scope Opname</label>
             <select
               className="border p-2 rounded w-full text-sm bg-white"
               value={sessionLocationId}
               onChange={(e) => setSessionLocationId(e.target.value)}
             >
-              <option value="">Pilih location</option>
+              <option value={ALL_STOCK_OPNAME_LOCATION_ID}>{ALL_STOCK_OPNAME_LOCATION_LABEL}</option>
               {(masterLocations || []).map((location) => (
                 <option key={location.id} value={location.id}>
                   {getSessionLocationLabel(location)}
@@ -845,7 +1221,9 @@ const TabStockOpname = (props) => {
           </button>
         </div>
         <div className="text-[11px] text-slate-500">
-          {sessionModeInput === 'scan_lot'
+          {isAllStockOpnameLocation(sessionLocationId)
+            ? 'Gunakan scope Semua Plant untuk stock opname serempak. Pembagian Gudang/WIP/Line tetap dipilih di Tally Input, Blanko, dan Print.'
+            : sessionModeInput === 'scan_lot'
             ? 'Mode Scan Lot menuntut input Lot No dan Qty fisik per baris.'
             : 'Mode Blind Count fokus ke input KBN/Box + remain, lalu sistem hitung total fisik.'}
         </div>
@@ -872,7 +1250,7 @@ const TabStockOpname = (props) => {
               <thead className="bg-slate-100 text-slate-600">
                 <tr>
                   <th className="text-left p-2">Session</th>
-                  <th className="text-left p-2">Location</th>
+                  <th className="text-left p-2">Scope</th>
                   <th className="text-left p-2">Mode</th>
                   <th className="text-left p-2">Status</th>
                   <th className="text-right p-2">Items</th>
@@ -883,27 +1261,55 @@ const TabStockOpname = (props) => {
                 </tr>
               </thead>
               <tbody>
-                {sessions.map((session) => (
-                  <tr key={session.id} className="border-t">
-                    <td className="p-2 font-semibold">{session.sessionNo || session.session_no || '-'}</td>
-                    <td className="p-2">{session.locationName || session.location_name || '-'}</td>
-                    <td className="p-2">{getStockOpnameModeLabel(session.mode)}</td>
-                    <td className="p-2">{getStockOpnameStatusLabel(session.status)}</td>
-                    <td className="p-2 text-right">{formatNumber0(session.itemCount || session.item_count || 0)}</td>
-                    <td className="p-2 text-right">{formatNumber0(session.lineCount || session.line_count || 0)}</td>
-                    <td className="p-2 text-right">{formatNumber0(session.varianceCount || session.variance_count || 0)}</td>
-                    <td className="p-2">{session.createdAt || session.created_at ? new Date(session.createdAt || session.created_at).toLocaleDateString('id-ID') : '-'}</td>
-                    <td className="p-2">
-                      <button
-                        type="button"
-                        onClick={() => setSelectedSessionId(session.id)}
-                        className="px-3 py-1.5 text-xs border rounded"
-                      >
-                        Pilih
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                {sessions.map((session) => {
+                  const statusKey = String(session.status || '').trim().toLowerCase();
+                  const canCloseSession = ['open', 'counting', 'review', 'approved'].includes(statusKey);
+                  return (
+                    <tr key={session.id} className="border-t">
+                      <td className="p-2 font-semibold">{session.sessionNo || session.session_no || '-'}</td>
+                      <td className="p-2">{getStockOpnameScopeLabel(session.locationId || session.location_id, session.locationName || session.location_name || '')}</td>
+                      <td className="p-2">{getStockOpnameModeLabel(session.mode)}</td>
+                      <td className="p-2">{getStockOpnameStatusLabel(session.status)}</td>
+                      <td className="p-2 text-right">{formatNumber0(session.itemCount || session.item_count || 0)}</td>
+                      <td className="p-2 text-right">{formatNumber0(session.lineCount || session.line_count || 0)}</td>
+                      <td className="p-2 text-right">{formatNumber0(session.varianceCount || session.variance_count || 0)}</td>
+                      <td className="p-2">{session.createdAt || session.created_at ? new Date(session.createdAt || session.created_at).toLocaleDateString('id-ID') : '-'}</td>
+                      <td className="p-2">
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setSelectedSessionId(session.id)}
+                            className="px-3 py-1.5 text-xs border rounded"
+                          >
+                            Pilih
+                          </button>
+                          {canCloseSession && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSelectedSessionId(session.id);
+                                  handleFinalize(session.id);
+                                }}
+                                className="rounded bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700"
+                                disabled={finalizing}
+                              >
+                                Selesai & Post
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleCancelSession(session.id)}
+                                className="rounded border border-rose-200 bg-white px-3 py-1.5 text-xs font-semibold text-rose-600 hover:bg-rose-50"
+                              >
+                                Batalkan
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
                 {sessions.length === 0 && (
                   <tr><td colSpan="9" className="p-3 text-center text-slate-400">Belum ada session.</td></tr>
                 )}
@@ -941,26 +1347,18 @@ const TabStockOpname = (props) => {
             </button>
             <button
               type="button"
-              onClick={() => {
-                setPrintMode('report');
-                setShowPrint(true);
-              }}
-              className="px-3 py-1.5 text-xs border rounded flex items-center gap-2"
-              disabled={!selectedSessionId || computedRows.length === 0}
+              onClick={handleOpenPrintReport}
+              className={getToolbarActionClassName(!selectedSessionId || itemsLoading || computedRows.length === 0)}
+              title={!selectedSessionId || itemsLoading || computedRows.length === 0 ? getActionBlockedMessage('Print Laporan') : 'Print laporan stock opname'}
             >
               <Printer size={12} />
               Print Laporan
             </button>
             <button
               type="button"
-              onClick={() => {
-                setPrintMode('blanko');
-                setBlankoScope('warehouse');
-                setBlankoTarget('');
-                setShowPrint(true);
-              }}
-              className="px-3 py-1.5 text-xs border rounded flex items-center gap-2"
-              disabled={!selectedSessionId || computedRows.length === 0}
+              onClick={handleOpenPrintBlanko}
+              className={getToolbarActionClassName(!selectedSessionId || itemsLoading || computedRows.length === 0)}
+              title={!selectedSessionId || itemsLoading || computedRows.length === 0 ? getActionBlockedMessage('Print Blanko') : 'Print blanko stock opname'}
             >
               <Printer size={12} />
               Print Blanko
@@ -968,8 +1366,8 @@ const TabStockOpname = (props) => {
             <button
               type="button"
               onClick={handleExportBlankoExcel}
-              className="px-3 py-1.5 text-xs border rounded flex items-center gap-2"
-              disabled={!selectedSessionId || computedRows.length === 0}
+              className={getToolbarActionClassName(!selectedSessionId || itemsLoading || computedRows.length === 0)}
+              title={!selectedSessionId || itemsLoading || computedRows.length === 0 ? getActionBlockedMessage('Export Excel Blanko') : 'Export blanko stock opname'}
             >
               <FileSpreadsheet size={12} />
               Export Excel Blanko
@@ -977,8 +1375,9 @@ const TabStockOpname = (props) => {
             <button
               type="button"
               onClick={handleAnalyzeVariance}
-              className="px-3 py-1.5 text-xs border rounded flex items-center gap-2"
-              disabled={!selectedSessionId || computedRows.length === 0 || aiLoading}
+              className={getToolbarActionClassName(!selectedSessionId || itemsLoading || computedRows.length === 0 || computedRows.every((row) => Number(row.difference || 0) === 0))}
+              disabled={aiLoading}
+              title={!selectedSessionId || itemsLoading || computedRows.length === 0 ? getActionBlockedMessage('Analisis AI') : 'Analisis item yang memiliki selisih'}
             >
               <Sparkles size={12} />
               {aiLoading ? 'Menganalisis...' : 'Analisis AI'}
@@ -990,14 +1389,18 @@ const TabStockOpname = (props) => {
               disabled={!selectedSessionId || finalizing || hasRowValidationIssues}
             >
               <CheckCircle size={12} />
-              {finalizing ? 'Posting...' : 'Finalize & Post'}
+              {finalizing ? 'Posting...' : 'Selesai & Post'}
             </button>
           </div>
         </div>
 
+        <div className="rounded-lg border border-sky-100 bg-sky-50 px-3 py-2 text-[11px] text-sky-800">
+          Syarat tombol Print Laporan, Print Blanko, Export Excel Blanko, dan Analisis AI: session SO sudah dipilih dan daftar item sudah muncul di tabel Tally Input. Untuk blanko/PDF per area, pilih Kategori SO dan Target saat modal print terbuka.
+        </div>
+
         <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-          <div className="grid grid-cols-1 lg:grid-cols-[180px_minmax(0,1fr)_auto] gap-3 items-start lg:items-center">
-            <div>
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-[200px_minmax(280px,1fr)_auto] lg:items-start">
+            <div className="min-w-0">
               <label className="block text-[10px] uppercase text-slate-400 mb-1">Kategori SO</label>
               <select
                 className="border rounded px-3 py-2 w-full h-10 text-xs bg-white"
@@ -1009,10 +1412,10 @@ const TabStockOpname = (props) => {
                 }}
               >
                 <option value="warehouse">SO Gudang</option>
-                <option value="wip">SO WIP</option>
+                <option value="wip">SO WIP / Line / Work Center</option>
               </select>
             </div>
-            <div>
+            <div className="min-w-0">
               <label className="block text-[10px] uppercase text-slate-400 mb-1">Target</label>
               <select
                 className="border rounded px-3 py-2 w-full h-10 text-xs bg-white"
@@ -1033,7 +1436,18 @@ const TabStockOpname = (props) => {
                   : 'Filter tampilan item berdasarkan Production Line / Work Center.'}
               </div>
             </div>
-            <div className="flex flex-wrap lg:flex-nowrap items-center lg:justify-end gap-2 self-center">
+            <div className="flex flex-wrap lg:flex-nowrap items-center lg:justify-end gap-2 lg:pt-[18px]">
+              <button
+                type="button"
+                onClick={handleOpenPrintBlankoFromTallyTarget}
+                className={`px-3 py-2 h-10 text-xs border rounded bg-white whitespace-nowrap flex items-center gap-2 ${
+                  selectedTallyTarget ? 'text-slate-700 hover:bg-slate-50' : 'border-slate-200 text-slate-400 hover:border-amber-300 hover:bg-amber-50 hover:text-amber-700'
+                }`}
+                title={selectedTallyTarget ? 'Print blanko sesuai target yang sedang dipilih' : 'Pilih target terlebih dahulu'}
+              >
+                <Printer size={12} />
+                Print Blanko Target
+              </button>
               <button
                 type="button"
                 onClick={() => {
@@ -1047,6 +1461,42 @@ const TabStockOpname = (props) => {
               <div className="px-3 py-2 h-10 flex items-center rounded border border-slate-200 bg-white text-[11px] text-slate-500 whitespace-nowrap">
                 {tallyRows.length} / {computedRows.length} item tampil
               </div>
+            </div>
+          </div>
+          <div className="mt-3 border-t border-slate-200 pt-3">
+            <label className="block text-[10px] uppercase text-slate-400 mb-1">Tambah Part ke Target</label>
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(280px,1fr)_auto] lg:items-center">
+              <div className="min-w-0">
+              <input
+                className="h-10 w-full rounded border bg-white px-3 py-2 text-xs"
+                list="stockopname-manual-item-options"
+                value={manualItemCode}
+                onChange={(e) => setManualItemCode(e.target.value)}
+                placeholder={selectedTallyTarget ? 'Ketik kode part / item yang ditemukan di target' : 'Pilih target terlebih dahulu'}
+                disabled={!selectedTallyTarget}
+              />
+              <datalist id="stockopname-manual-item-options">
+                {masterItemOptions.map((item) => (
+                  <option key={item.code} value={`${item.code}${item.name ? ` - ${item.name}` : ''}`}>
+                    {item.partNo || item.unit || ''}
+                  </option>
+                ))}
+              </datalist>
+              </div>
+              <button
+                type="button"
+                onClick={handleAddManualTallyItem}
+                className={`flex h-10 min-w-[126px] items-center justify-center gap-2 rounded px-3 py-2 text-xs font-semibold ${
+                  selectedTallyTarget ? 'bg-slate-900 text-white hover:bg-slate-800' : 'border border-slate-200 bg-white text-slate-400'
+                }`}
+                disabled={!selectedTallyTarget}
+              >
+                <Plus size={13} />
+                Tambah Part
+              </button>
+            </div>
+            <div className="mt-1 text-[10px] text-slate-500">
+              Jika fisik menemukan part lain di target, pilih item lalu klik Tambah Part. Bisa ditambah berulang sesuai temuan.
             </div>
           </div>
         </div>
@@ -1087,7 +1537,7 @@ const TabStockOpname = (props) => {
                   <th className="text-right p-3 border w-[130px]">Selisih</th>
                   <th className="text-center p-3 border w-[130px]">Status</th>
                   <th className="text-left p-3 border w-[180px]">Catatan</th>
-                  <th className="text-center p-3 border w-[70px]">Action</th>
+                  <th className="text-center p-3 border w-[92px]">Action</th>
                 </tr>
               </thead>
               <tbody>
@@ -1102,6 +1552,11 @@ const TabStockOpname = (props) => {
                     <tr key={row.id} className={`border-t ${isDiff ? 'bg-rose-50' : ''}`}>
                       <td className="p-3 border">
                         <div className="font-semibold">{row.itemCode}</div>
+                        {row.manual && (
+                          <div className="mt-1 inline-flex rounded bg-indigo-50 px-1.5 py-0.5 text-[9px] font-semibold uppercase text-indigo-700">
+                            Manual
+                          </div>
+                        )}
                         <div className="text-[10px] text-slate-500">{row.itemName}</div>
                         <div className="text-[10px] text-slate-400">{row.partNo}</div>
                       </td>
@@ -1206,7 +1661,11 @@ const TabStockOpname = (props) => {
                   );
                 })}
                 {tallyRows.length === 0 && (
-                  <tr><td colSpan={sessionMode === 'scan_lot' ? (showSystemQty ? 10 : 9) : (showSystemQty ? 11 : 10)} className="p-3 text-center text-slate-400">Belum ada item.</td></tr>
+                  <tr>
+                    <td colSpan={sessionMode === 'scan_lot' ? (showSystemQty ? 10 : 9) : (showSystemQty ? 11 : 10)} className="p-3 text-center text-slate-400">
+                      Belum ada daftar item. Klik Start Stock Opname dengan Scope "Semua Plant / Semua Lokasi", lalu pilih session yang baru dibuat.
+                    </td>
+                  </tr>
                 )}
               </tbody>
             </table>
@@ -1239,8 +1698,12 @@ const TabStockOpname = (props) => {
               <div className="flex items-center gap-2">
                 <button
                   onClick={handlePrintCurrentView}
-                  className="px-3 py-1.5 text-xs border rounded disabled:opacity-50"
-                  disabled={printMode === 'blanko' && !selectedBlankoTarget}
+                  className={`px-3 py-1.5 text-xs border rounded ${
+                    printMode === 'blanko' && !selectedBlankoTarget
+                      ? 'border-amber-200 bg-amber-50 text-amber-700'
+                      : ''
+                  }`}
+                  title={printMode === 'blanko' && !selectedBlankoTarget ? 'Pilih target blanko terlebih dahulu.' : 'Print atau simpan PDF'}
                 >
                   Print / PDF
                 </button>
@@ -1322,9 +1785,9 @@ const TabStockOpname = (props) => {
                             setBlankoScope(nextScope);
                             setBlankoTarget('');
                           }}
-                        >
-                          <option value="warehouse">SO Gudang</option>
-                          <option value="wip">SO WIP</option>
+                          >
+                            <option value="warehouse">SO Gudang</option>
+                          <option value="wip">SO WIP / Line / Work Center</option>
                         </select>
                       </div>
                       <div>
@@ -1345,7 +1808,7 @@ const TabStockOpname = (props) => {
                         <div className="mt-1 text-[10px] text-slate-500">
                           {blankoScope === 'warehouse'
                             ? 'Pilih Warehouse atau Location untuk SO Gudang.'
-                            : 'Pilih Production Line atau Work Center untuk SO WIP.'}
+                            : 'Pilih Production Line atau Work Center untuk SO WIP / Line / Work Center.'}
                         </div>
                       </div>
                     </div>

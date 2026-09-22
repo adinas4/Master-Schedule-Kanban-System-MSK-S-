@@ -107,6 +107,24 @@ const millsheetUploadDir = path.join(uploadsRoot, "millsheets");
 const frontendDistDir = path.resolve(__dirname, "..", "dist");
 const frontendIndexFile = path.join(frontendDistDir, "index.html");
 const execFileAsync = promisify(execFile);
+const resolveTesseractCommand = async () => {
+  const candidates = [
+    process.env.TESSERACT_CMD,
+    "tesseract",
+    "C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+    "C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe",
+  ].map((value) => String(value || "").trim()).filter(Boolean);
+  for (const candidate of candidates) {
+    if (candidate.toLowerCase() === "tesseract") return candidate;
+    try {
+      await fs.access(candidate);
+      return candidate;
+    } catch {
+      // try next candidate
+    }
+  }
+  return "tesseract";
+};
 const { createWorker } = Tesseract;
 const localOcrLangPath = path.resolve(process.env.LOCAL_OCR_LANG_PATH || __dirname);
 const localOcrEngDataPath = path.join(localOcrLangPath, "eng.traineddata");
@@ -767,6 +785,12 @@ const normalizePermissions = (input, role) => {
 const SETTINGS_KEYS = {
   GEMINI_API_KEY: "GEMINI_API_KEY",
   GEMINI_MODEL: "GEMINI_MODEL",
+  SMTP_HOST: "SMTP_HOST",
+  SMTP_PORT: "SMTP_PORT",
+  SMTP_USER: "SMTP_USER",
+  SMTP_PASS: "SMTP_PASS",
+  SMTP_FROM: "SMTP_FROM",
+  SMTP_SECURE: "SMTP_SECURE",
   CLOSING_DATE: "CLOSING_DATE",
   DAILY_USAGE_WINDOW_DAYS: "DAILY_USAGE_WINDOW_DAYS",
   LEAD_TIME_WINDOW_DAYS: "LEAD_TIME_WINDOW_DAYS",
@@ -810,6 +834,40 @@ const ensureGeminiModel = async (client) => {
   }
   return modelValue;
 };
+
+const DEFAULT_GEMINI_MODELS = [
+  {
+    name: "gemini-3.6-flash",
+    displayName: "Gemini 3.6 Flash",
+    description: "Model terbaru berkecepatan tinggi untuk tugas umum, coding, dan analisis.",
+    recommended: true,
+  },
+  {
+    name: "gemini-3.1-pro-preview",
+    displayName: "Gemini 3.1 Pro Preview",
+    description: "Preview Pro untuk reasoning dan workflow kompleks.",
+  },
+  {
+    name: "gemini-3.1-flash-lite",
+    displayName: "Gemini 3.1 Flash-Lite",
+    description: "Model ringan untuk latency dan biaya rendah.",
+  },
+  {
+    name: "gemini-2.5-pro",
+    displayName: "Gemini 2.5 Pro",
+    description: "Model 2.5 advanced untuk reasoning dan coding.",
+  },
+  {
+    name: "gemini-2.5-flash",
+    displayName: "Gemini 2.5 Flash",
+    description: "Model cepat untuk analisis harian.",
+  },
+  {
+    name: "gemini-2.5-flash-lite",
+    displayName: "Gemini 2.5 Flash-Lite",
+    description: "Model 2.5 ekonomis untuk volume tinggi.",
+  },
+];
 
 const AI_ANALYSIS_ROW_LIMIT = 300;
 const AI_ANALYSIS_CHAR_LIMIT = 120000;
@@ -1086,6 +1144,51 @@ const ensureSchema = async () => {
   await pool.query(`
     alter table schedules
     add column if not exists inbound_email_rejected_to text;
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists inbound_reminder_sent_at timestamptz;
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists inbound_reminder_sent_to text;
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists inbound_reminder_sent_by integer references users(id);
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists inbound_reminder_last_subject text;
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists inbound_reminder_send_count integer not null default 0;
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists inbound_reminder_last_error text;
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists inbound_reminder_smtp_status text;
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists inbound_reminder_message_id text;
+  `);
+
+  await pool.query(`
+    alter table schedules
+    add column if not exists inbound_reminder_rejected_to text;
   `);
 
   await pool.query(`
@@ -5352,6 +5455,14 @@ const mapRowToSchedule = (row) => {
     inboundEmailSmtpStatus: row.inbound_email_smtp_status || "",
     inboundEmailMessageId: row.inbound_email_message_id || "",
     inboundEmailRejectedTo: row.inbound_email_rejected_to || "",
+    inboundReminderSentAt: row.inbound_reminder_sent_at || null,
+    inboundReminderSentTo: row.inbound_reminder_sent_to || "",
+    inboundReminderLastSubject: row.inbound_reminder_last_subject || "",
+    inboundReminderSendCount: Number(row.inbound_reminder_send_count || 0),
+    inboundReminderLastError: row.inbound_reminder_last_error || "",
+    inboundReminderSmtpStatus: row.inbound_reminder_smtp_status || "",
+    inboundReminderMessageId: row.inbound_reminder_message_id || "",
+    inboundReminderRejectedTo: row.inbound_reminder_rejected_to || "",
   };
 };
 
@@ -5503,8 +5614,25 @@ const formatEmailFromAddress = (address, displayName = "") => {
   return cleanName ? `"${cleanName}" <${cleanAddress}>` : cleanAddress;
 };
 
+const getSmtpConfig = async (client = pool) => {
+  const read = async (settingKey, envKey, fallback = "") => {
+    const settingValue = await getSettingValue(client, settingKey);
+    return String(settingValue || process.env[envKey] || fallback || "").trim();
+  };
+  const secureRaw = (await read(SETTINGS_KEYS.SMTP_SECURE, "SMTP_SECURE", "false")).toLowerCase();
+  const user = await read(SETTINGS_KEYS.SMTP_USER, "SMTP_USER");
+  return {
+    host: await read(SETTINGS_KEYS.SMTP_HOST, "SMTP_HOST"),
+    port: Number(await read(SETTINGS_KEYS.SMTP_PORT, "SMTP_PORT", "587")) || 587,
+    user,
+    pass: await read(SETTINGS_KEYS.SMTP_PASS, "SMTP_PASS"),
+    secure: ["true", "1", "yes", "ssl"].includes(secureRaw),
+    from: await read(SETTINGS_KEYS.SMTP_FROM, "SMTP_FROM", user || "no-reply@example.com"),
+  };
+};
+
 const getSmtpMissingConfigMessage = () => (
-  "SMTP belum dikonfigurasi. Isi SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, dan SMTP_FROM di server/.env lalu restart API."
+  "SMTP belum dikonfigurasi. Isi Pengaturan Email Pengirim di menu Pengaturan, atau isi SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, dan SMTP_FROM di server/.env."
 );
 
 const getPublicAppUrl = () => {
@@ -5534,8 +5662,8 @@ const buildPublicDnUrl = (dnNumber, mode = "dn-label") => {
 };
 
 const sendHtmlEmail = async ({ to, cc = [], subject, html, text }) => {
-  const smtpHost = String(process.env.SMTP_HOST || "").trim();
-  if (!smtpHost) {
+  const smtpConfig = await getSmtpConfig(pool);
+  if (!smtpConfig.host) {
     return { sent: false, notice: getSmtpMissingConfigMessage() };
   }
   let nodemailer;
@@ -5546,19 +5674,14 @@ const sendHtmlEmail = async ({ to, cc = [], subject, html, text }) => {
     error.statusCode = 500;
     throw error;
   }
-  const smtpPort = Number(process.env.SMTP_PORT || 587);
-  const smtpUser = String(process.env.SMTP_USER || "").trim();
-  const smtpPass = String(process.env.SMTP_PASS || "").trim();
-  const smtpSecure = String(process.env.SMTP_SECURE || "").toLowerCase() === "true";
-  const fromAddress = String(process.env.SMTP_FROM || smtpUser || "no-reply@example.com").trim();
   const transporter = nodemailer.createTransport({
-    host: smtpHost,
-    port: smtpPort,
-    secure: smtpSecure,
-    auth: smtpUser ? { user: smtpUser, pass: smtpPass } : undefined,
+    host: smtpConfig.host,
+    port: smtpConfig.port,
+    secure: smtpConfig.secure,
+    auth: smtpConfig.user ? { user: smtpConfig.user, pass: smtpConfig.pass } : undefined,
   });
   const info = await transporter.sendMail({
-    from: fromAddress,
+    from: smtpConfig.from,
     to,
     cc: cc.length ? cc : undefined,
     subject,
@@ -6596,6 +6719,49 @@ const loadReceiptPoLineCandidates = async (client, { supplierId, itemCode, poNum
   }));
 };
 
+const ACTUAL_DRIVEN_SPLIT_MIN_SCHEDULE_RATIO = 0.5;
+const ACTUAL_DRIVEN_SPLIT_MIN_PACK_RATIO = 0.1;
+const ACTUAL_DRIVEN_SMALL_VARIANCE_REASON = "actual_driven_small_schedule_variance";
+
+const getActualDrivenSplitThreshold = (target = {}, fallbackPackQty = 0) => {
+  const requestQty = Math.max(
+    0,
+    Number(target.requestQty ?? target.request_qty ?? target.outstandingQty ?? target.remainingQty ?? 0),
+  );
+  const packQty = Math.max(0, Number(target.packQty ?? target.pack_qty ?? fallbackPackQty ?? 0));
+  return Math.max(
+    requestQty > 0 ? requestQty * ACTUAL_DRIVEN_SPLIT_MIN_SCHEDULE_RATIO : 0,
+    packQty > 0 ? packQty * ACTUAL_DRIVEN_SPLIT_MIN_PACK_RATIO : 0,
+  );
+};
+
+const shouldKeepActualDrivenSpilloverOnPreviousSchedule = ({
+  remainingQty,
+  target,
+  arrivalDate,
+  hasPriorAllocation,
+  fallbackPackQty = 0,
+} = {}) => {
+  if (!hasPriorAllocation || !target || target.allocationType === "po_line") return false;
+  const qtyValue = Math.max(0, Number(remainingQty || 0));
+  if (!(qtyValue > 0)) return false;
+  const targetDate = formatDateOnly(target.requestDate ?? target.request_date);
+  const actualDate = formatDateOnly(arrivalDate);
+  if (targetDate && actualDate && targetDate === actualDate) return false;
+  const threshold = getActualDrivenSplitThreshold(target, fallbackPackQty);
+  return threshold > 0 && qtyValue < threshold;
+};
+
+const addActualDrivenSmallVarianceToAllocation = (allocation, qty) => {
+  if (!allocation) return false;
+  const qtyValue = Math.max(0, Number(qty || 0));
+  if (!(qtyValue > 0)) return false;
+  allocation.allocatedQty = Number(allocation.allocatedQty || 0) + qtyValue;
+  allocation.overrideReason = allocation.overrideReason || ACTUAL_DRIVEN_SMALL_VARIANCE_REASON;
+  allocation.smallVarianceQty = Number(allocation.smallVarianceQty || 0) + qtyValue;
+  return true;
+};
+
 const loadActualDrivenScheduleCandidates = async (client, {
   supplierKeys = [],
   poNumber,
@@ -6627,15 +6793,22 @@ const loadActualDrivenScheduleCandidates = async (client, {
       coalesce(s.item_code, s.item) as item_code,
       s.do_number,
       s.request_date,
+      s.request_qty,
       s.received_qty,
+      coalesce(i.pack_qty, 0)::numeric as pack_qty,
       ph.po_date,
       greatest(coalesce(s.request_qty, 0) - coalesce(s.received_qty, 0), 0)::numeric as outstanding_qty
     from schedules s
     left join po_headers ph on ph.po_number = s.po_number
+    left join items i on lower(trim(i.code)) = lower(trim(coalesce(s.item_code, s.item)))
     where lower(trim(coalesce(s.supplier_id, s.supplier))) = any($1::text[])
       and s.po_number = $2
       and lower(trim(coalesce(s.item_code, s.item))) = lower(trim($3))
       and ($7::int is null or s.id = $7::int)
+      and (
+        $4::int is null
+        or s.po_line_id = $4::int
+      )
       and greatest(coalesce(s.request_qty, 0) - coalesce(s.received_qty, 0), 0) > 0
       and upper(coalesce(s.status, '')) not in ('CANCELLED', 'REJECTED', 'CLOSED')
     order by
@@ -6668,9 +6841,11 @@ const loadActualDrivenScheduleCandidates = async (client, {
     itemCode: row.item_code,
     doNumber: row.do_number,
     requestDate: formatDateOnly(row.request_date),
+    requestQty: Number(row.request_qty || 0),
     poDate: formatDateOnly(row.po_date),
     plannedDate: formatDateOnly(row.request_date || row.po_date),
     outstandingQty: Number(row.outstanding_qty || 0),
+    packQty: Number(row.pack_qty || 0),
   }));
 };
 
@@ -6904,6 +7079,19 @@ const buildActualDrivenReceiptAllocations = async (client, {
     if (remainingQty <= 0) break;
     const candidateOutstanding = Math.max(0, Number(candidate.outstandingQty || 0));
     if (candidateOutstanding <= 0) continue;
+    if (shouldKeepActualDrivenSpilloverOnPreviousSchedule({
+      remainingQty,
+      target: candidate,
+      arrivalDate,
+      hasPriorAllocation: allocations.length > 0,
+      fallbackPackQty: itemInfo.packQty,
+    })) {
+      const absorbed = addActualDrivenSmallVarianceToAllocation(allocations[allocations.length - 1], remainingQty);
+      if (absorbed) {
+        remainingQty = 0;
+        break;
+      }
+    }
     const allocatedQty = Math.min(remainingQty, candidateOutstanding);
     allocations.push({
       ...candidate,
@@ -6974,8 +7162,10 @@ const rebuildActualDrivenScheduleAllocations = async (client, { poNumber, itemCo
       s.request_qty,
       s.received_qty,
       s.arrival_date,
-      s.do_number
+      s.do_number,
+      coalesce(i.pack_qty, 0)::numeric as pack_qty
     from schedules s
+    left join items i on lower(trim(i.code)) = lower(trim(coalesce(s.item_code, s.item)))
     where s.po_number = $1
       and lower(trim(coalesce(s.item_code, s.item))) = lower(trim($2))
       and coalesce(s.request_date, s.created_at::date) between $3::date and $4::date
@@ -6992,40 +7182,11 @@ const rebuildActualDrivenScheduleAllocations = async (client, { poNumber, itemCo
     arrivalDate: null,
     doNumber: null,
     remainingQty: Math.max(0, Number(row.request_qty || 0)),
+    packQty: Number(row.pack_qty || 0),
     _seedReceivedQty: Math.max(0, Number(row.received_qty || 0)),
     _seedArrivalDate: formatDateOnly(row.arrival_date) || null,
     _seedDoNumber: String(row.do_number || "").trim() || null,
   }));
-
-  const actualResult = await client.query(
-    `
-    select
-      rnh.id as rn_id,
-      rnh.rn_number,
-      nullif(trim(rnh.do_number), '') as do_number,
-      coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) as arrival_date,
-      sum(greatest(coalesce(rni.received_qty, 0), 0))::numeric as received_qty
-    from receive_note_headers rnh
-    join receive_note_items rni on rni.rn_id = rnh.id
-    where rnh.po_number = $1
-      and coalesce(rnh.source, '') = 'ACTUAL_DRIVEN'
-      and lower(trim(coalesce(rni.item_code, ''))) = lower(trim($2))
-      and rnh.status = 'posted'
-      and coalesce(rni.line_status, '') = 'posted'
-      and greatest(coalesce(rni.received_qty, 0), 0) > 0
-      and coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) between $3::date and $4::date
-    group by rnh.id, rnh.rn_number, nullif(trim(rnh.do_number), ''), coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date)
-    order by coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) asc, rnh.id asc
-    `,
-    [normalizedPo, normalizedItemCode, start, end],
-  );
-  const actualEvents = (actualResult.rows || []).map((row) => ({
-    rnId: Number(row.rn_id),
-    rnNumber: String(row.rn_number || "").trim(),
-    doNumber: String(row.do_number || "").trim() || null,
-    arrivalDate: formatDateOnly(row.arrival_date) || null,
-    qty: Math.max(0, Number(row.received_qty || 0)),
-  })).filter((row) => row.qty > 0 && row.arrivalDate);
 
   const actualLineResult = await client.query(
     `
@@ -7061,34 +7222,122 @@ const rebuildActualDrivenScheduleAllocations = async (client, { poNumber, itemCo
   let allocatedQty = 0;
   let overflowQty = 0;
 
-  for (const event of actualEvents) {
-    let remainingQty = Number(event.qty || 0);
+  const actualLineIds = actualLines.map((line) => line.rnItemId).filter(Boolean);
+  if (actualLineIds.length > 0) {
+    await client.query(
+      "delete from receipt_allocations where rn_item_id = any($1::int[])",
+      [actualLineIds],
+    );
+  }
+  for (const line of actualLines) {
+    let remainingQty = Number(line.qty || 0);
     if (!(remainingQty > 0)) continue;
+    const matchesLine = (schedule) => (
+      line.poLineId ? Number(schedule.poLineId || 0) === Number(line.poLineId) : true
+    );
     const exactMatches = schedules
-      .filter((schedule) => schedule.remainingQty > 0 && schedule.requestDate === event.arrivalDate)
+      .filter((schedule) => matchesLine(schedule) && schedule.remainingQty > 0 && schedule.requestDate === line.arrivalDate)
       .sort((left, right) => left.id - right.id);
     const fifoMatches = schedules
-      .filter((schedule) => schedule.remainingQty > 0 && schedule.requestDate !== event.arrivalDate)
+      .filter((schedule) => matchesLine(schedule) && schedule.remainingQty > 0 && schedule.requestDate !== line.arrivalDate)
       .sort((left, right) => {
         if (left.requestDate !== right.requestDate) return String(left.requestDate || "").localeCompare(String(right.requestDate || ""));
         return left.id - right.id;
       });
     const orderedSchedules = [...exactMatches, ...fifoMatches];
-
-    for (const schedule of orderedSchedules) {
+    let lastAllocatedSchedule = null;
+    for (const targetSchedule of orderedSchedules) {
       if (remainingQty <= 0) break;
-      const allocQty = Math.min(remainingQty, schedule.remainingQty);
-      if (!(allocQty > 0)) continue;
-      schedule.receivedQty += allocQty;
-      schedule.remainingQty -= allocQty;
+      if (lastAllocatedSchedule && shouldKeepActualDrivenSpilloverOnPreviousSchedule({
+        remainingQty,
+        target: targetSchedule,
+        arrivalDate: line.arrivalDate,
+        hasPriorAllocation: true,
+        fallbackPackQty: lastAllocatedSchedule.packQty || targetSchedule.packQty,
+      })) {
+        const varianceQty = remainingQty;
+        lastAllocatedSchedule.receivedQty += varianceQty;
+        if (!lastAllocatedSchedule.arrivalDate) {
+          lastAllocatedSchedule.arrivalDate = line.arrivalDate;
+          lastAllocatedSchedule.doNumber = line.doNumber || null;
+        }
+        allocatedQty += varianceQty;
+        remainingQty = 0;
+        await client.query(
+          `
+          insert into receipt_allocations
+            (rn_id, rn_item_id, supplier, do_number, po_number, source_type, schedule_id, po_line_id, item_code, planned_date, request_date, po_date, available_before, allocated_qty, available_after, created_by)
+          values ($1,$2,'',$3,$4,'schedule',$5,$6,$7,$8,$8,null,0,$9,0,null)
+          `,
+          [
+            line.rnId,
+            line.rnItemId,
+            line.doNumber || "",
+            normalizedPo,
+            lastAllocatedSchedule.id,
+            lastAllocatedSchedule.poLineId || line.poLineId || null,
+            normalizedItemCode,
+            lastAllocatedSchedule.requestDate || null,
+            varianceQty,
+          ],
+        );
+        break;
+      }
+      const availableBefore = Math.max(0, Number(targetSchedule.remainingQty || 0));
+      if (!(availableBefore > 0)) continue;
+      const allocQty = Math.min(remainingQty, availableBefore);
+      targetSchedule.remainingQty = Math.max(0, availableBefore - allocQty);
+      targetSchedule.receivedQty += allocQty;
+      if (!targetSchedule.arrivalDate) {
+        targetSchedule.arrivalDate = line.arrivalDate;
+        targetSchedule.doNumber = line.doNumber || null;
+      }
       allocatedQty += allocQty;
       remainingQty -= allocQty;
-      if (!schedule.arrivalDate) {
-        schedule.arrivalDate = event.arrivalDate;
-        schedule.doNumber = event.doNumber || null;
-      }
+      lastAllocatedSchedule = targetSchedule;
+      await client.query(
+        `
+        insert into receipt_allocations
+          (rn_id, rn_item_id, supplier, do_number, po_number, source_type, schedule_id, po_line_id, item_code, planned_date, request_date, po_date, available_before, allocated_qty, available_after, created_by)
+        values ($1,$2,'',$3,$4,'schedule',$5,$6,$7,$8,$8,null,$9,$10,$11,null)
+        `,
+        [
+          line.rnId,
+          line.rnItemId,
+          line.doNumber || "",
+          normalizedPo,
+          targetSchedule.id,
+          targetSchedule.poLineId || line.poLineId || null,
+          normalizedItemCode,
+          targetSchedule.requestDate || null,
+          availableBefore,
+          allocQty,
+          targetSchedule.remainingQty,
+        ],
+      );
     }
-
+    if (remainingQty > 0 && line.poLineId) {
+      const availableBefore = remainingQty;
+      await client.query(
+        `
+        insert into receipt_allocations
+          (rn_id, rn_item_id, supplier, do_number, po_number, source_type, schedule_id, po_line_id, item_code, planned_date, request_date, po_date, available_before, allocated_qty, available_after, created_by)
+        values ($1,$2,'',$3,$4,'po_line',null,$5,$6,$7,null,null,$8,$8,0,null)
+        `,
+        [
+          line.rnId,
+          line.rnItemId,
+          line.doNumber || "",
+          normalizedPo,
+          line.poLineId,
+          normalizedItemCode,
+          line.arrivalDate || null,
+          availableBefore,
+        ],
+      );
+      allocatedQty += remainingQty;
+      remainingQty = 0;
+    }
     if (remainingQty > 0) {
       overflowQty += remainingQty;
     }
@@ -7122,66 +7371,10 @@ const rebuildActualDrivenScheduleAllocations = async (client, { poNumber, itemCo
     );
   }
 
-  const lineSchedules = schedules.map((schedule) => ({
-    id: schedule.id,
-    poLineId: schedule.poLineId,
-    requestDate: schedule.requestDate,
-    remainingQty: schedule.requestQty,
-  }));
-  const actualLineIds = actualLines.map((line) => line.rnItemId).filter(Boolean);
-  if (actualLineIds.length > 0) {
-    await client.query(
-      "delete from receipt_allocations where rn_item_id = any($1::int[])",
-      [actualLineIds],
-    );
-  }
-  for (const line of actualLines) {
-    let remainingQty = Number(line.qty || 0);
-    if (!(remainingQty > 0)) continue;
-    const exactMatches = lineSchedules
-      .filter((schedule) => schedule.remainingQty > 0 && schedule.requestDate === line.arrivalDate)
-      .sort((left, right) => left.id - right.id);
-    const fifoMatches = lineSchedules
-      .filter((schedule) => schedule.remainingQty > 0 && schedule.requestDate !== line.arrivalDate)
-      .sort((left, right) => {
-        if (left.requestDate !== right.requestDate) return String(left.requestDate || "").localeCompare(String(right.requestDate || ""));
-        return left.id - right.id;
-      });
-    const orderedSchedules = [...exactMatches, ...fifoMatches];
-    for (const targetSchedule of orderedSchedules) {
-      if (remainingQty <= 0) break;
-      const availableBefore = Math.max(0, Number(targetSchedule.remainingQty || 0));
-      if (!(availableBefore > 0)) continue;
-      const allocQty = Math.min(remainingQty, availableBefore);
-      targetSchedule.remainingQty = Math.max(0, availableBefore - allocQty);
-      remainingQty -= allocQty;
-      await client.query(
-        `
-        insert into receipt_allocations
-          (rn_id, rn_item_id, supplier, do_number, po_number, source_type, schedule_id, po_line_id, item_code, planned_date, request_date, po_date, available_before, allocated_qty, available_after, created_by)
-        values ($1,$2,'',$3,$4,'schedule',$5,$6,$7,$8,$8,null,$9,$10,$11,null)
-        `,
-        [
-          line.rnId,
-          line.rnItemId,
-          line.doNumber || "",
-          normalizedPo,
-          targetSchedule.id,
-          targetSchedule.poLineId || line.poLineId || null,
-          normalizedItemCode,
-          targetSchedule.requestDate || null,
-          availableBefore,
-          allocQty,
-          targetSchedule.remainingQty,
-        ],
-      );
-    }
-  }
-
   return {
     month,
     schedules: schedules.length,
-    actualEvents: actualEvents.length,
+    actualEvents: actualLines.length,
     allocatedQty,
     overflowQty,
   };
@@ -9723,6 +9916,29 @@ const buildStockOpnameSessionNo = (periodValue, idValue) => {
   return period ? `SO-${period}-${suffix}` : `SO-${suffix}`;
 };
 
+const ALL_STOCK_OPNAME_LOCATION_ID = "ALL_PLANT";
+const ALL_STOCK_OPNAME_LOCATION_LABEL = "Semua Plant / Semua Lokasi";
+const isAllStockOpnameLocation = (value) => (
+  String(value || "").trim().toUpperCase() === ALL_STOCK_OPNAME_LOCATION_ID
+);
+const STOCK_OPNAME_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const parseStockOpnamePeriod = (value) => {
+  const match = String(value || "").trim().match(/^([A-Za-z]{3})-(\d{4})$/);
+  if (!match) return null;
+  const monthIndex = STOCK_OPNAME_MONTHS.findIndex((month) => month.toLowerCase() === match[1].toLowerCase());
+  if (monthIndex < 0) return null;
+  return { monthIndex, year: Number(match[2]) };
+};
+const getStockOpnamePeriodIndex = ({ year, monthIndex }) => year * 12 + monthIndex;
+const isStockOpnamePeriodPast = (value, referenceDate = new Date()) => {
+  const parsed = parseStockOpnamePeriod(value);
+  if (!parsed) return false;
+  return getStockOpnamePeriodIndex(parsed) < getStockOpnamePeriodIndex({
+    year: referenceDate.getFullYear(),
+    monthIndex: referenceDate.getMonth(),
+  });
+};
+
 const mapStockOpnameSessionRow = (row) => ({
   id: row.id,
   sessionNo: row.session_no,
@@ -10276,6 +10492,94 @@ const ensureUniqueDoNumber = async (client, data, ignoreId = null) => {
   }
 };
 
+const mapScheduleDuplicatePayload = (row) => {
+  if (!row) return null;
+  return {
+    id: row.id,
+    poNumber: row.po_number,
+    supplier: row.supplier_id || row.supplier,
+    supplierName: row.supplier_name || null,
+    itemCode: row.item_code || row.item,
+    itemName: row.item_name || null,
+    requestDate: formatDateOnly(row.request_date),
+    deliveryTime: row.delivery_time || "",
+    requestQty: Number(row.request_qty || 0),
+    status: row.status || null,
+  };
+};
+
+const buildScheduleDuplicateMessage = ({ duplicate, rowNumber } = {}) => {
+  const parts = ["Jadwal duplikat terdeteksi (PO, Supplier, Item, Tanggal, Jam)."];
+  if (Number.isFinite(Number(rowNumber)) && Number(rowNumber) > 0) {
+    parts.push(`Baris ${Number(rowNumber)}.`);
+  }
+  if (duplicate) {
+    const itemLabel = duplicate.itemName
+      ? `${duplicate.itemCode || "-"} - ${duplicate.itemName}`
+      : (duplicate.itemCode || "-");
+    parts.push(
+      `Duplikat dengan Schedule #${duplicate.id || "-"}: PO ${duplicate.poNumber || "-"}, Supplier ${duplicate.supplier || "-"}, Item ${itemLabel}, Tanggal ${duplicate.requestDate || "-"}, Jam ${duplicate.deliveryTime || "-"}, Qty ${duplicate.requestQty ?? "-"}.`,
+    );
+  }
+  return parts.join("\n");
+};
+
+const createScheduleDuplicateError = ({ duplicate, rowNumber } = {}) => {
+  const payload = mapScheduleDuplicatePayload(duplicate);
+  const error = new Error(buildScheduleDuplicateMessage({ duplicate: payload, rowNumber }));
+  error.statusCode = 409;
+  error.code = "DUPLICATE_SCHEDULE";
+  error.duplicateSchedule = payload;
+  if (Number.isFinite(Number(rowNumber)) && Number(rowNumber) > 0) {
+    error.rowNumber = Number(rowNumber);
+  }
+  return error;
+};
+
+const findDuplicateScheduleByKey = async (client, data, ignoreId = null, { forUpdate = false } = {}) => {
+  const poNumber = normalizePoNumber(data?.poNumber || data?.po_number);
+  const supplier = String(data?.supplierId || data?.supplier_id || data?.supplier || "").trim();
+  const itemCode = normalizeItemCode(data?.itemCode || data?.item_code || data?.item);
+  const requestDate = normalizeDateOnly(data?.requestDate || data?.request_date);
+  const deliveryTime = String(data?.deliveryTime || data?.delivery_time || "").trim();
+  if (!poNumber || !supplier || !itemCode || !requestDate || !deliveryTime) return null;
+
+  const params = [poNumber, supplier, itemCode, requestDate, deliveryTime];
+  let query = `
+    select
+      s.*,
+      i.name as item_name,
+      mv.name as supplier_name
+    from schedules s
+    left join items i on lower(i.code) = lower(coalesce(s.item_code, s.item))
+    left join master_vendors mv on lower(mv.id) = lower(coalesce(s.supplier_id, s.supplier))
+    where lower(trim(s.po_number)) = lower(trim($1))
+      and (
+        lower(trim(coalesce(s.supplier_id, ''))) = lower(trim($2))
+        or lower(trim(coalesce(s.supplier, ''))) = lower(trim($2))
+      )
+      and lower(trim(coalesce(s.item_code, s.item))) = lower(trim($3))
+      and s.request_date = $4::date
+      and lower(trim(coalesce(s.delivery_time, ''))) = lower(trim($5))
+      and coalesce(s.is_split_result, false) = false
+  `;
+  if (ignoreId !== null) {
+    params.push(ignoreId);
+    query += ` and s.id <> $${params.length}`;
+  }
+  query += " order by s.id asc limit 1";
+  if (forUpdate) query += " for update of s";
+  const result = await client.query(query, params);
+  return result.rows[0] || null;
+};
+
+const assertUniqueScheduleKey = async (client, data, ignoreId = null, { rowNumber, forUpdate = false } = {}) => {
+  const duplicate = await findDuplicateScheduleByKey(client, data, ignoreId, { forUpdate });
+  if (duplicate) {
+    throw createScheduleDuplicateError({ duplicate, rowNumber });
+  }
+};
+
 const formatDateStamp = (value = new Date()) => {
   const iso = value.toISOString().slice(0, 10);
   return iso.replace(/-/g, "");
@@ -10612,7 +10916,8 @@ const runLocalTesseractOcr = async (file) => {
       .png()
       .toBuffer();
     await fs.writeFile(inputPath, imageBuffer);
-    await execFileAsync("tesseract", [inputPath, outputBase, "-l", "eng", "--psm", "6"], {
+    const tesseractCommand = await resolveTesseractCommand();
+    await execFileAsync(tesseractCommand, [inputPath, outputBase, "-l", "eng", "--psm", "6"], {
       timeout: 45000,
       windowsHide: true,
       maxBuffer: 1024 * 1024 * 4,
@@ -10806,7 +11111,13 @@ const parseDeliveryDocumentWithGemini = async (file) => {
   if (!String(apiKey || "").trim()) {
     throw new Error("GEMINI API Key belum dikonfigurasi.");
   }
-  const modelName = await ensureGeminiModel(pool);
+  const configuredModelName = await ensureGeminiModel(pool);
+  const modelCandidates = Array.from(new Set([
+    configuredModelName,
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash-lite",
+  ].map((value) => String(value || "").trim()).filter(Boolean)));
   const prompt = `
 Ekstrak isi dokumen Delivery Note dari gambar/PDF customer.
 Kembalikan HANYA JSON valid dengan struktur:
@@ -10841,64 +11152,83 @@ Aturan:
 - Jika ada nilai yang tidak pasti, gunakan tebakan terbaik dan sisakan null jika benar-benar tidak terbaca.
 - qtyOrder harus angka.
 `;
-  const contents = [{
-    role: "user",
-    parts: [
-      { text: prompt.trim() },
-      ...(await buildGeminiInlineParts(file)),
-    ],
-  }];
-  const payload = {
-    contents,
-    generationConfig: {
-      responseMimeType: "application/json",
-      temperature: 0.1,
-    },
-  };
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(apiKey)}`,
-    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) },
-  );
-  const text = await response.text();
-  let data = null;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = null;
-  }
-  if (!response.ok) {
-    const message = data?.error?.message || text || `AI request failed (${response.status})`;
-    throw new Error(message);
-  }
-  const contentText = data?.candidates?.[0]?.content?.parts?.map((part) => part?.text || "").join("").trim() || "";
-  if (!contentText) {
-    throw new Error("AI tidak mengembalikan hasil ekstraksi.");
-  }
-  const strippedText = contentText
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/```$/i, "")
-    .trim();
-  let parsed = null;
-  try {
-    parsed = JSON.parse(strippedText);
-  } catch {
-    const firstBrace = strippedText.indexOf("{");
-    const lastBrace = strippedText.lastIndexOf("}");
-    if (firstBrace >= 0 && lastBrace > firstBrace) {
-      const candidateText = strippedText.slice(firstBrace, lastBrace + 1);
+  const inlineParts = await buildGeminiInlineParts(file);
+  let lastError = null;
+  for (const modelName of modelCandidates) {
+    const contents = [{
+      role: "user",
+      parts: [
+        { text: prompt.trim() },
+        ...inlineParts,
+      ],
+    }];
+    const payload = {
+      contents,
+      generationConfig: {
+        responseMimeType: "application/json",
+        temperature: 0.1,
+      },
+    };
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) },
+      );
+      const text = await response.text();
+      let data = null;
       try {
-        parsed = JSON.parse(candidateText);
+        data = JSON.parse(text);
       } catch {
-        parsed = null;
+        data = null;
       }
-    } else {
-      parsed = null;
+      if (!response.ok) {
+        const message = data?.error?.message || text || `AI request failed (${response.status})`;
+        const error = new Error(`${modelName}: ${message}`);
+        error.statusCode = response.status;
+        throw error;
+      }
+      const contentText = data?.candidates?.[0]?.content?.parts?.map((part) => part?.text || "").join("").trim() || "";
+      if (!contentText) {
+        throw new Error(`${modelName}: AI tidak mengembalikan hasil ekstraksi.`);
+      }
+      const strippedText = contentText
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/```$/i, "")
+        .trim();
+      let parsed = null;
+      try {
+        parsed = JSON.parse(strippedText);
+      } catch {
+        const firstBrace = strippedText.indexOf("{");
+        const lastBrace = strippedText.lastIndexOf("}");
+        if (firstBrace >= 0 && lastBrace > firstBrace) {
+          const candidateText = strippedText.slice(firstBrace, lastBrace + 1);
+          try {
+            parsed = JSON.parse(candidateText);
+          } catch {
+            parsed = null;
+          }
+        } else {
+          parsed = null;
+        }
+      }
+      if (!parsed || typeof parsed !== "object") {
+        throw new Error(`${modelName}: AI tidak mengembalikan JSON yang valid.`);
+      }
+      return {
+        ...parsed,
+        extractionSource: modelName === configuredModelName ? "gemini" : `gemini_fallback:${modelName}`,
+        extractionWarning: modelName === configuredModelName ? "" : `Model utama ${configuredModelName} gagal/limit, sistem memakai ${modelName}.`,
+      };
+    } catch (error) {
+      lastError = error;
+      const message = String(error?.message || "");
+      if (!(isGeminiRateLimitError(error) || error?.statusCode === 404 || /not found|not supported|not available/i.test(message))) {
+        throw error;
+      }
     }
   }
-  if (!parsed || typeof parsed !== "object") {
-    throw new Error("AI tidak mengembalikan JSON yang valid.");
-  }
-  return parsed;
+  throw lastError || new Error("Gemini tidak mengembalikan hasil ekstraksi.");
 };
 
 const parseDeliveryDocumentForUpload = async (file) => {
@@ -10926,8 +11256,9 @@ const parseDeliveryDocumentForUpload = async (file) => {
       };
     } catch (localError) {
       if (isGeminiRateLimitError(geminiError)) {
+        const localMessage = localError?.message ? ` Detail OCR lokal: ${localError.message}` : "";
         throw createDeliveryUploadUserError(
-          "OCR Gemini sedang terkena limit/rate-limit. Coba lagi beberapa menit, atau install Tesseract lokal agar sistem bisa fallback tanpa menunggu Gemini.",
+          `OCR Gemini sedang terkena limit/rate-limit dan fallback OCR lokal belum berhasil membaca tabel DN.${localMessage}`,
           503,
           {
             code: "GEMINI_RATE_LIMIT",
@@ -11349,8 +11680,12 @@ const getScheduleStatusFromActual = ({ requestDate, arrivalDate, requestQty, rec
   const reqKey = formatDateOnly(reqDate);
   const arrKey = formatDateOnly(arrDate);
   const diffDays = Math.round((new Date(`${arrKey}T00:00:00`) - new Date(`${reqKey}T00:00:00`)) / 86400000);
-  if (diffDays >= -1 && diffDays <= 0) return "On Time";
-  return arrKey > reqKey ? "Late" : "Too Early";
+  const requested = Number(requestQty || 0);
+  const received = Number(receivedQty || 0);
+  const isPartial = requested > 0 && received > 0 && received < requested;
+  if (diffDays >= -1 && diffDays <= 0) return isPartial ? "Partial" : "On Time";
+  if (arrKey > reqKey) return isPartial ? "Partial Late" : "Late";
+  return isPartial ? "Partial Too Early" : "Too Early";
 };
 
 
@@ -11522,6 +11857,41 @@ const resolveKanbanItemCode = async (client, kanbanId) => {
     if (prefixResult.rows.length > 0) return prefixResult.rows[0].code;
   }
   return trimmed;
+};
+
+const resolveKanbanInputMode = async (client, rawValue, resolvedItemCode = "") => {
+  const raw = String(rawValue || "").trim();
+  const trimmed = extractKanbanIdToken(raw);
+  const itemCode = String(resolvedItemCode || "").trim();
+  if (!trimmed) return "manual_uniq";
+  if (raw.startsWith("{") && raw.endsWith("}")) {
+    try {
+      const payload = JSON.parse(raw);
+      if (payload?.kanbanId || payload?.kanban_id || payload?.cardUid || payload?.card_uid) return "kanban_card";
+      if (payload?.itemCode || payload?.item_code || payload?.uniq) return "manual_uniq";
+    } catch (_error) {
+      // fall through to table/format checks
+    }
+  }
+  const cardResult = await client.query(
+    `
+    select 1
+    from kanban_cards
+    where lower(card_uid) = lower($1)
+    union all
+    select 1
+    from inbound_cards
+    where lower(card_uid) = lower($1)
+    limit 1
+    `,
+    [trimmed],
+  );
+  if (cardResult.rows.length > 0) return "kanban_card";
+  const config = await getMasterConfigRow(client);
+  const format = config?.kanban_id_format || "KB-{CATEGORY}-{UNIQ}-{TOTAL:02}-{SEQ:02}";
+  if (trimmed.match(buildKanbanIdRegex(format))) return "kanban_card";
+  if (itemCode && trimmed.toLowerCase() === itemCode.toLowerCase()) return "manual_uniq";
+  return "kanban_card";
 };
 
 const resolveKanbanCardScanMeta = async (client, kanbanId, itemCode) => {
@@ -12075,6 +12445,9 @@ const finishKanbanProcessStep = async (client, { kanbanId = "", itemRow = null, 
 const buildKanbanScanPreview = async (client, { kanbanId = "", itemCode = "", qty = "", area = "" } = {}) => {
   const rawKanbanId = String(kanbanId || "").trim();
   let resolvedItemCode = String(itemCode || "").trim();
+  if (resolvedItemCode) {
+    resolvedItemCode = await resolveKanbanItemCode(client, resolvedItemCode);
+  }
   if (!resolvedItemCode && rawKanbanId) {
     resolvedItemCode = await resolveKanbanItemCode(client, rawKanbanId);
   }
@@ -12111,6 +12484,10 @@ const buildKanbanScanPreview = async (client, { kanbanId = "", itemCode = "", qt
       i.type,
       i.unit,
       i.model,
+      i.vendor_id,
+      i.supplier_name,
+      i.type_pack,
+      mp.name as type_pack_name,
       i.location_id,
       i.location_name,
       i.line_production,
@@ -12129,14 +12506,15 @@ const buildKanbanScanPreview = async (client, { kanbanId = "", itemCode = "", qt
       mw.site as warehouse_site
     from items i
     left join kanban_settings ks on ks.item_code = i.code
+    left join master_packings mp on mp.code = i.type_pack
     left join master_locations ml on ml.id = i.location_id
     left join master_warehouses mw on mw.id = ml.warehouse_id
-    where i.code = any($1::text[])
-       or i.part_no = any($1::text[])
-       or i.name = any($1::text[])
+    where lower(i.code) = any($1::text[])
+       or lower(i.part_no) = any($1::text[])
+       or lower(i.name) = any($1::text[])
     limit 1
     `,
-    [candidateValues],
+    [candidateValues.map((value) => String(value || "").toLowerCase())],
   );
   if (itemResult.rows.length === 0) {
     const error = new Error("Item tidak ditemukan");
@@ -12144,6 +12522,15 @@ const buildKanbanScanPreview = async (client, { kanbanId = "", itemCode = "", qt
     throw error;
   }
   const itemRow = itemResult.rows[0];
+  const vendorInfo = await getVendorRoleForItem(client, itemRow.code);
+  const supplierOptions = await resolveSupplierOptionsForItem(client, itemRow.code);
+  const supplierRaw = vendorInfo.supplier || itemRow.vendor_id || itemRow.supplier_name || "";
+  const supplierCode = supplierRaw ? await resolveSupplierCode(client, supplierRaw) : "";
+  const selectedSupplier = supplierOptions.find((row) => (
+    normalizeSupplierLookupValue(row.supplier) === normalizeSupplierLookupValue(supplierCode || supplierRaw)
+    || normalizeSupplierLookupValue(row.supplierCode) === normalizeSupplierLookupValue(supplierCode || supplierRaw)
+    || normalizeSupplierLookupValue(row.supplierName) === normalizeSupplierLookupValue(supplierCode || supplierRaw)
+  )) || supplierOptions[0] || null;
   const actionMeta = await resolveKanbanActionMeta(client, itemRow.type || itemRow.category || "");
   const routingSteps = resolveItemRoutingSteps(itemRow, processMap);
   const currentPositionCode = String(
@@ -12186,17 +12573,29 @@ const buildKanbanScanPreview = async (client, { kanbanId = "", itemCode = "", qt
     kanbanId: rawKanbanId || itemRow.code,
     routingSteps,
   });
+  const inputMode = await resolveKanbanInputMode(client, rawKanbanId || itemRow.code, itemRow.code);
+  const displayKanbanId = inputMode === "manual_uniq" ? itemRow.code : (rawKanbanId || itemRow.code);
   const currentProcessStep = processState.currentStep || nextStep || null;
   const nextProcessStep = processState.exists
     ? (processState.nextStep || null)
     : (routingSteps[1] || null);
   return {
     ok: true,
-    kanbanId: rawKanbanId || itemRow.code,
+    kanbanId: displayKanbanId,
     itemCode: itemRow.code,
     itemName: itemRow.name,
     partNo: itemRow.part_no || "",
+    unit: itemRow.unit || "",
+    typePack: itemRow.type_pack || "",
+    typePackName: itemRow.type_pack_name || "",
+    typePacking: itemRow.type_pack_name || itemRow.type_pack || "",
     itemLabel: `${itemRow.code} - ${itemRow.name}`,
+    inputMode,
+    isManualUniqInput: inputMode === "manual_uniq",
+    supplier: selectedSupplier?.supplier || supplierCode || supplierRaw || "",
+    supplierCode: selectedSupplier?.supplierCode || supplierCode || "",
+    supplierName: selectedSupplier?.supplierName || itemRow.supplier_name || supplierRaw || "",
+    supplierOptions,
     category: itemRow.type || "",
     itemCategoryCode: actionMeta.categoryCode,
     itemCategoryLabel: actionMeta.categoryLabel,
@@ -12379,6 +12778,102 @@ const requireFormat = (format, label) => {
 const normalizeVendorRole = (role) => String(role || "").trim().toLowerCase();
 
 const isScheduleVendor = (role) => normalizeVendorRole(role) === "schedule";
+
+const normalizeSupplierLookupValue = (value) => String(value || "").trim().toLowerCase();
+
+const extractSupplierOverrideFromNotes = (notes) => {
+  const text = String(notes || "");
+  const match = text.match(/(?:^|\s|\|)supplier:([^|]+)/i);
+  return match ? String(match[1] || "").trim() : "";
+};
+
+const resolveSupplierOptionsForItem = async (client, itemCode) => {
+  const code = String(itemCode || "").trim();
+  if (!code) return [];
+  const result = await client.query(
+    `
+    select
+      supplier_code,
+      supplier_name,
+      role,
+      share_percent,
+      source_order
+    from (
+      select
+        rel.vendor_id as supplier_code,
+        mv_rel.name as supplier_name,
+        mv_rel.role as role,
+        rel.share_percent,
+        0 as source_order
+      from item_suppliers rel
+      left join master_vendors mv_rel on mv_rel.id = rel.vendor_id
+      where rel.item_code = $1
+      union all
+      select
+        coalesce(nullif(trim(i.vendor_id), ''), mv_by_name.id, '') as supplier_code,
+        coalesce(mv_item.name, mv_by_name.name, nullif(trim(i.supplier_name), ''), nullif(trim(i.vendor_id), ''), '') as supplier_name,
+        coalesce(mv_item.role, mv_by_name.role, '') as role,
+        0::numeric as share_percent,
+        1 as source_order
+      from items i
+      left join master_vendors mv_item on mv_item.id = nullif(trim(i.vendor_id), '')
+      left join master_vendors mv_by_name on lower(mv_by_name.name) = lower(nullif(trim(i.supplier_name), ''))
+      where i.code = $1
+        and (coalesce(nullif(trim(i.vendor_id), ''), mv_by_name.id, nullif(trim(i.supplier_name), '')) is not null)
+    ) supplier_candidates
+    order by source_order asc, share_percent desc, supplier_code asc
+    `,
+    [code],
+  );
+  const seen = new Set();
+  return result.rows
+    .map((row) => {
+      const supplierCode = String(row.supplier_code || "").trim();
+      const supplierName = String(row.supplier_name || "").trim();
+      const key = normalizeSupplierLookupValue(supplierCode || supplierName);
+      if (!key || seen.has(key)) return null;
+      seen.add(key);
+      return {
+        supplier: supplierCode || supplierName,
+        supplierCode,
+        supplierName,
+        label: supplierName && supplierCode && supplierName !== supplierCode ? `${supplierCode} - ${supplierName}` : supplierCode || supplierName || "-",
+        role: row.role || "",
+        sharePercent: Number(row.share_percent || 0),
+      };
+    })
+    .filter(Boolean);
+};
+
+const resolveSupplierSelectionForItem = async (client, itemCode, supplierValue, options = {}) => {
+  const supplierOptions = await resolveSupplierOptionsForItem(client, itemCode);
+  const required = Boolean(options?.required);
+  const selectedRaw = String(supplierValue || "").trim();
+  if (!selectedRaw) {
+    if (required && supplierOptions.length === 0) {
+      const error = new Error("Supplier master item belum tersedia.");
+      error.statusCode = 409;
+      throw error;
+    }
+    return { selected: supplierOptions[0] || null, supplierOptions };
+  }
+  const resolvedCode = await resolveSupplierCode(client, selectedRaw);
+  const lookupValues = new Set([
+    normalizeSupplierLookupValue(selectedRaw),
+    normalizeSupplierLookupValue(resolvedCode),
+  ].filter(Boolean));
+  const selected = supplierOptions.find((row) => (
+    lookupValues.has(normalizeSupplierLookupValue(row.supplier))
+    || lookupValues.has(normalizeSupplierLookupValue(row.supplierCode))
+    || lookupValues.has(normalizeSupplierLookupValue(row.supplierName))
+  ));
+  if (!selected) {
+    const error = new Error("Supplier tidak sesuai master item.");
+    error.statusCode = 400;
+    throw error;
+  }
+  return { selected, supplierOptions };
+};
 
 const resolvePrimarySupplierForItem = async (client, itemCode) => {
   const code = String(itemCode || "").trim();
@@ -15702,126 +16197,10 @@ app.get("/api/schedules/today-summary", authenticate, requireNotSupplier, async 
 });
 
 app.post("/api/schedules/:id/split", authenticate, requirePermission("editSchedules"), async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id)) {
-      res.status(400).json({ error: "id tidak valid" });
-      return;
-    }
-
-    await client.query("begin");
-    const existingRow = await client.query("select * from schedules where id = $1 for update", [id]);
-    if (existingRow.rows.length === 0) {
-      await client.query("rollback");
-      res.status(404).json({ error: "data tidak ditemukan" });
-      return;
-    }
-
-    const existing = existingRow.rows[0];
-    const orderedQty = Math.max(0, Number(existing.request_qty || 0));
-    const receivedQty = Math.max(0, Number(existing.received_qty || 0));
-    const outstandingQty = Math.max(0, orderedQty - receivedQty);
-
-    if (!(receivedQty > 0 && receivedQty < orderedQty)) {
-      await client.query("rollback");
-      res.status(409).json({ error: "Hanya untuk penerimaan parsial." });
-      return;
-    }
-    if (outstandingQty <= 0) {
-      await client.query("rollback");
-      res.status(409).json({ error: "Tidak ada sisa untuk split." });
-      return;
-    }
-    if (existing.has_split) {
-      await client.query("rollback");
-      res.status(409).json({ error: "Jadwal sudah pernah di-split." });
-      return;
-    }
-
-    const notesValue = String(existing.notes || "").trim();
-    const nextNotes = notesValue
-      ? (notesValue.includes("(Parsial)") ? notesValue : `${notesValue} (Parsial)`)
-      : "(Parsial)";
-    const nextRequestQty = receivedQty;
-    const nextStatus = getScheduleStatusFromActual({
-      requestDate: existing.request_date,
-      arrivalDate: existing.arrival_date,
-      requestQty: nextRequestQty,
-      receivedQty,
-    });
-
-    const updatedResult = await client.query(
-      `
-        update schedules
-        set has_split = true,
-            notes = $2,
-            request_qty = $3,
-            status = $4,
-            updated_at = now()
-        where id = $1
-        returning *
-      `,
-      [id, nextNotes, nextRequestQty, nextStatus],
-    );
-    const updatedRow = updatedResult.rows[0];
-
-    let splitItemCode = normalizeItemCode(existing.item_code);
-    if (!splitItemCode && existing.po_line_id) {
-      const poLine = await resolvePoLineById(client, existing.po_line_id);
-      splitItemCode = normalizeItemCode(poLine?.item_code);
-    }
-    if (!splitItemCode) {
-      splitItemCode = normalizeItemCode(existing.item);
-    }
-    if (!splitItemCode) {
-      const error = new Error("Item wajib diisi (kode item).");
-      error.statusCode = 400;
-      throw error;
-    }
-
-    const createdResult = await client.query(
-      `
-        insert into schedules
-          (po_number, supplier, supplier_id, item, item_code, request_date, delivery_time, request_qty, arrival_date, received_qty, do_number, status, notes, has_split, is_split_result, actual_locked, dn_id, request_id, po_line_id)
-        values
-          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,false,true,false,$14,$15,$16)
-        returning *
-      `,
-      [
-        existing.po_number,
-        existing.supplier,
-        existing.supplier_id || existing.supplier,
-        splitItemCode,
-        splitItemCode,
-        existing.request_date,
-        existing.delivery_time,
-        outstandingQty,
-        null,
-        0,
-        null,
-        "Pending",
-        "Hasil Split dari Parsial",
-        existing.dn_id,
-        existing.request_id,
-        existing.po_line_id,
-      ],
-    );
-    const createdRow = createdResult.rows[0];
-
-    await createInboundCardsForSchedule(client, createdRow);
-    await client.query("commit");
-    clearScheduleCache();
-    res.json({
-      updated: mapRowToSchedule(updatedRow),
-      created: mapRowToSchedule(createdRow),
-    });
-  } catch (error) {
-    await client.query("rollback");
-    res.status(error.statusCode || 500).json({ error: error.message });
-  } finally {
-    client.release();
-  }
+  res.status(410).json({
+    error: "Split schedule parsial dinonaktifkan. Sisa qty tetap mengikuti schedule awal agar performance supplier tidak berubah.",
+    code: "PARTIAL_SCHEDULE_SPLIT_DISABLED",
+  });
 });
 
 app.post("/api/schedules", authenticate, requirePermission("editSchedules"), async (req, res) => {
@@ -15881,6 +16260,7 @@ app.post("/api/schedules", authenticate, requirePermission("editSchedules"), asy
       data.requestQty = Math.min(data.requestQty, remaining);
     }
     data.poLineId = poLine.id;
+    await assertUniqueScheduleKey(client, data);
     await ensureUniqueDoNumber(client, data);
     await client.query("begin");
     const nextStatus = getScheduleStatusFromActual({
@@ -15922,7 +16302,12 @@ app.post("/api/schedules", authenticate, requirePermission("editSchedules"), asy
     res.json(mapRowToSchedule(scheduleRow));
   } catch (error) {
     await client.query("rollback");
-    res.status(error.statusCode || 500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({
+      error: error.message,
+      code: error.code || null,
+      rowNumber: error.rowNumber || null,
+      duplicateSchedule: error.duplicateSchedule || null,
+    });
   } finally {
     client.release();
   }
@@ -15982,6 +16367,15 @@ app.post("/api/schedules/bulk", authenticate, requireAnyPermission("editSchedule
             requestDate: requestDateValue,
             arrivalDate: null,
           });
+          await assertUniqueScheduleKey(client, {
+            poNumber: data.poNumber,
+            supplier: poSupplierId,
+            supplierId: poSupplierId,
+            item: line.item_code,
+            itemCode: line.item_code,
+            requestDate: requestDateValue,
+            deliveryTime: deliveryTimeValue,
+          }, null, { rowNumber: index + 1 });
           const result = await client.query(
             `insert into schedules
               (po_number, supplier, supplier_id, item, item_code, request_date, delivery_time, request_qty, arrival_date, received_qty, do_number, status, notes, has_split, is_split_result, actual_locked, dn_id, request_id, po_line_id)
@@ -16052,6 +16446,7 @@ app.post("/api/schedules/bulk", authenticate, requireAnyPermission("editSchedule
         data.requestQty = Math.min(data.requestQty, remaining);
       }
       data.poLineId = poLine.id;
+      await assertUniqueScheduleKey(client, data, null, { rowNumber: index + 1 });
       await ensureUniqueDoNumber(client, data);
       const nextStatus = getScheduleStatusFromActual({
         requestDate: data.requestDate,
@@ -16209,6 +16604,7 @@ app.post("/api/schedules/bulk", authenticate, requireAnyPermission("editSchedule
         }
       }
 
+      await assertUniqueScheduleKey(client, data, id, { forUpdate: true });
       await ensureUniqueDoNumber(client, data, id);
       const nextStatus = getScheduleStatusFromActual({
         requestDate: data.requestDate || existing.request_date,
@@ -16382,7 +16778,12 @@ app.post("/api/schedules/bulk", authenticate, requireAnyPermission("editSchedule
       res.json(mapRowToSchedule(updatedRow));
     } catch (error) {
       await client.query("rollback");
-      res.status(error.statusCode || 500).json({ error: error.message });
+      res.status(error.statusCode || 500).json({
+        error: error.message,
+        code: error.code || null,
+        rowNumber: error.rowNumber || null,
+        duplicateSchedule: error.duplicateSchedule || null,
+      });
     } finally {
       client.release();
     }
@@ -17720,6 +18121,9 @@ app.get("/api/supplier/po", authenticate, requireSupplier, async (req, res) => {
         case
           when coalesce(ph.force_closed, false) then 'closed'
           when coalesce(sum(pl.qty_order), 0) <= coalesce(sum(pl.qty_received), 0) then 'closed'
+          when coalesce(sum(pl.qty_received), 0) > 0
+            and greatest(coalesce(sum(pl.qty_order - pl.qty_received), 0), 0) > 0
+            and greatest(coalesce(sum(pl.qty_order - pl.qty_received), 0), 0) < 100 then 'short closed'
           when coalesce(sum(pl.qty_received), 0) > 0 then 'partial'
           else 'open'
         end as status,
@@ -22354,6 +22758,7 @@ app.post("/api/delivery/upload-dn", authenticate, requirePermission("editSchedul
   } catch (error) {
     console.error("[delivery-upload] upload-dn failed:", {
       message: error?.message,
+      details: error?.details || null,
       stack: error?.stack,
       fileName: req.file?.originalname || null,
       fileType: req.file?.mimetype || null,
@@ -22984,6 +23389,7 @@ app.get("/api/quality/queue", authenticate, requirePermission("quality"), async 
           rni.item_code,
           coalesce(i.name, rni.item_name) as item_name,
           rni.part_no,
+          coalesce(nullif(i.unit, ''), nullif(rni.unit, '')) as item_unit,
           rnh.supplier,
           null::text as customer,
           rni.production_date,
@@ -23032,6 +23438,7 @@ app.get("/api/quality/queue", authenticate, requirePermission("quality"), async 
           coalesce(rn.item_code, s.item_code, s.item) as item_code,
           i.name as item_name,
           i.part_no,
+          i.unit as item_unit,
           coalesce(dn.supplier, s.supplier) as supplier,
           null::text as customer,
           null::date as production_date,
@@ -23090,6 +23497,7 @@ app.get("/api/quality/queue", authenticate, requirePermission("quality"), async 
           w.item_code,
           i.name as item_name,
           i.part_no,
+          i.unit as item_unit,
           null::text as supplier,
           null::text as customer,
           w.production_date,
@@ -23130,6 +23538,7 @@ app.get("/api/quality/queue", authenticate, requirePermission("quality"), async 
           qc.item_code,
           coalesce(i.name, qc.item_name) as item_name,
           coalesce(i.part_no, qc.part_no) as part_no,
+          i.unit as item_unit,
           qc.supplier,
           qc.customer,
           qc.production_date,
@@ -23196,6 +23605,7 @@ app.get("/api/quality/queue", authenticate, requirePermission("quality"), async 
       itemCode: row.item_code,
       itemName: row.item_name,
       partNo: row.part_no,
+      itemUnit: row.item_unit || null,
       supplier: row.supplier,
       customer: row.customer,
       productionDate: row.production_date,
@@ -23330,6 +23740,92 @@ app.get("/api/quality/millsheets", authenticate, requirePermission("quality"), a
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/quality/millsheets/bulk-review", authenticate, requirePermission("quality"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const ids = Array.from(new Set((Array.isArray(req.body?.ids) ? req.body.ids : [])
+      .map((value) => parsePositiveId(value))
+      .filter(Boolean)));
+    const status = normalizeMillsheetDocumentStatus(req.body?.status);
+    const notes = String(req.body?.notes || req.body?.qcNotes || req.body?.qc_notes || "").trim();
+    if (ids.length === 0) {
+      res.status(400).json({ error: "Pilih minimal satu Mill Sheet." });
+      return;
+    }
+    if (ids.length > 100) {
+      res.status(400).json({ error: "Bulk review maksimal 100 Mill Sheet per proses." });
+      return;
+    }
+    if (!["qc_approved", "qc_rejected"].includes(status)) {
+      res.status(400).json({ error: "Status review harus approve atau reject." });
+      return;
+    }
+
+    await client.query("begin");
+    const currentResult = await client.query(
+      "select * from millsheet_documents where id = any($1::int[]) for update",
+      [ids],
+    );
+    const currentRows = currentResult.rows || [];
+    if (currentRows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "Mill Sheet tidak ditemukan." });
+      return;
+    }
+
+    const updateResult = await client.query(
+      `
+      update millsheet_documents
+      set
+        status = $1,
+        qc_notes = $2,
+        reviewed_by = $3,
+        reviewed_at = now(),
+        updated_at = now()
+      where id = any($4::int[])
+      returning *
+      `,
+      [status, notes || null, req.user?.id || null, currentRows.map((row) => row.id)],
+    );
+
+    const dnIds = Array.from(new Set(currentRows.map((row) => row.dn_id).filter(Boolean)));
+    const rnIds = Array.from(new Set(currentRows.map((row) => row.rn_id).filter(Boolean)));
+    if (dnIds.length > 0) {
+      const relatedRnIds = await client.query(
+        `
+        select distinct rn_id
+        from receive_note_items
+        where origin_dn_id = any($1::int[])
+          and rn_id is not null
+        `,
+        [dnIds],
+      );
+      relatedRnIds.rows.forEach((row) => {
+        if (row.rn_id) rnIds.push(row.rn_id);
+      });
+    }
+
+    for (const dnId of dnIds) {
+      await refreshMillsheetStatusForDn(client, dnId);
+    }
+    for (const rnId of Array.from(new Set(rnIds))) {
+      await refreshMillsheetStatusForReceipt(client, rnId);
+    }
+
+    await client.query("commit");
+    res.json({
+      reviewedCount: updateResult.rows.length,
+      documents: updateResult.rows.map(mapMillsheetDocumentRow),
+      missingIds: ids.filter((id) => !currentRows.some((row) => Number(row.id) === Number(id))),
+    });
+  } catch (error) {
+    await client.query("rollback").catch(() => undefined);
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -23873,6 +24369,7 @@ app.post("/api/receive-notes/actual", authenticate, requirePermission("editSched
     );
     let nextLineNo = Number(nextLineNoResult.rows[0]?.next_line_no || 1);
     const allocationSummary = [];
+    let hasSystemSmallVariance = false;
 
     for (const item of groupedItems.values()) {
       const allocationResult = await buildActualDrivenReceiptAllocations(client, {
@@ -23922,6 +24419,9 @@ app.post("/api/receive-notes/actual", authenticate, requirePermission("editSched
           allocatedQty: allocation.allocatedQty,
           availableAfter: Math.max(0, Number(allocation.outstandingQty || 0) - Number(allocation.allocatedQty || 0)),
         }, req.user);
+        if (allocation.overrideReason === ACTUAL_DRIVEN_SMALL_VARIANCE_REASON) {
+          hasSystemSmallVariance = true;
+        }
         itemAllocations.push({
           allocationType: allocation.allocationType,
           scheduleId: allocation.scheduleId,
@@ -23932,6 +24432,8 @@ app.post("/api/receive-notes/actual", authenticate, requirePermission("editSched
           outstandingQty: allocation.outstandingQty,
           requestDate: allocation.requestDate,
           poDate: allocation.poDate,
+          overrideReason: allocation.overrideReason || null,
+          smallVarianceQty: Number(allocation.smallVarianceQty || 0),
         });
         nextLineNo += 1;
       }
@@ -23947,7 +24449,7 @@ app.post("/api/receive-notes/actual", authenticate, requirePermission("editSched
     }
 
     const postResult = await postReceiptDraft(client, header.id, req.user, {
-      allowOverReceive,
+      allowOverReceive: allowOverReceive || hasSystemSmallVariance,
       allowPartial: false,
     });
 
@@ -24395,13 +24897,23 @@ app.post("/api/stock-opname/sessions", authenticate, requirePermission("editSche
     const body = req.body || {};
     const period = String(body.period || body.opnamePeriod || "").trim();
     const locationId = String(body.locationId || "").trim();
-    const locationName = String(body.locationName || "").trim() || null;
+    const locationName = isAllStockOpnameLocation(locationId)
+      ? ALL_STOCK_OPNAME_LOCATION_LABEL
+      : String(body.locationName || "").trim() || null;
     const mode = normalizeStockOpnameMode(body.mode);
     const notes = String(body.notes || "").trim() || null;
     const sourceRefNo = String(body.sourceRefNo || "").trim() || null;
     const deviceGroup = String(body.deviceGroup || "").trim() || null;
     if (!period) {
       res.status(400).json({ error: "period wajib diisi." });
+      return;
+    }
+    if (!parseStockOpnamePeriod(period)) {
+      res.status(400).json({ error: "Period harus dipilih dari dropdown bulan-tahun." });
+      return;
+    }
+    if (isStockOpnamePeriodPast(period)) {
+      res.status(400).json({ error: "Periode yang sudah lewat tidak bisa dipilih untuk Start Stock Opname." });
       return;
     }
     if (!locationId) {
@@ -24449,7 +24961,68 @@ app.post("/api/stock-opname/sessions", authenticate, requirePermission("editSche
       [session.id, sessionNo],
     );
     const finalSession = updatedResult.rows[0];
+    const isAllPlantScope = isAllStockOpnameLocation(locationId);
+    const snapshotResult = await client.query(
+      `
+      insert into stock_opname_lines
+        (session_id, line_no, item_code, item_name, part_no, unit, location_id, location_name, lot_no, batch_id, snapshot_qty, counted_qty, variance_qty, qty_adjustment, uom, scan_mode, scan_source, scan_value, quality_status, reason_code, remarks, counted_by, verified_by, verified_at, posted_movement_id)
+      select
+        $1,
+        row_number() over (order by i.code asc)::int,
+        i.code,
+        i.name,
+        i.part_no,
+        i.unit,
+        coalesce(nullif(i.location_id, ''), $2),
+        coalesce(nullif(i.location_name, ''), nullif(i.line_production, ''), nullif(ml.line_description, ''), nullif(i.location_id, ''), $3, $2),
+        null,
+        null,
+        coalesce(i.qty_on_hand, 0),
+        0,
+        0,
+        0,
+        i.unit,
+        $4,
+        'snapshot',
+        null,
+        'ok',
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      from items i
+      left join master_locations ml on ml.id = i.location_id
+      where coalesce(i.code, '') <> ''
+        and (
+          lower(coalesce(i.item_status::text, 'active')) = 'active'
+          or coalesce(i.qty_on_hand, 0) <> 0
+        )
+        and (
+          $5::boolean
+          or lower(coalesce(i.location_id, '')) = lower($2)
+          or lower(coalesce(i.location_name, '')) = lower($2)
+          or lower(coalesce(i.line_production, '')) = lower($2)
+          or lower(coalesce(ml.line_description, '')) = lower($2)
+        )
+      order by i.code asc
+      returning id
+      `,
+      [session.id, locationId, locationName, mode, isAllPlantScope],
+    );
+    await refreshStockOpnameSessionTotals(client, session.id);
     await client.query("commit");
+    void recordActivityNotification(pool, {
+      userId: req.user?.id || null,
+      module: "Stock Opname",
+      severity: "info",
+      title: `Stock Opname ${period} dibuka.`,
+      detail: `Snapshot dibuat untuk ${snapshotResult.rowCount || 0} item.`,
+      entityType: "stock_opname_session",
+      entityId: String(session.id),
+      payload: { period, status: "open", locationId, locationName, itemCount: snapshotResult.rowCount || 0 },
+    }).catch((error) => console.warn("SO notification failed:", error.message));
     res.status(201).json(mapStockOpnameSessionRow(finalSession));
   } catch (error) {
     await client.query("rollback");
@@ -24504,9 +25077,12 @@ app.get("/api/stock-opname/sessions/:id/lines", authenticate, requirePermission(
         l.*,
         i.name as item_name_ref,
         i.location_name as item_location_name,
-        i.line_production
+        i.line_production,
+        i.price,
+        coalesce(i.pack_qty, ks.lot_qty, 0) as snp
       from stock_opname_lines l
       left join items i on i.code = l.item_code
+      left join kanban_settings ks on ks.item_code = l.item_code
       where l.session_id = $1
       order by l.line_no asc, l.id asc
       `,
@@ -24517,6 +25093,8 @@ app.get("/api/stock-opname/sessions/:id/lines", authenticate, requirePermission(
       itemNameRef: row.item_name_ref || null,
       itemLocationName: row.item_location_name || null,
       lineProduction: row.line_production || null,
+      price: Number(row.price || 0),
+      snp: Number(row.snp || 0),
     })));
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -24930,6 +25508,18 @@ app.delete("/api/stock-opname/sessions/:id", authenticate, requirePermission("ed
       return;
     }
     await client.query("begin");
+    const sessionResult = await client.query("select * from stock_opname_sessions where id = $1 for update", [id]);
+    if (sessionResult.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "session tidak ditemukan." });
+      return;
+    }
+    const currentStatus = String(sessionResult.rows[0]?.status || "").trim().toLowerCase();
+    if (["posted", "closed"].includes(currentStatus)) {
+      await client.query("rollback");
+      res.status(409).json({ error: "Session sudah selesai/posting dan tidak bisa dibatalkan." });
+      return;
+    }
     const result = await client.query(
       `
       update stock_opname_sessions
@@ -25546,7 +26136,14 @@ app.post("/api/schedules/reminder-email", authenticate, requirePermission("editS
         s.request_date,
         s.request_qty,
         s.received_qty,
-        s.status
+        s.status,
+        s.inbound_reminder_sent_at,
+        s.inbound_reminder_sent_to,
+        s.inbound_reminder_send_count,
+        s.inbound_reminder_last_subject,
+        s.inbound_reminder_smtp_status,
+        s.inbound_reminder_message_id,
+        s.inbound_reminder_rejected_to
       from schedules s
       left join items i on lower(i.code) = lower(coalesce(s.item_code, s.item))
       where (s.supplier = $1 or s.supplier_id = $1)
@@ -25560,6 +26157,49 @@ app.post("/api/schedules/reminder-email", authenticate, requirePermission("editS
       res.status(404).json({ error: "Tidak ada jadwal yang belum terpenuhi untuk supplier & tanggal ini." });
       return;
     }
+    const reminderSendCount = Math.max(0, ...schedulesResult.rows.map((row) => Number(row.inbound_reminder_send_count || 0)));
+    const previousReminder = schedulesResult.rows.find((row) => row.inbound_reminder_sent_at || Number(row.inbound_reminder_send_count || 0) > 0);
+    if (reminderSendCount >= 3) {
+      res.json({
+        sent: false,
+        alreadySent: true,
+        reminderLimitReached: true,
+        reminderLevel: 3,
+        to: previousReminder?.inbound_reminder_sent_to || null,
+        subject: previousReminder?.inbound_reminder_last_subject || "",
+        emailSentAt: previousReminder?.inbound_reminder_sent_at || null,
+        emailSentTo: previousReminder?.inbound_reminder_sent_to || "",
+        emailLastSubject: previousReminder?.inbound_reminder_last_subject || "",
+        emailSendCount: reminderSendCount,
+        smtpStatus: previousReminder?.inbound_reminder_smtp_status || "",
+        messageId: previousReminder?.inbound_reminder_message_id || "",
+        rejectedTo: previousReminder?.inbound_reminder_rejected_to || "",
+        notice: `Reminder inbound schedule untuk ${supplier} tanggal ${formatDateId(requestDate)} sudah mencapai Level 3. Tidak bisa kirim reminder lagi.`,
+      });
+      return;
+    }
+    const reminderLevel = reminderSendCount + 1;
+    const reminderLevelMeta = {
+      1: {
+        label: "REMINDER 1",
+        subjectPrefix: "[REMINDER 1]",
+        color: "#2563eb",
+        message: "Mohon konfirmasi dan penuhi jadwal pengiriman sesuai tanggal plan.",
+      },
+      2: {
+        label: "REMINDER 2",
+        subjectPrefix: "[REMINDER 2 - FOLLOW UP]",
+        color: "#d97706",
+        message: "Reminder kedua: jadwal masih belum terpenuhi. Mohon segera kirim update kesanggupan dan rencana pengiriman.",
+      },
+      3: {
+        label: "REMINDER 3",
+        subjectPrefix: "[REMINDER 3 - FINAL]",
+        color: "#dc2626",
+        message: "Reminder ketiga/final: jadwal belum terpenuhi dan perlu prioritas segera. Mohon eskalasi internal supplier dan konfirmasi final.",
+      },
+    };
+    const reminderMeta = reminderLevelMeta[reminderLevel] || reminderLevelMeta[3];
     const vendorResult = await client.query(
       "select email from master_vendors where id::text = $1::text or name::text = $1::text limit 1",
       [supplier],
@@ -25571,7 +26211,7 @@ app.post("/api/schedules/reminder-email", authenticate, requirePermission("editS
       res.status(400).json({ error: `Format email supplier tidak valid: ${invalidEmails.join(", ")}` });
       return;
     }
-    const subject = `[URGENT] Inbound Schedule Reminder - ${supplier} - ${formatDateId(requestDate)}`;
+    const subject = `${reminderMeta.subjectPrefix} Inbound Schedule - ${supplier} - ${formatDateId(requestDate)}`;
     const senderName = String(req.user?.username || "").trim();
     const senderLabel = senderName ? `Logistics Team - ${senderName}` : "Logistics Team";
     const rowsHtml = schedulesResult.rows.map((row) => {
@@ -25602,6 +26242,9 @@ app.post("/api/schedules/reminder-email", authenticate, requirePermission("editS
 
     const html = `
       <p>Kepada Yth. <strong>${escapeHtml(supplier)}</strong>,</p>
+      <p style="margin:0 0 12px;padding:10px 12px;border-left:4px solid ${reminderMeta.color};background:#f8fafc;font-weight:bold;color:${reminderMeta.color};">
+        ${escapeHtml(reminderMeta.label)} - ${escapeHtml(reminderMeta.message)}
+      </p>
       <p>Berikut adalah pengingat jadwal kedatangan barang (Inbound Schedule) yang <strong>wajib dikirim</strong> sesuai tanggal di bawah ini:</p>
       <table border="1" cellpadding="10" cellspacing="0" style="border-collapse: collapse; width: 100%; font-family: Arial, sans-serif;">
         <thead>
@@ -25626,6 +26269,7 @@ app.post("/api/schedules/reminder-email", authenticate, requirePermission("editS
     if (toEmails.length === 0) {
       res.json({
         sent: false,
+        reminderLevel,
         to: null,
         subject,
         html,
@@ -25634,9 +26278,9 @@ app.post("/api/schedules/reminder-email", authenticate, requirePermission("editS
       return;
     }
 
-    const smtpHost = String(process.env.SMTP_HOST || "").trim();
-    if (!smtpHost) {
-      res.json({ sent: false, to: recipientLabel, subject, html, notice: getSmtpMissingConfigMessage() });
+    const smtpConfig = await getSmtpConfig(client);
+    if (!smtpConfig.host) {
+      res.json({ sent: false, reminderLevel, to: recipientLabel, subject, html, notice: getSmtpMissingConfigMessage() });
       return;
     }
     let nodemailer;
@@ -25646,19 +26290,14 @@ app.post("/api/schedules/reminder-email", authenticate, requirePermission("editS
       res.status(500).json({ error: "Nodemailer belum terpasang. Jalankan npm install nodemailer di server." });
       return;
     }
-    const smtpPort = Number(process.env.SMTP_PORT || 587);
-    const smtpUser = String(process.env.SMTP_USER || "").trim();
-    const smtpPass = String(process.env.SMTP_PASS || "").trim();
-    const smtpSecure = String(process.env.SMTP_SECURE || "").toLowerCase() === "true";
-    const fromAddress = String(process.env.SMTP_FROM || smtpUser || "no-reply@example.com").trim();
     const transporter = nodemailer.createTransport({
-      host: smtpHost,
-      port: smtpPort,
-      secure: smtpSecure,
-      auth: smtpUser ? { user: smtpUser, pass: smtpPass } : undefined,
+      host: smtpConfig.host,
+      port: smtpConfig.port,
+      secure: smtpConfig.secure,
+      auth: smtpConfig.user ? { user: smtpConfig.user, pass: smtpConfig.pass } : undefined,
     });
     const sendInfo = await transporter.sendMail({
-      from: formatEmailFromAddress(fromAddress, senderLabel),
+      from: formatEmailFromAddress(smtpConfig.from, senderLabel),
       to: toEmails,
       subject,
       html,
@@ -25690,10 +26329,21 @@ app.post("/api/schedules/reminder-email", authenticate, requirePermission("editS
             inbound_email_smtp_status = $6,
             inbound_email_message_id = $7,
             inbound_email_rejected_to = $8,
+            inbound_reminder_sent_at = now(),
+            inbound_reminder_sent_to = $2,
+            inbound_reminder_sent_by = $3,
+            inbound_reminder_last_subject = $4,
+            inbound_reminder_send_count = coalesce(inbound_reminder_send_count, 0) + 1,
+            inbound_reminder_last_error = $5,
+            inbound_reminder_smtp_status = $6,
+            inbound_reminder_message_id = $7,
+            inbound_reminder_rejected_to = $8,
             updated_at = now()
         where id = any($1::int[])
         returning inbound_email_sent_at, inbound_email_sent_to, inbound_email_last_subject, inbound_email_send_count,
-          inbound_email_last_error, inbound_email_smtp_status, inbound_email_message_id, inbound_email_rejected_to
+          inbound_email_last_error, inbound_email_smtp_status, inbound_email_message_id, inbound_email_rejected_to,
+          inbound_reminder_sent_at, inbound_reminder_sent_to, inbound_reminder_last_subject, inbound_reminder_send_count,
+          inbound_reminder_last_error, inbound_reminder_smtp_status, inbound_reminder_message_id, inbound_reminder_rejected_to
         `,
         [scheduleIds, recipientLabel, req.user?.id || null, subject, smtpError, smtpStatus, sendInfo?.messageId || "", rejectedEmails.join(", ")],
       );
@@ -25709,10 +26359,19 @@ app.post("/api/schedules/reminder-email", authenticate, requirePermission("editS
       emailSentTo: emailMeta?.inbound_email_sent_to || recipientLabel,
       emailLastSubject: emailMeta?.inbound_email_last_subject || subject,
       emailSendCount: emailMeta?.inbound_email_send_count || 1,
+      reminderLevel,
       emailLastError: emailMeta?.inbound_email_last_error || "",
       smtpStatus: emailMeta?.inbound_email_smtp_status || smtpStatus,
       messageId: emailMeta?.inbound_email_message_id || sendInfo?.messageId || "",
       rejectedTo: emailMeta?.inbound_email_rejected_to || rejectedEmails.join(", "),
+      reminderSentAt: emailMeta?.inbound_reminder_sent_at || null,
+      reminderSentTo: emailMeta?.inbound_reminder_sent_to || recipientLabel,
+      reminderLastSubject: emailMeta?.inbound_reminder_last_subject || subject,
+      reminderSendCount: emailMeta?.inbound_reminder_send_count || 1,
+      reminderLastError: emailMeta?.inbound_reminder_last_error || "",
+      reminderSmtpStatus: emailMeta?.inbound_reminder_smtp_status || smtpStatus,
+      reminderMessageId: emailMeta?.inbound_reminder_message_id || sendInfo?.messageId || "",
+      reminderRejectedTo: emailMeta?.inbound_reminder_rejected_to || rejectedEmails.join(", "),
       acceptedTo: acceptedEmails.join(", "),
       pendingTo: pendingEmails.join(", "),
       recipients: buildEmailRecipientReport(toEmails, acceptedEmails, pendingEmails, rejectedEmails),
@@ -25787,8 +26446,8 @@ app.post("/api/schedules/send-pdf-email", authenticate, requirePermission("editS
       return;
     }
 
-    const smtpHost = String(process.env.SMTP_HOST || "").trim();
-    if (!smtpHost) {
+    const smtpConfig = await getSmtpConfig(client);
+    if (!smtpConfig.host) {
       res.status(409).json({ error: getSmtpMissingConfigMessage() });
       return;
     }
@@ -25813,16 +26472,11 @@ app.post("/api/schedules/send-pdf-email", authenticate, requirePermission("editS
       return;
     }
 
-    const smtpPort = Number(process.env.SMTP_PORT || 587);
-    const smtpUser = String(process.env.SMTP_USER || "").trim();
-    const smtpPass = String(process.env.SMTP_PASS || "").trim();
-    const smtpSecure = String(process.env.SMTP_SECURE || "").toLowerCase() === "true";
-    const fromAddress = String(process.env.SMTP_FROM || smtpUser || "no-reply@example.com").trim();
     const transporter = nodemailer.createTransport({
-      host: smtpHost,
-      port: smtpPort,
-      secure: smtpSecure,
-      auth: smtpUser ? { user: smtpUser, pass: smtpPass } : undefined,
+      host: smtpConfig.host,
+      port: smtpConfig.port,
+      secure: smtpConfig.secure,
+      auth: smtpConfig.user ? { user: smtpConfig.user, pass: smtpConfig.pass } : undefined,
     });
 
     const totalRows = Number(summary.totalRows || schedulesResult.rows.length || 0);
@@ -25863,7 +26517,7 @@ app.post("/api/schedules/send-pdf-email", authenticate, requirePermission("editS
     `;
 
     const sendInfo = await transporter.sendMail({
-      from: formatEmailFromAddress(fromAddress, senderLabel),
+      from: formatEmailFromAddress(smtpConfig.from, senderLabel),
       to: toEmails,
       subject,
       html,
@@ -26016,8 +26670,8 @@ app.post("/api/schedules/send-full-pdf-email", authenticate, requirePermission("
       return;
     }
 
-    const smtpHost = String(process.env.SMTP_HOST || "").trim();
-    if (!smtpHost) {
+    const smtpConfig = await getSmtpConfig(client);
+    if (!smtpConfig.host) {
       res.status(409).json({ error: getSmtpMissingConfigMessage() });
       return;
     }
@@ -26042,16 +26696,11 @@ app.post("/api/schedules/send-full-pdf-email", authenticate, requirePermission("
       return;
     }
 
-    const smtpPort = Number(process.env.SMTP_PORT || 587);
-    const smtpUser = String(process.env.SMTP_USER || "").trim();
-    const smtpPass = String(process.env.SMTP_PASS || "").trim();
-    const smtpSecure = String(process.env.SMTP_SECURE || "").toLowerCase() === "true";
-    const fromAddress = String(process.env.SMTP_FROM || smtpUser || "no-reply@example.com").trim();
     const transporter = nodemailer.createTransport({
-      host: smtpHost,
-      port: smtpPort,
-      secure: smtpSecure,
-      auth: smtpUser ? { user: smtpUser, pass: smtpPass } : undefined,
+      host: smtpConfig.host,
+      port: smtpConfig.port,
+      secure: smtpConfig.secure,
+      auth: smtpConfig.user ? { user: smtpConfig.user, pass: smtpConfig.pass } : undefined,
     });
 
     const supplierLabel = String(vendorResult.rows[0]?.name || supplier).trim();
@@ -26081,7 +26730,7 @@ app.post("/api/schedules/send-full-pdf-email", authenticate, requirePermission("
     `;
 
     const sendInfo = await transporter.sendMail({
-      from: formatEmailFromAddress(fromAddress, senderLabel),
+      from: formatEmailFromAddress(smtpConfig.from, senderLabel),
       to: toEmails,
       subject,
       html,
@@ -26651,7 +27300,7 @@ app.post("/api/kanban/requests/batch-dn", authenticate, requirePermission("editS
     );
     const supplierGroups = new Map();
     for (const row of validRows) {
-      const supplierValue = supplierByItem.get(row.item_code);
+      const supplierValue = extractSupplierOverrideFromNotes(row.notes) || supplierByItem.get(row.item_code);
       const supplierKey = String(supplierValue || "").trim();
       if (!supplierKey) {
         skipped.push({ id: row.id, itemCode: row.item_code, requestQty: Number(row.request_qty || 0), reason: "missing_supplier" });
@@ -26838,6 +27487,9 @@ const handleKanbanEmptyScan = async (req, res) => {
     const rawKanbanId = extractKanbanIdToken(body.kanbanId || body.kanban_uuid || body.kanban_id || "");
     const locationId = String(body.area || body.locationId || body.location_id || "").trim() || null;
     let itemCode = body.itemCode || "";
+    if (itemCode) {
+      itemCode = await resolveKanbanItemCode(client, itemCode);
+    }
     if (!itemCode && rawKanbanId) {
       itemCode = await resolveKanbanItemCode(client, rawKanbanId);
     }
@@ -26858,7 +27510,12 @@ const handleKanbanEmptyScan = async (req, res) => {
     qtyValue = normalizeQtyByPack(qtyValue, packQty);
 
     const itemInfoResult = await client.query(
-      "select name, part_no, vendor_id, supplier_name from items where code = $1",
+      `
+      select i.name, i.part_no, i.vendor_id, i.supplier_name, i.type_pack, mp.name as type_pack_name
+      from items i
+      left join master_packings mp on mp.code = i.type_pack
+      where i.code = $1
+      `,
       [itemCode],
     );
     if (itemInfoResult.rows.length === 0) {
@@ -26867,9 +27524,22 @@ const handleKanbanEmptyScan = async (req, res) => {
     }
     const itemName = itemInfoResult.rows[0]?.name || null;
     const partNo = itemInfoResult.rows[0]?.part_no || null;
+    const typePack = itemInfoResult.rows[0]?.type_pack || "";
+    const typePackName = itemInfoResult.rows[0]?.type_pack_name || "";
     const supplierHint = itemInfoResult.rows[0]?.vendor_id || itemInfoResult.rows[0]?.supplier_name || "";
 
-    const isScan = Boolean(rawKanbanId) || String(req.originalUrl || "").includes("/api/kanban/scan");
+    const forceManualInput = body.manualInput === true || String(body.source || "").trim() === "manual_confirm";
+    const isScan = !forceManualInput && (Boolean(rawKanbanId) || String(req.originalUrl || "").includes("/api/kanban/scan"));
+    const inputMode = await resolveKanbanInputMode(client, rawKanbanId || itemCode, itemCode);
+    if (!forceManualInput && inputMode === "manual_uniq") {
+      res.status(409).json({
+        error: "Input uniq wajib dikonfirmasi manual dengan qty dan supplier.",
+        code: "MANUAL_CONFIRM_REQUIRED",
+        inputMode,
+        itemCode,
+      });
+      return;
+    }
     if (isScan && !rawKanbanId) {
       res.status(400).json({ error: "kanban_uuid wajib diisi" });
       return;
@@ -26897,8 +27567,14 @@ const handleKanbanEmptyScan = async (req, res) => {
     }
 
     const vendorInfo = await getVendorRoleForItem(client, itemCode);
-    const supplierRaw = vendorInfo.supplier || supplierHint;
-    const supplierCode = supplierRaw ? await resolveSupplierCode(client, supplierRaw) : "";
+    const requestedSupplier = String(body.supplier || body.supplierId || body.supplier_id || "").trim();
+    const supplierSelection = forceManualInput
+      ? await resolveSupplierSelectionForItem(client, itemCode, requestedSupplier, { required: true })
+      : { selected: null, supplierOptions: [] };
+    const manualSupplier = supplierSelection.selected || null;
+    const supplierRaw = manualSupplier?.supplier || vendorInfo.supplier || supplierHint;
+    const supplierCode = manualSupplier?.supplierCode || (supplierRaw ? await resolveSupplierCode(client, supplierRaw) : "");
+    const supplierName = manualSupplier?.supplierName || "";
     let productionId = null;
     const operatorId = req.user?.id || null;
     const scanTimestamp = new Date();
@@ -26944,7 +27620,8 @@ const handleKanbanEmptyScan = async (req, res) => {
       sourceRefId: productionId,
     });
 
-    if (isScheduleVendor(vendorInfo.role)) {
+    const effectiveVendorRole = manualSupplier?.role || vendorInfo.role;
+    if (isScheduleVendor(effectiveVendorRole)) {
       await client.query("commit");
       void recordActivityNotification(pool, {
         userId: req.user?.id || null,
@@ -26974,8 +27651,9 @@ const handleKanbanEmptyScan = async (req, res) => {
         responsePayload.data = {
           part_name: itemName || "-",
           qty: qtyValue,
+          type_pack: typePackName || typePack || "-",
           scan_time: scanTimestamp.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }),
-          supplier: supplierCode || supplierRaw || "-",
+          supplier: supplierCode || supplierName || supplierRaw || "-",
         };
       }
       res.json(responsePayload);
@@ -27015,8 +27693,9 @@ const handleKanbanEmptyScan = async (req, res) => {
         responsePayload.data = {
           part_name: itemName || "-",
           qty: qtyValue,
+          type_pack: typePackName || typePack || "-",
           scan_time: scanTimestamp.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }),
-          supplier: supplierCode || supplierRaw || "-",
+          supplier: supplierCode || supplierName || supplierRaw || "-",
         };
       }
       res.json(responsePayload);
@@ -27028,6 +27707,7 @@ const handleKanbanEmptyScan = async (req, res) => {
     const noteParts = [];
     if (locationId) noteParts.push(`area:${locationId}`);
     if (rawKanbanId) noteParts.push(`kanban:${rawKanbanId}`);
+    if (manualSupplier?.supplier) noteParts.push(`supplier:${manualSupplier.supplier}`);
     if (prlPlan.prlId) noteParts.push(`prl:${prlPlan.year}:${prlPlan.monthKey}:${prlPlan.prlId}`);
     if (prlPlan.overPrl || cardMeta.overPrl) noteParts.push("over_prl");
     const limits = await resolveItemDeliveryLimits(client, itemCode);
@@ -27104,10 +27784,11 @@ const handleKanbanEmptyScan = async (req, res) => {
       responsePayload.data = {
         part_name: itemName || "-",
         qty: qtyValue,
+        type_pack: typePackName || typePack || "-",
         scan_time: scanTimestamp.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }),
-        supplier: supplierCode || supplierRaw || "-",
+        supplier: supplierCode || supplierName || supplierRaw || "-",
       };
-    }
+      }
     res.json(responsePayload);
   } catch (error) {
     await client.query("rollback");
@@ -27480,6 +28161,9 @@ app.post("/api/kanban/requests/:id/approve-dn", authenticate, requirePermission(
       }
     }
     let supplierValue = supplier ? String(supplier).trim() : "";
+    if (!supplierValue) {
+      supplierValue = extractSupplierOverrideFromNotes(requestRow.notes);
+    }
     if (!supplierValue) {
       const supplierMeta = await resolvePrimarySupplierForItem(client, requestRow.item_code);
       supplierValue = supplierMeta.supplierCode || supplierMeta.supplierName || "";
@@ -29257,6 +29941,7 @@ app.post("/api/prl/import", authenticate, requirePermission("prlImport"), async 
     let updated = 0;
     let duplicate = 0;
     let skipped = 0;
+    let seasonalActivated = 0;
 
     await client.query("begin");
     transactionStarted = true;
@@ -29346,6 +30031,7 @@ app.post("/api/prl/import", authenticate, requirePermission("prlImport"), async 
           months[key] = 0;
         }
       });
+      const hasPositivePrlQty = PRL_MONTH_KEYS.some((monthKey) => Number(months?.[monthKey] || 0) > 0);
       const existingPrlResult = await client.query(
         "select id, status from prl_records where item_code = $1 and year = $2",
         [uniq, targetYear],
@@ -29421,6 +30107,27 @@ app.post("/api/prl/import", authenticate, requirePermission("prlImport"), async 
       } else {
         inserted += 1;
       }
+      if (hasPositivePrlQty) {
+        const activationResult = await client.query(
+          `
+          update items
+          set
+            item_status = 'active',
+            inactive_remarks = '',
+            is_seasonal = true,
+            moving_status = 'SEASONAL'::moving_status_enum
+          where code = $1
+            and (
+              item_status is distinct from 'active'
+              or coalesce(inactive_remarks, '') <> ''
+              or is_seasonal is distinct from true
+              or moving_status::text is distinct from 'SEASONAL'
+            )
+          `,
+          [uniq],
+        );
+        seasonalActivated += activationResult.rowCount || 0;
+      }
     }
     await client.query("commit");
     transactionStarted = false;
@@ -29464,6 +30171,7 @@ app.post("/api/prl/import", authenticate, requirePermission("prlImport"), async 
       duplicate,
       skipped,
       saved: inserted + updated,
+      seasonalActivated,
       duplicateRows,
       skippedRows,
       errorDetails: detailRows,
@@ -29581,6 +30289,7 @@ app.post("/api/prl/release", authenticate, requirePermission("prlProcess"), asyn
       )
     )).length;
     let updated = 0;
+    let seasonalActivated = 0;
     if (releasableRows.length > 0) {
       const ids = releasableRows.map((row) => row.id);
       const result = await client.query(
@@ -29617,6 +30326,33 @@ app.post("/api/prl/release", authenticate, requirePermission("prlProcess"), asyn
         [ids, `{${monthKey}}`, monthKey, req.user?.id || null],
       );
       updated = result.rowCount;
+      const positiveItemCodes = Array.from(new Set(
+        releasableRows
+          .filter((row) => Number(row.month_qty || 0) > 0)
+          .map((row) => String(row.item_code || "").trim())
+          .filter(Boolean),
+      ));
+      if (positiveItemCodes.length > 0) {
+        const activationResult = await client.query(
+          `
+          update items
+          set
+            item_status = 'active',
+            inactive_remarks = '',
+            is_seasonal = true,
+            moving_status = 'SEASONAL'::moving_status_enum
+          where code = any($1::text[])
+            and (
+              item_status is distinct from 'active'
+              or coalesce(inactive_remarks, '') <> ''
+              or is_seasonal is distinct from true
+              or moving_status::text is distinct from 'SEASONAL'
+            )
+          `,
+          [positiveItemCodes],
+        );
+        seasonalActivated = activationResult.rowCount || 0;
+      }
     }
     const recalculation = parentEligibleRows.length > 0
       ? await recalculateKanbanFromReleasedPrl(client, {
@@ -29631,6 +30367,7 @@ app.post("/api/prl/release", authenticate, requirePermission("prlProcess"), asyn
       alreadyActive,
       autoDraftReleased,
       zeroQtyReleased,
+      seasonalActivated,
       kanbanCalculated: recalculation.updated,
       workingDays: recalculation.workingDays,
       eligible: parentEligibleRows.length,
@@ -31229,15 +31966,101 @@ app.put("/api/master/items/:code", authenticate, requireManageItems, async (req,
 });
 
 app.delete("/api/master/items/:code", authenticate, requireManageItems, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const result = await pool.query("delete from items where code = $1 returning *", [req.params.code]);
-    if (result.rows.length === 0) {
+    const code = String(req.params.code || "").trim();
+    if (!code) {
+      res.status(400).json({ error: "code wajib diisi" });
+      return;
+    }
+    const existsResult = await client.query("select code from items where code = $1", [code]);
+    if (existsResult.rows.length === 0) {
       res.status(404).json({ error: "item tidak ditemukan" });
       return;
     }
+    const usageResult = await client.query(
+      `
+      select
+        (select count(*)::int from master_bom_headers where parent_code = $1) as bom_parent,
+        (select count(*)::int from master_bom where parent_code = $1 or child_code = $1) as bom_line,
+        (select count(*)::int from prl_records where item_code = $1) as prl,
+        (select count(*)::int from po_lines where item_code = $1) as po_line,
+        (select count(*)::int from schedules where item_code = $1 or item = $1) as schedule,
+        (select count(*)::int from stock_batches where item_code = $1) as stock_batch,
+        (select count(*)::int from stock_movements where item_code = $1) as stock_movement,
+        (select count(*)::int from inventory_ledgers where item_id = $1) as inventory_ledger,
+        (select count(*)::int from stock_opname_lines where item_code = $1) as stock_opname,
+        (select count(*)::int from inventory_reservations where item_code = $1) as reservation,
+        (select count(*)::int from inventory_allocations where item_code = $1) as allocation,
+        (select count(*)::int from kanban_requests where item_code = $1) as kanban_request,
+        (select count(*)::int from delivery_note_items where item_code = $1) as delivery_note,
+        (select count(*)::int from receive_note_items where item_code = $1) as receive_note,
+        (select count(*)::int from quality_cases where item_code = $1) as quality_case,
+        (select count(*)::int from production_orders where product_code = $1) as production_order,
+        (select count(*)::int from production_consumption where item_code = $1) as production_consumption,
+        (select count(*)::int from subcon_deliveries where item_code = $1) as subcon_delivery,
+        (select count(*)::int from subcon_receipts where product_code = $1) as subcon_receipt,
+        (select count(*)::int from subcon_backflush_lines where item_code = $1) as subcon_backflush,
+        (select count(*)::int from subcon_stock_movements where item_code = $1) as subcon_movement,
+        (select count(*)::int from subcon_stock_opname where item_code = $1) as subcon_opname
+      `,
+      [code],
+    );
+    const usage = usageResult.rows[0] || {};
+    const usageLabels = {
+      bom_parent: "BOM parent",
+      bom_line: "BOM line",
+      prl: "PRL",
+      po_line: "PO",
+      schedule: "Schedule",
+      stock_batch: "Stock batch",
+      stock_movement: "Stock movement",
+      inventory_ledger: "Kartu stok",
+      stock_opname: "Stock opname",
+      reservation: "Inventory reservation",
+      allocation: "Inventory allocation",
+      kanban_request: "Kanban request",
+      delivery_note: "DN",
+      receive_note: "RN",
+      quality_case: "Quality case",
+      production_order: "Production order",
+      production_consumption: "Production consumption",
+      subcon_delivery: "Subcon delivery",
+      subcon_receipt: "Subcon receipt",
+      subcon_backflush: "Subcon backflush",
+      subcon_movement: "Subcon movement",
+      subcon_opname: "Subcon opname",
+    };
+    const blockers = Object.entries(usageLabels)
+      .map(([key, label]) => ({ key, label, count: Number(usage[key] || 0) }))
+      .filter((entry) => entry.count > 0);
+    if (blockers.length > 0) {
+      const preview = blockers.slice(0, 5).map((entry) => `${entry.label}: ${entry.count}`).join(", ");
+      const suffix = blockers.length > 5 ? `, dan ${blockers.length - 5} modul lain` : "";
+      res.status(400).json({
+        error: `Item ${code} tidak bisa dihapus karena masih dipakai di ${preview}${suffix}. Ubah Status Item menjadi Non Aktif jika item tidak dipakai lagi.`,
+        code: "ITEM_IN_USE",
+        details: blockers,
+      });
+      return;
+    }
+    await client.query("begin");
+    await client.query("delete from item_suppliers where item_code = $1", [code]);
+    await client.query("delete from item_customers where item_code = $1", [code]);
+    await client.query("delete from kanban_settings where item_code = $1", [code]);
+    const result = await client.query("delete from items where code = $1 returning *", [code]);
+    if (result.rows.length === 0) {
+      await client.query("rollback");
+      res.status(404).json({ error: "item tidak ditemukan" });
+      return;
+    }
+    await client.query("commit");
     res.json({ ok: true });
   } catch (error) {
+    await client.query("rollback").catch(() => {});
     res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -31664,6 +32487,46 @@ app.put("/api/settings/ai", authenticate, requireRole("admin"), async (req, res)
   }
 });
 
+app.get("/api/settings/email", authenticate, requireRole("admin"), async (req, res) => {
+  try {
+    const smtpConfig = await getSmtpConfig(pool);
+    res.json({
+      smtpHost: smtpConfig.host || "",
+      smtpPort: String(smtpConfig.port || 587),
+      smtpUser: smtpConfig.user || "",
+      smtpPass: smtpConfig.pass || "",
+      smtpFrom: smtpConfig.from || "",
+      smtpSecure: Boolean(smtpConfig.secure),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal memuat pengaturan email." });
+  }
+});
+
+app.put("/api/settings/email", authenticate, requireRole("admin"), async (req, res) => {
+  try {
+    const body = req.body || {};
+    const smtpPort = Number(body.smtpPort || 587);
+    await setSettingValue(pool, SETTINGS_KEYS.SMTP_HOST, body.smtpHost || "");
+    await setSettingValue(pool, SETTINGS_KEYS.SMTP_PORT, Number.isFinite(smtpPort) ? String(smtpPort) : "587");
+    await setSettingValue(pool, SETTINGS_KEYS.SMTP_USER, body.smtpUser || "");
+    await setSettingValue(pool, SETTINGS_KEYS.SMTP_PASS, body.smtpPass || "");
+    await setSettingValue(pool, SETTINGS_KEYS.SMTP_FROM, body.smtpFrom || "");
+    await setSettingValue(pool, SETTINGS_KEYS.SMTP_SECURE, body.smtpSecure ? "true" : "false");
+    const smtpConfig = await getSmtpConfig(pool);
+    res.json({
+      smtpHost: smtpConfig.host || "",
+      smtpPort: String(smtpConfig.port || 587),
+      smtpUser: smtpConfig.user || "",
+      smtpPass: smtpConfig.pass || "",
+      smtpFrom: smtpConfig.from || "",
+      smtpSecure: Boolean(smtpConfig.secure),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal menyimpan pengaturan email." });
+  }
+});
+
 app.get("/api/settings/ai/status", authenticate, requirePermission("useAI"), async (req, res) => {
   try {
     const value = await getSettingValue(pool, SETTINGS_KEYS.GEMINI_API_KEY);
@@ -31677,7 +32540,12 @@ app.get("/api/settings/ai/models", authenticate, requireRole("admin"), async (re
   try {
     const apiKey = await getSettingValue(pool, SETTINGS_KEYS.GEMINI_API_KEY);
     if (!String(apiKey || "").trim()) {
-      res.status(400).json({ error: "GEMINI API Key belum dikonfigurasi." });
+      res.json({
+        models: DEFAULT_GEMINI_MODELS,
+        latestModel: DEFAULT_GEMINI_MODELS[0]?.name || "",
+        source: "recommended",
+        notice: "GEMINI API Key belum dikonfigurasi. Daftar model memakai rekomendasi bawaan.",
+      });
       return;
     }
     const aiResponse = await fetch(
@@ -31692,7 +32560,12 @@ app.get("/api/settings/ai/models", authenticate, requireRole("admin"), async (re
     }
     if (!aiResponse.ok) {
       const message = data?.error?.message || text || `Model list failed (${aiResponse.status})`;
-      res.status(aiResponse.status).json({ error: message });
+      res.json({
+        models: DEFAULT_GEMINI_MODELS,
+        latestModel: DEFAULT_GEMINI_MODELS[0]?.name || "",
+        source: "recommended",
+        notice: `Gagal cek daftar model dari Google API: ${message}. Daftar model memakai rekomendasi bawaan.`,
+      });
       return;
     }
     const models = Array.isArray(data?.models) ? data.models : [];
@@ -31710,9 +32583,23 @@ app.get("/api/settings/ai/models", authenticate, requireRole("admin"), async (re
           outputTokenLimit: model.outputTokenLimit || null,
         };
       });
-    res.json({ models: filtered });
+    const merged = [...DEFAULT_GEMINI_MODELS];
+    filtered.forEach((model) => {
+      if (!merged.find((item) => item.name === model.name)) merged.push(model);
+    });
+    res.json({
+      models: merged,
+      latestModel: DEFAULT_GEMINI_MODELS[0]?.name || filtered[0]?.name || "",
+      source: "google-api",
+      checkedAt: new Date().toISOString(),
+    });
   } catch (error) {
-    res.status(500).json({ error: error.message || "Gagal memuat daftar model AI." });
+    res.json({
+      models: DEFAULT_GEMINI_MODELS,
+      latestModel: DEFAULT_GEMINI_MODELS[0]?.name || "",
+      source: "recommended",
+      notice: error.message || "Gagal memuat daftar model AI. Daftar model memakai rekomendasi bawaan.",
+    });
   }
 });
 
@@ -36447,6 +37334,568 @@ app.get("/api/reports/slow-moving", authenticate, requirePermission("viewReport"
   }
 });
 
+app.get("/api/reports/item-summary", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const startRaw = req.query.start || req.query.start_date || "";
+    const endRaw = req.query.end || req.query.end_date || "";
+    const startDate = normalizeDateOnly(startRaw);
+    const endDate = normalizeDateOnly(endRaw);
+    const supplier = String(req.query.supplier || "").trim();
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const values = [];
+    const itemFilters = ["i.code not ilike 'TEST-%'"];
+    const poFilters = [];
+    const rnFilters = [
+      "rnh.status = 'posted'",
+      "rnh.reversal_of is null",
+      "rni.line_status = 'posted'",
+      "rni.reversal_of_item_id is null",
+    ];
+
+    if (startRaw && !startDate) {
+      res.status(400).json({ error: "Format tanggal mulai tidak valid." });
+      return;
+    }
+    if (endRaw && !endDate) {
+      res.status(400).json({ error: "Format tanggal akhir tidak valid." });
+      return;
+    }
+    if (startDate && endDate && endDate < startDate) {
+      res.status(400).json({ error: "Tanggal akhir tidak boleh lebih kecil dari tanggal awal." });
+      return;
+    }
+    if (q) {
+      values.push(`%${q}%`);
+      itemFilters.push(`(
+        lower(i.code) like $${values.length}
+        or lower(coalesce(i.name, '')) like $${values.length}
+        or lower(coalesce(i.part_no, '')) like $${values.length}
+      )`);
+    }
+    if (startDate) {
+      values.push(startDate);
+      poFilters.push(`ph.po_date >= $${values.length}::date`);
+      rnFilters.push(`coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) >= $${values.length}::date`);
+    }
+    if (endDate) {
+      values.push(endDate);
+      poFilters.push(`ph.po_date <= $${values.length}::date`);
+      rnFilters.push(`coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) <= $${values.length}::date`);
+    }
+    if (supplier) {
+      values.push(supplier);
+      poFilters.push(`(
+        lower(trim(ph.supplier_id)) = lower(trim($${values.length}))
+        or lower(trim(coalesce(mv_po.name, ''))) = lower(trim($${values.length}))
+      )`);
+      rnFilters.push(`(
+        lower(trim(coalesce(rnh.supplier, ''))) = lower(trim($${values.length}))
+        or lower(trim(coalesce(mv_rn.id, ''))) = lower(trim($${values.length}))
+        or lower(trim(coalesce(mv_rn.name, ''))) = lower(trim($${values.length}))
+      )`);
+    }
+
+    const poWhere = poFilters.length ? `where ${poFilters.join(" and ")}` : "";
+    const rnWhere = rnFilters.length ? `where ${rnFilters.join(" and ")}` : "";
+
+    const result = await pool.query(
+      `
+      with item_base as (
+        select
+          i.code,
+          i.name,
+          i.part_no,
+          i.type,
+          i.unit,
+          i.location_name,
+          i.location_id,
+          i.safety_stock,
+          i.vendor_id,
+          i.supplier_name
+        from items i
+        where ${itemFilters.join(" and ")}
+      ),
+      po_summary as (
+        select
+          pl.item_code,
+          count(distinct ph.po_number)::int as po_count,
+          count(pl.id)::int as po_line_count,
+          coalesce(sum(pl.qty_order), 0)::numeric as qty_order,
+          coalesce(sum(pl.qty_received), 0)::numeric as qty_incoming_po,
+          coalesce(sum(greatest(pl.qty_order - pl.qty_received, 0)), 0)::numeric as qty_remaining_po,
+          max(ph.po_date) as last_po_date
+        from po_lines pl
+        join po_headers ph on ph.po_number = pl.po_number
+        left join master_vendors mv_po on mv_po.id = ph.supplier_id
+        ${poWhere}
+        group by pl.item_code
+      ),
+      rn_summary as (
+        select
+          rni.item_code,
+          count(distinct rnh.id)::int as rn_count,
+          coalesce(sum(rni.doc_qty), 0)::numeric as doc_qty,
+          coalesce(sum(rni.received_qty), 0)::numeric as received_qty,
+          coalesce(sum(rni.posted_qty), 0)::numeric as released_qty,
+          coalesce(sum(greatest(coalesce(rni.received_qty, 0) - coalesce(rni.posted_qty, 0), 0)), 0)::numeric as pending_qc_qty,
+          max(coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date)) as last_incoming_date,
+          string_agg(distinct rnh.rn_number, ', ' order by rnh.rn_number) as rn_numbers
+        from receive_note_items rni
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        left join master_vendors mv_rn
+          on lower(trim(mv_rn.id)) = lower(trim(rnh.supplier))
+          or lower(trim(mv_rn.name)) = lower(trim(rnh.supplier))
+        ${rnWhere}
+        group by rni.item_code
+      ),
+      stock_summary as (
+        select item_code, coalesce(sum(qty_in - qty_out), 0)::numeric as stock_qty
+        from stock_batches
+        group by item_code
+      )
+      select
+        ib.*,
+        coalesce(ps.po_count, 0)::int as po_count,
+        coalesce(ps.po_line_count, 0)::int as po_line_count,
+        coalesce(ps.qty_order, 0)::numeric as qty_order,
+        coalesce(ps.qty_incoming_po, 0)::numeric as qty_incoming_po,
+        coalesce(ps.qty_remaining_po, 0)::numeric as qty_remaining_po,
+        ps.last_po_date,
+        coalesce(rs.rn_count, 0)::int as rn_count,
+        coalesce(rs.doc_qty, 0)::numeric as doc_qty,
+        coalesce(rs.received_qty, 0)::numeric as received_qty,
+        coalesce(rs.released_qty, 0)::numeric as released_qty,
+        coalesce(rs.pending_qc_qty, 0)::numeric as pending_qc_qty,
+        rs.last_incoming_date,
+        rs.rn_numbers,
+        coalesce(ss.stock_qty, 0)::numeric as stock_qty
+      from item_base ib
+      left join po_summary ps on ps.item_code = ib.code
+      left join rn_summary rs on rs.item_code = ib.code
+      left join stock_summary ss on ss.item_code = ib.code
+      where coalesce(ps.qty_order, 0) <> 0
+         or coalesce(rs.received_qty, 0) <> 0
+         or coalesce(ss.stock_qty, 0) <> 0
+      order by
+        case when coalesce(rs.pending_qc_qty, 0) > 0 then 0 when coalesce(ps.qty_remaining_po, 0) > 0 then 1 else 2 end,
+        ib.code asc
+      limit 5000
+      `,
+      values,
+    );
+
+    const rows = result.rows.map((row) => {
+      const pendingQcQty = Number(row.pending_qc_qty || 0);
+      const qtyRemainingPo = Number(row.qty_remaining_po || 0);
+      const stockQty = Number(row.stock_qty || 0);
+      let status = "OK";
+      if (pendingQcQty > 0) status = "PENDING QC";
+      else if (qtyRemainingPo > 0) status = "OPEN PO";
+      else if (stockQty <= 0) status = "NO STOCK";
+      return {
+        itemCode: row.code,
+        itemName: row.name,
+        partNo: row.part_no,
+        category: row.type,
+        unit: row.unit,
+        location: row.location_name || row.location_id || "",
+        safetyStock: Number(row.safety_stock || 0),
+        defaultSupplier: row.vendor_id || row.supplier_name || "",
+        poCount: Number(row.po_count || 0),
+        poLineCount: Number(row.po_line_count || 0),
+        qtyOrder: Number(row.qty_order || 0),
+        qtyIncomingPo: Number(row.qty_incoming_po || 0),
+        qtyRemainingPo,
+        lastPoDate: row.last_po_date,
+        rnCount: Number(row.rn_count || 0),
+        docQty: Number(row.doc_qty || 0),
+        receivedQty: Number(row.received_qty || 0),
+        releasedQty: Number(row.released_qty || 0),
+        pendingQcQty,
+        lastIncomingDate: row.last_incoming_date,
+        rnNumbers: row.rn_numbers || "",
+        stockQty,
+        status,
+      };
+    });
+    const summary = rows.reduce((acc, row) => {
+      acc.itemCount += 1;
+      acc.qtyOrder += Number(row.qtyOrder || 0);
+      acc.receivedQty += Number(row.receivedQty || 0);
+      acc.releasedQty += Number(row.releasedQty || 0);
+      acc.pendingQcQty += Number(row.pendingQcQty || 0);
+      acc.stockQty += Number(row.stockQty || 0);
+      if (row.status === "PENDING QC") acc.pendingQcItems += 1;
+      if (row.status === "OPEN PO") acc.openPoItems += 1;
+      if (row.status === "NO STOCK") acc.noStockItems += 1;
+      return acc;
+    }, {
+      itemCount: 0,
+      qtyOrder: 0,
+      receivedQty: 0,
+      releasedQty: 0,
+      pendingQcQty: 0,
+      stockQty: 0,
+      pendingQcItems: 0,
+      openPoItems: 0,
+      noStockItems: 0,
+    });
+    res.json({ start: startDate || null, end: endDate || null, supplier: supplier || null, summary, rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal memuat laporan per barang." });
+  }
+});
+
+app.get("/api/reports/receive-notes", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const startRaw = req.query.start || req.query.start_date || "";
+    const endRaw = req.query.end || req.query.end_date || "";
+    const startDate = normalizeDateOnly(startRaw);
+    const endDate = normalizeDateOnly(endRaw);
+    const supplier = String(req.query.supplier || "").trim();
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const filters = ["coalesce(rni.item_code, '') not ilike 'TEST-%'"];
+    const values = [];
+
+    if (startRaw && !startDate) {
+      res.status(400).json({ error: "Format tanggal mulai tidak valid." });
+      return;
+    }
+    if (endRaw && !endDate) {
+      res.status(400).json({ error: "Format tanggal akhir tidak valid." });
+      return;
+    }
+    if (startDate && endDate && endDate < startDate) {
+      res.status(400).json({ error: "Tanggal akhir tidak boleh lebih kecil dari tanggal awal." });
+      return;
+    }
+    if (startDate) {
+      values.push(startDate);
+      filters.push("coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) >= $" + values.length + "::date");
+    }
+    if (endDate) {
+      values.push(endDate);
+      filters.push("coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) <= $" + values.length + "::date");
+    }
+    if (supplier) {
+      values.push(supplier);
+      filters.push(`(
+        lower(trim(coalesce(rnh.supplier, ''))) = lower(trim($${values.length}))
+        or lower(trim(coalesce(mv.id, ''))) = lower(trim($${values.length}))
+        or lower(trim(coalesce(mv.name, ''))) = lower(trim($${values.length}))
+      )`);
+    }
+    if (q) {
+      values.push(`%${q}%`);
+      filters.push(`(
+        lower(coalesce(rnh.rn_number, '')) like $${values.length}
+        or lower(coalesce(rnh.do_number, '')) like $${values.length}
+        or lower(coalesce(rnh.po_number, s.po_number, pl.po_number, '')) like $${values.length}
+        or lower(coalesce(rni.item_code, '')) like $${values.length}
+        or lower(coalesce(i.name, rni.item_name, '')) like $${values.length}
+        or lower(coalesce(rnh.supplier, mv.name, '')) like $${values.length}
+      )`);
+    }
+
+    const result = await pool.query(
+      `
+      select
+        rnh.id as rn_id,
+        rnh.rn_number,
+        rnh.status as rn_status,
+        rnh.source,
+        rnh.supplier as supplier_code,
+        coalesce(mv.name, rnh.supplier) as supplier_name,
+        rnh.do_number,
+        coalesce(rnh.po_number, s.po_number, pl.po_number) as po_number,
+        coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) as received_date,
+        rnh.truck_no,
+        rnh.driver_name,
+        rni.id as line_id,
+        rni.line_no,
+        rni.item_code,
+        coalesce(i.name, rni.item_name) as item_name,
+        coalesce(i.part_no, rni.part_no) as part_no,
+        coalesce(i.unit, rni.unit) as unit,
+        rni.doc_qty,
+        rni.received_qty,
+        rni.posted_qty,
+        rni.qc_status,
+        rni.line_status,
+        rni.match_status,
+        rni.match_basis,
+        rni.supplier_lot_no,
+        rni.notes,
+        coalesce(up.username, uc.username) as posted_by_name
+      from receive_note_items rni
+      join receive_note_headers rnh on rnh.id = rni.rn_id
+      left join schedules s on s.id = rni.schedule_id
+      left join po_lines pl on pl.id = rni.po_line_id
+      left join items i on i.code = rni.item_code
+      left join master_vendors mv
+        on lower(trim(mv.id)) = lower(trim(rnh.supplier))
+        or lower(trim(mv.name)) = lower(trim(rnh.supplier))
+      left join users uc on uc.id = rnh.created_by
+      left join users up on up.id = rnh.posted_by
+      where ${filters.join(" and ")}
+      order by received_date desc, rnh.rn_number desc, rni.line_no asc, rni.id asc
+      limit 5000
+      `,
+      values,
+    );
+
+    const rows = result.rows.map((row) => ({
+      rnId: row.rn_id,
+      rnNumber: row.rn_number,
+      rnStatus: row.rn_status,
+      source: row.source,
+      supplierCode: row.supplier_code,
+      supplierName: row.supplier_name,
+      doNumber: row.do_number,
+      poNumber: row.po_number,
+      receivedDate: row.received_date,
+      truckNo: row.truck_no,
+      driverName: row.driver_name,
+      lineId: row.line_id,
+      lineNo: Number(row.line_no || 0),
+      itemCode: row.item_code,
+      itemName: row.item_name,
+      partNo: row.part_no,
+      unit: row.unit,
+      docQty: Number(row.doc_qty || 0),
+      receivedQty: Number(row.received_qty || 0),
+      postedQty: Number(row.posted_qty || 0),
+      qcStatus: row.qc_status,
+      lineStatus: row.line_status,
+      matchStatus: row.match_status,
+      matchBasis: row.match_basis,
+      supplierLotNo: row.supplier_lot_no,
+      notes: row.notes,
+      postedByName: row.posted_by_name,
+    }));
+    const summary = rows.reduce((acc, row) => {
+      acc.rnCount = acc.rnSet.add(row.rnId).size;
+      acc.lineCount += 1;
+      acc.docQty += Number(row.docQty || 0);
+      acc.receivedQty += Number(row.receivedQty || 0);
+      acc.postedQty += Number(row.postedQty || 0);
+      return acc;
+    }, { rnSet: new Set(), rnCount: 0, lineCount: 0, docQty: 0, receivedQty: 0, postedQty: 0 });
+    delete summary.rnSet;
+    res.json({ start: startDate || null, end: endDate || null, supplier: supplier || null, summary, rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal memuat laporan RN." });
+  }
+});
+
+app.get("/api/reports/master-po", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const startRaw = req.query.start || req.query.start_date || "";
+    const endRaw = req.query.end || req.query.end_date || "";
+    const startDate = normalizeDateOnly(startRaw);
+    const endDate = normalizeDateOnly(endRaw);
+    const supplier = String(req.query.supplier || "").trim();
+    const status = String(req.query.status || "").trim().toLowerCase();
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const filters = ["coalesce(pl.item_code, '') not ilike 'TEST-%'"];
+    const values = [];
+
+    if (startRaw && !startDate) {
+      res.status(400).json({ error: "Format tanggal mulai tidak valid." });
+      return;
+    }
+    if (endRaw && !endDate) {
+      res.status(400).json({ error: "Format tanggal akhir tidak valid." });
+      return;
+    }
+    if (startDate && endDate && endDate < startDate) {
+      res.status(400).json({ error: "Tanggal akhir tidak boleh lebih kecil dari tanggal awal." });
+      return;
+    }
+    if (startDate) {
+      values.push(startDate);
+      filters.push("ph.po_date >= $" + values.length + "::date");
+    }
+    if (endDate) {
+      values.push(endDate);
+      filters.push("ph.po_date <= $" + values.length + "::date");
+    }
+    if (supplier) {
+      values.push(supplier);
+      filters.push(`(
+        lower(trim(ph.supplier_id)) = lower(trim($${values.length}))
+        or lower(trim(coalesce(mv.name, ''))) = lower(trim($${values.length}))
+      )`);
+    }
+    if (q) {
+      values.push(`%${q}%`);
+      filters.push(`(
+        lower(ph.po_number) like $${values.length}
+        or lower(ph.supplier_id) like $${values.length}
+        or lower(coalesce(mv.name, '')) like $${values.length}
+        or lower(pl.item_code) like $${values.length}
+        or lower(coalesce(i.name, '')) like $${values.length}
+      )`);
+    }
+
+    const statusFilter = ["open", "partial", "closed", "short closed"].includes(status)
+      ? `where line_rows.effective_status = '${status}'`
+      : "";
+
+    const result = await pool.query(
+      `
+      with valid_receipts as (
+        select
+          ra.po_number,
+          coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id) as po_line_id,
+          lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item))) as item_code_key,
+          sum(greatest(coalesce(ra.allocated_qty, 0), 0))::numeric as received_qty,
+          max(coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date)) as last_received_date,
+          string_agg(distinct rnh.rn_number, ', ' order by rnh.rn_number) as rn_numbers,
+          string_agg(distinct nullif(rnh.do_number, ''), ', ' order by nullif(rnh.do_number, '')) as do_numbers
+        from receipt_allocations ra
+        join receive_note_items rni on rni.id = ra.rn_item_id
+        join receive_note_headers rnh on rnh.id = rni.rn_id
+        left join schedules s on s.id = ra.schedule_id
+        where rnh.status = 'posted'
+          and rnh.reversal_of is null
+          and rni.line_status = 'posted'
+        group by
+          ra.po_number,
+          coalesce(ra.po_line_id, rni.po_line_id, s.po_line_id),
+          lower(trim(coalesce(ra.item_code, rni.item_code, s.item_code, s.item)))
+      ),
+      po_line_receipts as (
+        select
+          pl.id as po_line_id,
+          sum(vr.received_qty)::numeric as received_qty,
+          max(vr.last_received_date) as last_received_date,
+          string_agg(distinct vr.rn_numbers, ', ') as rn_numbers,
+          string_agg(distinct vr.do_numbers, ', ') as do_numbers
+        from po_lines pl
+        join valid_receipts vr
+          on vr.po_number = pl.po_number
+          and (
+            vr.po_line_id = pl.id
+            or (
+              vr.po_line_id is null
+              and vr.item_code_key = lower(trim(pl.item_code))
+              and (
+                select count(*)
+                from po_lines plx
+                where plx.po_number = vr.po_number
+                  and lower(trim(plx.item_code)) = vr.item_code_key
+              ) = 1
+            )
+          )
+        group by pl.id
+      ),
+      schedule_summary as (
+        select
+          coalesce(po_line_id, 0) as po_line_id,
+          po_number,
+          lower(trim(coalesce(item_code, item))) as item_code_key,
+          count(*)::int as schedule_count,
+          coalesce(sum(request_qty), 0)::numeric as scheduled_qty,
+          coalesce(sum(received_qty), 0)::numeric as schedule_received_qty
+        from schedules
+        group by coalesce(po_line_id, 0), po_number, lower(trim(coalesce(item_code, item)))
+      ),
+      line_rows as (
+        select
+          ph.po_number,
+          ph.po_date,
+          ph.supplier_id as supplier_code,
+          coalesce(mv.name, ph.supplier_id) as supplier_name,
+          ph.force_closed,
+          pl.id as po_line_id,
+          pl.line_no,
+          pl.item_code,
+          i.name as item_name,
+          i.part_no,
+          i.unit,
+          pl.qty_order::numeric,
+          coalesce(plr.received_qty, pl.qty_received, 0)::numeric as qty_received,
+          greatest(pl.qty_order - coalesce(plr.received_qty, pl.qty_received, 0), 0)::numeric as qty_remaining,
+          coalesce(ss.schedule_count, 0)::int as schedule_count,
+          coalesce(ss.scheduled_qty, 0)::numeric as scheduled_qty,
+          coalesce(ss.schedule_received_qty, 0)::numeric as schedule_received_qty,
+          plr.last_received_date,
+          plr.rn_numbers,
+          plr.do_numbers,
+          case
+            when coalesce(ph.force_closed, false) then 'closed'
+            when coalesce(pl.qty_order, 0) <= coalesce(plr.received_qty, pl.qty_received, 0) then 'closed'
+            when coalesce(plr.received_qty, pl.qty_received, 0) > 0
+              and greatest(coalesce(pl.qty_order, 0) - coalesce(plr.received_qty, pl.qty_received, 0), 0) > 0
+              and greatest(coalesce(pl.qty_order, 0) - coalesce(plr.received_qty, pl.qty_received, 0), 0) < 100 then 'short closed'
+            when coalesce(plr.received_qty, pl.qty_received, 0) > 0 then 'partial'
+            else 'open'
+          end as effective_status
+        from po_headers ph
+        join po_lines pl on pl.po_number = ph.po_number
+        left join items i on i.code = pl.item_code
+        left join master_vendors mv on mv.id = ph.supplier_id
+        left join po_line_receipts plr on plr.po_line_id = pl.id
+        left join schedule_summary ss
+          on ss.po_line_id = pl.id
+          or (
+            ss.po_line_id = 0
+            and ss.po_number = pl.po_number
+            and ss.item_code_key = lower(trim(pl.item_code))
+          )
+        where ${filters.join(" and ")}
+      )
+      select *
+      from line_rows
+      ${statusFilter}
+      order by po_date desc nulls last, po_number desc, line_no asc
+      limit 5000
+      `,
+      values,
+    );
+
+    const rows = result.rows.map((row) => ({
+      poNumber: row.po_number,
+      poDate: row.po_date,
+      supplierCode: row.supplier_code,
+      supplierName: row.supplier_name,
+      forceClosed: Boolean(row.force_closed),
+      poLineId: row.po_line_id,
+      lineNo: Number(row.line_no || 0),
+      itemCode: row.item_code,
+      itemName: row.item_name,
+      partNo: row.part_no,
+      unit: row.unit,
+      qtyOrder: Number(row.qty_order || 0),
+      qtyReceived: Number(row.qty_received || 0),
+      qtyRemaining: Number(row.qty_remaining || 0),
+      scheduleCount: Number(row.schedule_count || 0),
+      scheduledQty: Number(row.scheduled_qty || 0),
+      scheduleReceivedQty: Number(row.schedule_received_qty || 0),
+      lastReceivedDate: row.last_received_date,
+      rnNumbers: row.rn_numbers || "",
+      doNumbers: row.do_numbers || "",
+      status: row.effective_status,
+    }));
+    const summary = rows.reduce((acc, row) => {
+      acc.poCount = acc.poSet.add(row.poNumber).size;
+      acc.lineCount += 1;
+      acc.qtyOrder += Number(row.qtyOrder || 0);
+      acc.qtyReceived += Number(row.qtyReceived || 0);
+      acc.qtyRemaining += Number(row.qtyRemaining || 0);
+      if (row.status === "open") acc.openLines += 1;
+      if (row.status === "partial") acc.partialLines += 1;
+      if (row.status === "closed" || row.status === "short closed") acc.closedLines += 1;
+      return acc;
+    }, { poSet: new Set(), poCount: 0, lineCount: 0, qtyOrder: 0, qtyReceived: 0, qtyRemaining: 0, openLines: 0, partialLines: 0, closedLines: 0 });
+    delete summary.poSet;
+    res.json({ start: startDate || null, end: endDate || null, supplier: supplier || null, status: status || null, summary, rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal memuat laporan master PO." });
+  }
+});
+
 app.get("/api/reports/inbound-performance", authenticate, requirePermission("viewReport"), async (req, res) => {
   try {
     const { start, end, supplier } = req.query;
@@ -36469,10 +37918,10 @@ app.get("/api/reports/inbound-performance", authenticate, requirePermission("vie
       select
         s.id,
         coalesce(s.supplier_id, ph.supplier_id, mv.id, s.supplier) as supplier_id,
-        coalesce(mv.name, s.supplier_name, s.supplier, coalesce(s.supplier_id, ph.supplier_id)) as supplier_name,
+        coalesce(mv.name, nullif(trim(s.supplier), ''), coalesce(s.supplier_id, ph.supplier_id)) as supplier_name,
         s.supplier as schedule_supplier,
         s.po_number,
-        coalesce(do_number, rl.latest_do_number) as do_number,
+        coalesce(nullif(trim(s.do_number), ''), rl.latest_do_number) as do_number,
         coalesce(s.item_code, s.item) as item,
         s.request_date,
         coalesce(s.arrival_date, rl.latest_arrival_date) as arrival_date,
@@ -36499,7 +37948,7 @@ app.get("/api/reports/inbound-performance", authenticate, requirePermission("vie
       ) mv on true
       left join lateral (
         select
-          coalesce(sum(greatest(coalesce(rni.posted_qty, rni.received_qty, 0), 0)), 0)::numeric as total_received_qty
+          coalesce(sum(greatest(coalesce(nullif(rni.received_qty, 0), rni.posted_qty, 0), 0)), 0)::numeric as total_received_qty
         from receive_note_items rni
         join receive_note_headers rnh on rnh.id = rni.rn_id
         where rni.schedule_id = s.id
@@ -36543,6 +37992,8 @@ app.get("/api/reports/inbound-performance", authenticate, requirePermission("vie
         status: getScheduleStatusFromActual({
           requestDate: row.request_date,
           arrivalDate: row.arrival_date,
+          requestQty: row.request_qty,
+          receivedQty: row.received_qty,
         }),
         dayDiff,
       };
@@ -36589,6 +38040,259 @@ app.get("/api/reports/fifo-violations", authenticate, requirePermission("viewRep
     res.json(mapped);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/reports/customer-category-stock", authenticate, requirePermission("viewReport"), async (req, res) => {
+  try {
+    const targetDaysParam = Number(req.query.targetDays ?? req.query.days ?? 2);
+    const targetDays = Number.isFinite(targetDaysParam) && targetDaysParam > 0
+      ? Math.min(Math.max(Number(targetDaysParam), 0.01), 365)
+      : 2;
+    const categoryFilter = String(req.query.category || "").trim();
+    const customerFilter = String(req.query.customer || "").trim();
+    const params = [];
+    const filters = ["i.code not ilike 'TEST-%'"];
+
+    if (categoryFilter && !["all", "semua"].includes(categoryFilter.toLowerCase())) {
+      params.push(categoryFilter);
+      const idx = params.length;
+      filters.push(`(
+        lower(trim(coalesce(i.type, ''))) = lower(trim($${idx}))
+        or lower(trim(coalesce(cat.code, ''))) = lower(trim($${idx}))
+        or lower(trim(coalesce(cat.name, ''))) = lower(trim($${idx}))
+      )`);
+    }
+
+    if (customerFilter) {
+      params.push(customerFilter);
+      const idx = params.length;
+      filters.push(`(
+        lower(trim(coalesce(c.customer_id, ''))) = lower(trim($${idx}))
+        or lower(trim(coalesce(c.customer_name, ''))) = lower(trim($${idx}))
+      )`);
+    }
+
+    const now = new Date();
+    const allowedMonths = new Set(monthKeyByIndex);
+    const requestedMonthKey = String(req.query.monthKey || req.query.month || monthKeyByIndex[now.getMonth()] || "jan").toLowerCase();
+    const prlMonthKey = allowedMonths.has(requestedMonthKey) ? requestedMonthKey : (monthKeyByIndex[now.getMonth()] || "jan");
+    const prlYear = Number(req.query.year) || now.getFullYear();
+    const targetDaysParamIndex = params.length + 1;
+    const prlYearParamIndex = params.length + 2;
+    const prlMonthParamIndex = params.length + 3;
+    const reportParams = [...params, targetDays, prlYear, prlMonthKey];
+    const baseReportCte = `
+      with stock_main as (
+        select item_code, sum(qty_in - qty_out)::numeric as stock_qty
+        from stock_batches
+        group by item_code
+      ),
+      stock_subcon as (
+        select item_code, sum(case when direction = 'in' then qty else -qty end)::numeric as stock_qty
+        from subcon_stock_movements
+        group by item_code
+      ),
+      stock as (
+        select
+          coalesce(m.item_code, s.item_code) as item_code,
+          (coalesce(m.stock_qty, 0) + coalesce(s.stock_qty, 0))::numeric as stock_qty
+        from stock_main m
+        full join stock_subcon s on s.item_code = m.item_code
+      ),
+      prl as (
+        select
+          item_code,
+          sum(
+            case
+              when (months ->> $${prlMonthParamIndex}) ~ '^[0-9]+(\\.[0-9]+)?$'
+                then (months ->> $${prlMonthParamIndex})::numeric
+              else 0
+            end
+          )::numeric as prl_qty
+        from prl_records
+        where year = $${prlYearParamIndex}
+        group by item_code
+      ),
+      base as (
+        select
+          coalesce(nullif(cat.name, ''), nullif(cat.code, ''), nullif(i.type, ''), 'Uncategorized') as category,
+          coalesce(nullif(c.customer_name, ''), nullif(c.customer_id, ''), 'Unassigned') as customer,
+          i.code as item_code,
+          i.part_no,
+          i.name as item_name,
+          i.model,
+          coalesce(nullif(i.line_production, ''), nullif(i.location_name, ''), nullif(i.location_id, ''), '-') as plant_process,
+          coalesce(s.stock_qty, 0)::numeric as stock_qty,
+          coalesce(i.safety_stock, 0)::numeric as safety_stock,
+          coalesce(prl.prl_qty, 0)::numeric as prl_qty,
+          case
+            when c.item_code is null then 1::numeric
+            when coalesce(c.share_total, 0) > 0 then greatest(coalesce(c.share_percent, 0), 0)::numeric / c.share_total::numeric
+            else 1::numeric / nullif(c.customer_count, 0)::numeric
+          end as allocation_ratio
+        from items i
+        left join master_categories cat
+          on lower(trim(cat.code)) = lower(trim(coalesce(i.type, '')))
+          or lower(trim(cat.name)) = lower(trim(coalesce(i.type, '')))
+        left join stock s on s.item_code = i.code
+        left join prl on prl.item_code = i.code
+        left join lateral (
+          select
+            ic.item_code,
+            ic.customer_id,
+            mc.name as customer_name,
+            coalesce(ic.share_percent, 0)::numeric as share_percent,
+            count(*) over (partition by ic.item_code)::numeric as customer_count,
+            sum(case when coalesce(ic.share_percent, 0) > 0 then ic.share_percent else 0 end) over (partition by ic.item_code)::numeric as share_total
+          from item_customers ic
+          left join master_customers mc on mc.id = ic.customer_id
+          where ic.item_code = i.code
+        ) c on true
+        where ${filters.join(" and ")}
+      )
+    `;
+
+    const result = await pool.query(
+      `
+      ${baseReportCte}
+      select
+        category,
+        customer,
+        count(distinct item_code)::int as item_count,
+        coalesce(sum(stock_qty * allocation_ratio), 0)::numeric as stock_qty,
+        coalesce(sum(safety_stock * allocation_ratio), 0)::numeric as safety_stock,
+        (coalesce(sum(safety_stock * allocation_ratio), 0) / $${targetDaysParamIndex})::numeric as daily_need_qty
+      from base
+      group by category, customer
+      having coalesce(sum(stock_qty * allocation_ratio), 0) <> 0
+        or coalesce(sum(safety_stock * allocation_ratio), 0) <> 0
+      order by category asc, customer asc
+      `,
+      reportParams,
+    );
+
+    const detailResult = await pool.query(
+      `
+      ${baseReportCte}
+      select
+        category,
+        customer,
+        model,
+        item_code,
+        part_no,
+        item_name,
+        plant_process,
+        (stock_qty * allocation_ratio)::numeric as stock_qty,
+        (safety_stock * allocation_ratio)::numeric as safety_stock,
+        ((safety_stock * allocation_ratio) / $${targetDaysParamIndex})::numeric as daily_need_qty,
+        (prl_qty * allocation_ratio)::numeric as prl_qty
+      from base
+      where coalesce(stock_qty * allocation_ratio, 0) <> 0
+         or coalesce(safety_stock * allocation_ratio, 0) <> 0
+      order by customer asc, model asc, item_code asc
+      `,
+      reportParams,
+    );
+
+    const rows = result.rows.map((row) => {
+      const stockQty = Number(row.stock_qty || 0);
+      const safetyStock = Number(row.safety_stock || 0);
+      const avgDailyConsumption = Number(row.daily_need_qty || 0);
+      const coverageDays = avgDailyConsumption > 0 ? stockQty / avgDailyConsumption : null;
+      let indicator = "AMAN";
+      if (stockQty <= 0) {
+        indicator = "BAHAYA";
+      } else if (coverageDays !== null && coverageDays < 1) {
+        indicator = "BAHAYA";
+      } else if (coverageDays !== null && coverageDays < 2) {
+        indicator = "AWAS";
+      }
+      return {
+        category: row.category || "-",
+        customer: row.customer || "-",
+        itemCount: Number(row.item_count || 0),
+        stockQty,
+        safetyStock,
+        avgDailyConsumption,
+        coverageDays,
+        stockVsSafety: stockQty - safetyStock,
+        indicator,
+      };
+    }).sort((left, right) => {
+      const rank = { BAHAYA: 0, AWAS: 1, AMAN: 2 };
+      return (rank[left.indicator] ?? 9) - (rank[right.indicator] ?? 9)
+        || String(left.category || "").localeCompare(String(right.category || ""), "id")
+        || String(left.customer || "").localeCompare(String(right.customer || ""), "id");
+    });
+
+    const summary = rows.reduce((acc, row) => {
+      acc.totalGroups += 1;
+      acc.totalStockQty += Number(row.stockQty || 0);
+      acc.totalSafetyStock += Number(row.safetyStock || 0);
+      acc.totalDailyConsumption += Number(row.avgDailyConsumption || 0);
+      if (row.indicator === "AMAN") acc.amanGroups += 1;
+      if (row.indicator === "AWAS") acc.awasGroups += 1;
+      if (row.indicator === "BAHAYA") acc.bahayaGroups += 1;
+      return acc;
+    }, {
+      totalGroups: 0,
+      amanGroups: 0,
+      awasGroups: 0,
+      bahayaGroups: 0,
+      totalStockQty: 0,
+      totalSafetyStock: 0,
+      totalDailyConsumption: 0,
+    });
+    const detailRows = detailResult.rows.map((row, index) => {
+      const stockQty = Number(row.stock_qty || 0);
+      const safetyStock = Number(row.safety_stock || 0);
+      const dailyNeedQty = Number(row.daily_need_qty || 0);
+      const coverageDays = dailyNeedQty > 0 ? stockQty / dailyNeedQty : null;
+      let indicator = "AMAN";
+      if (stockQty <= 0) {
+        indicator = "BAHAYA";
+      } else if (coverageDays !== null && coverageDays < 1) {
+        indicator = "BAHAYA";
+      } else if (coverageDays !== null && coverageDays < 2) {
+        indicator = "AWAS";
+      }
+      return {
+        no: index + 1,
+        category: row.category || "-",
+        customer: row.customer || "-",
+        model: row.model || "-",
+        uniq: row.item_code || "-",
+        partNo: row.part_no || "",
+        partName: row.item_name || "",
+        itemName: row.item_name || "",
+        stockQty,
+        stockDay: coverageDays,
+        safetyStock,
+        safetyDay: targetDays,
+        qtyPrl: Number(row.prl_qty || 0),
+        recoveryTarget: "",
+        plantProcess: row.plant_process || "-",
+        remark: "",
+        indicator,
+      };
+    }).sort((left, right) => {
+      const leftDay = left.stockDay === null ? 999999 : left.stockDay;
+      const rightDay = right.stockDay === null ? 999999 : right.stockDay;
+      return leftDay - rightDay || String(left.customer).localeCompare(String(right.customer), "id") || String(left.uniq).localeCompare(String(right.uniq), "id");
+    }).map((row, index) => ({ ...row, no: index + 1 }));
+
+    res.json({
+      days: targetDays,
+      targetDays,
+      category: categoryFilter || "all",
+      customer: customerFilter || "",
+      summary,
+      rows,
+      detailRows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Gagal memuat laporan stok per customer." });
   }
 });
 
@@ -37466,7 +39170,28 @@ app.get("/api/reports/raw-material-ledger", authenticate, requirePermission("vie
     if (category === "raw") {
       const result = await pool.query(
         `
-        with raw_items as (
+        with raw_stock_movements as (
+          select
+            m.item_code,
+            m.created_at::date as movement_date,
+            m.qty::numeric as qty,
+            m.direction
+          from stock_movements m
+          union all
+          select
+            rni.item_code,
+            coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) as movement_date,
+            greatest(coalesce(rni.received_qty, 0) - coalesce(rni.posted_qty, 0), 0)::numeric as qty,
+            'in'::text as direction
+          from receive_note_items rni
+          join receive_note_headers rnh on rnh.id = rni.rn_id
+          where rnh.status = 'posted'
+            and rnh.reversal_of is null
+            and rni.line_status = 'posted'
+            and rni.reversal_of_item_id is null
+            and greatest(coalesce(rni.received_qty, 0) - coalesce(rni.posted_qty, 0), 0) > 0
+        ),
+        raw_items as (
           select code, part_no, name, unit
           from items
           where lower(trim(type)) in ('rm', 'raw', 'raw material')
@@ -37476,9 +39201,9 @@ app.get("/api/reports/raw-material-ledger", authenticate, requirePermission("vie
           select i.code,
             coalesce((
               select sum(case when m.direction = 'in' then m.qty else -m.qty end)
-              from stock_movements m
+              from raw_stock_movements m
               where m.item_code = i.code
-                and m.created_at::date < $1::date
+                and m.movement_date < $1::date
             ), 0) as opening_balance
           from raw_items i
         ),
@@ -37486,9 +39211,9 @@ app.get("/api/reports/raw-material-ledger", authenticate, requirePermission("vie
           select item_code,
             sum(case when direction = 'in' then qty else 0 end) as total_in,
             sum(case when direction = 'out' then qty else 0 end) as total_out
-          from stock_movements
-          where created_at::date >= $1::date
-            and created_at::date <= $2::date
+          from raw_stock_movements
+          where movement_date >= $1::date
+            and movement_date <= $2::date
           group by item_code
         )
         select
@@ -37710,11 +39435,34 @@ app.get("/api/reports/all-mutations", authenticate, requirePermission("viewRepor
       const rawLocationClause = buildStockClauses(rawOpeningParams);
       const openingResult = await pool.query(
         `
+        with raw_stock_movements as (
+          select
+            m.item_code,
+            m.created_at::date as movement_date,
+            m.qty::numeric as qty,
+            m.direction,
+            m.reason as source_doc
+          from stock_movements m
+          union all
+          select
+            rni.item_code,
+            coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) as movement_date,
+            greatest(coalesce(rni.received_qty, 0) - coalesce(rni.posted_qty, 0), 0)::numeric as qty,
+            'in'::text as direction,
+            coalesce(nullif(rnh.rn_number, ''), nullif(rnh.do_number, ''), 'Incoming RN') as source_doc
+          from receive_note_items rni
+          join receive_note_headers rnh on rnh.id = rni.rn_id
+          where rnh.status = 'posted'
+            and rnh.reversal_of is null
+            and rni.line_status = 'posted'
+            and rni.reversal_of_item_id is null
+            and greatest(coalesce(rni.received_qty, 0) - coalesce(rni.posted_qty, 0), 0) > 0
+        )
         select m.item_code,
           coalesce(sum(case when m.direction = 'in' then m.qty else -m.qty end), 0) as opening_balance
-        from stock_movements m
+        from raw_stock_movements m
         join items i on i.code = m.item_code
-        where m.created_at::date < $1::date
+        where m.movement_date < $1::date
           and m.item_code not ilike 'TEST-%'
           ${rawLocationClause}
         group by m.item_code
@@ -37730,22 +39478,51 @@ app.get("/api/reports/all-mutations", authenticate, requirePermission("viewRepor
       const rawMovementLocationClause = buildStockClauses(rawMovementParams);
       const movementResult = await pool.query(
         `
+        with raw_stock_movements as (
+          select
+            m.id,
+            m.item_code,
+            m.created_at::date as movement_date,
+            m.qty::numeric as qty,
+            m.direction,
+            'stock_movement'::text as source_type,
+            coalesce(nullif(m.reason, ''), nullif(m.source_ref_type, ''), 'Stock Movement') as source_doc
+          from stock_movements m
+          union all
+          select
+            rni.id,
+            rni.item_code,
+            coalesce(rni.arrival_date, rnh.document_date, rnh.created_at::date) as movement_date,
+            greatest(coalesce(rni.received_qty, 0) - coalesce(rni.posted_qty, 0), 0)::numeric as qty,
+            'in'::text as direction,
+            'incoming_rn_pending'::text as source_type,
+            concat_ws(' / ', nullif(rnh.rn_number, ''), nullif(rnh.do_number, '')) as source_doc
+          from receive_note_items rni
+          join receive_note_headers rnh on rnh.id = rni.rn_id
+          where rnh.status = 'posted'
+            and rnh.reversal_of is null
+            and rni.line_status = 'posted'
+            and rni.reversal_of_item_id is null
+            and greatest(coalesce(rni.received_qty, 0) - coalesce(rni.posted_qty, 0), 0) > 0
+        )
         select m.id,
-          m.created_at::date as date,
+          m.movement_date as date,
           m.item_code,
           m.qty,
           m.direction,
+          m.source_type,
+          m.source_doc,
           i.name,
           i.type,
           i.location_name,
           i.location_id
-        from stock_movements m
+        from raw_stock_movements m
         join items i on i.code = m.item_code
-        where m.created_at::date >= $1::date
-          and m.created_at::date <= $2::date
+        where m.movement_date >= $1::date
+          and m.movement_date <= $2::date
           and m.item_code not ilike 'TEST-%'
           ${rawMovementLocationClause}
-        order by m.created_at::date asc, m.item_code asc, m.id asc
+        order by m.movement_date asc, m.item_code asc, m.id asc
         `,
         rawMovementParams,
       );
@@ -37770,6 +39547,8 @@ app.get("/api/reports/all-mutations", authenticate, requirePermission("viewRepor
           itemName: row.name,
           category: getCategoryLabel(row.type),
           location: locationLabel,
+          sourceType: row.source_type,
+          sourceDoc: row.source_doc,
           openingBalance: opening,
           qtyIn,
           qtyOut,
@@ -37869,7 +39648,9 @@ app.get("/api/reports/all-mutations", authenticate, requirePermission("viewRepor
           itemCode,
           itemName: row.name,
           category: getCategoryLabel(row.type),
-          location: hasLocation ? locationFilter : `${row.from_location} → ${row.to_location}`,
+          location: hasLocation ? locationFilter : `${row.from_location || "-"} -> ${row.to_location || "-"}`,
+          sourceType: "wip_stock_movement",
+          sourceDoc: "",
           openingBalance: opening,
           qtyIn,
           qtyOut,

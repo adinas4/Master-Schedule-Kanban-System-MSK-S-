@@ -156,8 +156,8 @@ const TabFifo = (props) => {
                   </div>
                 ) : (
                   <>
-                  <div className="overflow-x-auto">
-                    <table className="w-max table-auto text-xs whitespace-nowrap">
+                  <div className="w-full overflow-x-auto">
+                    <table className="w-full min-w-[1180px] table-auto text-xs whitespace-nowrap">
                       <thead className="bg-slate-100 text-[11px] uppercase text-slate-500">
                         <tr>
                           <th className="px-2.5 py-2 text-left">FIFO Seq</th>
@@ -172,7 +172,7 @@ const TabFifo = (props) => {
                           <th className="px-2.5 py-2 text-left">Quality</th>
                           <th className="px-2.5 py-2 text-left">Days in Stock</th>
                           <th className="px-2.5 py-2 text-left">Usage</th>
-                          <th className="px-2.5 py-2 text-left">Actions</th>
+                          <th className="px-2.5 py-2 text-center">Actions</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y">
@@ -182,8 +182,8 @@ const TabFifo = (props) => {
                             const usagePct = lot.initialQty ? Math.round(((lot.initialQty - lot.remainingQty) / lot.initialQty) * 100) : 0;
                             return (
                               <tr key={lot.id} className={`${index === 0 && lot.status === 'Active' ? 'bg-emerald-50' : ''}`}>
-                                <td className="px-2.5 py-2">
-                                  <div className="flex items-center gap-2">
+                                <td className="px-2.5 py-2 text-center">
+                                  <div className="flex items-center justify-center gap-2">
                                     <span className="font-medium">{lot.fifoSequence}</span>
                                     {index === 0 && lot.status === 'Active' && (
                                       <span className="shrink-0 text-[10px] px-2 py-0.5 rounded-full bg-emerald-600 text-white">Next</span>

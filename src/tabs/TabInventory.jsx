@@ -58,6 +58,9 @@ const TabInventory = (props) => {
     qrTitle,
     showQrModal,
     setShowQrModal,
+    inventoryNav,
+    setActiveInventoryHelpTab,
+    masterItems = [],
   } = props;
 
   const getCurrentMonthRange = () => {
@@ -77,6 +80,19 @@ const TabInventory = (props) => {
   const inventoryRowOptions = useMemo(() => [25, 50, 75], []);
   const [inventoryTab, setInventoryTab] = useState('overview');
   const [inventoryAnalyticsItem, setInventoryAnalyticsItem] = useState(null);
+
+  useEffect(() => {
+    if (typeof setActiveInventoryHelpTab === 'function') {
+      setActiveInventoryHelpTab(inventoryTab);
+    }
+  }, [inventoryTab, setActiveInventoryHelpTab]);
+
+  useEffect(() => {
+    const targetTab = String(inventoryNav?.tab || '').trim();
+    if (!['overview', 'stock', 'lot', 'opname'].includes(targetTab)) return;
+    if (targetTab === 'opname' && !canManageItems) return;
+    setInventoryTab(targetTab);
+  }, [inventoryNav, canManageItems]);
 
   const stockCardRange = getCurrentMonthRange();
   const [stockCardItem, setStockCardItem] = useState('');
@@ -652,6 +668,7 @@ const TabInventory = (props) => {
                     formatRupiah={formatRupiah}
                     masterLocations={masterLocations}
                     masterWarehouses={masterWarehouses}
+                    masterItems={masterItems}
                     soOpenSession={soOpenSession}
                     fetchSoOpenSession={fetchSoOpenSession}
                     ensureAiConfigured={ensureAiConfigured}

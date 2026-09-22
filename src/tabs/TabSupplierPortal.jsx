@@ -659,6 +659,7 @@ const TabSupplierPortal = (props) => {
     if (!normalized) return 'bg-slate-100 text-slate-600';
     if (['open', 'pending'].includes(normalized)) return 'bg-amber-100 text-amber-700';
     if (['closed', 'fulfilled', 'complete'].includes(normalized)) return 'bg-emerald-100 text-emerald-700';
+    if (normalized === 'short closed') return 'bg-sky-100 text-sky-700';
     if (normalized.includes('partial on time')) return 'bg-amber-100 text-amber-700';
     if (normalized.includes('late completion') || normalized.includes('partial late')) return 'bg-rose-100 text-rose-700';
     if (['late', 'overdue'].includes(normalized)) return 'bg-rose-100 text-rose-700';

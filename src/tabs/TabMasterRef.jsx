@@ -418,9 +418,7 @@ const TabMasterRef = (props) => {
       String(packing.code || '').trim().toLowerCase() === raw.toLowerCase()
       || String(packing.name || '').trim().toLowerCase() === raw.toLowerCase()
     ));
-    return matched
-      ? [String(matched.code || '').trim(), String(matched.name || '').trim()].filter(Boolean).join(' - ')
-      : raw;
+    return matched ? String(matched.code || raw).trim() : raw;
   };
   const getItemModelCodesOnly = (item) => {
     const sourceCodes = Array.isArray(item?.modelCodes) && item.modelCodes.length > 0
@@ -3202,8 +3200,8 @@ const TabMasterRef = (props) => {
                       const activeStatusValue = normalizeItemActiveStatus(item.item_status || item.itemStatus);
                       const inactiveRemarksText = String(item.inactive_remarks || item.inactiveRemarks || '').trim();
                       return (
-                        <tr key={item.code} className="border-t">
-                          <td className="p-2 text-center">
+                        <tr key={item.code} className="border-t align-middle">
+                          <td className="p-2 text-center align-middle">
                             <input
                               type="checkbox"
                               checked={selectedItemCodes.includes(item.code)}
@@ -3217,7 +3215,7 @@ const TabMasterRef = (props) => {
                               }}
                             />
                           </td>
-                          <td className="p-2">
+                          <td className="p-2 align-middle whitespace-nowrap">
                             <div className="flex items-center gap-1">
                               <span>{item.code}</span>
                               {isCodeDuplicate && (
@@ -3225,31 +3223,31 @@ const TabMasterRef = (props) => {
                               )}
                             </div>
                           </td>
-                          <td className="p-2 max-w-[180px] whitespace-normal break-words align-top">
-                            <div className="flex items-start gap-1">
-                              <span className="block whitespace-normal break-all">{item.part_no || item.partNo || '-'}</span>
+                          <td className="p-2 align-middle whitespace-nowrap">
+                            <div className="flex items-center gap-1">
+                              <span className="block whitespace-nowrap">{item.part_no || item.partNo || '-'}</span>
                               {isPartDuplicate && (
                                 <Flag size={12} className="text-red-500" title="Duplicate Detected" />
                               )}
                             </div>
                           </td>
-                          <td className="p-2 max-w-[240px] truncate">{item.name}</td>
-                          <td className="p-2">{getItemCategoryCode(item.type)}</td>
-                          <td className="p-2 max-w-[180px]">
-                            <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold ${activeStatusValue === 'inactive' ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-emerald-200 bg-emerald-50 text-emerald-700'}`}>
+                          <td className="p-2 align-middle max-w-[240px] truncate">{item.name}</td>
+                          <td className="p-2 align-middle whitespace-nowrap">{getItemCategoryCode(item.type)}</td>
+                          <td className="p-2 align-middle whitespace-nowrap">
+                            <span className={`inline-flex whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-semibold ${activeStatusValue === 'inactive' ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-emerald-200 bg-emerald-50 text-emerald-700'}`}>
                               {activeStatusValue === 'inactive' ? 'Non Aktif' : 'Active'}
                             </span>
                             {activeStatusValue === 'inactive' && inactiveRemarksText && (
-                              <div className="mt-1 text-[10px] leading-snug text-slate-500 whitespace-normal break-words">
+                              <div className="mt-1 whitespace-nowrap text-[10px] leading-snug text-slate-500">
                                 {inactiveRemarksText}
                               </div>
                             )}
                           </td>
-                          <td className="p-2">{item.unit || '-'}</td>
-                          <td className="p-2">{getItemPackingCode(item.type_pack)}</td>
-                          <td className="p-2">{item.location_id || '-'}</td>
-                          <td className="p-2 text-right">{item.pack_qty ?? '-'}</td>
-                          <td className="p-2">
+                          <td className="p-2 align-middle whitespace-nowrap">{item.unit || '-'}</td>
+                          <td className="p-2 align-middle whitespace-nowrap">{getItemPackingCode(item.type_pack)}</td>
+                          <td className="p-2 align-middle whitespace-nowrap">{item.location_id || '-'}</td>
+                          <td className="p-2 text-right align-middle whitespace-nowrap">{item.pack_qty ?? '-'}</td>
+                          <td className="p-2 align-middle">
                             {isProductionOutputItem ? (
                               <span className="inline-flex rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700">
                                 Production
@@ -3258,17 +3256,17 @@ const TabMasterRef = (props) => {
                               renderRelationCodeBadges(itemSupplierMap.get(item.code) || [], 'vendorId')
                             )}
                           </td>
-                          <td className="p-2">{formatRelationList(itemCustomerMap.get(item.code) || [], 'customerId', 'customerId')}</td>
-                          <td className="p-2">
+                          <td className="p-2 align-middle whitespace-nowrap">{formatRelationList(itemCustomerMap.get(item.code) || [], 'customerId', 'customerId')}</td>
+                          <td className="p-2 align-middle whitespace-nowrap">
                             {getItemModelCodesOnly(item)}
                           </td>
-                          <td className="p-2">
-                            <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold ${movingBadgeClass}`}>
+                          <td className="p-2 align-middle whitespace-nowrap">
+                            <span className={`inline-flex items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-semibold ${movingBadgeClass}`}>
                               {movingLabel}
                             </span>
                           </td>
-                          <td className="p-2">{item.shelf_life_days ?? (item.shelf_life_months ? Math.round(Number(item.shelf_life_months) * 30) : '-')}</td>
-                          <td className="p-2">
+                          <td className="p-2 align-middle whitespace-nowrap">{item.shelf_life_days ?? (item.shelf_life_months ? Math.round(Number(item.shelf_life_months) * 30) : '-')}</td>
+                          <td className="p-2 align-middle whitespace-nowrap">
                             {allowItemEdit ? (
                               <div className="flex items-center gap-2">
                                   <button
@@ -3355,7 +3353,7 @@ const TabMasterRef = (props) => {
                                 </button>
                                 <button
                                   type="button"
-                                  onClick={() => handleDeleteMaster(`/api/master/items/${item.code}`)}
+                                  onClick={() => handleDeleteMaster(`/api/master/items/${encodeURIComponent(item.code)}`)}
                                   className="p-2 rounded text-rose-600 hover:bg-rose-50"
                                   title="Hapus"
                                   aria-label="Hapus"

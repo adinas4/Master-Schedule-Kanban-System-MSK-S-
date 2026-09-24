@@ -1,6 +1,7 @@
 // Indonesian translations of short quotations, with traceable source links.
 // Kept locally so inspiration never blocks login or depends on a third-party API.
 import { ADDITIONAL_WORK_QUOTES } from './additionalWorkQuotes.js';
+import { MOTIVATIONAL_WORK_QUOTES } from './motivationalWorkQuotes.js';
 
 export const WORK_QUOTES = [
   {
@@ -48,6 +49,7 @@ export const WORK_QUOTES = [
     source: 'The Henry Ford · Ford News, 1923',
     url: 'https://www.thehenryford.org/collections/explore/popular-research-topics/henry-ford-quotations',
   },
+  ...MOTIVATIONAL_WORK_QUOTES,
   ...ADDITIONAL_WORK_QUOTES,
 ];
 

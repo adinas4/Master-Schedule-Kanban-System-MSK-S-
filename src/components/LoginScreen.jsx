@@ -50,8 +50,10 @@ function InspirationPanel() {
         <div className="login-quote-content" key={quote.id}>
           <blockquote>“{quote.text}”</blockquote>
           <div className="login-quote-author"><span className="login-author-line" /><div><strong>{quote.author}</strong><span>{quote.role}</span></div></div>
-          <a className="login-quote-source" href={quote.url} target="_blank" rel="noopener noreferrer">{quote.source}<ArrowUpRight size={14} aria-hidden="true" /></a>
-          <span className="login-translation">Terjemahan bahasa Indonesia</span>
+          {quote.url
+            ? <a className="login-quote-source" href={quote.url} target="_blank" rel="noopener noreferrer">{quote.source}<ArrowUpRight size={14} aria-hidden="true" /></a>
+            : <span className="login-quote-source">{quote.source}</span>}
+          {quote.originalLanguage !== 'id' && <span className="login-translation">Terjemahan bahasa Indonesia</span>}
         </div>
         <div className="login-quote-controls">
           <span>{paused ? 'Pergantian dijeda' : `Inspirasi baru setiap ${QUOTE_INTERVAL_MS / 1000} detik`}</span>

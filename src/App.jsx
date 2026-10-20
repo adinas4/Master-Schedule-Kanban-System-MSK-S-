@@ -22,6 +22,11 @@ import {
 } from './utils/modelUtils';
 import { QRCodeCanvas, QRCodeSVG } from 'qrcode.react';
 import { useScheduleStore } from './stores/useScheduleStore';
+import {
+  MAIN_MENU_DESCRIPTIONS,
+  REPORT_DESCRIPTIONS,
+  REPORT_GROUP_DESCRIPTIONS,
+} from './data/menuDescriptions';
 
 const standardKanbanIdFormat = 'KB-{CATEGORY}-{UNIQ}';
 const standardKanbanCardIdFormat = 'KB-{CATEGORY}-{UNIQ}-{TOTAL:02}-{SEQ:02}';
@@ -171,6 +176,22 @@ const parseAppRouteFromLocation = () => {
   }
   if (first === 'inventory') {
     return { mainTab: 'inventory', inventoryTab: INVENTORY_PATH_TABS[second] || 'overview' };
+  }
+  if (['field', 'lapangan'].includes(first)) {
+    if (['production', 'produksi'].includes(second)) {
+      return {
+        mainTab: 'kanban',
+        kanbanView: 'board',
+        kanbanSubTab: 'production',
+        fieldQuickAction: 'production',
+      };
+    }
+    return {
+      mainTab: 'kanban',
+      kanbanView: 'board',
+      kanbanSubTab: 'receiving',
+      fieldQuickAction: 'pcd',
+    };
   }
   if (first === 'kanban') {
     const kanbanSubTab = second || 'requests';
@@ -1915,6 +1936,13 @@ const Dashboard = ({ onLogout, token, user }) => {
     customers: [],
     modelCodes: [],
     weight: '',
+    materialGrade: '',
+    grade: '',
+    materialForm: '',
+    widthMm: '',
+    thicknessMm: '',
+    lengthMm: '',
+    diameterMm: '',
     locationId: '',
     locationName: '',
     lineProduction: '',
@@ -2453,7 +2481,16 @@ const Dashboard = ({ onLogout, token, user }) => {
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
   const [incomingMenuOpen, setIncomingMenuOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [incomingQuickAction, setIncomingQuickAction] = useState(null);
+  const [incomingQuickAction, setIncomingQuickAction] = useState(() => (
+    initialRoute.fieldQuickAction === 'pcd'
+      ? { type: 'dn', nonce: Date.now(), source: 'field-shortcut' }
+      : null
+  ));
+  const [productionQuickAction, setProductionQuickAction] = useState(() => (
+    initialRoute.fieldQuickAction === 'production'
+      ? { type: 'production', nonce: Date.now(), source: 'field-shortcut' }
+      : null
+  ));
   const isAdmin = user?.role === 'admin';
   const isSupplier = user?.role === 'supplier';
   const isProductionUser = user?.role === 'production';
@@ -2492,6 +2529,28 @@ const Dashboard = ({ onLogout, token, user }) => {
   const canProduction = can('production') || isProductionUser;
   const canQuality = can('quality');
   const canOpenReportMenu = canViewReport || canViewScorecard;
+  useEffect(() => {
+    if (initialRoute.fieldQuickAction === 'pcd' && !canEditSchedules) {
+      setIncomingQuickAction(null);
+      setMainTab(isProductionUser ? 'kanban' : 'dashboard');
+      if (isProductionUser) setKanbanSubTab('production');
+      showToastMessage('Shortcut PCD hanya tersedia untuk akun dengan akses Receiving.', '', null, 'error');
+      return;
+    }
+    if (initialRoute.fieldQuickAction === 'production' && !canProduction) {
+      setProductionQuickAction(null);
+      setMainTab('dashboard');
+      showToastMessage('Shortcut Produksi hanya tersedia untuk akun dengan akses produksi.', '', null, 'error');
+    }
+  }, [
+    canEditSchedules,
+    canProduction,
+    initialRoute.fieldQuickAction,
+    isProductionUser,
+    setKanbanSubTab,
+    setMainTab,
+    showToastMessage,
+  ]);
   const applyRouteFromLocation = useCallback(() => {
     const route = parseAppRouteFromLocation();
     setMainTab(route.mainTab || 'dashboard');
@@ -2574,6 +2633,9 @@ const Dashboard = ({ onLogout, token, user }) => {
       links,
       detailLabel,
       title: detailLabel ? `${base.title} - ${detailLabel}` : base.title,
+      subtitle: mainTab === 'reports'
+        ? (REPORT_DESCRIPTIONS[reportTab] || base.subtitle)
+        : base.subtitle,
     };
   }, [activeInventoryHelpTab, activeQualityHelpTab, canManageItems, kanbanSubTab, kanbanView, mainTab, masterRefTab, reportTab]);
   const reportMenuGroups = useMemo(() => {
@@ -2595,6 +2657,7 @@ const Dashboard = ({ onLogout, token, user }) => {
         icon: Package,
         reports: [
           { key: 'stock-coverage', label: 'Stock Coverage', icon: BarChart3, access: canViewReport },
+          { key: 'stock-by-customer', label: 'Stok per Customer', icon: BarChart3, access: canViewReport },
           { key: 'slow-moving', label: 'Slow & Dead Stock', icon: TrendingDown, access: canViewReport },
           { key: 'item-summary', label: 'Laporan per Barang', icon: Package, access: canViewReport },
           { key: 'fifo-violations', label: 'FIFO Violation Log', icon: AlertTriangle, access: canViewReport },
@@ -2639,7 +2702,13 @@ const Dashboard = ({ onLogout, token, user }) => {
       },
     ];
     return groups
-      .map((group) => ({ ...group, reports: group.reports.filter((report) => report.access) }))
+      .map((group) => ({
+        ...group,
+        description: REPORT_GROUP_DESCRIPTIONS[group.key] || '',
+        reports: group.reports
+          .filter((report) => report.access)
+          .map((report) => ({ ...report, description: REPORT_DESCRIPTIONS[report.key] || '' })),
+      }))
       .filter((group) => group.reports.length > 0);
   }, [canViewReport, canViewScorecard]);
   const activeReportMenuGroup = reportMenuGroups.find((group) => group.key === reportMenuCategory) || reportMenuGroups[0] || null;
@@ -3173,7 +3242,8 @@ const Dashboard = ({ onLogout, token, user }) => {
   ]);
 
   const openIncomingQuickAction = useCallback((type) => {
-    if (!canEditSchedules) {
+    const isCustomerMaterialReceipt = type === 'ssp';
+    if (isCustomerMaterialReceipt ? !canProduction : !canEditSchedules) {
       showToastMessage(getMainNavAccessMessage('kanban'), '', null, 'error');
       return;
     }
@@ -3182,6 +3252,13 @@ const Dashboard = ({ onLogout, token, user }) => {
     setReportMenuOpen(false);
     setIncomingMenuOpen(false);
     setShowForm(false);
+    if (isCustomerMaterialReceipt) {
+      setProductionQuickAction({ type: 'ssp', nonce: Date.now() });
+      setMainTab('kanban');
+      setKanbanView(isProductionUser ? 'board' : 'planning');
+      setKanbanSubTab('production');
+      return;
+    }
     const nextAction = { type, nonce: Date.now() };
     setIncomingQuickAction(nextAction);
     if (type === 'schedule') {
@@ -3193,12 +3270,30 @@ const Dashboard = ({ onLogout, token, user }) => {
     setKanbanSubTab('receiving');
   }, [
     canEditSchedules,
+    canProduction,
     getMainNavAccessMessage,
+    isProductionUser,
     setKanbanSubTab,
     setKanbanView,
     setMainTab,
     showToastMessage,
   ]);
+
+  const openProductionQuickAction = useCallback(() => {
+    if (!canProduction) {
+      showToastMessage('Anda tidak memiliki akses input produksi.', '', null, 'error');
+      return;
+    }
+    setActiveMenu(null);
+    setSettingsMenuOpen(false);
+    setReportMenuOpen(false);
+    setIncomingMenuOpen(false);
+    setShowForm(false);
+    setProductionQuickAction({ type: 'production', nonce: Date.now() });
+    setMainTab('kanban');
+    setKanbanView(isProductionUser ? 'board' : 'planning');
+    setKanbanSubTab('production');
+  }, [canProduction, isProductionUser, setKanbanSubTab, setKanbanView, setMainTab, showToastMessage]);
 
   const refreshAiConfigStatus = useCallback(async ({ silent = false } = {}) => {
     if (!canUseAI) {
@@ -6318,7 +6413,7 @@ const Dashboard = ({ onLogout, token, user }) => {
       dailyCapacityQty: '',
       deliverySchedule: [],
     });
-    setItemMasterForm({ code: '', name: '', partNo: '', type: 'Raw Material', unit: 'PCS', typePack: '', packQty: '', orderLotSize: '', maxDeliveryPerRit: '', isSeasonal: false, suppliers: [], customers: [], modelCodes: [], weight: '', locationId: '', locationName: '', lineProduction: '', processRouting: [], itemStatus: 'active', inactiveRemarks: '', leadTimeDays: '', cycleTimeSeconds: '', imageUrl: '', imageThumbUrl: '', shelfLifeDays: '' });
+    setItemMasterForm({ code: '', name: '', partNo: '', type: 'Raw Material', unit: 'PCS', typePack: '', packQty: '', orderLotSize: '', maxDeliveryPerRit: '', isSeasonal: false, suppliers: [], customers: [], modelCodes: [], weight: '', materialGrade: '', grade: '', materialForm: '', widthMm: '', thicknessMm: '', lengthMm: '', diameterMm: '', locationId: '', locationName: '', lineProduction: '', processRouting: [], itemStatus: 'active', inactiveRemarks: '', leadTimeDays: '', cycleTimeSeconds: '', imageUrl: '', imageThumbUrl: '', shelfLifeDays: '' });
       setItemModelEntry('');
     setLocationForm({ id: '', lineDescription: '', areaId: '', warehouseId: '', category: 'Raw Material', fifoLane: '', machineNote: '' });
     setPackingForm({ code: '', name: '' });
@@ -6615,14 +6710,33 @@ const Dashboard = ({ onLogout, token, user }) => {
     return (
       compact === 'fg'
       || compact === 'sa'
+      || compact === 'cp'
       || compact.includes('finishedgood')
       || compact.includes('finishgood')
       || compact.includes('finishgoods')
+      || compact.includes('childpart')
       || compact.includes('assembly')
       || compact.includes('assy')
       || compact.includes('subassy')
       || compact.includes('subassembly')
     );
+  };
+
+  const isCustomerSuppliedItemCategory = (value) => {
+    const compact = String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+    return ['ssp', 'issp', 'suppliedsupplypart', 'indirectssp', 'customersuppliedmaterial'].includes(compact);
+  };
+
+  const isMaterialSpecificationCategory = (value) => {
+    const raw = String(value || '').trim();
+    const matched = (masterCategories || []).find((category) => (
+      String(category.code || '').trim().toLowerCase() === raw.toLowerCase()
+      || String(category.name || '').trim().toLowerCase() === raw.toLowerCase()
+    ));
+    return [raw, matched?.code, matched?.name].some((candidate) => {
+      const compact = String(candidate || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+      return ['rm', 'raw', 'rawmaterial', 'indirect', 'indirectmaterial', 'im', 'ssp', 'issp', 'suppliedsupplypart', 'indirectssp', 'customersuppliedmaterial'].includes(compact);
+    });
   };
 
   const handleSaveItemMaster = async () => {
@@ -6631,8 +6745,13 @@ const Dashboard = ({ onLogout, token, user }) => {
       return;
     }
     const isProductionOutputItem = isProductionOutputItemCategory(itemMasterForm.type);
-    const normalizedSuppliers = isProductionOutputItem ? [] : (itemMasterForm.suppliers || []);
-    const normalizedCustomers = isProductionOutputItem ? (itemMasterForm.customers || []) : [];
+    const isCustomerSuppliedItem = isCustomerSuppliedItemCategory(itemMasterForm.type);
+    const usesMaterialSpecification = isMaterialSpecificationCategory(itemMasterForm.type);
+    const materialFormValue = usesMaterialSpecification ? String(itemMasterForm.materialForm || '').trim() : '';
+    const materialFormKey = materialFormValue.toLowerCase();
+    const isCustomerOwnedItem = isProductionOutputItem || isCustomerSuppliedItem;
+    const normalizedSuppliers = isCustomerOwnedItem ? [] : (itemMasterForm.suppliers || []);
+    const normalizedCustomers = isCustomerOwnedItem ? (itemMasterForm.customers || []) : [];
     const supplierShareTotal = normalizedSuppliers.reduce((acc, row) => acc + Number(row.sharePercent || 0), 0);
     const customerShareTotal = normalizedCustomers.reduce((acc, row) => acc + Number(row.sharePercent || 0), 0);
     if (supplierShareTotal > 100) {
@@ -6652,11 +6771,11 @@ const Dashboard = ({ onLogout, token, user }) => {
       const ratio = value / pack;
       return Math.abs(ratio - Math.round(ratio)) < 1e-6;
     };
-    if (!Number.isFinite(orderLotValue) || orderLotValue <= 0) {
+    if (!isCustomerSuppliedItem && (!Number.isFinite(orderLotValue) || orderLotValue <= 0)) {
       alert('Order Lot Size wajib diisi dan > 0.');
       return;
     }
-    if (!Number.isFinite(maxDeliveryValue) || maxDeliveryValue <= 0) {
+    if (!isCustomerSuppliedItem && (!Number.isFinite(maxDeliveryValue) || maxDeliveryValue <= 0)) {
       alert('Max Delivery / RIT wajib diisi dan > 0.');
       return;
     }
@@ -6664,11 +6783,11 @@ const Dashboard = ({ onLogout, token, user }) => {
       alert('SNP / Pack Qty wajib diisi untuk Order Lot Size dan Max Delivery / RIT.');
       return;
     }
-    if (!isMultipleOfPack(orderLotValue, packQtyValue)) {
+    if (!isCustomerSuppliedItem && !isMultipleOfPack(orderLotValue, packQtyValue)) {
       alert('Order Lot Size harus kelipatan SNP / Pack Qty.');
       return;
     }
-    if (!isMultipleOfPack(maxDeliveryValue, packQtyValue)) {
+    if (!isCustomerSuppliedItem && !isMultipleOfPack(maxDeliveryValue, packQtyValue)) {
       alert('Max Delivery / RIT harus kelipatan SNP / Pack Qty.');
       return;
     }
@@ -6700,13 +6819,20 @@ const Dashboard = ({ onLogout, token, user }) => {
       shelfLifeMonths: null,
       isSeasonal: !!itemMasterForm.isSeasonal,
       packQty: Number.isFinite(packQtyValue) ? Math.max(0, packQtyValue) : 0,
-      orderLotSize: Number.isFinite(orderLotValue) ? Math.max(0, orderLotValue) : 0,
-      maxDeliveryPerRit: Number.isFinite(maxDeliveryValue) ? Math.max(0, maxDeliveryValue) : 0,
+      orderLotSize: isCustomerSuppliedItem ? 0 : (Number.isFinite(orderLotValue) ? Math.max(0, orderLotValue) : 0),
+      maxDeliveryPerRit: isCustomerSuppliedItem ? 0 : (Number.isFinite(maxDeliveryValue) ? Math.max(0, maxDeliveryValue) : 0),
       cycleTimeSeconds: Number.isFinite(cycleTimeSecondsValue) ? Math.max(0, cycleTimeSecondsValue) : 0,
       processFlow: processFlowValue,
       processRouting: normalizedProcessRouting,
       itemStatus: itemStatusValue,
       inactiveRemarks: itemStatusValue === 'inactive' ? String(itemMasterForm.inactiveRemarks || itemMasterForm.inactive_remarks || '').trim() : '',
+      materialGrade: usesMaterialSpecification ? String(itemMasterForm.materialGrade || '').trim() : '',
+      grade: usesMaterialSpecification ? String(itemMasterForm.grade || '').trim() : '',
+      materialForm: materialFormValue,
+      widthMm: usesMaterialSpecification && ['plate', 'coil'].includes(materialFormKey) ? itemMasterForm.widthMm : null,
+      thicknessMm: usesMaterialSpecification && ['plate', 'coil', 'pipe'].includes(materialFormKey) ? itemMasterForm.thicknessMm : null,
+      lengthMm: usesMaterialSpecification && ['pipe', 'wire'].includes(materialFormKey) ? itemMasterForm.lengthMm : null,
+      diameterMm: usesMaterialSpecification && ['pipe', 'wire'].includes(materialFormKey) ? itemMasterForm.diameterMm : null,
       suppliers: normalizedSuppliers,
       customers: normalizedCustomers,
     };
@@ -8987,6 +9113,25 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
       showToastMessage('Masukkan data QR terlebih dahulu.', '', null, 'warning');
       return;
     }
+    if (lines.length === 1 && /^(?:MSKS\|LBL\||INB-)/i.test(lines[0])) {
+      if (!canEditSchedules) {
+        setScanError('Anda tidak memiliki akses Penerimaan Aktual.');
+        showToastMessage('Anda tidak memiliki akses Penerimaan Aktual.', '', null, 'error');
+        return;
+      }
+      setScanError('');
+      setScanInput('');
+      setScanResults([]);
+      setScanActiveResult(null);
+      setIncomingQuickAction({
+        type: 'schedule',
+        nonce: Date.now(),
+        source: 'unified-scan',
+        scanValue: lines[0],
+      });
+      setMainTab('monitoring');
+      return;
+    }
     setScanError('');
     const parsed = lines.map((line) => parseScanLine(line)).filter(Boolean);
     if (parsed.length === 0) {
@@ -9263,12 +9408,22 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         };
         const pickNumberValue = (importedValue, existingValue = 0) => {
           if (hasImportValue(importedValue)) {
-            const parsed = Number(importedValue);
+            const parsed = Number(String(importedValue).trim().replace(',', '.'));
             return Number.isFinite(parsed) ? parsed : Number(existingValue || 0);
           }
           if (isReplaceMode) return 0;
           const parsedExisting = Number(existingValue || 0);
           return Number.isFinite(parsedExisting) ? parsedExisting : 0;
+        };
+        const pickOptionalNumberValue = (importedValue, existingValue = null) => {
+          if (hasImportValue(importedValue)) {
+            const parsed = Number(String(importedValue).trim().replace(',', '.'));
+            return Number.isFinite(parsed) ? parsed : (isReplaceMode ? null : existingValue);
+          }
+          if (isReplaceMode) return null;
+          if (!hasImportValue(existingValue)) return null;
+          const parsedExisting = Number(String(existingValue ?? '').trim().replace(',', '.'));
+          return Number.isFinite(parsedExisting) ? parsedExisting : null;
         };
         const pickBooleanValue = (importedValue, existingValue = false) => (
           hasImportValue(importedValue)
@@ -9286,6 +9441,13 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
           const typePack = getImportValue(row, ['Type Pack', 'TypePack', 'typePack', 'type_pack']);
           const model = getImportValue(row, ['Model', 'model']);
           const weight = getImportValue(row, ['Berat', 'Weight', 'weight', 'Kgs', 'kgs']);
+          const materialGrade = getImportValue(row, ['Material Grade', 'materialGrade', 'material_grade']);
+          const grade = getImportValue(row, ['Grade', 'grade']);
+          const materialForm = getImportValue(row, ['Form', 'Material Form', 'materialForm', 'material_form']);
+          const widthMm = getImportValue(row, ['Width (mm)', 'Width_mm', 'widthMm', 'width_mm']);
+          const thicknessMm = getImportValue(row, ['Thickness (mm)', 'Thickness_mm', 'thicknessMm', 'thickness_mm']);
+          const lengthMm = getImportValue(row, ['Length (mm)', 'Length_mm', 'lengthMm', 'length_mm']);
+          const diameterMm = getImportValue(row, ['Diameter (mm)', 'Diameter_mm', 'diameterMm', 'diameter_mm']);
           const price = getImportValue(row, ['Price', 'Harga', 'price']);
           const leadTimeDays = getImportValue(row, ['Lead Time (Days)', 'Lead Time', 'leadTimeDays', 'lead_time_days']);
           const cycle = getImportValue(row, ['Cycle', 'cycle']);
@@ -9366,6 +9528,10 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
           const derivedCycleTimeSeconds = normalizedProcessRouting.reduce((sum, step) => sum + Number(step.standardTime || 0), 0);
           const normalizedCode = String(code).trim();
           const existingItem = masterItems.find((item) => String(item.code || '').trim() === normalizedCode) || null;
+          const materialFormValue = isMaterialSpecificationCategory(type)
+            ? pickTextValue(materialForm, existingItem?.material_form || existingItem?.materialForm || '')
+            : '';
+          const materialFormKey = materialFormValue.toLowerCase();
           const itemStatusValue = hasImportValue(itemStatus)
             ? normalizeItemActiveStatus(itemStatus)
             : normalizeItemActiveStatus(existingItem?.item_status || existingItem?.itemStatus || 'active');
@@ -9399,6 +9565,13 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
             unit: pickTextValue(unit, existingItem?.unit || ''),
             model: pickTextValue(model, existingItem?.model || ''),
             weight: pickNumberValue(weight, existingItem?.weight ?? null),
+            materialGrade: isMaterialSpecificationCategory(type) ? pickTextValue(materialGrade, existingItem?.material_grade || existingItem?.materialGrade || '') : '',
+            grade: isMaterialSpecificationCategory(type) ? pickTextValue(grade, existingItem?.grade || '') : '',
+            materialForm: materialFormValue,
+            widthMm: isMaterialSpecificationCategory(type) && ['plate', 'coil'].includes(materialFormKey) ? pickOptionalNumberValue(widthMm, existingItem?.width_mm ?? existingItem?.widthMm ?? null) : null,
+            thicknessMm: isMaterialSpecificationCategory(type) && ['plate', 'coil', 'pipe'].includes(materialFormKey) ? pickOptionalNumberValue(thicknessMm, existingItem?.thickness_mm ?? existingItem?.thicknessMm ?? null) : null,
+            lengthMm: isMaterialSpecificationCategory(type) && ['pipe', 'wire'].includes(materialFormKey) ? pickOptionalNumberValue(lengthMm, existingItem?.length_mm ?? existingItem?.lengthMm ?? null) : null,
+            diameterMm: isMaterialSpecificationCategory(type) && ['pipe', 'wire'].includes(materialFormKey) ? pickOptionalNumberValue(diameterMm, existingItem?.diameter_mm ?? existingItem?.diameterMm ?? null) : null,
             price: pickNumberValue(price, existingItem?.price ?? null),
             locationId: pickTextValue(locationIdResolved, existingItem?.location_id || existingItem?.locationId || ''),
             locationName: pickTextValue(
@@ -9558,6 +9731,13 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         "Max Delivery / Rit": 100,
         "Model": "SEAT-BASE-A",
         "Berat Part (Kg)": 12.5,
+        "Material Grade": "",
+        "Grade": "",
+        "Form": "",
+        "Width (mm)": "",
+        "Thickness (mm)": "",
+        "Length (mm)": "",
+        "Diameter (mm)": "",
         "Kode Lokasi": sampleWarehouseCode,
         "Nama Lokasi": sampleWarehouseName,
         "Master Ord Warehouse": sampleWarehouseCode,
@@ -9589,6 +9769,13 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         "Max Delivery / Rit": 500,
         "Model": "STEEL-GRADE-A",
         "Berat Part (Kg)": 1.8,
+        "Material Grade": "C31",
+        "Grade": "STKM370G",
+        "Form": "Pipe",
+        "Width (mm)": "",
+        "Thickness (mm)": 1.6,
+        "Length (mm)": 886,
+        "Diameter (mm)": 31.8,
         "Kode Lokasi": sampleWarehouseCode,
         "Nama Lokasi": sampleWarehouseName,
         "Master Ord Warehouse": sampleWarehouseCode,
@@ -9620,6 +9807,13 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         "Max Delivery / Rit": 40,
         "Model": "SEAT-BASE-A",
         "Berat Part (Kg)": 2.15,
+        "Material Grade": "",
+        "Grade": "",
+        "Form": "",
+        "Width (mm)": "",
+        "Thickness (mm)": "",
+        "Length (mm)": "",
+        "Diameter (mm)": "",
         "Kode Lokasi": sampleWarehouseCode,
         "Nama Lokasi": sampleWarehouseName,
         "Master Ord Warehouse": sampleWarehouseCode,
@@ -9651,6 +9845,13 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         "Max Delivery / Rit": 1000,
         "Model": "MRO-STANDARD",
         "Berat Part (Kg)": 0.01,
+        "Material Grade": "",
+        "Grade": "",
+        "Form": "",
+        "Width (mm)": "",
+        "Thickness (mm)": "",
+        "Length (mm)": "",
+        "Diameter (mm)": "",
         "Kode Lokasi": sampleWarehouseCode,
         "Nama Lokasi": sampleWarehouseName,
         "Master Ord Warehouse": sampleWarehouseCode,
@@ -9713,6 +9914,13 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         "Max Delivery / Rit": item.max_delivery_per_rit ?? '',
         "Model": formatModelCodes(masterModelsMap, resolveModelCodesFromMaster(item.model)) || item.model || '',
         "Berat Part (kg)": item.weight ?? '',
+        "Material Grade": item.material_grade || item.materialGrade || '',
+        "Grade": item.grade || '',
+        "Form": item.material_form || item.materialForm || '',
+        "Width (mm)": item.width_mm ?? item.widthMm ?? '',
+        "Thickness (mm)": item.thickness_mm ?? item.thicknessMm ?? '',
+        "Length (mm)": item.length_mm ?? item.lengthMm ?? '',
+        "Diameter (mm)": item.diameter_mm ?? item.diameterMm ?? '',
         "Master Ord Warehouse": locationLabel,
         "Nama Master Ord Warehouse": item.location_name || locationLabel || '',
         "Work Center": workCenterLabel,
@@ -9999,7 +10207,6 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
           : item
       )
     );
-    setShowFifoReceive(false);
   };
 
   const handleFifoIssue = () => {
@@ -10043,7 +10250,6 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
           : item
       )
     );
-    setShowFifoIssue(false);
     const lotSummary = buildLotSummaryText(consumedLots, { label: 'Lot terpakai' });
     showToastMessage(
       `Issue FIFO selesai. Stok terpotong ${formatNumber0(issueQty)}${lotSummary ? ` | ${lotSummary}` : ''}.`,
@@ -10313,6 +10519,25 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
           lastScanRef.current = { value, time: now };
           setScanCameraStatus('QR terbaca, memproses...');
           try {
+            if (/^(?:MSKS\|LBL\||INB-)/i.test(value)) {
+              if (!canEditSchedules) {
+                setScanError('Anda tidak memiliki akses Penerimaan Aktual.');
+                setScanCameraStatus('Akses penerimaan tidak tersedia.');
+                return;
+              }
+              setScanError('');
+              setScanResults([]);
+              setScanActiveResult(null);
+              setIncomingQuickAction({
+                type: 'schedule',
+                nonce: Date.now(),
+                source: 'unified-camera-scan',
+                scanValue: value,
+              });
+              setMainTab('monitoring');
+              setScanCameraStatus('Label inbound terbaca. Membuka form penerimaan...');
+              return;
+            }
             const payload = parseScanLine(value);
             const built = await (fetchScanPreviewRef.current || fetchScanPreview)(payload, 0);
             if (built.scanPreviewError) {
@@ -10408,7 +10633,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
         scanStartPendingRef.current = false;
       }
     }
-  }, [kanbanSubTab, pushScanHistory, scanMode, stopScanner]);
+  }, [canEditSchedules, kanbanSubTab, pushScanHistory, scanMode, setMainTab, stopScanner]);
 
   const handleBatchApproveAndDn = async () => handleRequestDnBatch({ approveBeforeDn: true });
 
@@ -10529,8 +10754,12 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       'Ketepatan Waktu %': row?.summary?.timeScore ?? 0,
       'Fulfillment Qty %': row?.summary?.qtyScoreRaw ?? row?.summary?.qtyScore ?? 0,
       'QC Incoming %': row?.summary?.qcScore ?? 0,
+      'Score SNP %': row?.summary?.snpScore ?? '',
+      'SNP Diperiksa': row?.summary?.snpChecked ?? 0,
+      'SNP Tidak Sesuai': row?.summary?.snpMismatch ?? 0,
       Jadwal: row?.summary?.totalSchedules ?? 0,
       'On Time': row?.summary?.onTime ?? 0,
+      'Early + On Time': row?.summary?.earlyOnTime ?? 0,
       Late: row?.summary?.late ?? 0,
       'Late Completion': row?.summary?.lateCompletion ?? 0,
       'Partial OK': row?.summary?.partialOnTime ?? 0,
@@ -10550,9 +10779,30 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       'Qty DN': row?.summary?.dnDocQty ?? 0,
       'Qty DN Diterima': row?.summary?.dnReceivedQty ?? 0,
     }));
+    const detailRows = reportRows.flatMap((supplierReport) => {
+      const supplierName = supplierReport?.supplier?.name || supplierReport?.supplier?.code || resolveSupplierLabel(supplierReport);
+      const supplierCode = supplierReport?.supplier?.code || supplierReport?.supplier || '';
+      const schedules = Array.isArray(supplierReport?.schedules) ? supplierReport.schedules : [];
+      return schedules.map((schedule) => ({
+        Supplier: supplierName,
+        'Kode Supplier': supplierCode,
+        'No PO': schedule?.poNumber || '',
+        Item: schedule?.itemCode || '',
+        SNP: Number(schedule?.snp || 0) || '',
+        'Tanggal Rencana': schedule?.requestDate || '',
+        'Tanggal Tiba': schedule?.arrivalDate || '',
+        'Qty Jadwal': Number(schedule?.requestQty || 0),
+        'Qty Diterima': Number(schedule?.receivedQty || 0),
+        Status: schedule?.status || '',
+      }));
+    });
     const ws = XLSX.utils.json_to_sheet(exportRows);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Report');
+    if (detailRows.length > 0) {
+      const detailWs = XLSX.utils.json_to_sheet(detailRows);
+      XLSX.utils.book_append_sheet(wb, detailWs, 'Detail Jadwal');
+    }
     XLSX.writeFile(wb, `Report_${new Date().toISOString().split('T')[0]}.xlsx`);
   };
 
@@ -14363,6 +14613,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     inboundCardScanOpen,
     inboundCardScanValue,
     incomingQuickAction,
+    productionQuickAction,
     inboundNav,
     clearInboundNav,
     calculateSupplierPerformance,
@@ -15110,6 +15361,24 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
             active: mainTab === 'monitoring',
             onSelect: () => setMainTab('monitoring'),
           },
+          ...(canEditSchedules
+            ? [{
+                key: 'field-receiving',
+                label: 'Receiving',
+                icon: Truck,
+                active: mainTab === 'kanban' && kanbanSubTab === 'receiving',
+                onSelect: () => openIncomingQuickAction('dn'),
+              }]
+            : []),
+          ...(canProduction
+            ? [{
+                key: 'field-production',
+                label: 'Produksi',
+                icon: Play,
+                active: mainTab === 'kanban' && kanbanSubTab === 'production',
+                onSelect: openProductionQuickAction,
+              }]
+            : []),
           ...(canQuality
             ? [{
                 key: 'quality',
@@ -15257,8 +15526,17 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                               onClick={() => openIncomingQuickAction('dn')}
                               className="flex w-full items-center gap-2 border-t border-slate-100 px-4 py-3 text-left text-sm text-slate-700 hover:bg-slate-50"
                             >
-                              <FileText size={16} /> DN
+                              <FileText size={16} /> Receiving PCD
                             </button>
+                            {canProduction && (
+                              <button
+                                type="button"
+                                onClick={() => openIncomingQuickAction('ssp')}
+                                className="flex w-full items-center gap-2 border-t border-slate-100 px-4 py-3 text-left text-sm text-sky-700 hover:bg-sky-50"
+                              >
+                                <Package size={16} /> Terima SSP/ISSP
+                              </button>
+                            )}
                           </div>
                         )}
                       </div>
@@ -15281,7 +15559,49 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                     </button>
                     </div>
                   )}
-                  
+
+                  {canProduction && !canEditSchedules && (
+                    <div className={`relative ${incomingMenuOpen ? 'z-[260]' : 'z-10'}`}>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setActiveMenu(null);
+                          setSettingsMenuOpen(false);
+                          setReportMenuOpen(false);
+                          setIncomingMenuOpen((prev) => !prev);
+                        }}
+                        className="bg-white border border-slate-200 text-slate-600 p-2 rounded-lg shadow-sm hover:bg-slate-50 hover:text-emerald-700 transition"
+                        title="Incoming Cepat"
+                        aria-label="Incoming Cepat"
+                      >
+                        <Truck size={20} />
+                      </button>
+                      {incomingMenuOpen && (
+                        <div className="absolute right-0 top-full z-[270] mt-2 w-52 overflow-hidden rounded-lg border border-gray-100 bg-white shadow-xl">
+                          <button
+                            type="button"
+                            onClick={() => openIncomingQuickAction('ssp')}
+                            className="flex w-full items-center gap-2 px-4 py-3 text-left text-sm text-sky-700 hover:bg-sky-50"
+                          >
+                            <Package size={16} /> Terima SSP/ISSP
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {canProduction && (
+                    <button
+                      type="button"
+                      onClick={openProductionQuickAction}
+                      className="bg-emerald-600 hover:bg-emerald-700 text-white p-2 rounded-lg shadow transition"
+                      title="Input Produksi Cepat"
+                      aria-label="Input Produksi Cepat"
+                    >
+                      <Play size={20} />
+                    </button>
+                  )}
 
 
 
@@ -15407,12 +15727,14 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                 <div className="app-main-nav-track relative z-40 flex w-full flex-nowrap items-center gap-1 overflow-visible rounded-2xl border border-slate-200 bg-white/90 p-1.5 shadow-sm backdrop-blur">
                   <button
                     onClick={() => setMainTab('dashboard')}
+                    title={MAIN_MENU_DESCRIPTIONS.dashboard}
                     className={`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'dashboard' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                   >
                     Dashboard
                   </button>
                   <button
                     onClick={() => setMainTab('monitoring')}
+                    title={MAIN_MENU_DESCRIPTIONS.monitoring}
                     className={`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'monitoring' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                   >
                     Inbound
@@ -15424,7 +15746,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                       setMainTab('quality');
                     }}
                     disabled={!canQuality}
-                    title={canQuality ? 'Buka Quality Control' : getMainNavAccessMessage('quality')}
+                    title={canQuality ? MAIN_MENU_DESCRIPTIONS.quality : getMainNavAccessMessage('quality')}
                     className={getMainNavButtonClassName(`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'quality' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canQuality)}
                   >
                     Quality
@@ -15438,19 +15760,21 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                       setKanbanSubTab('requests');
                     }}
                     disabled={!canEditSchedules}
-                    title={canEditSchedules ? 'Buka Kanban Board' : getMainNavAccessMessage('kanban')}
+                    title={canEditSchedules ? MAIN_MENU_DESCRIPTIONS.kanban : getMainNavAccessMessage('kanban')}
                     className={getMainNavButtonClassName(`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'kanban' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canEditSchedules)}
                   >
                     Kanban Board
                   </button>
                   <button
                     onClick={() => setMainTab('fifo')}
+                    title={MAIN_MENU_DESCRIPTIONS.fifo}
                     className={`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'fifo' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                   >
                     FIFO
                   </button>
                   <button
                     onClick={() => setMainTab('inventory')}
+                    title={MAIN_MENU_DESCRIPTIONS.inventory}
                     className={`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'inventory' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
                   >
                     Inventory
@@ -15462,7 +15786,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                       setMainTab('andon');
                     }}
                     disabled={!canProduction}
-                    title={canProduction ? 'Buka Andon TV Produksi' : getMainNavAccessMessage('production')}
+                    title={canProduction ? MAIN_MENU_DESCRIPTIONS.andon : getMainNavAccessMessage('production')}
                     className={getMainNavButtonClassName(`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'andon' ? 'bg-rose-600 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canProduction)}
                   >
                     Andon TV
@@ -15474,7 +15798,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                       setMainTab('subcon');
                     }}
                     disabled={!canSubcon}
-                    title={canSubcon ? 'Buka Subcon' : getMainNavAccessMessage('subcon')}
+                    title={canSubcon ? MAIN_MENU_DESCRIPTIONS.subcon : getMainNavAccessMessage('subcon')}
                     className={getMainNavButtonClassName(`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'subcon' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canSubcon)}
                   >
                     Subcon
@@ -15486,7 +15810,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                       setMainTab('prl');
                     }}
                     disabled={!canViewPrl}
-                    title={canViewPrl ? 'Buka PRL' : getMainNavAccessMessage('prl')}
+                    title={canViewPrl ? MAIN_MENU_DESCRIPTIONS.prl : getMainNavAccessMessage('prl')}
                     className={getMainNavButtonClassName(`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'prl' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canViewPrl)}
                   >
                     PRL
@@ -15498,7 +15822,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                       setMainTab('masterref');
                     }}
                     disabled={!canViewMaster}
-                    title={canViewMaster ? 'Buka Master Referensi' : getMainNavAccessMessage('masterref')}
+                    title={canViewMaster ? MAIN_MENU_DESCRIPTIONS.masterref : getMainNavAccessMessage('masterref')}
                     className={getMainNavButtonClassName(`shrink-0 px-3.5 py-2 rounded-full text-sm transition ${mainTab === 'masterref' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`, !canViewMaster)}
                   >
                     Master Data
@@ -15557,13 +15881,14 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                         setReportMenuOpen((prev) => !prev);
                       }}
                       className={`px-3.5 py-2 rounded-full text-sm transition flex items-center gap-1.5 ${mainTab === 'reports' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-slate-100'}`}
+                      title={MAIN_MENU_DESCRIPTIONS.reports}
                     >
                       Laporan
                       <ChevronDown size={14} />
                     </button>
                     {reportMenuOpen && (
-                      <div className="absolute right-0 top-full z-[110] mt-2 w-[520px] overflow-hidden rounded-xl border border-gray-100 bg-white shadow-2xl">
-                        <div className="grid grid-cols-[190px_1fr]">
+                      <div className="absolute right-0 top-full z-[110] mt-2 w-[620px] overflow-hidden rounded-xl border border-gray-100 bg-white shadow-2xl">
+                        <div className="grid grid-cols-[210px_1fr]">
                           <div className="border-r border-slate-100 bg-slate-50 p-2">
                             {reportMenuGroups.map((group) => {
                               const GroupIcon = group.icon;
@@ -15577,19 +15902,24 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                                     setReportMenuCategory(group.key);
                                     openReportFromTree(group.key, group.reports[0]?.key);
                                   }}
-                                  className={`flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2 text-left text-sm ${active ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:bg-white/70'}`}
+                                  className={`flex w-full items-start justify-between gap-2 rounded-lg px-3 py-2.5 text-left ${active ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:bg-white/70'}`}
                                 >
-                                  <span className="flex items-center gap-2">
-                                    <GroupIcon size={15} /> {group.label}
+                                  <span className="flex min-w-0 items-start gap-2">
+                                    <GroupIcon size={15} className="mt-0.5 shrink-0" />
+                                    <span>
+                                      <span className="block text-sm font-semibold">{group.label}</span>
+                                      <span className="mt-0.5 block text-[10px] leading-4 text-slate-400">{group.description}</span>
+                                    </span>
                                   </span>
-                                  <ChevronDown size={13} className="-rotate-90 text-slate-400" />
+                                  <ChevronDown size={13} className="mt-0.5 shrink-0 -rotate-90 text-slate-400" />
                                 </button>
                               );
                             })}
                           </div>
                           <div className="p-2">
-                            <div className="px-3 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
-                              {activeReportMenuGroup?.label || 'Laporan'}
+                            <div className="px-3 pb-2 pt-1">
+                              <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">{activeReportMenuGroup?.label || 'Laporan'}</div>
+                              <div className="mt-1 text-xs leading-4 text-slate-500">{activeReportMenuGroup?.description}</div>
                             </div>
                             {(activeReportMenuGroup?.reports || []).map((report) => {
                               const ReportIcon = report.icon;
@@ -15598,9 +15928,13 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                                   key={report.key}
                                   type="button"
                                   onClick={() => openReportFromTree(activeReportMenuGroup.key, report.key)}
-                                  className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-left text-sm text-slate-700 hover:bg-slate-50"
+                                  className={`flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-slate-50 ${reportTab === report.key ? 'bg-indigo-50/70' : ''}`}
                                 >
-                                  <ReportIcon size={15} /> {report.label}
+                                  <ReportIcon size={16} className="mt-0.5 shrink-0 text-slate-500" />
+                                  <span className="min-w-0">
+                                    <span className="block text-sm font-semibold text-slate-700">{report.label}</span>
+                                    <span className="mt-0.5 block text-xs leading-4 text-slate-500">{report.description}</span>
+                                  </span>
                                 </button>
                               );
                             })}
@@ -16889,13 +17223,18 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                         key={item.key}
                         type="button"
                         onClick={() => selectMobileNavItem(item)}
-                        className={`flex min-h-14 items-center gap-3 rounded-2xl border px-3 py-3 text-left text-sm font-semibold transition ${item.active ? 'border-indigo-200 bg-indigo-50 text-indigo-700' : 'border-slate-200 bg-white text-slate-700 active:bg-slate-100'}`}
+                        className={`flex min-h-16 items-start gap-3 rounded-2xl border px-3 py-3 text-left transition ${item.active ? 'border-indigo-200 bg-indigo-50 text-indigo-700' : 'border-slate-200 bg-white text-slate-700 active:bg-slate-100'}`}
                         aria-current={item.active ? 'page' : undefined}
                       >
                         <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-xl ${item.active ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-500'}`}>
                           <MobileItemIcon size={19} strokeWidth={1.8} />
                         </span>
-                        <span className="min-w-0 leading-tight">{item.label}</span>
+                        <span className="min-w-0">
+                          <span className="block text-sm font-semibold leading-tight">{item.label}</span>
+                          <span className={`mt-1 block text-[10px] leading-4 ${item.active ? 'text-indigo-600/80' : 'text-slate-500'}`}>
+                            {MAIN_MENU_DESCRIPTIONS[item.key] || ''}
+                          </span>
+                        </span>
                       </button>
                     );
                   })}

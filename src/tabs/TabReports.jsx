@@ -33,8 +33,12 @@ import {
   Wand2,
   X,
 } from 'lucide-react';
+
+const SHOW_LEGACY_REPORT_SUMMARY = false;
+const SHOW_LEGACY_CUSTOMER_STOCK_SUMMARY = false;
 import logoPrl from '../assets/kop-mrp.png';
 import SearchableSelectDropdown from '../components/SearchableSelectDropdown';
+import { REPORT_DESCRIPTIONS, REPORT_GROUP_DESCRIPTIONS } from '../data/menuDescriptions';
 import TabReportInbound from './TabReportInbound';
 
 const SafeResponsiveContainer = ({ children }) => {
@@ -444,7 +448,13 @@ const TabReports = (props) => {
       },
     ];
     return groups
-      .map((group) => ({ ...group, reports: group.reports.filter((report) => report.access) }))
+      .map((group) => ({
+        ...group,
+        description: REPORT_GROUP_DESCRIPTIONS[group.key] || '',
+        reports: group.reports
+          .filter((report) => report.access)
+          .map((report) => ({ ...report, description: REPORT_DESCRIPTIONS[report.key] || '' })),
+      }))
       .filter((group) => group.reports.length > 0);
   }, [canViewReport, canViewScorecard]);
   const reportCategoryByTab = useMemo(() => {
@@ -456,6 +466,8 @@ const TabReports = (props) => {
   }, [reportMenuGroups]);
   const activeReportCategory = reportCategory || reportCategoryByTab.get(reportTab) || reportMenuGroups[0]?.key || 'supplier';
   const activeReportGroup = reportMenuGroups.find((group) => group.key === activeReportCategory) || reportMenuGroups[0] || null;
+  const activeReport = activeReportGroup?.reports.find((report) => report.key === reportTab) || null;
+  const ActiveReportIcon = activeReport?.icon || FileText;
   const selectReportCategory = (group) => {
     if (!group) return;
     setReportCategory?.(group.key);
@@ -1495,6 +1507,7 @@ const TabReports = (props) => {
                         type="button"
                         onClick={() => selectReportCategory(group)}
                         className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold ${active ? 'bg-slate-900 text-white shadow' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+                        title={group.description}
                       >
                         <GroupIcon size={15} /> {group.label}
                       </button>
@@ -1512,11 +1525,21 @@ const TabReports = (props) => {
                           type="button"
                           onClick={() => selectReportTab(activeReportGroup, report.key)}
                           className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold ${active ? 'border-indigo-200 bg-indigo-50 text-indigo-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'}`}
+                          title={report.description}
                         >
                           <ReportIcon size={14} /> {report.label}
                         </button>
                       );
                     })}
+                  </div>
+                )}
+                {activeReport && (
+                  <div className="mt-3 flex items-start gap-3 rounded-lg border border-indigo-100 bg-indigo-50/60 px-3 py-3" role="note">
+                    <ActiveReportIcon size={18} className="mt-0.5 shrink-0 text-indigo-600" />
+                    <div>
+                      <div className="text-sm font-semibold text-slate-800">{activeReport.label}</div>
+                      <div className="mt-0.5 text-xs leading-5 text-slate-600">{activeReport.description}</div>
+                    </div>
                   </div>
                 )}
               </div>
@@ -1576,7 +1599,7 @@ const TabReports = (props) => {
                     )}
                     {!reportLoading && reportRows.length > 0 && (
                       <>
-                        <div className="report-summary-kpi-grid grid grid-cols-1 gap-3 lg:grid-cols-5">
+                        <div className="report-summary-kpi-grid grid grid-cols-1 gap-3 lg:grid-cols-6">
                           {[
                             { label: 'Total Score', value: `${Math.round(Number(reportSummary?.weightedScore || 0))}%`, icon: Trophy, tone: 'text-indigo-700 bg-indigo-50' },
                             { label: 'Ketepatan Waktu', value: `${Math.round(Number(reportSummary?.timeScore || 0))}%`, icon: Clock3, tone: 'text-sky-700 bg-sky-50' },
@@ -1595,6 +1618,13 @@ const TabReports = (props) => {
                               tone: 'text-orange-700 bg-orange-50',
                             },
                             { label: 'QC + Line Claim', value: `${Math.round(Number(reportSummary?.qcScore || 0))}%`, icon: ShieldCheck, tone: 'text-violet-700 bg-violet-50' },
+                            {
+                              label: 'Score SNP',
+                              value: reportSummary?.snpScore === null || reportSummary?.snpScore === undefined ? '-' : `${Math.round(Number(reportSummary.snpScore))}%`,
+                              note: 'Kesesuaian qty terima terhadap SNP',
+                              icon: CheckCircle,
+                              tone: 'text-teal-700 bg-teal-50',
+                            },
                           ].map((tile) => {
                             const TileIcon = tile.icon;
                             return (
@@ -1640,6 +1670,9 @@ const TabReports = (props) => {
                                   </div>
                                 </div>
                                 <div className="flex items-center gap-2">
+                                  <div className="inline-flex items-center rounded-full bg-teal-50 px-3 py-1 text-sm font-bold text-teal-700">
+                                    SNP {summary.snpScore === null || summary.snpScore === undefined ? '-' : `${Math.round(Number(summary.snpScore))}%`}
+                                  </div>
                                   <div className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-bold ${ratingClass}`}>
                                     {Array.from({ length: 5 }).map((_, index) => (
                                       <Star key={index} size={14} className={index < rating ? 'fill-current' : ''} />
@@ -1660,6 +1693,7 @@ const TabReports = (props) => {
                                 {[
                                   { label: 'Jadwal', value: summary.totalSchedules, tone: 'border-sky-200 bg-sky-50 text-sky-700' },
                                   { label: 'On Time', value: summary.onTime, tone: 'border-emerald-200 bg-emerald-50 text-emerald-700' },
+                                  { label: 'Early + On Time', value: summary.earlyOnTime, tone: 'border-cyan-200 bg-cyan-50 text-cyan-700' },
                                   { label: 'Late', value: summary.late, tone: 'border-rose-200 bg-rose-50 text-rose-700' },
                                   { label: 'Late Completion', value: summary.lateCompletion, tone: 'border-orange-200 bg-orange-50 text-orange-700' },
                                   { label: 'Partial OK', value: summary.partialOnTime, tone: 'border-teal-200 bg-teal-50 text-teal-700' },
@@ -1791,6 +1825,7 @@ const TabReports = (props) => {
                                           <tr>
                                             <th className="p-2 text-left">PO</th>
                                             <th className="p-2 text-left">Item</th>
+                                            <th className="p-2 text-right">SNP</th>
                                             <th className="p-2 text-left">Tgl Rencana</th>
                                             <th className="p-2 text-left">Tgl Tiba</th>
                                             <th className="p-2 text-right">Qty Jadwal</th>
@@ -1803,6 +1838,7 @@ const TabReports = (props) => {
                                             <tr key={`${supplierKey}-${row.id}-${row.poNumber}-${row.itemCode}`} className="border-t border-slate-100">
                                               <td className="p-2 font-semibold text-slate-800">{row.poNumber || '-'}</td>
                                               <td className="p-2">{row.itemCode || '-'}</td>
+                                              <td className="p-2 text-right">{Number(row.snp || 0) > 0 ? formatQuantity(row.snp) : '-'}</td>
                                               <td className="p-2">{formatPrintDate(row.requestDate)}</td>
                                               <td className="p-2">{row.arrivalDate ? formatPrintDate(row.arrivalDate) : '-'}</td>
                                               <td className="p-2 text-right">{formatQuantity(row.requestQty)}</td>
@@ -1811,7 +1847,7 @@ const TabReports = (props) => {
                                             </tr>
                                           ))}
                                           {schedules.length === 0 && (
-                                            <tr><td colSpan={7} className="p-4 text-center text-slate-500">Tidak ada jadwal pada periode ini.</td></tr>
+                                            <tr><td colSpan={8} className="p-4 text-center text-slate-500">Tidak ada jadwal pada periode ini.</td></tr>
                                           )}
                                         </tbody>
                                       </table>
@@ -1864,11 +1900,95 @@ const TabReports = (props) => {
                             </div>
                           );
                         })}
+
+                        <div className="report-performance-legend break-inside-avoid rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+                          <div className="flex items-start gap-3">
+                            <div className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-900 text-white">
+                              <ListChecks size={18} />
+                            </div>
+                            <div>
+                              <div className="text-sm font-bold text-slate-900">Keterangan Performa Supplier</div>
+                              <div className="mt-0.5 text-xs text-slate-500">
+                                Panduan membaca nilai KPI, rating, dan status jadwal pada periode laporan yang dipilih.
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-3">
+                            <div className="rounded-lg border border-slate-200 bg-white p-3">
+                              <div className="mb-2 text-xs font-bold uppercase tracking-wide text-indigo-700">Nilai KPI</div>
+                              <dl className="space-y-2 text-xs leading-relaxed text-slate-600">
+                                <div>
+                                  <dt className="font-bold text-slate-900">Total Score</dt>
+                                  <dd>Nilai akhir: 60% Ketepatan Waktu + 30% Fulfillment Jadwal + 10% QC + Line Claim.</dd>
+                                </div>
+                                <div>
+                                  <dt className="font-bold text-slate-900">Ketepatan Waktu</dt>
+                                  <dd>Persentase qty yang diterima tepat waktu dibanding total qty jadwal.</dd>
+                                </div>
+                                <div>
+                                  <dt className="font-bold text-slate-900">Fulfillment Jadwal</dt>
+                                  <dd>Persentase total qty diterima dibanding total qty jadwal, maksimal 100%.</dd>
+                                </div>
+                                <div>
+                                  <dt className="font-bold text-slate-900">DN Fulfillment</dt>
+                                  <dd>Persentase qty terima RN dibanding qty pada DN/SJ. Nilai ini ditampilkan terpisah dan tidak membentuk Total Score.</dd>
+                                </div>
+                                <div>
+                                  <dt className="font-bold text-slate-900">QC + Line Claim</dt>
+                                  <dd>Nilai kualitas dari total kasus setelah dikurangi kasus open dan reject, termasuk incoming QC dan line claim.</dd>
+                                </div>
+                                <div>
+                                  <dt className="font-bold text-slate-900">Score SNP</dt>
+                                  <dd>Persentase input penerimaan yang rata-rata qty per packing-nya sesuai SNP item. Item Kg memakai toleransi ±25%. Data lama tanpa total packing memakai penilaian per baris RN.</dd>
+                                </div>
+                              </dl>
+                            </div>
+
+                            <div className="rounded-lg border border-slate-200 bg-white p-3">
+                              <div className="mb-2 text-xs font-bold uppercase tracking-wide text-emerald-700">Status Jadwal</div>
+                              <dl className="space-y-2 text-xs leading-relaxed text-slate-600">
+                                <div><dt className="inline font-bold text-slate-900">Jadwal:</dt> <dd className="inline">jumlah baris jadwal pada periode laporan.</dd></div>
+                                <div><dt className="inline font-bold text-slate-900">On Time:</dt> <dd className="inline">qty lengkap diterima pada H-1 sampai tanggal jadwal.</dd></div>
+                                <div><dt className="inline font-bold text-slate-900">Early + On Time:</dt> <dd className="inline">sebagian qty diterima terlalu awal dan sisanya diterima tepat waktu hingga qty jadwal terpenuhi.</dd></div>
+                                <div><dt className="inline font-bold text-slate-900">Late:</dt> <dd className="inline">seluruh penerimaan terjadi setelah tanggal jadwal.</dd></div>
+                                <div><dt className="inline font-bold text-slate-900">Late Completion:</dt> <dd className="inline">sebagian diterima tepat waktu, lalu dilengkapi setelah tanggal jadwal.</dd></div>
+                                <div><dt className="inline font-bold text-slate-900">Partial OK:</dt> <dd className="inline">baru diterima sebagian, tetapi bagian yang masuk masih tepat waktu.</dd></div>
+                                <div><dt className="inline font-bold text-slate-900">Partial Late:</dt> <dd className="inline">baru diterima sebagian dan terdapat qty yang datang terlambat.</dd></div>
+                                <div><dt className="inline font-bold text-slate-900">Too Early:</dt> <dd className="inline">penerimaan terjadi sebelum H-1 tanggal jadwal.</dd></div>
+                                <div><dt className="inline font-bold text-slate-900">Pending:</dt> <dd className="inline">belum ada qty yang diterima.</dd></div>
+                                <div><dt className="inline font-bold text-slate-900">QC Open:</dt> <dd className="inline">jumlah kasus QC/line claim yang belum ditutup.</dd></div>
+                              </dl>
+                            </div>
+
+                            <div className="rounded-lg border border-slate-200 bg-white p-3">
+                              <div className="mb-2 text-xs font-bold uppercase tracking-wide text-amber-700">Informasi Laporan</div>
+                              <dl className="space-y-2 text-xs leading-relaxed text-slate-600">
+                                <div>
+                                  <dt className="font-bold text-slate-900">Nama Supplier &amp; Kategori</dt>
+                                  <dd>Menunjukkan supplier yang dinilai dan sumber penilaiannya, misalnya Schedule.</dd>
+                                </div>
+                                <div>
+                                  <dt className="font-bold text-slate-900">Periode</dt>
+                                  <dd>Rentang tanggal jadwal yang masuk dalam perhitungan laporan.</dd>
+                                </div>
+                                <div>
+                                  <dt className="font-bold text-slate-900">Rating</dt>
+                                  <dd>Excellent: ≥95; Good: 80–&lt;95; Fair: 60–&lt;80; Poor: &lt;60.</dd>
+                                </div>
+                                <div>
+                                  <dt className="font-bold text-slate-900">Tombol Detail / Tutup</dt>
+                                  <dd>Membuka atau menyembunyikan Trend Bulanan, Ringkasan DN/SJ, dan tabel detail tanpa mengubah data.</dd>
+                                </div>
+                              </dl>
+                            </div>
+                          </div>
+                        </div>
                       </>
                     )}
                   </div>
 
-                  {false && reportSummary && (
+                  {SHOW_LEGACY_REPORT_SUMMARY && reportSummary && (
                   <div className="grid grid-cols-2 md:grid-cols-8 gap-3 mb-6">
                       <div className="bg-white p-3 rounded border text-center">
                         <div className="text-xs text-gray-400 uppercase">Total PO</div>
@@ -2477,7 +2597,7 @@ const TabReports = (props) => {
                       </div>
                     </div>
                   </div>
-                  {false && (
+                  {SHOW_LEGACY_CUSTOMER_STOCK_SUMMARY && (
                   <div>
                   <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mb-4">
                     <div className="rounded-lg border bg-slate-50 p-3">

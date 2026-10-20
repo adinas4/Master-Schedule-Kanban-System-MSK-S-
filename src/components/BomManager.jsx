@@ -52,10 +52,20 @@ const isProductionOrWorkCenter = (record) => {
 };
 const normalizeMaterialType = (value, fallback = 'RAW MATERIAL') => {
   const normalized = String(value || '').trim().toUpperCase();
+  if (normalized === 'ISSP' || normalized.includes('INDIRECT SSP')) return 'INDIRECT MATERIAL';
+  if (normalized === 'SSP' || normalized.includes('SUPPLIED SUPPLY PART')) return 'RAW MATERIAL';
   if (normalized.includes('INDIRECT')) return 'INDIRECT MATERIAL';
   if (normalized.includes('CONSUMABLE')) return 'INDIRECT MATERIAL';
   if (normalized.includes('RAW')) return 'RAW MATERIAL';
   return fallback;
+};
+const normalizeBomUom = (value) => String(value || '').trim().toUpperCase() || 'PCS';
+const formatBomQuantityPerUnit = (quantity, unit) => {
+  const numericValue = Number(quantity || 0);
+  const formattedValue = Number.isFinite(numericValue)
+    ? numericValue.toLocaleString('id-ID', { maximumFractionDigits: 6 })
+    : '0';
+  return `${formattedValue} ${normalizeBomUom(unit)}`;
 };
 const normalizeBucketKey = (value) => String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
 const bucketAliasPatterns = {
@@ -83,12 +93,16 @@ const bucketAliasPatterns = {
     /\braw\s*material\b/i,
     /\braw\b/i,
     /\bbahan\s*baku\b/i,
+    /\bssp\b/i,
+    /\bsupplied\s*supply\s*part\b/i,
   ],
   INDIRECT: [
     /\bindirect\s*material\b/i,
     /\bindirect\b/i,
     /\bim\b/i,
     /\bconsumable\b/i,
+    /\bissp\b/i,
+    /\bindirect\s*ssp\b/i,
   ],
 };
 const BOM_BUCKET_META = {
@@ -110,8 +124,8 @@ const inferBomBucketFromText = (value) => {
   if (bucketAliasPatterns.FG.some((pattern) => pattern.test(text))) return 'FG';
   if (bucketAliasPatterns.SUB_ASSY.some((pattern) => pattern.test(text))) return 'SUB_ASSY';
   if (bucketAliasPatterns.CP.some((pattern) => pattern.test(text))) return 'CP';
-  if (bucketAliasPatterns.RM.some((pattern) => pattern.test(text))) return 'RM';
   if (bucketAliasPatterns.INDIRECT.some((pattern) => pattern.test(text))) return 'INDIRECT';
+  if (bucketAliasPatterns.RM.some((pattern) => pattern.test(text))) return 'RM';
   return '';
 };
 
@@ -691,6 +705,10 @@ export default function BOMManager({
     substituteCodesText: '',
     ...overrides,
   });
+  const readBomQuantity = (value, fallback = 1) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
   const [newItem, setNewItem] = useState(() => getDefaultNewItem());
   const [selectedParent, setSelectedParent] = useState(null);
   const [itemSaving, setItemSaving] = useState(false);
@@ -882,6 +900,12 @@ export default function BOMManager({
     if (!node?.relation) return;
     const relation = node.relation;
     const parentItem = masterItemsByCode.get(relation.parent_code) || itemsByCode.get(relation.parent_code) || items.find((item) => item.code === relation.parent_code);
+    // The legacy single-relation form is no longer rendered. Route Edit to the
+    // visible single/multi-level editor and hydrate it from the active BOM.
+    if (parentItem) {
+      openBomEditorForParent(parentItem);
+      return;
+    }
     const item = masterItemsByCode.get(node.code) || itemsByCode.get(node.code) || {};
     const modelCodes = parseModelCodes(item.model || relation.child_model || '');
     const processFlow = Array.isArray(item.process_flow) && item.process_flow.length
@@ -1543,6 +1567,8 @@ export default function BOMManager({
 
   const normalizeImportItemType = ({ rowType = '', typeValue = '', level = null } = {}) => {
     const normalizedType = String(typeValue || '').trim().toUpperCase().replace(/\s+/g, ' ');
+    if (normalizedType === 'ISSP' || normalizedType.includes('INDIRECT SSP')) return 'ISSP';
+    if (normalizedType === 'SSP' || normalizedType.includes('SUPPLIED SUPPLY PART')) return 'SSP';
     if (normalizedType.includes('RAW')) return 'RAW MATERIAL';
     if (normalizedType.includes('INDIRECT') || normalizedType.includes('CONSUMABLE')) return 'INDIRECT MATERIAL';
     if (normalizedType === 'FG' || normalizedType.includes('FINISHED')) return 'FG';
@@ -1642,8 +1668,8 @@ export default function BOMManager({
     const typeValue = String(rel.component_type || rel.child_type || '').toLowerCase();
     if (typeValue.includes('process consumable')) return false;
     const normalized = typeValue.replace(/[^a-z0-9]/g, '');
-    const isRawByRelation = typeValue.includes('raw') || normalized === 'rm' || normalized.startsWith('rm');
-    const isIndirectByRelation = typeValue.includes('indirect') || normalized === 'im' || normalized.startsWith('im');
+    const isRawByRelation = typeValue.includes('raw') || normalized === 'rm' || normalized.startsWith('rm') || normalized === 'ssp';
+    const isIndirectByRelation = typeValue.includes('indirect') || normalized === 'im' || normalized.startsWith('im') || normalized === 'issp';
     if (isRawByRelation || isIndirectByRelation) return true;
     const childCode = String(rel.child_code || rel.childCode || '').trim();
     const childType = String(itemsByCode.get(childCode)?.type || '').toLowerCase();
@@ -1652,9 +1678,11 @@ export default function BOMManager({
       childType.includes('raw')
       || childNormalized === 'rm'
       || childNormalized.startsWith('rm')
+      || childNormalized === 'ssp'
       || childType.includes('indirect')
       || childNormalized === 'im'
       || childNormalized.startsWith('im')
+      || childNormalized === 'issp'
     );
   };
 
@@ -1691,7 +1719,7 @@ export default function BOMManager({
           code: childCode,
           name: rel.child_name || rel.component_description || childItem?.name || '',
           uom: rel.child_unit || rel.uom || childItem?.unit || childItem?.uom || 'PCS',
-          qty: Number(rel.quantity) || 1,
+          qty: readBomQuantity(rel.quantity),
           scrap: Number(rel.scrap_factor) || 0,
           yieldFactor: Number(rel.yield_factor || 1) || 1,
           positionCode: rel.position_code || '',
@@ -1719,7 +1747,7 @@ export default function BOMManager({
           code: childCode,
           name: rel.child_name || rel.component_description || childItem?.name || '',
           uom: rel.child_unit || rel.uom || childItem?.unit || childItem?.uom || 'PCS',
-          qty: Number(rel.quantity) || 1,
+          qty: readBomQuantity(rel.quantity),
           scrap: Number(rel.scrap_factor) || 0,
           yieldFactor: Number(rel.yield_factor || 1) || 1,
           positionCode: rel.position_code || '',
@@ -1765,7 +1793,7 @@ export default function BOMManager({
           name: rel.child_name || rel.component_description || childItem.name || '',
           type: 'CP',
           uom: rel.child_unit || childItem.unit || childItem.uom || 'PCS',
-          qty: Number(rel.quantity) || 1,
+          qty: readBomQuantity(rel.quantity),
           scrap: Number(rel.scrap_factor) || 0,
           weight: Number(childItem.weight || 0),
           leadTime: Number(childItem.lead_time_days || rel.lead_time_days || 0),
@@ -2572,6 +2600,11 @@ export default function BOMManager({
         for (const material of aggregateDraftMaterials(bulkParentMaterials || [])) {
           const materialCode = String(material.code || '').trim();
           if (!materialCode) continue;
+          const materialQty = Number(material.qty);
+          if (!Number.isFinite(materialQty) || materialQty <= 0) {
+            alert(`Qty/Use material ${materialCode} wajib lebih dari 0.`);
+            return;
+          }
           const materialType = normalizeMaterialType(material.type, 'RAW MATERIAL');
           const targetBucket = getMaterialBucketForType(materialType);
           const existingMaterial = masterItemsByCode.get(materialCode);
@@ -2587,7 +2620,7 @@ export default function BOMManager({
           const materialRelPayload = {
             parentCode,
             childCode: materialCode,
-            quantity: Number(material.qty) || 1,
+            quantity: materialQty,
             scrapFactor: Number(material.scrap) || 0,
             yieldFactor: Number(material.yieldFactor) || 1,
             positionCode: String(material.positionCode || '').trim(),
@@ -2596,22 +2629,24 @@ export default function BOMManager({
             componentDescription: String(material.name || existingMaterial?.name || materialCode).trim(),
             modelSpec: '',
             assemblyNote: '',
-            processFlow: parentProcessCodes,
-            processRouting: buildProcessRoutingSnapshot(parentProcessCodes),
             lineProduction: String(bulkParentDetails.line || '').trim(),
             locationName: String(bulkParentDetails.location || '').trim(),
             packing: String(bulkParentDetails.packing || '').trim(),
-            cycleTimeSeconds: Number(bulkParentDetails.cycleTime) || 0,
             headerMeta,
           };
           await upsertBomRelation({
             ...materialRelPayload,
-            quantity: Number(material.qty) || 1,
+            quantity: materialQty,
           });
         }
         for (const consumable of aggregateDraftMaterials(bulkParentProcessConsumables || [])) {
           const materialCode = String(consumable.code || '').trim();
           if (!materialCode) continue;
+          const consumableQty = Number(consumable.qty);
+          if (!Number.isFinite(consumableQty) || consumableQty <= 0) {
+            alert(`Qty konsumsi ${materialCode} wajib lebih dari 0.`);
+            return;
+          }
           const processCode = resolveConsumableProcessCode(consumable, parentProcessCodes);
           if (!processCode) {
             alert(`Process Consumable ${materialCode} wajib memilih proses.`);
@@ -2631,7 +2666,7 @@ export default function BOMManager({
           await upsertBomRelation({
             parentCode,
             childCode: materialCode,
-            quantity: Number(consumable.qty) || 1,
+            quantity: consumableQty,
             scrapFactor: Number(consumable.scrap) || 0,
             yieldFactor: Number(consumable.yieldFactor) || 1,
             positionCode: String(consumable.positionCode || '').trim(),
@@ -2642,12 +2677,9 @@ export default function BOMManager({
             assemblyNote: `Process consumable ${processCode} (${consumable.consumptionBasis || 'PER_PCS'})`,
             processCode,
             consumptionBasis: String(consumable.consumptionBasis || 'PER_PCS').trim(),
-            processFlow: parentProcessCodes,
-            processRouting: buildProcessRoutingSnapshot(parentProcessCodes),
             lineProduction: String(bulkParentDetails.line || '').trim(),
             locationName: String(bulkParentDetails.location || '').trim(),
             packing: String(bulkParentDetails.packing || '').trim(),
-            cycleTimeSeconds: Number(bulkParentDetails.cycleTime) || 0,
             headerMeta,
           });
         }
@@ -2664,6 +2696,11 @@ export default function BOMManager({
         for (const child of aggregateBulkChildren(bulkChildren)) {
           const childCode = String(child.code || '').trim();
           if (!childCode) continue;
+          const childQty = Number(child.qty);
+          if (!Number.isFinite(childQty) || childQty <= 0) {
+            alert(`Qty/Use Child Part ${childCode} wajib lebih dari 0.`);
+            return;
+          }
           const childNote = String(child.note || '').trim();
           const existingChild = masterItemsByCode.get(childCode);
           if (!existingChild) {
@@ -2679,7 +2716,7 @@ export default function BOMManager({
           const childRelPayload = {
             parentCode,
             childCode,
-            quantity: Number(child.qty) || 1,
+            quantity: childQty,
             scrapFactor: Number(child.scrap) || 0,
             yieldFactor: Number(child.yieldFactor) || 1,
             positionCode: String(child.positionCode || '').trim(),
@@ -2698,11 +2735,16 @@ export default function BOMManager({
           };
           await upsertBomRelation({
             ...childRelPayload,
-            quantity: Number(child.qty) || 1,
+            quantity: childQty,
           });
           for (const material of child.materials || []) {
             const materialCode = String(material.code || '').trim();
             if (!materialCode) continue;
+            const materialQty = Number(material.qty);
+            if (!Number.isFinite(materialQty) || materialQty <= 0) {
+              alert(`Qty/Use material ${materialCode} untuk ${childCode} wajib lebih dari 0.`);
+              return;
+            }
             const materialType = normalizeMaterialType(material.type, 'RAW MATERIAL');
             const targetBucket = getMaterialBucketForType(materialType);
             const existingMaterial = masterItemsByCode.get(materialCode);
@@ -2718,7 +2760,7 @@ export default function BOMManager({
             const materialRelPayload = {
               parentCode: childCode,
               childCode: materialCode,
-              quantity: Number(material.qty) || 1,
+              quantity: materialQty,
               scrapFactor: Number(material.scrap) || 0,
               yieldFactor: Number(material.yieldFactor) || 1,
               positionCode: String(material.positionCode || '').trim(),
@@ -2727,22 +2769,24 @@ export default function BOMManager({
               componentDescription: String(material.name || existingMaterial?.name || materialCode).trim(),
               modelSpec: '',
               assemblyNote: '',
-              processFlow: childProcessCodes,
-              processRouting: buildProcessRoutingSnapshot(childProcessCodes),
               lineProduction: String(child.line || '').trim(),
               locationName: String(child.location || '').trim(),
               packing: String(child.packing || '').trim(),
-              cycleTimeSeconds: Number(child.cycleTime) || 0,
               headerMeta: buildBomHeaderPayload(bomHeader, childCode),
             };
             await upsertBomRelation({
               ...materialRelPayload,
-              quantity: Number(material.qty) || 1,
+              quantity: materialQty,
             });
           }
           for (const consumable of child.processConsumables || []) {
             const materialCode = String(consumable.code || '').trim();
             if (!materialCode) continue;
+            const consumableQty = Number(consumable.qty);
+            if (!Number.isFinite(consumableQty) || consumableQty <= 0) {
+              alert(`Qty konsumsi ${materialCode} untuk ${childCode} wajib lebih dari 0.`);
+              return;
+            }
             const processCode = resolveConsumableProcessCode(consumable, childProcessCodes);
             if (!processCode) {
               alert(`Process Consumable ${materialCode} wajib memilih proses.`);
@@ -2762,7 +2806,7 @@ export default function BOMManager({
             await upsertBomRelation({
               parentCode: childCode,
               childCode: materialCode,
-              quantity: Number(consumable.qty) || 1,
+              quantity: consumableQty,
               scrapFactor: Number(consumable.scrap) || 0,
               yieldFactor: Number(consumable.yieldFactor) || 1,
               positionCode: String(consumable.positionCode || '').trim(),
@@ -2773,12 +2817,9 @@ export default function BOMManager({
               assemblyNote: `Process consumable ${processCode} (${consumable.consumptionBasis || 'PER_PCS'})`,
               processCode,
               consumptionBasis: String(consumable.consumptionBasis || 'PER_PCS').trim(),
-              processFlow: childProcessCodes,
-              processRouting: buildProcessRoutingSnapshot(childProcessCodes),
               lineProduction: String(child.line || '').trim(),
               locationName: String(child.location || '').trim(),
               packing: String(child.packing || '').trim(),
-              cycleTimeSeconds: Number(child.cycleTime) || 0,
               headerMeta: buildBomHeaderPayload(bomHeader, childCode),
             });
           }
@@ -2964,6 +3005,7 @@ export default function BOMManager({
           parentType: parentItem.type || '-',
           headerId: Number(rel.header_id || 0) || null,
           qtyUse: Number(rel.quantity || 0),
+          childUnit: String(rel.child_unit || itemsByCode.get(whereUsedTargetCode)?.unit || 'PCS').trim().toUpperCase() || 'PCS',
           scrap: Number(rel.scrap_factor || 0),
           yieldFactor: Number(rel.yield_factor || 1),
           positionCode: rel.position_code || '',
@@ -3008,12 +3050,32 @@ export default function BOMManager({
       ...extra,
     };
   };
-  const relationMatchesHeader = (relation, headerPayload) => (
-    String(relation.parent_code || '').trim() === String(headerPayload.parentCode || '').trim()
-    && Number(relation.revision_no || 1) === Number(headerPayload.revisionNo || 1)
-    && String(relation.effective_start_date || relation.effective_date || '') === String(headerPayload.effectiveStartDate || '')
-    && String(relation.effective_end_date || '') === String(headerPayload.effectiveEndDate || '')
-  );
+  const normalizeBomDateValue = (value) => String(value || '').trim().slice(0, 10);
+  const relationMatchesHeader = (relation, headerPayload) => {
+    const relationParent = String(relation.parent_code || '').trim();
+    const payloadParent = String(headerPayload.parentCode || '').trim();
+    if (relationParent !== payloadParent) return false;
+
+    const relationHeaderId = Number(relation.header_id || 0);
+    const payloadHeaderId = Number(headerPayload.headerId || 0);
+    if (relationHeaderId > 0 && payloadHeaderId > 0) {
+      return relationHeaderId === payloadHeaderId;
+    }
+
+    return Number(relation.revision_no || 1) === Number(headerPayload.revisionNo || 1)
+      && normalizeBomDateValue(relation.effective_start_date || relation.effective_date)
+        === normalizeBomDateValue(headerPayload.effectiveStartDate)
+      && normalizeBomDateValue(relation.effective_end_date)
+        === normalizeBomDateValue(headerPayload.effectiveEndDate);
+  };
+  const assertSavedBomQuantity = (savedRelation, expectedQuantity) => {
+    const actualQuantity = Number(savedRelation?.quantity);
+    const expected = Number(expectedQuantity);
+    if (!Number.isFinite(actualQuantity) || !Number.isFinite(expected)) return;
+    if (Math.abs(actualQuantity - expected) > 1e-9) {
+      throw new Error(`Verifikasi BOM gagal: Qty/Use tersimpan ${actualQuantity}, seharusnya ${expected}.`);
+    }
+  };
   const upsertBomRelation = async ({
     relationId = null,
     parentCode,
@@ -3027,21 +3089,19 @@ export default function BOMManager({
     const normalizedChild = String(childCode || '').trim();
     const qtyNumber = Number(quantity || 0);
     const headerPayload = buildBomHeaderPayload(headerMeta || bomHeader, normalizedParent);
-    const payloadComponentType = String(payload.componentType || '').trim().toUpperCase();
-    const payloadProcessCode = String(payload.processCode || '').trim();
+    // Database uniqueness is (header_id, parent_code, child_code). Match that
+    // same identity here so an edit becomes PUT instead of a duplicate POST.
     const existing = bomRelations.find((rel) => (
       String(rel.parent_code || '').trim() === normalizedParent
       && String(rel.child_code || '').trim() === normalizedChild
       && relationMatchesHeader(rel, headerPayload)
-      && String(rel.component_type || '').trim().toUpperCase() === payloadComponentType
-      && String(rel.process_code || rel.processCode || '').trim() === payloadProcessCode
       && Number(rel.id) !== Number(relationId)
     ));
     if (!relationId && existing) {
       const nextQuantity = mergeOnDuplicate
         ? Number(existing.quantity || 0) + qtyNumber
         : qtyNumber;
-      await apiFetch(`/api/bom/${existing.id}`, {
+      const savedRelation = await apiFetch(`/api/bom/${existing.id}`, {
         method: 'PUT',
         body: JSON.stringify({
           ...payload,
@@ -3050,23 +3110,26 @@ export default function BOMManager({
           quantity: nextQuantity,
         }),
       });
-      return { relationId: existing.id, merged: mergeOnDuplicate };
+      assertSavedBomQuantity(savedRelation, nextQuantity);
+      return { relationId: existing.id, merged: mergeOnDuplicate, relation: savedRelation };
     }
     if (relationId && existing) {
-      await apiFetch(`/api/bom/${existing.id}`, {
+      const nextQuantity = Number(existing.quantity || 0) + qtyNumber;
+      const savedRelation = await apiFetch(`/api/bom/${existing.id}`, {
         method: 'PUT',
         body: JSON.stringify({
           ...payload,
           ...headerPayload,
           childCode: normalizedChild,
-          quantity: Number(existing.quantity || 0) + qtyNumber,
+          quantity: nextQuantity,
         }),
       });
+      assertSavedBomQuantity(savedRelation, nextQuantity);
       await apiFetch(`/api/bom/${relationId}`, { method: 'DELETE' });
-      return { relationId: existing.id, merged: true };
+      return { relationId: existing.id, merged: true, relation: savedRelation };
     }
     if (relationId) {
-      await apiFetch(`/api/bom/${relationId}`, {
+      const savedRelation = await apiFetch(`/api/bom/${relationId}`, {
         method: 'PUT',
         body: JSON.stringify({
           ...payload,
@@ -3075,9 +3138,10 @@ export default function BOMManager({
           quantity: qtyNumber,
         }),
       });
-      return { relationId, merged: false };
+      assertSavedBomQuantity(savedRelation, qtyNumber);
+      return { relationId, merged: false, relation: savedRelation };
     }
-    await apiFetch('/api/bom', {
+    const savedRelation = await apiFetch('/api/bom', {
       method: 'POST',
       body: JSON.stringify({
         ...payload,
@@ -3087,7 +3151,8 @@ export default function BOMManager({
         quantity: qtyNumber,
       }),
     });
-    return { relationId: null, merged: false };
+    assertSavedBomQuantity(savedRelation, qtyNumber);
+    return { relationId: savedRelation?.id || null, merged: false, relation: savedRelation };
   };
   const aggregateDraftMaterials = (materials = []) => {
     const map = new Map();
@@ -3362,6 +3427,9 @@ export default function BOMManager({
     const canAddChildPart = allowEdit && nodeBucket === 'SUB_ASSY';
     const processSnapshots = buildProcessRoutingSnapshot(node.processes || []);
     const isLeafRaw = meta.kind === 'raw' && !hasChildren;
+    const relationQty = relation ? Number(relation.quantity) : null;
+    const relationCycleTime = relation ? Number(relation.cycle_time_seconds) : 0;
+    const hasInvalidRelationQty = Boolean(relation) && (!Number.isFinite(relationQty) || relationQty <= 0);
     const displayLevel = level + 1;
     const hasNextSibling = !isLast;
     const levelLabel = meta.label;
@@ -3485,8 +3553,11 @@ export default function BOMManager({
               </div>
             )}
             {relation && (
-              <div className="text-[10px] text-gray-400 mt-1">
-                Qty/Use: {Number(relation.quantity || 0)} • Cycle Time: {Number(relation.cycle_time_seconds || node.cycle_time_seconds || 0)}s • Yield: {Number(relation.yield_factor || 1)} • Scrap: {Number(relation.scrap_factor || 0)}%
+              <div className={`mt-1 text-[10px] ${hasInvalidRelationQty ? 'font-semibold text-red-600' : 'text-gray-400'}`}>
+                {normalizeBomUom(node.unit || relation.child_unit) === 'KG' ? 'Berat' : 'Qty'} per 1 parent: {formatBomQuantityPerUnit(relation.quantity, node.unit || relation.child_unit)}
+                {Number.isFinite(relationCycleTime) && relationCycleTime > 0 ? ` • Cycle Time Relasi: ${relationCycleTime}s` : ''}
+                {' '}• Yield: {Number(relation.yield_factor || 1)} • Scrap: {Number(relation.scrap_factor || 0)}%
+                {hasInvalidRelationQty && <span className="ml-2 rounded-full bg-red-100 px-2 py-0.5 text-[9px] text-red-700">Qty wajib &gt; 0</span>}
               </div>
             )}
             {relation && (relation.position_code || (relation.substitute_material_codes || []).length > 0 || relation.revision_no) && (
@@ -4733,7 +4804,9 @@ export default function BOMManager({
           content: JSON.stringify(bomData, null, 2),
         });
         setShowAiModal(false);
-      } catch (e) {}
+      } catch (e) {
+        // Ignore malformed AI output and leave the draft modal closed.
+      }
     } setIsAiLoading(false);
   };
 
@@ -5458,9 +5531,12 @@ export default function BOMManager({
                                   <label className="text-[10px] font-bold text-gray-400 uppercase block mb-1">Qty</label>
                                   <input
                                     type="number"
-                                    className="w-full p-2 border border-gray-300 rounded text-xs text-right"
+                                    min="0.000001"
+                                    step="any"
+                                    className={`w-full rounded border p-2 text-right text-xs ${Number(material.qty) > 0 ? 'border-gray-300' : 'border-red-300 bg-red-50 text-red-700'}`}
                                     value={material.qty}
                                     onChange={(e) => updateBulkParentMaterial(matIdx, { qty: e.target.value })}
+                                    title="Qty pemakaian material per 1 parent; wajib lebih dari 0"
                                   />
                                 </div>
                                 <div>
@@ -6151,7 +6227,7 @@ export default function BOMManager({
                           <tr>
                             <th className="p-2 text-left">Parent</th>
                             <th className="p-2 text-left">Child</th>
-                            <th className="p-2 text-right">Qty/Use</th>
+                            <th className="p-2 text-right">Qty per Unit</th>
                             <th className="p-2 text-right">Yield</th>
                             <th className="p-2 text-right">Scrap %</th>
                             <th className="p-2 text-left">Posisi</th>
@@ -6168,7 +6244,7 @@ export default function BOMManager({
                                 <div className="font-mono text-indigo-700">{line.child_code}</div>
                                 <div className="text-[11px] text-slate-500">{line.child_name || line.component_description || '-'}</div>
                               </td>
-                              <td className="p-2 text-right font-mono">{Number(line.quantity || 0)}</td>
+                              <td className="p-2 text-right font-mono">{formatBomQuantityPerUnit(line.quantity, line.child_unit)}</td>
                               <td className="p-2 text-right font-mono">{Number(line.yield_factor || 1)}</td>
                               <td className="p-2 text-right font-mono">{Number(line.scrap_factor || 0)}</td>
                               <td className="p-2">{line.position_code || '-'}</td>
@@ -6261,7 +6337,7 @@ export default function BOMManager({
                         <th className="p-2 text-left">Parent Code</th>
                         <th className="p-2 text-left">Parent Name</th>
                         <th className="p-2 text-left">Type</th>
-                        <th className="p-2 text-right">Qty/Use</th>
+                        <th className="p-2 text-right">Qty per Unit</th>
                         <th className="p-2 text-right">Yield</th>
                         <th className="p-2 text-right">Scrap %</th>
                         <th className="p-2 text-left">Posisi</th>
@@ -6278,7 +6354,7 @@ export default function BOMManager({
                           <td className="p-2 font-mono text-indigo-700">{row.parentCode}</td>
                           <td className="p-2">{row.parentName}</td>
                           <td className="p-2">{getBomDisplayMeta(row.parentType || '').label}</td>
-                          <td className="p-2 text-right font-mono">{row.qtyUse}</td>
+                          <td className="p-2 text-right font-mono">{formatBomQuantityPerUnit(row.qtyUse, row.childUnit)}</td>
                           <td className="p-2 text-right font-mono">{row.yieldFactor}</td>
                           <td className="p-2 text-right font-mono">{row.scrap}</td>
                           <td className="p-2">{row.positionCode || '-'}</td>

@@ -152,8 +152,6 @@ const TabInbound = (props) => {
     setInboundCardScanOpen,
     inboundCardScanValue,
     setInboundCardScanValue,
-    handleInboundCardScanSubmit,
-    inboundCardScanLoading,
     incomingQuickAction,
     scheduleSupplierOptions,
     inboundCardAdjustOpen,
@@ -359,6 +357,7 @@ const TabInbound = (props) => {
   const actualReceivePoPickerRef = useRef(null);
   const actualReceiveDoCheckSeqRef = useRef(0);
   const incomingQuickActionNonceRef = useRef(null);
+  const incomingQuickActionScanNonceRef = useRef(null);
   const [actualReceiveImportLoading, setActualReceiveImportLoading] = useState(false);
   const [actualReceiveImportError, setActualReceiveImportError] = useState('');
   const [actualReceiveImportSummary, setActualReceiveImportSummary] = useState(null);
@@ -390,6 +389,7 @@ const TabInbound = (props) => {
     itemCode: overrides.itemCode || '',
     unit: overrides.unit || '',
     qty: overrides.qty ?? '',
+    packageCount: overrides.packageCount ?? '',
   }), []);
 
   const getActualReceiveRemainingQty = useCallback((line) => {
@@ -1142,8 +1142,9 @@ const TabInbound = (props) => {
     handleActualReceivePoPick(firstMatch);
   }, [actualReceivePoActiveIndex, actualReceivePoPickerOpen, actualReceivePoMenuOptions, handleActualReceivePoPick]);
 
-  const handleResolveActualReceiveLabel = useCallback(async () => {
-    const scanValue = String(actualReceiveLabelScan || '').trim();
+  const handleResolveActualReceiveLabel = useCallback(async (scanOverride = '') => {
+    const explicitValue = typeof scanOverride === 'string' ? scanOverride : '';
+    const scanValue = String(explicitValue || actualReceiveLabelScan || '').trim();
     if (!scanValue) {
       setActualReceiveLabelError('Scan atau ketik QR label schedule terlebih dahulu.');
       return;
@@ -1176,8 +1177,12 @@ const TabInbound = (props) => {
       if (!selectedLine) {
         throw new Error(`Item ${itemCode} dari label tidak ditemukan di PO ${poNumber}.`);
       }
-      const scheduleRemaining = Number(label?.schedule?.remainingQty ?? label?.suggestedQty ?? 0);
-      const suggestedQty = scheduleRemaining > 0 ? scheduleRemaining : '';
+      const scheduleRemaining = Number(label?.schedule?.remainingQty ?? 0);
+      const labelSuggestedQty = Number(label?.suggestedQty ?? 0);
+      const isInboundCard = label?.sourceType === 'inbound_card';
+      const suggestedQty = isInboundCard
+        ? (labelSuggestedQty > 0 ? labelSuggestedQty : '')
+        : (scheduleRemaining > 0 ? scheduleRemaining : '');
       const effectiveAvailablePoLines = availablePoLines.some((line) => Number(line.id) === Number(selectedLine.id))
         ? availablePoLines
         : (scheduleRemaining > 0 ? [...availablePoLines, selectedLine] : availablePoLines);
@@ -1189,6 +1194,7 @@ const TabInbound = (props) => {
         itemCode: selectedLine.item_code || itemCode,
         unit: selectedLine.unit || label?.item?.unit || '',
         qty: suggestedQty,
+        packageCount: isInboundCard ? 1 : '',
       });
 
       setActualReceivePoNumber(poNumber);
@@ -1211,6 +1217,44 @@ const TabInbound = (props) => {
       setActualReceiveLabelLoading(false);
     }
   }, [actualReceiveLabelScan, apiFetch, createActualReceiveRow, focusActualReceiveQty]);
+
+  const handleInboundCardOpenActual = useCallback(async () => {
+    const scanValue = String(inboundCardScanValue || '').trim();
+    if (!scanValue) {
+      showToastMessage?.('Masukkan ID kartu inbound.', '', null, 'error');
+      return;
+    }
+    resetActualReceiveForm();
+    setInboundCardScanOpen(false);
+    setInboundCardScanValue('');
+    setShowActualReceiveModal(true);
+    setActualReceiveLabelScan(scanValue);
+    await handleResolveActualReceiveLabel(scanValue);
+  }, [
+    handleResolveActualReceiveLabel,
+    inboundCardScanValue,
+    resetActualReceiveForm,
+    setInboundCardScanOpen,
+    setInboundCardScanValue,
+    showToastMessage,
+  ]);
+
+  useEffect(() => {
+    if (mainTab !== 'monitoring') return;
+    if (incomingQuickAction?.type !== 'schedule') return;
+    const scanValue = String(incomingQuickAction?.scanValue || '').trim();
+    if (!scanValue) return;
+    if (!incomingQuickAction?.nonce || incomingQuickActionScanNonceRef.current === incomingQuickAction.nonce) return;
+    incomingQuickActionScanNonceRef.current = incomingQuickAction.nonce;
+    setActualReceiveLabelScan(scanValue);
+    void handleResolveActualReceiveLabel(scanValue);
+  }, [
+    handleResolveActualReceiveLabel,
+    incomingQuickAction?.nonce,
+    incomingQuickAction?.scanValue,
+    incomingQuickAction?.type,
+    mainTab,
+  ]);
 
   const performActualReceiveDoCheck = useCallback(async (supplierValue, doNumberValue) => {
     const supplier = String(supplierValue || '').trim();
@@ -1354,6 +1398,7 @@ const TabInbound = (props) => {
         scheduleId: Number(row.scheduleId || 0) > 0 ? Number(row.scheduleId) : null,
         itemCode: matchedLine?.item_code || String(row.itemCode || '').trim(),
         qty: Number(row.qty || 0),
+        packageCount: Number(row.packageCount || 0),
         itemName: matchedLine?.item_name || '',
         partNo: matchedLine?.part_no || '',
         unit: String(row.unit || matchedLine?.unit || '').trim(),
@@ -1367,6 +1412,10 @@ const TabInbound = (props) => {
     for (const row of items) {
       if (!(Number(row.qty) > 0)) {
         setActualReceiveError(`Qty aktual tidak valid untuk ${row.itemCode || row.poLineId}.`);
+        return;
+      }
+      if (!Number.isInteger(Number(row.packageCount)) || !(Number(row.packageCount) > 0)) {
+        setActualReceiveError(`Total packing wajib diisi dengan bilangan bulat lebih dari 0 untuk ${row.itemCode || row.poLineId}.`);
         return;
       }
       if (!row.itemCode) {
@@ -1389,6 +1438,9 @@ const TabInbound = (props) => {
           driverName: String(actualReceiveDriverName || '').trim(),
           remarks,
           allowOverReceive,
+          scannedInboundCardUid: actualReceiveLabelInfo?.sourceType === 'inbound_card'
+            ? actualReceiveLabelInfo?.inboundCard?.uid || ''
+            : '',
           items,
         }),
       });
@@ -1417,7 +1469,9 @@ const TabInbound = (props) => {
     actualReceiveSupplier,
     actualReceiveTruckNo,
     actualReceivePoAvailableLines,
+    actualReceivePoLines,
     actualReceiveAllowOver,
+    actualReceiveLabelInfo,
     canEditSchedules,
     apiFetch,
     closeActualReceiveModal,
@@ -3725,10 +3779,10 @@ const TabInbound = (props) => {
                       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                         <div>
                           <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-emerald-800">
-                            <QrCode size={15} /> Scan Label Schedule
+                            <QrCode size={15} /> Scan Label Supplier / Inbound Card
                           </div>
                           <div className="mt-1 text-[11px] text-emerald-700">
-                            Scan QR dari label supplier untuk auto-pilih PO, item, schedule, dan qty sisa. Input manual tetap bisa dipakai jika label belum tersedia.
+                            Scan label supplier sebagai jalur utama. Inbound Card juga dapat dipakai sebagai identitas satu pack; keduanya masuk ke form dan transaksi penerimaan yang sama.
                           </div>
                         </div>
                       </div>
@@ -3746,7 +3800,7 @@ const TabInbound = (props) => {
                               void handleResolveActualReceiveLabel();
                             }
                           }}
-                          placeholder="Scan / ketik QR label: MSKS|LBL|TOKEN"
+                          placeholder="MSKS|LBL|TOKEN atau INB-..."
                           autoComplete="off"
                         />
                         <button
@@ -3766,7 +3820,9 @@ const TabInbound = (props) => {
                       )}
                       {actualReceiveLabelInfo && (
                         <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 rounded border border-emerald-200 bg-white px-3 py-2 text-[11px] text-slate-700">
-                          <span className="font-semibold text-emerald-700">Label OK</span>
+                          <span className="font-semibold text-emerald-700">
+                            {actualReceiveLabelInfo.sourceType === 'inbound_card' ? 'Inbound Card OK' : 'Label Supplier OK'}
+                          </span>
                           <span>PO: {actualReceiveLabelInfo.schedule?.poNumber || '-'}</span>
                           <span>Schedule: {actualReceiveLabelInfo.schedule?.id || '-'}</span>
                           <span>Item: {actualReceiveLabelInfo.item?.code || '-'}</span>
@@ -4033,11 +4089,12 @@ const TabInbound = (props) => {
                         </button>
                       </div>
                       <div className="max-h-[46vh] overflow-auto [scrollbar-gutter:stable]">
-                        <table className="min-w-[1040px] table-fixed border-collapse text-xs">
+                        <table className="min-w-[1160px] table-fixed border-collapse text-xs">
                           <thead className="sticky top-0 z-20 bg-slate-100 shadow-[0_1px_0_#e2e8f0]">
                             <tr className="text-left">
                               <th className="w-[460px] border border-slate-200 p-2">Item</th>
                               <th className="w-[180px] border border-slate-200 p-2 text-right">Qty Aktual Datang</th>
+                              <th className="w-[140px] border border-slate-200 p-2 text-right">Total Packing</th>
                               <th className="w-[300px] border border-slate-200 p-2">Detail</th>
                               <th className="w-[100px] border border-slate-200 p-2 text-center">Aksi</th>
                             </tr>
@@ -4111,9 +4168,27 @@ const TabInbound = (props) => {
                                       />
                                     </div>
                                   </td>
+                                  <td className="border border-slate-200 p-2">
+                                    <input
+                                      type="number"
+                                      min="1"
+                                      step="1"
+                                      className="h-10 w-full rounded border border-slate-200 bg-white px-3 py-2 text-right text-sm outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                                      value={row.packageCount}
+                                      placeholder="0"
+                                      onChange={(e) => updateActualReceiveRow(row.key, { packageCount: e.target.value })}
+                                    />
+                                    <div className="mt-1 text-right text-[10px] text-slate-400">Jumlah pack fisik</div>
+                                  </td>
                                   <td className="border border-slate-200 p-2 text-xs text-slate-600">
                                     <div className="font-semibold text-slate-900">{matchedLine?.item_name || '-'}</div>
                                     <div>Part Code: {matchedLine?.item_code || '-'}</div>
+                                    <div>SNP: {formatQty(matchedLine?.pack_qty ?? matchedLine?.packQty ?? 0)}</div>
+                                    <div>
+                                      Rata-rata/Pack: {Number(row.qty || 0) > 0 && Number(row.packageCount || 0) > 0
+                                        ? formatQty(Number(row.qty) / Number(row.packageCount))
+                                        : '-'}
+                                    </div>
                                     <div>Sisa Tersedia untuk Incoming: {formatNumber0(getActualReceiveRemainingQty(matchedLine))}</div>
                                   </td>
                                   <td className="border border-slate-200 p-2 text-center">
@@ -4210,7 +4285,7 @@ const TabInbound = (props) => {
                   <div className="flex items-center justify-between mb-4">
                     <div>
                       <div className="text-lg font-semibold text-slate-900">Scan Inbound Card</div>
-                      <div className="text-xs text-slate-500">Scan QR atau tempel ID kartu inbound.</div>
+                      <div className="text-xs text-slate-500">Kartu hanya mengisi Form Penerimaan Aktual; qty belum dicatat sebelum form disimpan.</div>
                     </div>
                     <button onClick={() => setInboundCardScanOpen(false)} className="text-slate-500 hover:text-slate-700">
                       <XIcon size={18} />
@@ -4227,7 +4302,7 @@ const TabInbound = (props) => {
                         onKeyDown={(e) => {
                           if (e.key === 'Enter') {
                             e.preventDefault();
-                            handleInboundCardScanSubmit();
+                            void handleInboundCardOpenActual();
                           }
                         }}
                       />
@@ -4236,11 +4311,11 @@ const TabInbound = (props) => {
                   <div className="flex justify-end gap-2 mt-4">
                     <button onClick={() => setInboundCardScanOpen(false)} className="px-4 py-2 rounded border text-sm">Tutup</button>
                     <button
-                      onClick={handleInboundCardScanSubmit}
+                      onClick={handleInboundCardOpenActual}
                       className="px-4 py-2 rounded bg-slate-900 text-white text-sm disabled:opacity-60"
-                      disabled={inboundCardScanLoading}
+                      disabled={actualReceiveLabelLoading}
                     >
-                      {inboundCardScanLoading ? 'Memproses...' : 'Terima'}
+                      {actualReceiveLabelLoading ? 'Memproses...' : 'Buka Form Penerimaan'}
                     </button>
                   </div>
                 </div>

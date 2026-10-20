@@ -52,6 +52,7 @@ const getStockOpnameStatusLabel = (value) => {
 
 const ALL_STOCK_OPNAME_LOCATION_ID = 'ALL_PLANT';
 const ALL_STOCK_OPNAME_LOCATION_LABEL = 'Semua Plant / Semua Lokasi';
+const TALLY_PAGE_SIZE = 100;
 const isAllStockOpnameLocation = (value) => (
   String(value || '').trim().toUpperCase() === ALL_STOCK_OPNAME_LOCATION_ID
 );
@@ -68,6 +69,7 @@ const TabStockOpname = (props) => {
     ensureAiConfigured,
     canUseAI,
     showToastMessage,
+    isAdmin = false,
   } = props;
 
   const [sessions, setSessions] = useState([]);
@@ -84,7 +86,10 @@ const TabStockOpname = (props) => {
   const [itemsError, setItemsError] = useState('');
   const [showSystemQty, setShowSystemQty] = useState(true);
   const [rows, setRows] = useState([]);
+  const [dirtyRowIds, setDirtyRowIds] = useState(() => new Set());
   const [uploading, setUploading] = useState(false);
+  const [excelImporting, setExcelImporting] = useState(false);
+  const excelImportInputRef = useRef(null);
   const [finalizing, setFinalizing] = useState(false);
   const [showPrint, setShowPrint] = useState(false);
   const [printMode, setPrintMode] = useState('report');
@@ -93,6 +98,7 @@ const TabStockOpname = (props) => {
   const [tallyScope, setTallyScope] = useState('warehouse');
   const [tallyTarget, setTallyTarget] = useState('');
   const [manualItemCode, setManualItemCode] = useState('');
+  const [tallyPage, setTallyPage] = useState(1);
   const [aiModalOpen, setAiModalOpen] = useState(false);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState('');
@@ -390,29 +396,50 @@ const TabStockOpname = (props) => {
     setItemsError('');
     try {
       const data = await apiFetch(`/api/stock-opname/sessions/${sessionId}/lines`);
-      const mapped = (Array.isArray(data) ? data : []).map((row) => ({
-        id: row.id,
-        itemCode: row.itemCode || row.item_code,
-        itemName: row.item_name || row.itemName || '',
-        partNo: row.partNo || row.part_no || '-',
-        locationName: row.location_name || row.locationName || row.line_production || row.lineProduction || row.location_id || row.locationId || '',
-        locationId: row.locationId || row.location_id || '',
-        lineProduction: row.line_production || row.lineProduction || '',
-        unit: row.unit || '',
-        snp: Number(row.snp ?? row.pack_qty ?? row.lot_qty ?? 0),
-        price: Number(row.price || 0),
-        bookQty: Number(row.snapshot_qty ?? row.snapshotQty ?? row.book_qty ?? row.bookQty ?? 0),
-        inputBox: Number(row.input_box || row.inputBox || 0),
-        inputLoose: Number(row.input_loose || row.inputLoose || 0),
-        countedQty: Number(row.counted_qty ?? row.countedQty ?? 0),
-        lotNo: row.lot_no || row.lotNo || '',
-        scanMode: row.scan_mode || row.scanMode || '',
-        scanSource: row.scan_source || row.scanSource || '',
-        scanValue: row.scan_value || row.scanValue || '',
-        reason: row.remarks || row.reason || '',
-        hidden: false,
-      }));
+      const mapped = (Array.isArray(data) ? data : []).map((row) => {
+        const snp = Number(row.snp ?? row.pack_qty ?? row.lot_qty ?? 0);
+        const bookQty = Number(row.snapshot_qty ?? row.snapshotQty ?? row.book_qty ?? row.bookQty ?? 0);
+        const scanSource = row.scan_source || row.scanSource || '';
+        const countedBy = row.counted_by ?? row.countedBy ?? null;
+        const rowMode = normalizeStockOpnameMode(row.scan_mode || row.scanMode || selectedSession?.mode);
+        // Snapshot rows start with no variance. Until a row is counted/imported,
+        // keep its physical quantity equal to the snapshot instead of treating it as zero.
+        const isUntouchedSnapshot = rowMode !== 'scan_lot'
+          && normalizeValue(scanSource) === 'snapshot'
+          && !countedBy;
+        const countedQty = isUntouchedSnapshot
+          ? bookQty
+          : Number(row.counted_qty ?? row.countedQty ?? 0);
+        const hasSavedBox = row.input_box !== undefined || row.inputBox !== undefined;
+        const hasSavedLoose = row.input_loose !== undefined || row.inputLoose !== undefined;
+        const derivedBox = rowMode !== 'scan_lot' && snp > 0 ? Math.floor(countedQty / snp) : 0;
+        const derivedLoose = rowMode !== 'scan_lot' && snp > 0 ? countedQty - (derivedBox * snp) : countedQty;
+        return {
+          id: row.id,
+          itemCode: row.itemCode || row.item_code,
+          itemName: row.item_name || row.itemName || '',
+          partNo: row.partNo || row.part_no || '-',
+          locationName: row.location_name || row.locationName || row.line_production || row.lineProduction || row.location_id || row.locationId || '',
+          locationId: row.locationId || row.location_id || '',
+          lineProduction: row.line_production || row.lineProduction || '',
+          unit: row.unit || '',
+          snp,
+          price: Number(row.price || 0),
+          bookQty,
+          inputBox: hasSavedBox ? Number(row.input_box ?? row.inputBox ?? 0) : derivedBox,
+          inputLoose: hasSavedLoose ? Number(row.input_loose ?? row.inputLoose ?? 0) : derivedLoose,
+          countedQty,
+          lotNo: row.lot_no || row.lotNo || '',
+          scanMode: row.scan_mode || row.scanMode || '',
+          scanSource,
+          scanValue: row.scan_value || row.scanValue || '',
+          countedBy,
+          reason: row.remarks || row.reason || '',
+          hidden: false,
+        };
+      });
       setRows(mapped);
+      setDirtyRowIds(new Set());
     } catch (error) {
       setRows([]);
       setItemsError(error.message || 'Gagal memuat item.');
@@ -461,6 +488,8 @@ const TabStockOpname = (props) => {
 
   const sessionMode = normalizeStockOpnameMode(selectedSession?.mode || sessionModeInput);
   const isScanLotMode = sessionMode === 'scan_lot';
+  const selectedSessionStatus = String(selectedSession?.status || '').trim().toLowerCase();
+  const isSessionEditable = ['open', 'counting', 'review', 'approved'].includes(selectedSessionStatus);
 
   useEffect(() => {
     if (typeof document === 'undefined') return undefined;
@@ -557,6 +586,22 @@ const TabStockOpname = (props) => {
     () => filterRowsByTarget(computedRows, tallyScope, selectedTallyTarget?.value),
     [computedRows, tallyScope, selectedTallyTarget, masterLocationById],
   );
+  const tallyPageCount = Math.max(1, Math.ceil(tallyRows.length / TALLY_PAGE_SIZE));
+  const safeTallyPage = Math.min(tallyPage, tallyPageCount);
+  const paginatedTallyRows = useMemo(() => {
+    const startIndex = (safeTallyPage - 1) * TALLY_PAGE_SIZE;
+    return tallyRows.slice(startIndex, startIndex + TALLY_PAGE_SIZE);
+  }, [tallyRows, safeTallyPage]);
+  const tallyPageStart = tallyRows.length ? ((safeTallyPage - 1) * TALLY_PAGE_SIZE) + 1 : 0;
+  const tallyPageEnd = Math.min(safeTallyPage * TALLY_PAGE_SIZE, tallyRows.length);
+
+  useEffect(() => {
+    setTallyPage(1);
+  }, [selectedSessionId, tallyScope, tallyTarget]);
+
+  useEffect(() => {
+    if (tallyPage > tallyPageCount) setTallyPage(tallyPageCount);
+  }, [tallyPage, tallyPageCount]);
   const tallyVarianceCount = useMemo(
     () => tallyRows.filter((row) => row.difference !== 0).length,
     [tallyRows],
@@ -664,17 +709,187 @@ const TabStockOpname = (props) => {
     }
   };
 
+  const normalizeExcelHeader = (value) => String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+
+  const readExcelCell = (source, aliases) => {
+    const entries = Object.entries(source || {});
+    const aliasSet = new Set(aliases.map(normalizeExcelHeader));
+    const match = entries.find(([key]) => aliasSet.has(normalizeExcelHeader(key)));
+    return match ? { found: true, value: match[1] } : { found: false, value: undefined };
+  };
+
+  const parseExcelQty = (value, label, rowNumber) => {
+    if (typeof value === 'number') {
+      if (Number.isFinite(value) && value >= 0) return value;
+      throw new Error(`${label} tidak valid pada baris Excel ${rowNumber}.`);
+    }
+    const raw = String(value ?? '').trim();
+    if (!raw) throw new Error(`${label} kosong pada baris Excel ${rowNumber}.`);
+    const normalized = raw.includes(',') && raw.includes('.')
+      ? raw.replace(/\./g, '').replace(',', '.')
+      : raw.replace(',', '.');
+    const parsed = Number(normalized);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      throw new Error(`${label} tidak valid pada baris Excel ${rowNumber}.`);
+    }
+    return parsed;
+  };
+
+  const handleAdminExcelImport = async (event) => {
+    const file = event.target.files?.[0] || null;
+    event.target.value = '';
+    if (!file || excelImporting) return;
+    if (!isAdmin) {
+      notifyActionBlocked('Upload Excel Stock Opname hanya tersedia untuk admin.');
+      return;
+    }
+    if (!selectedSessionId) {
+      notifyActionBlocked('Pilih session Stock Opname terlebih dahulu.');
+      return;
+    }
+    if (!isSessionEditable) {
+      notifyActionBlocked('Session sudah selesai dan tidak dapat menerima import lagi.');
+      return;
+    }
+
+    setExcelImporting(true);
+    setItemsError('');
+    try {
+      const XLSX = await ensureXlsx?.();
+      if (!XLSX) throw new Error('Library Excel belum tersedia.');
+      const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+      const firstSheetName = workbook.SheetNames?.[0];
+      if (!firstSheetName) throw new Error('File Excel tidak memiliki worksheet.');
+      const excelRows = XLSX.utils.sheet_to_json(workbook.Sheets[firstSheetName], { defval: '' });
+      if (!excelRows.length) throw new Error('File Excel tidak memiliki data.');
+      if (excelRows.length > 5000) throw new Error('Maksimal 5.000 baris per upload.');
+
+      const currentRowsByCode = new Map();
+      rows.filter((row) => !row.hidden).forEach((row) => {
+        const key = normalizeValue(row.itemCode);
+        if (!currentRowsByCode.has(key)) currentRowsByCode.set(key, []);
+        currentRowsByCode.get(key).push(row);
+      });
+
+      const payload = [];
+      const unknownCodes = new Set();
+      excelRows.forEach((excelRow, index) => {
+        const rowNumber = index + 2;
+        const itemCodeCell = readExcelCell(excelRow, ['Kode Item', 'Item Code', 'Kode Part', 'Part No']);
+        const itemCode = String(itemCodeCell.value || '').trim();
+        if (!itemCode) return;
+
+        const lotCell = readExcelCell(excelRow, ['Lot No', 'Lot Number', 'Batch']);
+        const lotNo = String(lotCell.value || '').trim();
+        const candidates = currentRowsByCode.get(normalizeValue(itemCode)) || [];
+        const sourceRow = (isScanLotMode && lotNo
+          ? candidates.find((row) => normalizeValue(row.lotNo) === normalizeValue(lotNo)) || candidates[0]
+          : candidates[0]) || null;
+        if (!sourceRow) {
+          unknownCodes.add(itemCode);
+          return;
+        }
+
+        const reasonCell = readExcelCell(excelRow, ['Catatan', 'Reason', 'Alasan', 'Remarks']);
+        let countedQty = 0;
+        let inputBox = 0;
+        let inputLoose = 0;
+
+        if (isScanLotMode) {
+          if (!lotNo) throw new Error(`Lot No kosong pada baris Excel ${rowNumber}.`);
+          const qtyCell = readExcelCell(excelRow, ['Qty Fisik', 'Total Fisik', 'Counted Qty', 'Actual Qty']);
+          if (!qtyCell.found || String(qtyCell.value).trim() === '') return;
+          countedQty = parseExcelQty(qtyCell.value, 'Qty Fisik', rowNumber);
+        } else {
+          const totalCell = readExcelCell(excelRow, ['Total Fisik', 'Qty Fisik', 'Counted Qty', 'Actual Qty']);
+          const boxCell = readExcelCell(excelRow, ['Input KBN/Box', 'Input Box', 'KBN/Box', 'Box']);
+          const looseCell = readExcelCell(excelRow, ['Input Eceran/Remain', 'Input Loose', 'Eceran/Remain', 'Remain']);
+          const totalProvided = totalCell.found && String(totalCell.value).trim() !== '';
+          const boxProvided = boxCell.found && String(boxCell.value).trim() !== '';
+          const looseProvided = looseCell.found && String(looseCell.value).trim() !== '';
+          if (!totalProvided && !boxProvided && !looseProvided) return;
+          inputBox = boxProvided ? parseExcelQty(boxCell.value, 'Input KBN/Box', rowNumber) : 0;
+          inputLoose = looseProvided ? parseExcelQty(looseCell.value, 'Input Eceran/Remain', rowNumber) : 0;
+          countedQty = totalProvided
+            ? parseExcelQty(totalCell.value, 'Total Fisik', rowNumber)
+            : (inputBox * Number(sourceRow.snp || 0)) + inputLoose;
+        }
+
+        const variance = countedQty - Number(sourceRow.bookQty || 0);
+        const reason = String(reasonCell.value || '').trim();
+        if (variance !== 0 && !reason) {
+          throw new Error(`Catatan/Reason wajib diisi untuk ${itemCode} pada baris Excel ${rowNumber}.`);
+        }
+        payload.push({
+          itemCode: sourceRow.itemCode,
+          itemName: sourceRow.itemName || '',
+          partNo: sourceRow.partNo || '',
+          unit: sourceRow.unit || '',
+          locationId: sourceRow.locationId || selectedSession?.locationId || '',
+          locationName: sourceRow.locationName || selectedSession?.locationName || '',
+          lotNo: isScanLotMode ? lotNo : '',
+          batchId: sourceRow.batchId || null,
+          countedQty,
+          snapshotQty: Number(sourceRow.bookQty || 0),
+          scanMode: sessionMode,
+          scanSource: 'admin_excel_import',
+          scanValue: file.name,
+          qualityStatus: 'ok',
+          reason,
+          remarks: reason,
+          inputBox,
+          inputLoose,
+        });
+      });
+
+      if (unknownCodes.size) {
+        const preview = Array.from(unknownCodes).slice(0, 5).join(', ');
+        throw new Error(`Kode item tidak ada di session: ${preview}${unknownCodes.size > 5 ? ', ...' : ''}.`);
+      }
+      if (!payload.length) {
+        throw new Error('Tidak ada baris dengan hasil hitung yang dapat diimport. Isi Qty Fisik atau Input KBN/Remain.');
+      }
+
+      const result = await apiFetch(`/api/stock-opname/sessions/${selectedSessionId}/import`, {
+        method: 'POST',
+        body: JSON.stringify({ items: payload, mode: sessionMode, fileName: file.name }),
+      });
+      await loadSessions();
+      await loadOpenSession();
+      await loadItems(selectedSessionId);
+      const importedCount = Number(result?.summary?.totalLines || payload.length);
+      if (showToastMessage) {
+        showToastMessage(`${importedCount} baris Stock Opname berhasil diimport.`, '', null, 'success');
+      } else {
+        alert(`${importedCount} baris Stock Opname berhasil diimport.`);
+      }
+    } catch (error) {
+      setItemsError(error.message || 'Gagal mengimport Excel Stock Opname.');
+      if (showToastMessage) showToastMessage(error.message || 'Gagal mengimport Excel Stock Opname.');
+    } finally {
+      setExcelImporting(false);
+    }
+  };
+
   const handleUploadBatch = async () => {
     if (!selectedSessionId) return;
     if (uploading) return;
-    if (computedRows.length === 0) {
-      setItemsError('Tidak ada item untuk diupload.');
+    if (!isSessionEditable) {
+      notifyActionBlocked('Session sudah selesai dan tidak dapat diubah lagi.');
+      return;
+    }
+    const changedRows = computedRows.filter((row) => dirtyRowIds.has(row.id));
+    if (changedRows.length === 0) {
+      setItemsError('Tidak ada perubahan yang perlu disimpan.');
       if (showToastMessage) {
-        showToastMessage('Tidak ada item untuk diupload.');
+        showToastMessage('Tidak ada perubahan yang perlu disimpan.');
       }
       return;
     }
-    const invalidRow = computedRows.find((row) => (rowValidationMap.get(row.id) || []).length > 0);
+    const invalidRow = changedRows.find((row) => (rowValidationMap.get(row.id) || []).length > 0);
     if (invalidRow) {
       const firstIssue = rowValidationMap.get(invalidRow.id)?.[0] || 'Data baris belum valid.';
       setItemsError(`Item ${invalidRow.itemCode}: ${firstIssue}.`);
@@ -686,7 +901,7 @@ const TabStockOpname = (props) => {
     setUploading(true);
     setItemsError('');
     try {
-      const payload = computedRows.map((row) => ({
+      const payload = changedRows.map((row) => ({
         itemCode: row.itemCode,
         itemName: row.itemName || '',
         partNo: row.partNo || '',
@@ -792,9 +1007,15 @@ const TabStockOpname = (props) => {
   };
 
   const handleRowChange = (id, key, value) => {
+    if (!isSessionEditable) return;
     setRows((prev) => prev.map((row) => (
       row.id === id ? { ...row, [key]: value } : row
     )));
+    setDirtyRowIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
   };
 
   const handleAddManualTallyItem = () => {
@@ -864,6 +1085,11 @@ const TabStockOpname = (props) => {
         targetSourceId: targetSource.id || '',
       },
     ]);
+    setDirtyRowIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
     setManualItemCode('');
   };
 
@@ -1328,6 +1554,27 @@ const TabStockOpname = (props) => {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {isAdmin && (
+              <>
+                <input
+                  ref={excelImportInputRef}
+                  type="file"
+                  accept=".xlsx,.xls"
+                  className="hidden"
+                  onChange={handleAdminExcelImport}
+                />
+                <button
+                  type="button"
+                  onClick={() => excelImportInputRef.current?.click()}
+                  className="px-3 py-1.5 text-xs border border-amber-300 bg-amber-50 text-amber-800 rounded flex items-center gap-2 hover:bg-amber-100"
+                  disabled={!selectedSessionId || !isSessionEditable || excelImporting || uploading}
+                  title="Khusus admin: import hasil hitung dari blanko Excel"
+                >
+                  <FileSpreadsheet size={12} />
+                  {excelImporting ? 'Mengimport...' : 'Upload Excel (Admin)'}
+                </button>
+              </>
+            )}
             <button
               type="button"
               onClick={() => setShowSystemQty((prev) => !prev)}
@@ -1340,10 +1587,10 @@ const TabStockOpname = (props) => {
               type="button"
               onClick={handleUploadBatch}
               className="px-3 py-1.5 text-xs bg-indigo-600 text-white rounded flex items-center gap-2"
-              disabled={!selectedSessionId || uploading || hasRowValidationIssues}
+              disabled={!selectedSessionId || !isSessionEditable || uploading || dirtyRowIds.size === 0}
             >
               <Upload size={12} />
-              {uploading ? 'Uploading...' : 'Upload Batch SO'}
+              {uploading ? 'Menyimpan...' : `Simpan Perubahan${dirtyRowIds.size ? ` (${dirtyRowIds.size})` : ''}`}
             </button>
             <button
               type="button"
@@ -1386,7 +1633,7 @@ const TabStockOpname = (props) => {
               type="button"
               onClick={handleFinalize}
               className="px-3 py-1.5 text-xs bg-emerald-600 text-white rounded flex items-center gap-2"
-              disabled={!selectedSessionId || finalizing || hasRowValidationIssues}
+              disabled={!selectedSessionId || !isSessionEditable || finalizing || hasRowValidationIssues || dirtyRowIds.size > 0}
             >
               <CheckCircle size={12} />
               {finalizing ? 'Posting...' : 'Selesai & Post'}
@@ -1395,7 +1642,7 @@ const TabStockOpname = (props) => {
         </div>
 
         <div className="rounded-lg border border-sky-100 bg-sky-50 px-3 py-2 text-[11px] text-sky-800">
-          Syarat tombol Print Laporan, Print Blanko, Export Excel Blanko, dan Analisis AI: session SO sudah dipilih dan daftar item sudah muncul di tabel Tally Input. Untuk blanko/PDF per area, pilih Kategori SO dan Target saat modal print terbuka.
+          Syarat tombol Print Laporan, Print Blanko, Export Excel Blanko, dan Analisis AI: session SO sudah dipilih dan daftar item sudah muncul di tabel Tally Input. Untuk blanko/PDF per area, pilih Kategori SO dan Target saat modal print terbuka. Admin dapat mengisi blanko Excel lalu mengunggahnya kembali lewat Upload Excel (Admin).
         </div>
 
         <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
@@ -1473,7 +1720,7 @@ const TabStockOpname = (props) => {
                 value={manualItemCode}
                 onChange={(e) => setManualItemCode(e.target.value)}
                 placeholder={selectedTallyTarget ? 'Ketik kode part / item yang ditemukan di target' : 'Pilih target terlebih dahulu'}
-                disabled={!selectedTallyTarget}
+                disabled={!selectedTallyTarget || !isSessionEditable}
               />
               <datalist id="stockopname-manual-item-options">
                 {masterItemOptions.map((item) => (
@@ -1487,9 +1734,9 @@ const TabStockOpname = (props) => {
                 type="button"
                 onClick={handleAddManualTallyItem}
                 className={`flex h-10 min-w-[126px] items-center justify-center gap-2 rounded px-3 py-2 text-xs font-semibold ${
-                  selectedTallyTarget ? 'bg-slate-900 text-white hover:bg-slate-800' : 'border border-slate-200 bg-white text-slate-400'
+                  selectedTallyTarget && isSessionEditable ? 'bg-slate-900 text-white hover:bg-slate-800' : 'border border-slate-200 bg-white text-slate-400'
                 }`}
-                disabled={!selectedTallyTarget}
+                disabled={!selectedTallyTarget || !isSessionEditable}
               >
                 <Plus size={13} />
                 Tambah Part
@@ -1541,7 +1788,7 @@ const TabStockOpname = (props) => {
                 </tr>
               </thead>
               <tbody>
-                {tallyRows.map((row) => {
+                {paginatedTallyRows.map((row) => {
                   const diff = row.difference;
                   const diffTone = diff === 0 ? '' : diff > 0 ? 'text-emerald-600' : 'text-rose-600';
                   const isDiff = diff !== 0;
@@ -1575,6 +1822,7 @@ const TabStockOpname = (props) => {
                               value={row.lotNo}
                               onChange={(e) => handleRowChange(row.id, 'lotNo', e.target.value)}
                               placeholder="Scan / isi lot"
+                              disabled={!isSessionEditable}
                             />
                             {rowIssues.some((issue) => issue.includes('Lot No')) && (
                               <div className="mt-1 text-[10px] text-amber-600">{rowIssues.find((issue) => issue.includes('Lot No'))}</div>
@@ -1587,6 +1835,7 @@ const TabStockOpname = (props) => {
                               value={row.countedQty}
                               min={0}
                               onChange={(e) => handleRowChange(row.id, 'countedQty', Number(e.target.value || 0))}
+                              disabled={!isSessionEditable}
                             />
                             {rowIssues.some((issue) => issue.includes('Qty fisik')) && (
                               <div className="mt-1 text-[10px] text-amber-600">{rowIssues.find((issue) => issue.includes('Qty fisik'))}</div>
@@ -1604,7 +1853,7 @@ const TabStockOpname = (props) => {
                               className={`border rounded px-2 py-2 w-full text-right text-[12px] ${snpMissing ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : ''}`}
                               value={row.inputBox}
                               min={0}
-                              disabled={snpMissing}
+                              disabled={snpMissing || !isSessionEditable}
                               onChange={(e) => handleRowChange(row.id, 'inputBox', Number(e.target.value || 0))}
                             />
                             {snpMissing && (
@@ -1618,6 +1867,7 @@ const TabStockOpname = (props) => {
                               value={row.inputLoose}
                               min={0}
                               onChange={(e) => handleRowChange(row.id, 'inputLoose', Number(e.target.value || 0))}
+                              disabled={!isSessionEditable}
                             />
                           </td>
                         </>
@@ -1643,6 +1893,7 @@ const TabStockOpname = (props) => {
                               value={row.reason}
                               onChange={(e) => handleRowChange(row.id, 'reason', e.target.value)}
                               placeholder={isDiff ? 'Wajib isi reason' : ''}
+                              disabled={!isSessionEditable}
                             />
                             {rowIssues.some((issue) => issue.includes('Reason wajib')) && (
                               <div className="mt-1 text-[10px] text-rose-600">{rowIssues.find((issue) => issue.includes('Reason wajib'))}</div>
@@ -1653,6 +1904,7 @@ const TabStockOpname = (props) => {
                           type="button"
                           onClick={() => handleRowChange(row.id, 'hidden', true)}
                           className="px-2 py-1 text-[10px] border rounded"
+                          disabled={!isSessionEditable}
                         >
                           Hapus
                         </button>
@@ -1669,6 +1921,35 @@ const TabStockOpname = (props) => {
                 )}
               </tbody>
             </table>
+          </div>
+        )}
+
+        {!itemsLoading && tallyRows.length > TALLY_PAGE_SIZE && (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs">
+            <div className="text-slate-500">
+              Menampilkan {tallyPageStart}-{tallyPageEnd} dari {tallyRows.length} item
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                className="rounded border px-3 py-1.5 disabled:cursor-not-allowed disabled:text-slate-300"
+                onClick={() => setTallyPage((page) => Math.max(1, page - 1))}
+                disabled={safeTallyPage <= 1}
+              >
+                Sebelumnya
+              </button>
+              <span className="min-w-[92px] text-center text-slate-600">
+                Halaman {safeTallyPage} / {tallyPageCount}
+              </span>
+              <button
+                type="button"
+                className="rounded border px-3 py-1.5 disabled:cursor-not-allowed disabled:text-slate-300"
+                onClick={() => setTallyPage((page) => Math.min(tallyPageCount, page + 1))}
+                disabled={safeTallyPage >= tallyPageCount}
+              >
+                Berikutnya
+              </button>
+            </div>
           </div>
         )}
 

@@ -81,7 +81,9 @@ const TabSupplierPortal = (props) => {
   const [dnPage, setDnPage] = useState(1);
   const [dnPageSize, setDnPageSize] = useState(50);
   const [dnDetails, setDnDetails] = useState({});
-  const [labelModal, setLabelModal] = useState({ open: false, mode: 'label', dnNumber: '', header: null, items: [], controls: {} });
+  const [labelModal, setLabelModal] = useState({ open: false, mode: 'label', dnNumber: '', header: null, items: [], controls: {}, manifest: null });
+  const [manifestSaving, setManifestSaving] = useState(false);
+  const [manifestError, setManifestError] = useState('');
   const [labelBulkDraft, setLabelBulkDraft] = useState({ packageText: '' });
   const [labelSelectedKeys, setLabelSelectedKeys] = useState([]);
   const portalDeepLinkHandledRef = useRef(false);
@@ -389,8 +391,10 @@ const TabSupplierPortal = (props) => {
         const seq = packageIndex + 1;
         const total = packages.length;
         const status = getPackageStatus(qty, packQty);
+        const labelUid = `${dnNumber}-${key}-${String(seq).padStart(3, '0')}`;
         const qrValue = [
           `type:incoming_label`,
+          `label:${labelUid}`,
           `supplier:${supplierValue}`,
           `dn:${dnNumber}`,
           `item:${itemCode}`,
@@ -402,7 +406,7 @@ const TabSupplierPortal = (props) => {
           `next:${nextProcessLabel}`,
         ].join('|');
         labels.push({
-          key: `${dnNumber}-${itemCode}-${seq}`,
+          key: labelUid,
           dnNumber,
           itemCode,
           itemName,
@@ -420,6 +424,7 @@ const TabSupplierPortal = (props) => {
           nextProcessLabel,
           status,
           qrValue,
+          dnItemId: Number(item?.id || item?.dn_item_id || 0) || null,
         });
       });
     });
@@ -476,7 +481,8 @@ const TabSupplierPortal = (props) => {
       remarks: header.remarks || '',
       rows,
       totals,
-      qrValue: [`type:dn`, `dn:${dnNumber}`, `supplier:${supplierCode || supplierName}`].join('|'),
+      qrValue: labelModal.manifest?.qrValue
+        || [`type:dn`, `dn:${dnNumber}`, `supplier:${supplierCode || supplierName}`].join('|'),
       printDate: new Date().toLocaleDateString('id-ID'),
     };
   }, [labelBuild.labels, labelModal]);
@@ -527,7 +533,9 @@ const TabSupplierPortal = (props) => {
       header: detail?.header || null,
       items: itemsForLabel,
       controls,
+      manifest: null,
     });
+    setManifestError('');
     setLabelSelectedKeys([]);
   };
 
@@ -639,9 +647,43 @@ const TabSupplierPortal = (props) => {
   };
 
   const closeLabelModal = () => {
-    setLabelModal({ open: false, dnNumber: '', header: null, items: [], controls: {} });
+    setLabelModal({ open: false, mode: 'label', dnNumber: '', header: null, items: [], controls: {}, manifest: null });
     setLabelBulkDraft({ packageText: '' });
     setLabelSelectedKeys([]);
+    setManifestError('');
+  };
+
+  const handlePrintDnAndLabels = async () => {
+    if (labelModal.mode === 'dn' || publicMode) {
+      window.print();
+      return;
+    }
+    if (labelBuild.errors.length > 0 || labelBuild.labels.length === 0 || manifestSaving) return;
+    setManifestSaving(true);
+    setManifestError('');
+    try {
+      const manifest = await apiFetch(`/api/supplier/dn/${encodeURIComponent(labelModal.dnNumber)}/manifest`, {
+        method: 'POST',
+        body: JSON.stringify({
+          labels: labelBuild.labels.map((label) => ({
+            labelUid: label.key,
+            qrValue: label.qrValue,
+            dnItemId: label.dnItemId,
+            itemCode: label.itemCode,
+            qty: label.packageQty,
+            lotNo: label.lotNo,
+            packageSeq: label.packageSeq,
+            packageTotal: label.packageTotal,
+          })),
+        }),
+      });
+      setLabelModal((prev) => ({ ...prev, manifest }));
+      setTimeout(() => window.print(), 180);
+    } catch (error) {
+      setManifestError(error.message || 'Gagal membuat manifest QR pengiriman.');
+    } finally {
+      setManifestSaving(false);
+    }
   };
 
   const buildQuery = useCallback((params = {}) => {
@@ -3063,7 +3105,15 @@ const TabSupplierPortal = (props) => {
               {!scheduleLabelModal.loading && scheduleLabelModal.data && (() => {
                 const data = scheduleLabelModal.data;
                 return (
-                  <div className="supplier-package-label supplier-kanban-card bg-white">
+                  <div className="space-y-3">
+                    <div className={`rounded-xl border px-3 py-2 text-xs supplier-label-print-hidden ${data.deliveryNote?.id
+                      ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                      : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
+                      {data.deliveryNote?.id
+                        ? `Siap untuk Receiving - terhubung ke ${data.deliveryNote.number || `DN-${data.deliveryNote.id}`}.`
+                        : 'Schedule belum terhubung ke DN internal. Label tetap dapat dicetak, tetapi PCD harus membuat DN sebelum Receiving.'}
+                    </div>
+                    <div className="supplier-package-label supplier-kanban-card bg-white">
                     <div className="supplier-kanban-card__body">
                       <div className="supplier-kanban-card__top">
                         <div className="border-r-2 border-black flex flex-col items-center justify-center px-1 text-center">
@@ -3117,6 +3167,7 @@ const TabSupplierPortal = (props) => {
                         </div>
                       </div>
                     </div>
+                    </div>
                   </div>
                 );
               })()}
@@ -3149,11 +3200,15 @@ const TabSupplierPortal = (props) => {
                 <button
                   type="button"
                   className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
-                  onClick={() => window.print()}
-                  disabled={labelModal.mode !== 'dn' && (labelBuild.errors.length > 0 || labelBuild.labels.length === 0)}
+                  onClick={handlePrintDnAndLabels}
+                  disabled={manifestSaving || (labelModal.mode !== 'dn' && (labelBuild.errors.length > 0 || labelBuild.labels.length === 0))}
                 >
                   <Printer size={14} />
-                  {labelModal.mode === 'dn' ? 'Print/PDF DN' : `Print DN + Label 1 DN (${labelBuild.labels.length})`}
+                  {manifestSaving
+                    ? 'Membuat Manifest...'
+                    : labelModal.mode === 'dn'
+                      ? 'Print/PDF DN'
+                      : `Print DN + Manifest + Label (${labelBuild.labels.length})`}
                 </button>
                 <button
                   type="button"
@@ -3167,6 +3222,11 @@ const TabSupplierPortal = (props) => {
             </div>
 
             <div className="overflow-y-auto bg-slate-50 p-5 supplier-label-print-wrap">
+              {manifestError && (
+                <div className="mb-4 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700 supplier-label-print-hidden">
+                  {manifestError}
+                </div>
+              )}
               {labelModal.mode !== 'dn' && (
               <div className="mb-4 space-y-3 supplier-label-print-hidden">
                 <div className="rounded-xl border border-slate-200 bg-white p-3">
@@ -3477,6 +3537,56 @@ const TabSupplierPortal = (props) => {
                   </div>
                 </div>
               </div>
+
+              {labelModal.mode !== 'dn' && labelModal.manifest && (
+                <div className="mb-5 break-before-page rounded-xl border border-slate-900 bg-white p-4 text-slate-900 supplier-manifest-attachment">
+                  <div className="grid grid-cols-[1fr_auto] items-start gap-4 border-b border-slate-900 pb-3">
+                    <div>
+                      <div className="text-base font-black uppercase">Lampiran QR Manifest Pengiriman</div>
+                      <div className="mt-1 text-[10px]">
+                        DN {supplierDnSummary.dnNumber || '-'} • Manifest V{labelModal.manifest.version} • {labelModal.manifest.labelCount} label • {formatQty(labelModal.manifest.totalQty)} pcs
+                      </div>
+                      <div className="mt-1 text-[9px] text-slate-500">
+                        Scan QR utama di Incoming untuk memuat daftar label sebagai pending verifikasi. Scan ini belum memposting stok.
+                      </div>
+                      <div className="mt-1 break-all font-mono text-[7px] text-slate-400">HASH {labelModal.manifest.payloadHash}</div>
+                    </div>
+                    <div className="flex flex-col items-center border border-slate-900 p-2">
+                      <QRCodeSVG value={labelModal.manifest.qrValue} size={92} />
+                      <div className="mt-1 text-[8px] font-bold">QR MANIFEST UTAMA</div>
+                    </div>
+                  </div>
+                  <table className="mt-3 w-full border-collapse text-[8px]">
+                    <thead className="bg-slate-100">
+                      <tr>
+                        <th className="border border-slate-500 p-1 text-center">No</th>
+                        <th className="border border-slate-500 p-1 text-left">Label ID</th>
+                        <th className="border border-slate-500 p-1 text-left">Item</th>
+                        <th className="border border-slate-500 p-1 text-left">Lot</th>
+                        <th className="border border-slate-500 p-1 text-right">Qty</th>
+                        <th className="border border-slate-500 p-1 text-center">QR Label</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {labelBuild.labels.map((label, index) => (
+                        <tr key={`manifest-${label.key}`} className="break-inside-avoid">
+                          <td className="border border-slate-500 p-1 text-center">{index + 1}</td>
+                          <td className="border border-slate-500 p-1 font-mono">{label.key}</td>
+                          <td className="border border-slate-500 p-1">
+                            <div className="font-bold">{label.itemCode}</div>
+                            <div>{label.partNo || label.itemName || '-'}</div>
+                          </td>
+                          <td className="border border-slate-500 p-1">{label.lotNo || '-'}</td>
+                          <td className="border border-slate-500 p-1 text-right font-bold">{formatQty(label.packageQty)}</td>
+                          <td className="border border-slate-500 p-1 text-center">
+                            <QRCodeSVG value={label.qrValue} size={34} />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
 
               {labelModal.mode !== 'dn' && (
               <div className="grid grid-cols-1 gap-4 supplier-label-grid md:grid-cols-2">

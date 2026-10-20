@@ -33,7 +33,19 @@ import logoPrl from '../assets/kop-mrp.png';
 import logoMatra from '../assets/logo-matra.png';
 import SearchableSelectDropdown from '../components/SearchableSelectDropdown';
 
+const SHOW_LEGACY_SCAN_HISTORY = false;
+
 const normalizeReceiveDoNumber = (value) => String(value || '').trim();
+
+const getProductionOutputCategory = (item) => {
+  const typeKey = String(item?.type || item?.item_type || item?.category || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+  if (['fg', 'finishgood', 'finishedgood', 'finishedgoods'].includes(typeKey)) return 'FG';
+  if (['cp', 'child', 'childpart'].includes(typeKey)) return 'CP';
+  if (['subassy', 'subass', 'subassembly', 'sa', 'assy'].includes(typeKey)) return 'SUBASSY';
+  return '';
+};
 
 const validateReceiveDoNumberFormat = (value) => {
   const normalized = normalizeReceiveDoNumber(value);
@@ -146,6 +158,7 @@ const TabKanban = (props) => {
     handleKanbanProcessStart,
     handleKanbanProcessFinish,
     items,
+    itemCustomerMap,
     itemSupplierMap,
     kanbanCategory,
     kanbanCategoryFilter,
@@ -177,6 +190,7 @@ const TabKanban = (props) => {
     kanbanView,
     isStockOpnameLocked,
     incomingQuickAction,
+    productionQuickAction,
     mainTab,
     manualRequestForm,
     manualRequestQueue,
@@ -184,6 +198,7 @@ const TabKanban = (props) => {
     masterAreas,
     masterDeliveries,
     masterCategories,
+    masterCustomers,
     masterItems,
     masterItemsByCode,
     masterLocations,
@@ -2618,6 +2633,7 @@ const TabKanban = (props) => {
   const [receiveScanInput, setReceiveScanInput] = useState('');
   const [receiveScanError, setReceiveScanError] = useState('');
   const [receiveScanLogs, setReceiveScanLogs] = useState([]);
+  const [receiveManifestInfo, setReceiveManifestInfo] = useState(null);
   const receiveScanSetRef = useRef(new Set());
   const receiveAutoLoadRef = useRef(false);
   const [receiveFlashKey, setReceiveFlashKey] = useState('');
@@ -2652,6 +2668,24 @@ const TabKanban = (props) => {
   const [productionManualError, setProductionManualError] = useState('');
   const [productionManualSuccess, setProductionManualSuccess] = useState('');
   const [showProductionManualForm, setShowProductionManualForm] = useState(false);
+  const [productionDraftRows, setProductionDraftRows] = useState([]);
+  const [productionDraftLoading, setProductionDraftLoading] = useState(false);
+  const [productionDraftError, setProductionDraftError] = useState('');
+  const [productionDraftSaving, setProductionDraftSaving] = useState(false);
+  const [productionDraftActionId, setProductionDraftActionId] = useState(null);
+  const [editingProductionDraftId, setEditingProductionDraftId] = useState(null);
+  const [showCustomerMaterialForm, setShowCustomerMaterialForm] = useState(false);
+  const [customerMaterialSaving, setCustomerMaterialSaving] = useState(false);
+  const [customerMaterialError, setCustomerMaterialError] = useState('');
+  const [customerMaterialSuccess, setCustomerMaterialSuccess] = useState('');
+  const [customerMaterialForm, setCustomerMaterialForm] = useState(() => ({
+    receivedDate: getTodayDnDateInput(),
+    itemCode: '',
+    qty: '',
+    deliveryNoteNo: '',
+    batchNo: '',
+    notes: '',
+  }));
   const [productionOrderPage, setProductionOrderPage] = useState(1);
   const [productionOrderPageSize, setProductionOrderPageSize] = useState(25);
   const [productionManualForm, setProductionManualForm] = useState(() => ({
@@ -2722,6 +2756,7 @@ const TabKanban = (props) => {
   const [localProductionCompareCode, setLocalProductionCompareCode] = useState('');
   const [showReceiveFormModal, setShowReceiveFormModal] = useState(false);
   const incomingQuickActionNonceRef = useRef(null);
+  const productionQuickActionNonceRef = useRef(null);
   const [showRnDetailModal, setShowRnDetailModal] = useState(false);
   const [selectedRnDetail, setSelectedRnDetail] = useState(null);
   const [showRnPrintModal, setShowRnPrintModal] = useState(false);
@@ -2742,6 +2777,33 @@ const TabKanban = (props) => {
     setKanbanSubTab('receiving');
     setShowReceiveFormModal(true);
   }, [incomingQuickAction?.nonce, incomingQuickAction?.type, mainTab, setKanbanSubTab, setKanbanView]);
+
+  useEffect(() => {
+    if (mainTab !== 'kanban') return undefined;
+    if (!productionQuickAction?.nonce || productionQuickActionNonceRef.current === productionQuickAction.nonce) return undefined;
+    productionQuickActionNonceRef.current = productionQuickAction.nonce;
+    setKanbanView?.(isProductionUser ? 'board' : 'planning');
+    setKanbanSubTab('production');
+    setProductionTab('fg');
+    const isCustomerMaterialReceipt = productionQuickAction?.type === 'ssp';
+    setShowProductionManualForm(!isCustomerMaterialReceipt);
+    setShowCustomerMaterialForm(isCustomerMaterialReceipt);
+    setCustomerMaterialError('');
+    setCustomerMaterialSuccess('');
+    const timer = setTimeout(() => {
+      document.getElementById(
+        isCustomerMaterialReceipt ? 'customer-material-receipt' : 'production-manual-input',
+      )?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 180);
+    return () => clearTimeout(timer);
+  }, [
+    isProductionUser,
+    mainTab,
+    productionQuickAction?.nonce,
+    productionQuickAction?.type,
+    setKanbanSubTab,
+    setKanbanView,
+  ]);
 
   useEffect(() => {
     if (dnPrintCardsTimerRef.current) {
@@ -2869,10 +2931,12 @@ const TabKanban = (props) => {
       .map((item) => ({
         ...item,
         code: item.code || item.item_code,
+        productionCategory: getProductionOutputCategory(item),
         label: [
           item.code || item.item_code,
           item.part_no || item.partNo,
           item.name,
+          getProductionOutputCategory(item),
         ].filter(Boolean).join(' | '),
       }))
       .filter((item) => item.code);
@@ -2885,6 +2949,51 @@ const TabKanban = (props) => {
       || masterItemsByCode?.get?.(code)
       || null;
   }, [masterItemsByCode, productionManualForm.productCode, productionOutputItemOptions]);
+  const selectedProductionManualCategory = getProductionOutputCategory(selectedProductionManualItem);
+  const selectedProductionManualSnp = useMemo(() => {
+    if (!selectedProductionManualItem) return '';
+    const itemCode = String(selectedProductionManualItem.code || selectedProductionManualItem.item_code || '').trim();
+    const setting = itemCode ? kanbanSettingsByCode?.get?.(itemCode) : null;
+    const candidates = [
+      selectedProductionManualItem.pack_qty,
+      selectedProductionManualItem.packQty,
+      selectedProductionManualItem.snp,
+      setting?.lot_qty,
+      setting?.lotQty,
+    ];
+    const value = candidates.map(Number).find((candidate) => Number.isFinite(candidate) && candidate > 0);
+    return value || '';
+  }, [kanbanSettingsByCode, selectedProductionManualItem]);
+
+  const customerMaterialItemOptions = useMemo(() => (
+    (Array.isArray(masterItems) ? masterItems : [])
+      .filter((item) => {
+        const typeKey = String(item?.type || item?.item_type || item?.category || '')
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '');
+        return ['ssp', 'issp', 'suppliedsupplypart', 'indirectssp', 'customersuppliedmaterial'].includes(typeKey);
+      })
+      .map((item) => ({
+        ...item,
+        code: item.code || item.item_code,
+        label: [item.code || item.item_code, item.part_no || item.partNo, item.name, item.type].filter(Boolean).join(' | '),
+      }))
+      .filter((item) => item.code)
+  ), [masterItems]);
+
+  const selectedCustomerMaterialItem = useMemo(() => (
+    customerMaterialItemOptions.find((item) => item.code === customerMaterialForm.itemCode) || null
+  ), [customerMaterialForm.itemCode, customerMaterialItemOptions]);
+  const selectedCustomerMaterialRelation = useMemo(() => {
+    const relations = itemCustomerMap?.get?.(customerMaterialForm.itemCode) || [];
+    return [...relations].sort((left, right) => Number(right?.sharePercent || 0) - Number(left?.sharePercent || 0))[0] || null;
+  }, [customerMaterialForm.itemCode, itemCustomerMap]);
+  const selectedCustomerMaterialCustomer = useMemo(() => {
+    const customerId = String(selectedCustomerMaterialRelation?.customerId || '').trim();
+    if (!customerId) return null;
+    return (masterCustomers || []).find((customer) => String(customer?.id || '').trim() === customerId)
+      || { id: customerId, name: selectedCustomerMaterialRelation?.customerName || customerId };
+  }, [masterCustomers, selectedCustomerMaterialRelation]);
 
   const productionLineOptions = useMemo(() => {
     const normalizeLocationType = (value) => {
@@ -2965,6 +3074,7 @@ const TabKanban = (props) => {
     setReceiveScanInput('');
     setReceiveScanError('');
     setReceiveScanLogs([]);
+    setReceiveManifestInfo(null);
     receiveScanSetRef.current = new Set();
     setReceiveFlashKey('');
     setReceiveTruckNo('');
@@ -3077,6 +3187,7 @@ const TabKanban = (props) => {
         setReceiveScanInput('');
         setReceiveScanError('');
         setReceiveScanLogs([]);
+        setReceiveManifestInfo(null);
         receiveScanSetRef.current = new Set();
         setReceiveFlashKey('');
       } else {
@@ -3209,11 +3320,13 @@ const TabKanban = (props) => {
 
   useEffect(() => {
     if (kanbanSubTab === 'production') {
-      setProductionTab('queue');
+      const isQuickInput = productionQuickAction?.nonce
+        && productionQuickActionNonceRef.current === productionQuickAction.nonce;
+      setProductionTab(isQuickInput ? 'fg' : 'queue');
     } else if (kanbanSubTab === 'delivery') {
       setDeliveryWorkflowTab('upload-dn');
     }
-  }, [kanbanSubTab]);
+  }, [kanbanSubTab, productionQuickAction?.nonce]);
 
   useEffect(() => {
     if (!isProductionUser) return;
@@ -3236,6 +3349,7 @@ const TabKanban = (props) => {
 
   useEffect(() => {
     if (kanbanSubTab !== 'production') return;
+    fetchProductionDrafts();
     if (productionTab === 'fg') {
       fetchProductionImportHistory();
       fetchProductionOrderHistory();
@@ -3283,6 +3397,21 @@ const TabKanban = (props) => {
       setProductionOrderHistoryError(error.message || 'Gagal memuat riwayat output produksi.');
     } finally {
       setProductionOrderHistoryLoading(false);
+    }
+  };
+
+  const fetchProductionDrafts = async () => {
+    if (!canProduction) return;
+    setProductionDraftLoading(true);
+    setProductionDraftError('');
+    try {
+      const data = await apiFetch('/api/production/drafts');
+      setProductionDraftRows(Array.isArray(data) ? data : []);
+    } catch (error) {
+      setProductionDraftRows([]);
+      setProductionDraftError(error.message || 'Gagal memuat draft produksi.');
+    } finally {
+      setProductionDraftLoading(false);
     }
   };
 
@@ -3664,6 +3793,10 @@ const TabKanban = (props) => {
 
   const handleSubmitManualProductionReport = async (event) => {
     event.preventDefault();
+    if (editingProductionDraftId) {
+      setProductionManualError('Selesaikan Update Draft atau batalkan mode edit sebelum posting produksi langsung.');
+      return;
+    }
     if (isStockOpnameLocked) {
       notifyMessage('Selesaikan dulu Stock Opname!');
       return;
@@ -3700,7 +3833,12 @@ const TabKanban = (props) => {
           notes: productionManualForm.notes,
         }),
       });
-      setProductionManualSuccess(`Input produksi tersimpan. PROD-${result?.productionId || '-'}`);
+      const pendingCount = Array.isArray(result?.customerMaterialPending) ? result.customerMaterialPending.length : 0;
+      setProductionManualSuccess(
+        pendingCount > 0
+          ? `Input produksi tersimpan. PROD-${result?.productionId || '-'}; ${pendingCount} material customer menunggu rekonsiliasi.`
+          : `Input produksi tersimpan. PROD-${result?.productionId || '-'}`,
+      );
       setProductionManualForm((prev) => ({
         ...prev,
         qty: '',
@@ -3720,6 +3858,164 @@ const TabKanban = (props) => {
       setProductionManualError(error.message || 'Input produksi manual gagal.');
     } finally {
       setProductionManualSaving(false);
+    }
+  };
+
+  const handleSaveProductionDraft = async () => {
+    if (isStockOpnameLocked) {
+      notifyMessage('Selesaikan dulu Stock Opname!');
+      return;
+    }
+    const productionDate = String(productionManualForm.productionDate || '').trim();
+    const productCode = String(productionManualForm.productCode || '').trim();
+    const qty = Number(productionManualForm.qty);
+    if (!productionDate || !productCode || !Number.isFinite(qty) || qty <= 0) {
+      setProductionManualError('Tanggal, item, dan qty produksi wajib diisi sebelum menyimpan draft.');
+      return;
+    }
+    setProductionDraftSaving(true);
+    setProductionManualError('');
+    setProductionManualSuccess('');
+    try {
+      const payload = {
+        productCode,
+        qty,
+        productionDate,
+        source: 'MANUAL_REPORT',
+        lineCode: productionManualForm.lineCode,
+        shiftLabel: productionManualForm.shiftLabel,
+        documentNo: productionManualForm.documentNo,
+        notes: productionManualForm.notes,
+      };
+      const result = await apiFetch(
+        editingProductionDraftId
+          ? `/api/production/drafts/${editingProductionDraftId}`
+          : '/api/production/drafts',
+        {
+          method: editingProductionDraftId ? 'PUT' : 'POST',
+          body: JSON.stringify(payload),
+        },
+      );
+      const shortageCount = Number(result?.draft?.shortage_count ?? result?.blockingRows?.length ?? 0);
+      setProductionManualSuccess(
+        `${editingProductionDraftId ? 'Draft diperbarui' : 'Draft tersimpan'}: ${result?.draft?.draft_no || '-'}${shortageCount > 0 ? `, ${shortageCount} material menunggu stok.` : ', material sudah siap diposting.'}`,
+      );
+      setEditingProductionDraftId(null);
+      setProductionManualForm((prev) => ({
+        ...prev,
+        qty: '',
+        documentNo: '',
+        notes: '',
+      }));
+      await fetchProductionDrafts();
+      notifyMessage('Draft produksi berhasil direkam tanpa mengubah stok.');
+    } catch (error) {
+      setProductionManualError(error.message || 'Gagal menyimpan draft produksi.');
+    } finally {
+      setProductionDraftSaving(false);
+    }
+  };
+
+  const handleEditProductionDraft = (draft) => {
+    if (!draft?.id || ['POSTED', 'CANCELLED'].includes(String(draft.status || '').toUpperCase())) return;
+    setEditingProductionDraftId(draft.id);
+    setProductionManualForm({
+      productionDate: String(draft.production_date || '').slice(0, 10),
+      productCode: draft.product_code || '',
+      qty: String(draft.qty ?? ''),
+      lineCode: draft.line_code || '',
+      shiftLabel: draft.shift_label || 'Shift 1',
+      documentNo: draft.document_no || '',
+      notes: draft.notes || '',
+    });
+    setShowProductionManualForm(true);
+    setProductionManualError('');
+    setProductionManualSuccess(`Mengedit ${draft.draft_no || `draft #${draft.id}`}.`);
+    setProductionTab('fg');
+    setTimeout(() => document.getElementById('production-manual-input')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
+  };
+
+  const handleProductionDraftAction = async (draft, action) => {
+    if (!draft?.id) return;
+    if (action === 'cancel' && !window.confirm(`Batalkan ${draft.draft_no || `draft #${draft.id}`}?`)) return;
+    setProductionDraftActionId(draft.id);
+    setProductionDraftError('');
+    try {
+      const endpoint = action === 'check'
+        ? `/api/production/drafts/${draft.id}/check`
+        : action === 'post'
+          ? `/api/production/drafts/${draft.id}/post`
+          : `/api/production/drafts/${draft.id}`;
+      const result = await apiFetch(endpoint, {
+        method: action === 'cancel' ? 'DELETE' : 'POST',
+        body: action === 'cancel' ? undefined : JSON.stringify({}),
+      });
+      if (action === 'post') {
+        notifyMessage(`Draft diposting menjadi PROD-${result?.productionId || draft.posted_production_id || '-'}.`);
+        await fetchProductionOrderHistory();
+      } else if (action === 'check') {
+        const isReady = String(result?.draft?.status || '').toUpperCase() === 'READY';
+        notifyMessage(isReady ? 'Stok lengkap. Draft siap diposting.' : 'Kebutuhan stok draft diperbarui.');
+      } else {
+        notifyMessage('Draft produksi dibatalkan.');
+      }
+      await fetchProductionDrafts();
+    } catch (error) {
+      setProductionDraftError(error.message || 'Aksi draft produksi gagal.');
+      await fetchProductionDrafts();
+    } finally {
+      setProductionDraftActionId(null);
+    }
+  };
+
+  const handleSubmitCustomerMaterialReceipt = async (event) => {
+    event.preventDefault();
+    if (isStockOpnameLocked) {
+      notifyMessage('Selesaikan dulu Stock Opname!');
+      return;
+    }
+    const itemCode = String(customerMaterialForm.itemCode || '').trim();
+    const qty = Number(customerMaterialForm.qty);
+    if (!itemCode) {
+      setCustomerMaterialError('Pilih material kategori SSP atau ISSP.');
+      return;
+    }
+    if (!Number.isFinite(qty) || qty <= 0) {
+      setCustomerMaterialError('Qty penerimaan wajib lebih dari 0.');
+      return;
+    }
+    setCustomerMaterialSaving(true);
+    setCustomerMaterialError('');
+    setCustomerMaterialSuccess('');
+    try {
+      const result = await apiFetch('/api/customer-material/receipts', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...customerMaterialForm,
+          itemCode,
+          qty,
+          customerId: selectedCustomerMaterialCustomer?.id || null,
+          autoReconcile: true,
+        }),
+      });
+      const reconciledQty = Number(result?.reconciledQty || 0);
+      setCustomerMaterialSuccess(
+        reconciledQty > 0
+          ? `Penerimaan ${result?.receipt?.receipt_no || ''} tersimpan; ${formatNumber2(reconciledQty)} langsung direkonsiliasi ke produksi tertunda.`
+          : `Penerimaan ${result?.receipt?.receipt_no || ''} tersimpan sebagai stok titipan customer.`,
+      );
+      setCustomerMaterialForm((prev) => ({
+        ...prev,
+        qty: '',
+        deliveryNoteNo: '',
+        batchNo: '',
+        notes: '',
+      }));
+      notifyMessage('Material customer diterima tanpa PO.');
+    } catch (error) {
+      setCustomerMaterialError(error.message || 'Penerimaan material customer gagal.');
+    } finally {
+      setCustomerMaterialSaving(false);
     }
   };
 
@@ -4113,6 +4409,7 @@ const TabKanban = (props) => {
       }).filter((row) => Number(row.docQty || 0) > 0);
       setReceiveItems(mapped);
       setReceiveScanLogs([]);
+      setReceiveManifestInfo(null);
       receiveScanSetRef.current = new Set();
       return mapped;
     } catch (error) {
@@ -4128,12 +4425,217 @@ const TabKanban = (props) => {
     await loadReceiveItemsByDnIds(receiveSelectedDnIds);
   };
 
+  const handleReceiveScheduleLabelScan = async (rawValue) => {
+    setReceiveScanError('');
+    setReceiveLoading(true);
+    try {
+      const label = await apiFetch(`/api/receiving-labels/resolve?token=${encodeURIComponent(rawValue)}`);
+      const schedule = label?.schedule || {};
+      const deliveryNote = label?.deliveryNote || {};
+      const item = label?.item || {};
+      const dnId = Number(deliveryNote.id || 0);
+      if (!schedule.id || !item.code) {
+        throw new Error('QR Schedule tidak memiliki referensi jadwal atau item yang valid.');
+      }
+      if (!dnId) {
+        throw new Error(`Schedule SCH-${schedule.id} valid, tetapi belum memiliki DN internal. PCD harus membuat DN dari Request sebelum receiving.`);
+      }
+
+      const qrValue = String(label.qrValue || rawValue || '').trim();
+      if (receiveScanSetRef.current.has(qrValue)) {
+        throw new Error('QR Schedule ini sudah dipindai pada form receiving saat ini. Qty tidak ditambahkan kembali.');
+      }
+      const supplierValue = label?.supplier?.id || label?.supplier?.name || '';
+      if (!supplierValue) throw new Error('Supplier pada QR Schedule tidak ditemukan.');
+
+      const dnOption = {
+        id: dnId,
+        dn_number: deliveryNote.number || `DN-${dnId}`,
+        supplier: supplierValue,
+        status: deliveryNote.status || '',
+        total_qty: schedule.remainingQty || schedule.requestQty || 0,
+      };
+      receiveAutoLoadRef.current = true;
+      setReceiveSupplier(supplierValue);
+      setReceiveDnOptions([dnOption]);
+      setReceiveSelectedDnIds([dnId]);
+      const loadedItems = await loadReceiveItemsByDnIds([dnId]);
+      if (loadedItems.length === 0) {
+        throw new Error(`DN ${deliveryNote.number || dnId} sudah tidak memiliki qty outstanding untuk receiving.`);
+      }
+      const itemIndex = loadedItems.findIndex((row) => String(row.itemCode || '').trim() === String(item.code || '').trim());
+      if (itemIndex < 0) {
+        throw new Error(`Item ${item.code} dari Schedule tidak ditemukan pada DN ${deliveryNote.number || dnId}.`);
+      }
+      const target = loadedItems[itemIndex];
+      const scheduleQty = Number(schedule.remainingQty || label?.label?.plannedQty || schedule.requestQty || 0);
+      const receiveQty = Math.min(Number(target.docQty || 0), scheduleQty);
+      if (!Number.isFinite(receiveQty) || receiveQty <= 0) {
+        throw new Error(`Schedule SCH-${schedule.id} sudah tidak memiliki qty yang dapat diterima.`);
+      }
+      const nextItems = loadedItems.map((row, index) => ({
+        ...row,
+        receivedQty: index === itemIndex ? receiveQty : 0,
+      }));
+      const scanLog = {
+        qrValue,
+        itemCode: target.itemCode,
+        originDnId: target.originDnId,
+        originDnItemId: target.originDnItemId,
+        dnNumber: target.dnNumber,
+        qty: receiveQty,
+        lotNo: '',
+        kanbanId: '',
+        scheduleId: Number(schedule.id),
+        source: 'schedule',
+      };
+      setReceiveItems(nextItems);
+      setReceiveScanLogs([scanLog]);
+      receiveScanSetRef.current = new Set([qrValue]);
+      setReceiveManifestInfo(null);
+      setReceiveDoNumber((prev) => prev || schedule.doNumber || '');
+      setReceiveScanInput('');
+      setReceiveScanError(`Schedule SCH-${schedule.id} dimuat. Verifikasi SJ fisik dan qty sebelum Confirm Receiving.`);
+    } catch (error) {
+      setReceiveScanError(error.message || 'Gagal membaca QR Schedule Incoming.');
+    } finally {
+      setReceiveLoading(false);
+    }
+  };
+
+  const handleReceiveManifestScan = async (rawValue) => {
+    setReceiveScanError('');
+    setReceiveLoading(true);
+    try {
+      const data = await apiFetch(`/api/delivery-note-manifests/resolve?token=${encodeURIComponent(rawValue)}`);
+      const manifest = data?.manifest || {};
+      const labels = Array.isArray(data?.labels) ? data.labels : [];
+      const duplicateLabels = Array.isArray(data?.duplicateLabels) ? data.duplicateLabels : [];
+      if (!manifest.dnId || labels.length === 0) {
+        throw new Error('Manifest tidak memiliki DN atau daftar label.');
+      }
+      if (duplicateLabels.length > 0) {
+        const first = duplicateLabels[0];
+        const scannedAt = first.previouslyScannedAt
+          ? new Date(first.previouslyScannedAt).toLocaleString('id-ID')
+          : 'waktu sebelumnya';
+        throw new Error(
+          `Manifest memuat ${duplicateLabels.length} label yang sudah pernah diterima. Contoh: ${first.labelUid || first.itemCode} pada ${scannedAt}${first.previouslyScannedBy ? ` oleh ${first.previouslyScannedBy}` : ''}. Qty tidak ditambahkan kembali.`,
+        );
+      }
+
+      const supplierValue = manifest.supplier || manifest.supplierName || '';
+      const dnOption = {
+        id: Number(manifest.dnId),
+        dn_number: manifest.dnNumber,
+        supplier: supplierValue,
+        status: manifest.dnStatus,
+        total_qty: manifest.totalQty,
+      };
+      receiveAutoLoadRef.current = true;
+      setReceiveSupplier(supplierValue);
+      setReceiveDnOptions([dnOption]);
+      setReceiveSelectedDnIds([Number(manifest.dnId)]);
+      const loadedItems = await loadReceiveItemsByDnIds([Number(manifest.dnId)]);
+      if (loadedItems.length === 0) throw new Error(`Item DN ${manifest.dnNumber || ''} tidak tersedia untuk receiving.`);
+
+      const quantities = new Map();
+      const logs = [];
+      for (const label of labels) {
+        const exactIndex = loadedItems.findIndex((item) => (
+          Number(label.dnItemId || 0) > 0 && Number(item.originDnItemId || 0) === Number(label.dnItemId)
+        ));
+        const itemIndex = exactIndex >= 0
+          ? exactIndex
+          : loadedItems.findIndex((item) => item.itemCode === label.itemCode);
+        if (itemIndex < 0) throw new Error(`Label ${label.labelUid || '-'} tidak cocok dengan baris DN.`);
+        const item = loadedItems[itemIndex];
+        const qty = Number(label.qty || 0);
+        if (!Number.isFinite(qty) || qty <= 0) throw new Error(`Qty label ${label.labelUid || '-'} tidak valid.`);
+        const key = item.key;
+        quantities.set(key, Number(quantities.get(key) || 0) + qty);
+        logs.push({
+          qrValue: label.qrValue,
+          itemCode: item.itemCode,
+          originDnId: item.originDnId,
+          originDnItemId: item.originDnItemId,
+          dnNumber: item.dnNumber,
+          qty,
+          lotNo: label.lotNo || '',
+          kanbanId: label.labelUid || '',
+          manifestId: manifest.id,
+          source: 'manifest',
+          sampleRequired: Boolean(label.sampleRequired),
+          physicalVerified: false,
+        });
+      }
+      const overRow = loadedItems.find((item) => Number(quantities.get(item.key) || 0) > Number(item.docQty || 0) + 0.0001);
+      if (overRow) {
+        throw new Error(`Qty manifest ${overRow.itemCode} melebihi sisa qty DN. Minta supplier membuat manifest versi terbaru.`);
+      }
+      setReceiveItems(loadedItems.map((item) => ({
+        ...item,
+        receivedQty: Number(quantities.get(item.key) || 0),
+      })));
+      setReceiveScanLogs(logs);
+      receiveScanSetRef.current = new Set(logs.map((log) => log.qrValue));
+      setReceiveManifestInfo({
+        ...manifest,
+        verificationStatus: 'PENDING_PHYSICAL_CHECK',
+        requiredSampleCount: labels.filter((label) => label.sampleRequired).length,
+        verifiedSampleCount: 0,
+      });
+      setReceiveDoNumber((prev) => prev || manifest.dnNumber || '');
+      setReceiveScanInput('');
+    } catch (error) {
+      setReceiveManifestInfo(null);
+      setReceiveScanError(error.message || 'Gagal membaca manifest pengiriman.');
+    } finally {
+      setReceiveLoading(false);
+    }
+  };
+
   const handleReceiveScan = async () => {
     const lines = receiveScanInput
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter(Boolean);
     if (lines.length === 0) return;
+    if (lines.length === 1 && lines[0].toUpperCase().startsWith('MSKS|DNM|')) {
+      await handleReceiveManifestScan(lines[0]);
+      return;
+    }
+    if (lines.length === 1 && lines[0].toUpperCase().startsWith('MSKS|LBL|')) {
+      await handleReceiveScheduleLabelScan(lines[0]);
+      return;
+    }
+    if (receiveManifestInfo) {
+      const manifestQrSet = new Set(receiveScanLogs.map((log) => log.qrValue));
+      const unknown = lines.find((raw) => !manifestQrSet.has(raw));
+      if (unknown) {
+        setReceiveScanError('Label fisik tidak termasuk dalam manifest aktif. Pisahkan sebagai UNEXPECTED dan periksa DN supplier.');
+        return;
+      }
+      const scannedSet = new Set(lines);
+      const nextLogs = receiveScanLogs.map((log) => (
+        scannedSet.has(log.qrValue) ? { ...log, physicalVerified: true } : log
+      ));
+      const requiredRows = nextLogs.filter((log) => log.sampleRequired);
+      const verifiedCount = requiredRows.filter((log) => log.physicalVerified).length;
+      setReceiveScanLogs(nextLogs);
+      setReceiveManifestInfo((prev) => ({
+        ...prev,
+        verifiedSampleCount: verifiedCount,
+        verificationStatus: verifiedCount >= requiredRows.length ? 'VERIFIED' : 'PENDING_PHYSICAL_CHECK',
+      }));
+      setReceiveScanInput('');
+      setReceiveScanError(
+        verifiedCount >= requiredRows.length
+          ? 'Sampling fisik manifest lengkap. Penerimaan siap dikonfirmasi.'
+          : `Sampling fisik ${verifiedCount}/${requiredRows.length}. Scan label sampel yang ditandai.`,
+      );
+      return;
+    }
     let workingItems = [...receiveItems];
     if (!workingItems.length) {
       const initialParsed = lines.map((raw) => parseReceiveScanPayload(raw, [])).filter(Boolean);
@@ -4327,6 +4829,13 @@ const TabKanban = (props) => {
       setReceiveError('DN belum dipilih.');
       return;
     }
+    if (receiveManifestInfo) {
+      const pendingSamples = receiveScanLogs.filter((scan) => scan.sampleRequired && !scan.physicalVerified);
+      if (pendingSamples.length > 0) {
+        setReceiveError(`Verifikasi fisik belum lengkap. Scan ${pendingSamples.length} label sampel yang ditentukan sistem.`);
+        return;
+      }
+    }
     const normalizedReceiveDoNumber = normalizeReceiveDoNumber(receiveDoNumber);
     if (!normalizedReceiveDoNumber) {
       const message = 'Nomor SJ / DO masih kosong. Isi nomor surat jalan sebelum confirm receiving.';
@@ -4408,6 +4917,12 @@ const TabKanban = (props) => {
           dnIds: receiveSelectedDnIds,
           items: payloadItems,
           scans: receiveScanLogs,
+          manifestVerification: receiveManifestInfo ? {
+            manifestId: receiveManifestInfo.id,
+            verifiedLabelUids: receiveScanLogs
+              .filter((scan) => scan.sampleRequired && scan.physicalVerified)
+              .map((scan) => scan.kanbanId),
+          } : null,
           truckNo: receiveTruckNo,
           driverName: receiveDriverName,
           millsheetQuestion: receiveMillsheetQuestion,
@@ -8754,6 +9269,63 @@ ${reasons.join('\n')}`);
                           </div>
                           <div className="p-4 overflow-y-auto bg-slate-50">
                             <div className="bg-white border rounded-xl p-4">
+                      <div className="mb-4 rounded-xl border border-sky-200 bg-sky-50 p-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="text-xs font-semibold text-sky-900">Scan QR Incoming</div>
+                          <span className="rounded-full border border-sky-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-sky-700">
+                            Schedule / Manifest Supplier
+                          </span>
+                        </div>
+                        <div className="mt-1 text-[10px] text-sky-700">
+                          Scan QR Schedule pada label barang atau QR Manifest pada lampiran DN. QR hanya memuat referensi untuk diverifikasi; stok belum bertambah sebelum Confirm Receiving.
+                        </div>
+                        <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-[1fr_auto]">
+                          <input
+                            className="rounded border border-sky-200 bg-white p-2 text-sm"
+                            placeholder="Scan MSKS|LBL|... atau MSKS|DNM|..."
+                            value={receiveScanInput}
+                            onChange={(event) => setReceiveScanInput(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter') {
+                                event.preventDefault();
+                                handleReceiveScan();
+                              }
+                            }}
+                          />
+                          <button
+                            type="button"
+                            onClick={handleReceiveScan}
+                            disabled={receiveLoading || !String(receiveScanInput || '').trim()}
+                            className="rounded bg-sky-700 px-4 py-2 text-xs font-semibold text-white disabled:opacity-60"
+                          >
+                            {receiveLoading ? 'Memuat...' : 'Muat QR'}
+                          </button>
+                        </div>
+                        {receiveItems.length === 0 && receiveScanError && (
+                          <div className="mt-2 text-xs text-amber-700">{receiveScanError}</div>
+                        )}
+                      </div>
+                      <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-3">
+                        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                          <div>
+                            <div className="text-xs font-semibold text-amber-900">Supplier belum menggunakan Portal?</div>
+                            <div className="mt-1 text-[10px] leading-relaxed text-amber-800">
+                              Gunakan jalur PCD: buat DN internal dari Request yang disetujui, lalu pilih supplier dan Load DN di bawah. Nomor SJ fisik, qty aktual, dan label tetap diverifikasi saat receiving.
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShowReceiveFormModal(false);
+                              setKanbanView?.('board');
+                              setKanbanSubTab('requests');
+                            }}
+                            className="shrink-0 rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-800 hover:bg-amber-100"
+                          >
+                            Buka Request / Buat DN PCD
+                          </button>
+                        </div>
+                      </div>
                       <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-3 items-end">
                         <div>
                           <label className="block text-[10px] uppercase text-slate-400 mb-1">Supplier</label>
@@ -8942,6 +9514,25 @@ ${reasons.join('\n')}`);
                           </div>
                           {receiveScanError && (
                             <div className="text-xs text-amber-700">{receiveScanError}</div>
+                          )}
+                          {receiveManifestInfo && (
+                            <div className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
+                              <div className="font-semibold">
+                                Manifest V{receiveManifestInfo.version} dimuat: {receiveManifestInfo.labelCount} label / {formatQty(receiveManifestInfo.totalQty)} pcs
+                              </div>
+                              <div className="mt-1">
+                                Status: menunggu verifikasi fisik. Data ini belum menambah stok; stok baru berubah setelah Confirm Receiving.
+                              </div>
+                              <div className="mt-1 font-semibold">
+                                Sampling fisik: {receiveManifestInfo.verifiedSampleCount || 0}/{receiveManifestInfo.requiredSampleCount || 0}
+                              </div>
+                              <div className="mt-1 text-[10px]">
+                                Label sampel: {receiveScanLogs
+                                  .filter((log) => log.sampleRequired)
+                                  .map((log) => `${log.kanbanId}${log.physicalVerified ? ' ✓' : ''}`)
+                                  .join(', ') || '-'}
+                              </div>
+                            </div>
                           )}
 
                           <div className="overflow-x-auto">
@@ -9417,6 +10008,11 @@ ${reasons.join('\n')}`);
                         {[
                           { key: 'queue', label: 'Production Queue' },
                           { key: 'fg', label: 'Input Produksi' },
+                          {
+                            key: 'draft',
+                            label: 'Draft Produksi',
+                            badge: productionDraftRows.filter((row) => ['WAITING_STOCK', 'READY'].includes(String(row.status || '').toUpperCase())).length,
+                          },
                           { key: 'wip', label: 'Import Mutasi WIP' },
                           { key: 'report', label: 'Laporan Produksi' },
                         ].map((tab) => (
@@ -9430,7 +10026,14 @@ ${reasons.join('\n')}`);
                                 : 'text-slate-500 hover:text-slate-800'
                             }`}
                           >
-                            {tab.label}
+                            <span className="inline-flex items-center gap-1.5">
+                              {tab.label}
+                              {Number(tab.badge || 0) > 0 && (
+                                <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-700">
+                                  {tab.badge}
+                                </span>
+                              )}
+                            </span>
                             {productionTab === tab.key && (
                               <span className="absolute left-0 -bottom-[1px] h-[2px] w-full rounded-full bg-slate-900" />
                             )}
@@ -9805,6 +10408,135 @@ ${reasons.join('\n')}`);
                         </div>
                       </div>
                     )}
+                    {productionTab === 'draft' && (
+                    <div className="rounded-xl border bg-white p-4">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-semibold text-slate-900">Draft Produksi</div>
+                          <div className="text-xs text-slate-500">Draft tidak mengubah stok, batch FIFO, ledger, maupun output produksi sebelum diposting.</div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditingProductionDraftId(null);
+                              setProductionManualForm((prev) => ({
+                                ...prev,
+                                productionDate: getTodayDnDateInput(),
+                                productCode: '',
+                                qty: '',
+                                documentNo: '',
+                                notes: '',
+                              }));
+                              setShowProductionManualForm(true);
+                              setProductionTab('fg');
+                            }}
+                            className="inline-flex items-center gap-1 rounded bg-amber-500 px-3 py-2 text-xs font-semibold text-white"
+                          >
+                            <Plus size={14} /> Draft Baru
+                          </button>
+                          <button
+                            type="button"
+                            onClick={fetchProductionDrafts}
+                            disabled={productionDraftLoading}
+                            className="inline-flex items-center gap-1 rounded border px-3 py-2 text-xs"
+                          >
+                            <RotateCcw size={14} /> {productionDraftLoading ? 'Memuat...' : 'Refresh'}
+                          </button>
+                        </div>
+                      </div>
+                      {productionDraftError && <div className="mt-3 rounded border border-red-200 bg-red-50 p-2 text-xs text-red-700">{productionDraftError}</div>}
+                      <div className="mt-3 overflow-x-auto">
+                        <table className="min-w-[1150px] w-full text-xs">
+                          <thead className="bg-slate-100 text-slate-600">
+                            <tr>
+                              <th className="p-2 text-left">Draft</th>
+                              <th className="p-2 text-left">Tanggal</th>
+                              <th className="p-2 text-left">Item Produksi</th>
+                              <th className="p-2 text-right">Qty</th>
+                              <th className="p-2 text-left">Line / Shift</th>
+                              <th className="p-2 text-left">Kebutuhan Material</th>
+                              <th className="p-2 text-left">Status</th>
+                              <th className="p-2 text-left">Action</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {!productionDraftLoading && productionDraftRows.length === 0 && (
+                              <tr><td colSpan={8} className="p-5 text-center text-slate-400">Belum ada draft produksi.</td></tr>
+                            )}
+                            {productionDraftRows.map((draft) => {
+                              const status = String(draft.status || '').toUpperCase();
+                              const requirements = Array.isArray(draft.requirements) ? draft.requirements : [];
+                              const blockingShortages = requirements.filter((row) => Number(row.shortage || 0) > 0 && !row.isCustomerSupplied);
+                              const customerPending = requirements.filter((row) => Number(row.shortage || 0) > 0 && row.isCustomerSupplied);
+                              const isBusy = productionDraftActionId === draft.id;
+                              const isFinal = ['POSTED', 'CANCELLED'].includes(status);
+                              const statusClass = status === 'READY'
+                                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                : status === 'WAITING_STOCK'
+                                  ? 'bg-amber-50 text-amber-700 border-amber-200'
+                                  : status === 'POSTED'
+                                    ? 'bg-sky-50 text-sky-700 border-sky-200'
+                                    : 'bg-slate-100 text-slate-600 border-slate-200';
+                              return (
+                                <tr key={draft.id} className="border-t align-top">
+                                  <td className="p-2">
+                                    <div className="font-semibold text-slate-800">{draft.draft_no || `DRF-${draft.id}`}</div>
+                                    <div className="text-[10px] text-slate-400">{draft.created_by_name || '-'}</div>
+                                  </td>
+                                  <td className="p-2">{formatProductionDateValue(draft.production_date)}</td>
+                                  <td className="p-2">
+                                    <div className="font-semibold">{buildProductionUniqLabel(draft.product_code, draft.part_no)}</div>
+                                    <div className="max-w-[220px] truncate text-[10px] text-slate-500" title={draft.product_name || ''}>{draft.product_name || '-'}</div>
+                                  </td>
+                                  <td className="p-2 text-right font-semibold">{formatNumber2(draft.qty || 0)}</td>
+                                  <td className="p-2">
+                                    <div>{getProductionLineDisplayLabel(draft.line_code)}</div>
+                                    <div className="text-[10px] text-slate-500">{draft.shift_label || '-'}</div>
+                                  </td>
+                                  <td className="p-2">
+                                    {blockingShortages.length === 0 && customerPending.length === 0 ? (
+                                      <span className="text-emerald-700">Semua material tersedia</span>
+                                    ) : (
+                                      <div className="space-y-1">
+                                        {blockingShortages.slice(0, 4).map((row) => (
+                                          <div key={row.itemCode} className="rounded bg-amber-50 px-2 py-1 text-[10px] text-amber-700">
+                                            {row.itemCode}: kurang {formatNumber2(row.shortage || 0)} {row.unit || ''}
+                                          </div>
+                                        ))}
+                                        {customerPending.slice(0, 2).map((row) => (
+                                          <div key={row.itemCode} className="rounded bg-sky-50 px-2 py-1 text-[10px] text-sky-700">
+                                            {row.itemCode}: SSP/ISSP pending {formatNumber2(row.shortage || 0)}
+                                          </div>
+                                        ))}
+                                        {blockingShortages.length > 4 && <div className="text-[10px] text-slate-400">+{blockingShortages.length - 4} material lainnya</div>}
+                                      </div>
+                                    )}
+                                  </td>
+                                  <td className="p-2">
+                                    <span className={`inline-flex rounded-full border px-2 py-1 text-[10px] font-semibold ${statusClass}`}>
+                                      {status.replaceAll('_', ' ')}
+                                    </span>
+                                    {draft.posted_production_id && <div className="mt-1 text-[10px] text-sky-600">PROD-{draft.posted_production_id}</div>}
+                                  </td>
+                                  <td className="p-2">
+                                    {!isFinal && (
+                                      <div className="flex flex-wrap gap-1">
+                                        <button type="button" disabled={isBusy} onClick={() => handleProductionDraftAction(draft, 'check')} className="rounded border px-2 py-1 text-[10px] disabled:opacity-50">Cek Stok</button>
+                                        <button type="button" disabled={isBusy} onClick={() => handleEditProductionDraft(draft)} className="rounded border px-2 py-1 text-[10px] disabled:opacity-50">Edit</button>
+                                        <button type="button" disabled={isBusy || status !== 'READY'} onClick={() => handleProductionDraftAction(draft, 'post')} className="rounded bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-40">Posting</button>
+                                        <button type="button" disabled={isBusy} onClick={() => handleProductionDraftAction(draft, 'cancel')} className="rounded border border-red-200 px-2 py-1 text-[10px] text-red-600 disabled:opacity-50">Batalkan</button>
+                                      </div>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                    )}
                     {productionTab === 'fg' && (
                     <div className="bg-white rounded-xl border p-4">
                       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -9813,32 +10545,64 @@ ${reasons.join('\n')}`);
                           <div className="text-xs text-slate-500">Hasil produksi akan masuk stok FG/Subassy/Child Part dan konsumsi material mengikuti BOM.</div>
                         </div>
                         <div className="flex flex-wrap items-center justify-end gap-2">
-                          {selectedProductionManualItem && showProductionManualForm && (
-                            <div className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">
-                              <span className="font-semibold">{selectedProductionManualItem.code}</span>
-                              {selectedProductionManualItem.name ? ` - ${selectedProductionManualItem.name}` : ''}
-                            </div>
-                          )}
                           <button
                             type="button"
                             onClick={() => {
-                              setShowProductionManualForm((prev) => !prev);
+                              setShowProductionManualForm(true);
                               setProductionManualError('');
                               setProductionManualSuccess('');
                             }}
-                            className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold ${
-                              showProductionManualForm
-                                ? 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
-                                : 'border border-emerald-600 bg-emerald-600 text-white hover:bg-emerald-700'
-                            }`}
+                            className="inline-flex items-center gap-2 rounded-lg border border-emerald-600 bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-700"
                           >
-                            {showProductionManualForm ? <X size={14} /> : <Plus size={14} />}
-                            {showProductionManualForm ? 'Tutup Form' : 'Input Produksi'}
+                            <Plus size={14} /> Input Produksi
                           </button>
                         </div>
                       </div>
                       {showProductionManualForm && (
-                      <form onSubmit={handleSubmitManualProductionReport} className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-12 text-xs">
+                      <div
+                        className="fixed inset-0 z-[300] flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-sm"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="production-manual-input-title"
+                        onClick={() => {
+                          if (!productionManualSaving && !productionDraftSaving) setShowProductionManualForm(false);
+                        }}
+                      >
+                      <div
+                        id="production-manual-input"
+                        className="max-h-[92vh] w-full max-w-6xl overflow-y-auto rounded-2xl border bg-white shadow-2xl"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <div className="sticky top-0 z-20 flex flex-wrap items-start justify-between gap-3 border-b bg-white px-5 py-4">
+                          <div>
+                            <div id="production-manual-input-title" className="text-base font-semibold text-slate-900">
+                              {editingProductionDraftId ? 'Edit Draft Produksi' : 'Input Produksi'}
+                            </div>
+                            <div className="mt-1 text-xs text-slate-500">Isi hasil produksi; konsumsi material tetap mengikuti BOM.</div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {selectedProductionManualItem && (
+                              <div className="hidden rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600 md:block">
+                                <span className="font-semibold">{selectedProductionManualItem.code}</span>
+                                {selectedProductionManualItem.name ? ` - ${selectedProductionManualItem.name}` : ''}
+                                {selectedProductionManualCategory ? (
+                                  <span className="ml-2 rounded bg-indigo-100 px-1.5 py-0.5 font-semibold text-indigo-700">
+                                    {selectedProductionManualCategory}
+                                  </span>
+                                ) : null}
+                              </div>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => setShowProductionManualForm(false)}
+                              disabled={productionManualSaving || productionDraftSaving}
+                              className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+                            >
+                              <X size={14} /> Tutup
+                            </button>
+                          </div>
+                        </div>
+                      <form onSubmit={handleSubmitManualProductionReport} className="grid grid-cols-1 gap-3 p-5 text-xs lg:grid-cols-12">
                         <div className="lg:col-span-2">
                           <label className="block text-[10px] uppercase text-slate-400 mb-1">Tanggal Produksi</label>
                           <input
@@ -9848,14 +10612,16 @@ ${reasons.join('\n')}`);
                             onChange={(e) => setProductionManualForm((prev) => ({ ...prev, productionDate: e.target.value }))}
                           />
                         </div>
-                        <div className="lg:col-span-4">
+                        <div className="lg:col-span-2">
                           <label className="block text-[10px] uppercase text-slate-400 mb-1">Item Produksi</label>
                           <SearchableSelectDropdown
+                            autoFocus={!editingProductionDraftId}
                             value={productionManualForm.productCode}
                             options={productionOutputItemOptions}
                             placeholder="Ketik kode / part no / nama"
                             searchPlaceholder="Cari item produksi..."
                             emptyText="Item produksi tidak ditemukan."
+                            disabled={Boolean(editingProductionDraftId)}
                             getOptionValue={(item) => item.code}
                             getOptionLabel={(item) => item.label || item.code}
                             controlClassName="rounded border-slate-200 px-2 py-1.5 text-xs shadow-none"
@@ -9864,6 +10630,28 @@ ${reasons.join('\n')}`);
                               productCode: value,
                               lineCode: prev.lineCode || option?.line_production || option?.lineProduction || '',
                             }))}
+                          />
+                        </div>
+                        <div className="lg:col-span-1">
+                          <label className="block text-[10px] uppercase text-slate-400 mb-1">Kategori</label>
+                          <input
+                            type="text"
+                            className="border bg-slate-50 p-2 rounded w-full text-xs font-semibold text-center text-slate-700"
+                            value={selectedProductionManualCategory}
+                            placeholder="Auto"
+                            readOnly
+                            title="Kategori otomatis dari Master Item"
+                          />
+                        </div>
+                        <div className="lg:col-span-1">
+                          <label className="block text-[10px] uppercase text-slate-400 mb-1">SNP</label>
+                          <input
+                            type="text"
+                            className="border bg-slate-50 p-2 rounded w-full text-xs font-semibold text-right text-slate-700"
+                            value={selectedProductionManualSnp}
+                            placeholder="-"
+                            readOnly
+                            title="SNP hanya ditampilkan dari Master Item / Kanban dan tidak mengubah qty produksi"
                           />
                         </div>
                         <div className="lg:col-span-1">
@@ -9924,23 +10712,189 @@ ${reasons.join('\n')}`);
                             onChange={(e) => setProductionManualForm((prev) => ({ ...prev, notes: e.target.value }))}
                           />
                         </div>
-                        <div className="lg:col-span-3 flex items-end">
+                        <div className="lg:col-span-3 flex items-end gap-2">
+                          {editingProductionDraftId && (
+                            <button
+                              type="button"
+                              className="rounded border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600"
+                              onClick={() => {
+                                setEditingProductionDraftId(null);
+                                setProductionManualError('');
+                                setProductionManualSuccess('');
+                                setProductionManualForm((prev) => ({
+                                  ...prev,
+                                  productCode: '',
+                                  qty: '',
+                                  documentNo: '',
+                                  notes: '',
+                                }));
+                              }}
+                            >
+                              Batal Edit
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={handleSaveProductionDraft}
+                            className="flex-1 rounded border border-amber-500 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-700 disabled:opacity-60"
+                            disabled={productionDraftSaving || productionManualSaving}
+                          >
+                            {productionDraftSaving
+                              ? 'Merekam...'
+                              : editingProductionDraftId
+                                ? 'Update Draft'
+                                : 'Simpan Draft'}
+                          </button>
                           <button
                             type="submit"
-                            className="w-full rounded bg-emerald-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-60"
-                            disabled={productionManualSaving}
+                            className="flex-1 rounded bg-emerald-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-60"
+                            disabled={productionManualSaving || productionDraftSaving || Boolean(editingProductionDraftId)}
                           >
-                            {productionManualSaving ? 'Menyimpan...' : 'Simpan Produksi'}
+                            {productionManualSaving ? 'Memposting...' : 'Posting Produksi'}
                           </button>
                         </div>
                       </form>
+                        {productionManualError && (
+                          <div className="mx-5 mb-5 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{productionManualError}</div>
+                        )}
+                        {productionManualSuccess && (
+                          <div className="mx-5 mb-5 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">{productionManualSuccess}</div>
+                        )}
+                      </div>
+                      </div>
                       )}
-                      {productionManualError && (
-                        <div className="mt-2 text-xs text-red-600">{productionManualError}</div>
+                    </div>
+                    )}
+                    {productionTab === 'fg' && showCustomerMaterialForm && (
+                    <div
+                      className="fixed inset-0 z-[300] flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-sm"
+                      role="dialog"
+                      aria-modal="true"
+                      aria-labelledby="customer-material-receipt-title"
+                      onClick={() => {
+                        if (!customerMaterialSaving) setShowCustomerMaterialForm(false);
+                      }}
+                    >
+                    <div
+                      id="customer-material-receipt"
+                      className="max-h-[90vh] w-full max-w-5xl overflow-y-auto rounded-2xl border bg-white p-5 shadow-2xl"
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <div id="customer-material-receipt-title" className="text-base font-semibold">Penerimaan Material Customer SSP/ISSP</div>
+                          <div className="text-xs text-slate-500">Khusus SSP/ISSP, masuk stok titipan tanpa PO dan otomatis merekonsiliasi kekurangan produksi terdahulu.</div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowCustomerMaterialForm(false);
+                            setCustomerMaterialError('');
+                            setCustomerMaterialSuccess('');
+                          }}
+                          disabled={customerMaterialSaving}
+                          className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+                        >
+                          <X size={14} /> Tutup
+                        </button>
+                      </div>
+                      {showCustomerMaterialForm && (
+                        <form onSubmit={handleSubmitCustomerMaterialReceipt} className="mt-3 grid grid-cols-1 gap-3 text-xs lg:grid-cols-12">
+                          <div className="lg:col-span-2">
+                            <label className="mb-1 block text-[10px] uppercase text-slate-400">Tanggal Terima</label>
+                            <input
+                              type="date"
+                              className="w-full rounded border p-2 text-xs"
+                              value={customerMaterialForm.receivedDate}
+                              onChange={(e) => setCustomerMaterialForm((prev) => ({ ...prev, receivedDate: e.target.value }))}
+                            />
+                          </div>
+                          <div className="lg:col-span-4">
+                            <label className="mb-1 block text-[10px] uppercase text-slate-400">Material Customer</label>
+                            <SearchableSelectDropdown
+                              value={customerMaterialForm.itemCode}
+                              options={customerMaterialItemOptions}
+                              placeholder="Pilih material SSP / ISSP"
+                              searchPlaceholder="Cari kode / part no / nama..."
+                              emptyText="Belum ada item berkategori SSP/ISSP di Master Item."
+                              getOptionValue={(item) => item.code}
+                              getOptionLabel={(item) => item.label || item.code}
+                              controlClassName="rounded border-slate-200 px-2 py-1.5 text-xs shadow-none"
+                              onChange={(value) => setCustomerMaterialForm((prev) => ({ ...prev, itemCode: value }))}
+                            />
+                          </div>
+                          <div className="lg:col-span-1">
+                            <label className="mb-1 block text-[10px] uppercase text-slate-400">Kategori</label>
+                            <input
+                              className="w-full rounded border bg-slate-50 p-2 text-center text-xs font-semibold"
+                              value={selectedCustomerMaterialItem?.type || ''}
+                              placeholder="Auto"
+                              readOnly
+                            />
+                          </div>
+                          <div className="lg:col-span-1">
+                            <label className="mb-1 block text-[10px] uppercase text-slate-400">Qty</label>
+                            <input
+                              type="number"
+                              min="0"
+                              step="any"
+                              className="w-full rounded border p-2 text-right text-xs"
+                              value={customerMaterialForm.qty}
+                              onChange={(e) => setCustomerMaterialForm((prev) => ({ ...prev, qty: e.target.value }))}
+                            />
+                          </div>
+                          <div className="lg:col-span-2">
+                            <label className="mb-1 block text-[10px] uppercase text-slate-400">No SJ Customer</label>
+                            <input
+                              className="w-full rounded border p-2 text-xs"
+                              placeholder="Opsional"
+                              value={customerMaterialForm.deliveryNoteNo}
+                              onChange={(e) => setCustomerMaterialForm((prev) => ({ ...prev, deliveryNoteNo: e.target.value }))}
+                            />
+                          </div>
+                          <div className="lg:col-span-2">
+                            <label className="mb-1 block text-[10px] uppercase text-slate-400">Lot / Batch</label>
+                            <input
+                              className="w-full rounded border p-2 text-xs"
+                              placeholder="Auto bila kosong"
+                              value={customerMaterialForm.batchNo}
+                              onChange={(e) => setCustomerMaterialForm((prev) => ({ ...prev, batchNo: e.target.value }))}
+                            />
+                          </div>
+                          <div className="lg:col-span-3">
+                            <label className="mb-1 block text-[10px] uppercase text-slate-400">Customer (Master Item)</label>
+                            <input
+                              className="w-full rounded border bg-slate-50 p-2 text-xs"
+                              value={selectedCustomerMaterialCustomer
+                                ? `${selectedCustomerMaterialCustomer.id} - ${selectedCustomerMaterialCustomer.name || selectedCustomerMaterialCustomer.id}`
+                                : ''}
+                              placeholder="Belum dipetakan"
+                              readOnly
+                            />
+                          </div>
+                          <div className="lg:col-span-6">
+                            <label className="mb-1 block text-[10px] uppercase text-slate-400">Catatan</label>
+                            <input
+                              className="w-full rounded border p-2 text-xs"
+                              placeholder="Material titipan / referensi customer"
+                              value={customerMaterialForm.notes}
+                              onChange={(e) => setCustomerMaterialForm((prev) => ({ ...prev, notes: e.target.value }))}
+                            />
+                          </div>
+                          <div className="flex items-end lg:col-span-3">
+                            <button
+                              type="submit"
+                              disabled={customerMaterialSaving || customerMaterialItemOptions.length === 0}
+                              className="w-full rounded bg-sky-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-60"
+                            >
+                              {customerMaterialSaving ? 'Menyimpan...' : 'Simpan Penerimaan Tanpa PO'}
+                            </button>
+                          </div>
+                        </form>
                       )}
-                      {productionManualSuccess && (
-                        <div className="mt-2 text-xs text-emerald-700">{productionManualSuccess}</div>
-                      )}
+                      {customerMaterialError && <div className="mt-2 text-xs text-red-600">{customerMaterialError}</div>}
+                      {customerMaterialSuccess && <div className="mt-2 text-xs text-emerald-700">{customerMaterialSuccess}</div>}
+                    </div>
                     </div>
                     )}
                     {productionTab === 'fg' && (
@@ -10789,7 +11743,7 @@ ${reasons.join('\n')}`);
                       </div>
                     </div>
 
-                    {false && !isProductionUser && (
+                    {SHOW_LEGACY_SCAN_HISTORY && !isProductionUser && (
                       <div className="bg-white rounded-xl border p-4">
                       <div className="flex items-center gap-2 text-sm font-semibold mb-3">
                         <Clock size={16} /> Pemindaian Terbaru

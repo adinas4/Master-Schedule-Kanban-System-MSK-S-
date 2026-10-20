@@ -13,6 +13,7 @@ const SearchableSelectDropdown = ({
   searchPlaceholder = 'Ketik untuk mencari...',
   emptyText = 'Tidak ada data yang cocok.',
   disabled = false,
+  autoFocus = false,
   onChange,
   getOptionLabel = defaultGetOptionLabel,
   getOptionValue = defaultGetOptionValue,
@@ -151,6 +152,7 @@ const SearchableSelectDropdown = ({
         <input
           ref={inputRef}
           type="text"
+          autoFocus={autoFocus}
           value={query}
           disabled={disabled}
           placeholder={placeholder}

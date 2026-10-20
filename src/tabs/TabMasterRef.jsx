@@ -358,17 +358,59 @@ const TabMasterRef = (props) => {
     return (
       compact === 'fg'
       || compact === 'sa'
+      || compact === 'cp'
       || compact.includes('finishedgood')
       || compact.includes('finishgood')
       || compact.includes('finishgoods')
+      || compact.includes('childpart')
       || compact.includes('assembly')
       || compact.includes('assy')
       || compact.includes('subassy')
       || compact.includes('subassembly')
     );
   };
-  const isCustomerAllowedItemCategory = isProductionOutputItemCategory;
-  const isSupplierAllowedItemCategory = (value) => !isProductionOutputItemCategory(value);
+  const isCustomerSuppliedItemCategory = (value) => {
+    const compact = String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+    return ['ssp', 'issp', 'suppliedsupplypart', 'indirectssp', 'customersuppliedmaterial'].includes(compact);
+  };
+  const isMaterialSpecificationCategory = (value) => {
+    const raw = String(value || '').trim();
+    const matched = (masterCategories || []).find((category) => (
+      String(category.code || '').trim().toLowerCase() === raw.toLowerCase()
+      || String(category.name || '').trim().toLowerCase() === raw.toLowerCase()
+    ));
+    return [raw, matched?.code, matched?.name].some((candidate) => {
+      const compact = String(candidate || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+      return ['rm', 'raw', 'rawmaterial', 'indirect', 'indirectmaterial', 'im', 'ssp', 'issp', 'suppliedsupplypart', 'indirectssp', 'customersuppliedmaterial'].includes(compact);
+    });
+  };
+  const normalizeMaterialForm = (value) => {
+    const normalized = String(value || '').trim().toLowerCase();
+    return ['plate', 'coil', 'pipe', 'wire'].includes(normalized) ? normalized : '';
+  };
+  const formatMaterialSpecification = (item) => {
+    if (!isMaterialSpecificationCategory(item?.type)) return '-';
+    const form = normalizeMaterialForm(item?.material_form || item?.materialForm);
+    const dimensions = [];
+    const width = item?.width_mm ?? item?.widthMm;
+    const thickness = item?.thickness_mm ?? item?.thicknessMm;
+    const length = item?.length_mm ?? item?.lengthMm;
+    const diameter = item?.diameter_mm ?? item?.diameterMm;
+    if (['plate', 'coil'].includes(form) && width != null && width !== '') dimensions.push(`W${width}`);
+    if (['plate', 'coil', 'pipe'].includes(form) && thickness != null && thickness !== '') dimensions.push(`t${thickness}`);
+    if (['pipe', 'wire'].includes(form) && length != null && length !== '') dimensions.push(`L${length}`);
+    if (['pipe', 'wire'].includes(form) && diameter != null && diameter !== '') dimensions.push(`Ø${diameter}`);
+    const parts = [
+      item?.material_form || item?.materialForm,
+      item?.grade,
+      dimensions.length ? `${dimensions.join(' × ')} mm` : '',
+    ].map((part) => String(part || '').trim()).filter(Boolean);
+    return parts.length ? parts.join(' · ') : '-';
+  };
+  const isCustomerAllowedItemCategory = (value) => (
+    isProductionOutputItemCategory(value) || isCustomerSuppliedItemCategory(value)
+  );
+  const isSupplierAllowedItemCategory = (value) => !isCustomerAllowedItemCategory(value);
   const isItemCustomerEnabled = isCustomerAllowedItemCategory(itemMasterForm?.type);
   const isItemSupplierEnabled = isSupplierAllowedItemCategory(itemMasterForm?.type);
   const renderRelationCodeBadges = (rows = [], idKey = 'vendorId') => {
@@ -2349,7 +2391,7 @@ const TabMasterRef = (props) => {
                       title={getMasterActionTitle(allowItemEdit, 'Tambah Baru')}
                       onClick={() => {
                         if (!allowItemEdit) return;
-                        setItemMasterForm({ code: '', name: '', partNo: '', type: 'Raw Material', unit: 'PCS', typePack: '', packQty: '', orderLotSize: '', maxDeliveryPerRit: '', isSeasonal: false, suppliers: [], customers: [], modelCodes: [], weight: '', locationId: '', locationName: '', lineProduction: '', processRouting: [], leadTimeDays: '', cycleTimeSeconds: '', imageUrl: '', imageThumbUrl: '', shelfLifeDays: '' });
+                        setItemMasterForm({ code: '', name: '', partNo: '', type: 'Raw Material', unit: 'PCS', typePack: '', packQty: '', orderLotSize: '', maxDeliveryPerRit: '', isSeasonal: false, suppliers: [], customers: [], modelCodes: [], weight: '', materialGrade: '', grade: '', materialForm: '', widthMm: '', thicknessMm: '', lengthMm: '', diameterMm: '', locationId: '', locationName: '', lineProduction: '', processRouting: [], itemStatus: 'active', inactiveRemarks: '', leadTimeDays: '', cycleTimeSeconds: '', imageUrl: '', imageThumbUrl: '', shelfLifeDays: '' });
                         setItemModelEntry('');
                         setItemImageError('');
                         setItemImageUploading(false);
@@ -2507,6 +2549,59 @@ const TabMasterRef = (props) => {
                           />
                         ), 'lg:col-span-2')}
                       </div>
+
+                      {isMaterialSpecificationCategory(itemMasterForm?.type) && (
+                        <div className="grid grid-cols-1 gap-2 rounded-lg border border-cyan-200 bg-cyan-50/40 p-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
+                          <div className="col-span-full">
+                            <div className="text-[10px] font-semibold uppercase tracking-wide text-cyan-700">Spesifikasi Raw Material</div>
+                            <div className="mt-0.5 text-[10px] text-slate-500">Pilih Form terlebih dahulu. Field ukuran akan tampil sesuai bentuk material.</div>
+                          </div>
+                          {renderItemFormGroup('Form', (
+                            <select
+                              className={getItemFieldClass('reference')}
+                              value={itemMasterForm.materialForm || ''}
+                              onChange={(e) => {
+                                const nextForm = e.target.value;
+                                const normalizedForm = normalizeMaterialForm(nextForm);
+                                setItemMasterForm((prev) => ({
+                                  ...prev,
+                                  materialForm: nextForm,
+                                  widthMm: ['plate', 'coil'].includes(normalizedForm) ? prev.widthMm : '',
+                                  thicknessMm: ['plate', 'coil', 'pipe'].includes(normalizedForm) ? prev.thicknessMm : '',
+                                  lengthMm: ['pipe', 'wire'].includes(normalizedForm) ? prev.lengthMm : '',
+                                  diameterMm: ['pipe', 'wire'].includes(normalizedForm) ? prev.diameterMm : '',
+                                }));
+                              }}
+                            >
+                              <option value="">Pilih Form</option>
+                              <option value="Plate">Plate</option>
+                              <option value="Coil">Coil</option>
+                              <option value="Pipe">Pipe</option>
+                              <option value="Wire">Wire</option>
+                            </select>
+                          ))}
+                          {normalizeMaterialForm(itemMasterForm.materialForm) && renderItemFormGroup('Grade', (
+                            <input
+                              className={getItemFieldClass('identity')}
+                              placeholder="Contoh: STKM370G"
+                              value={itemMasterForm.grade || ''}
+                              onChange={(e) => setItemMasterForm({ ...itemMasterForm, grade: e.target.value })}
+                            />
+                          ))}
+                          {['plate', 'coil'].includes(normalizeMaterialForm(itemMasterForm.materialForm)) && renderItemFormGroup('Width (mm)', (
+                            <input inputMode="decimal" className={getItemFieldClass('identity')} placeholder="Width" value={itemMasterForm.widthMm || ''} onChange={(e) => setItemMasterForm({ ...itemMasterForm, widthMm: e.target.value })} />
+                          ))}
+                          {['plate', 'coil', 'pipe'].includes(normalizeMaterialForm(itemMasterForm.materialForm)) && renderItemFormGroup('Thickness (mm)', (
+                            <input inputMode="decimal" className={getItemFieldClass('identity')} placeholder="Thickness" value={itemMasterForm.thicknessMm || ''} onChange={(e) => setItemMasterForm({ ...itemMasterForm, thicknessMm: e.target.value })} />
+                          ))}
+                          {['pipe', 'wire'].includes(normalizeMaterialForm(itemMasterForm.materialForm)) && renderItemFormGroup('Length (mm)', (
+                            <input inputMode="decimal" className={getItemFieldClass('identity')} placeholder="Length" value={itemMasterForm.lengthMm || ''} onChange={(e) => setItemMasterForm({ ...itemMasterForm, lengthMm: e.target.value })} />
+                          ))}
+                          {['pipe', 'wire'].includes(normalizeMaterialForm(itemMasterForm.materialForm)) && renderItemFormGroup('Diameter (mm)', (
+                            <input inputMode="decimal" className={getItemFieldClass('identity')} placeholder="Diameter" value={itemMasterForm.diameterMm || ''} onChange={(e) => setItemMasterForm({ ...itemMasterForm, diameterMm: e.target.value })} />
+                          ))}
+                        </div>
+                      )}
 
                       <div className="grid grid-cols-1 gap-2 rounded-lg border border-slate-200 bg-white p-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
                         <div className="col-span-full text-[10px] font-semibold uppercase tracking-wide text-slate-500">Packing, Quantity & Location</div>
@@ -3028,6 +3123,7 @@ const TabMasterRef = (props) => {
                       <th className="text-left p-2">Category</th>
                       <th className="text-left p-2">Status</th>
                       <th className="text-left p-2">Unit</th>
+                      <th className="text-left p-2">Material Spec</th>
                       <th className="text-left p-2">Type Pack</th>
                       <th className="text-left p-2">Location</th>
                       <th className="text-left p-2">SNP</th>
@@ -3039,7 +3135,7 @@ const TabMasterRef = (props) => {
                       <th className="text-left p-2">Actions</th>
                     </tr>
                     <tr className="bg-white text-[10px] text-slate-500">
-                      <th className="p-1 text-left" colSpan={16}>
+                      <th className="p-1 text-left" colSpan={17}>
                         <label className="inline-flex items-center gap-2">
                           <input
                             type="checkbox"
@@ -3051,7 +3147,6 @@ const TabMasterRef = (props) => {
                       </th>
                     </tr>
                     <tr className="bg-white text-[10px] text-slate-500">
-                      <th className="p-1" />
                       <th className="p-1">
                         <input
                           className="border rounded px-2 py-1 w-full"
@@ -3060,6 +3155,7 @@ const TabMasterRef = (props) => {
                           onChange={(e) => setLocalItemFilters({ ...localItemFilters, code: e.target.value })}
                         />
                       </th>
+                      <th className="p-1" />
                       <th className="p-1">
                         <input
                           className="border rounded px-2 py-1 w-full"
@@ -3109,6 +3205,7 @@ const TabMasterRef = (props) => {
                           onChange={(e) => setLocalItemFilters({ ...localItemFilters, unit: e.target.value })}
                         />
                       </th>
+                      <th className="p-1" />
                       <th className="p-1">
                         <select
                           className="border rounded px-2 py-1 w-full"
@@ -3244,6 +3341,9 @@ const TabMasterRef = (props) => {
                             )}
                           </td>
                           <td className="p-2 align-middle whitespace-nowrap">{item.unit || '-'}</td>
+                          <td className="p-2 align-middle min-w-[220px] max-w-[320px]">
+                            <span className="block whitespace-normal leading-snug">{formatMaterialSpecification(item)}</span>
+                          </td>
                           <td className="p-2 align-middle whitespace-nowrap">{getItemPackingCode(item.type_pack)}</td>
                           <td className="p-2 align-middle whitespace-nowrap">{item.location_id || '-'}</td>
                           <td className="p-2 text-right align-middle whitespace-nowrap">{item.pack_qty ?? '-'}</td>
@@ -3293,6 +3393,13 @@ const TabMasterRef = (props) => {
                                       customers: itemCustomerMap.get(item.code) || [],
                                        modelCodes: parseModelCodes(item.model || ''),
                                        weight: item.weight || '',
+                                       materialGrade: item.material_grade || item.materialGrade || '',
+                                       grade: item.grade || '',
+                                       materialForm: item.material_form || item.materialForm || '',
+                                       widthMm: String(item.width_mm ?? item.widthMm ?? ''),
+                                       thicknessMm: String(item.thickness_mm ?? item.thicknessMm ?? ''),
+                                       lengthMm: String(item.length_mm ?? item.lengthMm ?? ''),
+                                       diameterMm: String(item.diameter_mm ?? item.diameterMm ?? ''),
                                        locationId: item.location_id || '',
                                        locationName: item.location_name || buildWarehouseLabel((masterWarehouses || []).find((warehouse) => String(warehouse.id || '').trim() === String(item.location_id || '').trim())) || '',
                                        lineProduction: matchedItemProcess?.work_center || itemLineProductionValue || '',

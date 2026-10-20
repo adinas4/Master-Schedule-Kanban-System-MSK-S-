@@ -61,6 +61,7 @@ const TabInventory = (props) => {
     inventoryNav,
     setActiveInventoryHelpTab,
     masterItems = [],
+    user,
   } = props;
 
   const getCurrentMonthRange = () => {
@@ -674,6 +675,7 @@ const TabInventory = (props) => {
                     ensureAiConfigured={ensureAiConfigured}
                     canUseAI={canUseAI}
                     showToastMessage={showToastMessage}
+                    isAdmin={String(user?.role || '').trim().toLowerCase() === 'admin'}
                   />
                 </Suspense>
               )}

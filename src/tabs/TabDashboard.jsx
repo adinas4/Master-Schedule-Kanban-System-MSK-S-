@@ -72,6 +72,22 @@ const SafeResponsiveContainer = ({ children }) => {
 
 const formatNumberFallback = (value) => Number(value || 0).toLocaleString('id-ID');
 
+const SkeletonBlock = ({ className }) => (
+  <div className={`animate-pulse rounded bg-slate-200/70 ${className}`} />
+);
+
+const SkeletonCard = ({ lines = 3 }) => (
+  <div className="w-full bg-white rounded-2xl border border-slate-100/80 p-3 shadow-sm">
+    <SkeletonBlock className="h-3 w-16 mb-2" />
+    <SkeletonBlock className="h-3 w-32 mb-2" />
+    {Array.from({ length: lines }).map((_, idx) => (
+      <SkeletonBlock key={idx} className="h-2 w-full mb-1" />
+    ))}
+  </div>
+);
+
+const SkeletonStatValue = () => <SkeletonBlock className="h-7 w-16" />;
+
 const applyMonitoringDateFilter = (dateKey, handlers = {}) => {
   if (!dateKey) return;
   const { setFilterStart, setFilterEnd, setMainTab, setSearchQuery, setFilterStatus, setFilterSupplier } = handlers;
@@ -269,19 +285,6 @@ const TabDashboard = (props) => {
     { key: 'day2', title: 'LUSA', dateKey: dayTwoKey, dateLabel: formatDateLabel(dayTwoKey), tone: 'border-slate-200', rows: dayTwoRows },
   ];
 
-  const SkeletonBlock = ({ className }) => (
-    <div className={`animate-pulse rounded bg-slate-200/70 ${className}`} />
-  );
-  const SkeletonCard = ({ lines = 3 }) => (
-    <div className="w-full bg-white rounded-2xl border border-slate-100/80 p-3 shadow-sm">
-      <SkeletonBlock className="h-3 w-16 mb-2" />
-      <SkeletonBlock className="h-3 w-32 mb-2" />
-      {Array.from({ length: lines }).map((_, idx) => (
-        <SkeletonBlock key={idx} className="h-2 w-full mb-1" />
-      ))}
-    </div>
-  );
-  const SkeletonStatValue = () => <SkeletonBlock className="h-7 w-16" />;
   const dashboardTabs = ['dashboard', 'dash-prl', 'dash-kanban', 'dash-inventory', 'dash-masterref', 'dash-schedule'];
   if (!dashboardTabs.includes(mainTab)) return null;
 

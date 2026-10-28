@@ -12561,12 +12561,15 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       const qtyBox = lotQty || row.min_qty || '';
       const itemUnit = row.item_unit || masterItem?.unit || '';
       const areaId = masterArea?.id || masterLocation?.area_id || row.drop_zone || masterLocation?.id || '';
-      const partLocationLabel = masterLocation?.line_description
+      const rawPartLocationLabel = masterLocation?.line_description
         || masterItem?.location_name
         || masterItem?.line_production
         || masterLocation?.id
         || row.drop_zone
         || '';
+      const partLocationLabel = String(rawPartLocationLabel)
+        .replace(/^Production\s+Line\s*[-:]\s*/i, '')
+        .trim();
       const dockCode = masterDelivery?.id || '';
       const progressLine = masterWarehouse?.id || masterLocation?.warehouse_id || '';
       const plantName = masterPlant?.name || masterPlant?.id || '';

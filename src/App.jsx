@@ -12561,15 +12561,17 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       const qtyBox = lotQty || row.min_qty || '';
       const itemUnit = row.item_unit || masterItem?.unit || '';
       const areaId = masterArea?.id || masterLocation?.area_id || row.drop_zone || masterLocation?.id || '';
-      const rawPartLocationLabel = masterLocation?.line_description
-        || masterItem?.location_name
-        || masterItem?.line_production
-        || masterLocation?.id
-        || row.drop_zone
-        || '';
-      const partLocationLabel = String(rawPartLocationLabel)
-        .replace(/^Production\s+Line\s*[-:]\s*/i, '')
+      const normalizePartLocationLabel = (value) => String(value || '')
+        .replace(/\bproduction\s*[-_/]?\s*line\b\s*(?:[-–—:|/]\s*)?/gi, '')
+        .replace(/^[\s\-–—:|/]+|[\s\-–—:|/]+$/g, '')
         .trim();
+      const partLocationLabel = [
+        masterLocation?.line_description,
+        masterItem?.location_name,
+        masterItem?.line_production,
+        masterLocation?.id,
+        row.drop_zone,
+      ].map(normalizePartLocationLabel).find(Boolean) || '';
       const dockCode = masterDelivery?.id || '';
       const progressLine = masterWarehouse?.id || masterLocation?.warehouse_id || '';
       const plantName = masterPlant?.name || masterPlant?.id || '';

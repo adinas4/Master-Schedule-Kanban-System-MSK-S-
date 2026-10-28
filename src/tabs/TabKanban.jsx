@@ -116,6 +116,7 @@ const TabKanban = (props) => {
     extractKanbanIdNote,
     fetchKanbanRequests,
     fetchKanbanSettings,
+    fetchKanbanEmptyLogs,
     fetchDeliveryNotes,
     fetchReceiveNotes,
     fifoTotalsByItemCode,
@@ -2671,6 +2672,10 @@ const TabKanban = (props) => {
   const [productionDraftRows, setProductionDraftRows] = useState([]);
   const [productionDraftLoading, setProductionDraftLoading] = useState(false);
   const [productionDraftError, setProductionDraftError] = useState('');
+  const [productionProcessDashboard, setProductionProcessDashboard] = useState({ summary: {}, rows: [] });
+  const [productionProcessLoading, setProductionProcessLoading] = useState(false);
+  const [productionProcessError, setProductionProcessError] = useState('');
+  const [deliveryDraftPostingId, setDeliveryDraftPostingId] = useState(null);
   const [productionDraftSaving, setProductionDraftSaving] = useState(false);
   const [productionDraftActionId, setProductionDraftActionId] = useState(null);
   const [editingProductionDraftId, setEditingProductionDraftId] = useState(null);
@@ -3322,7 +3327,7 @@ const TabKanban = (props) => {
     if (kanbanSubTab === 'production') {
       const isQuickInput = productionQuickAction?.nonce
         && productionQuickActionNonceRef.current === productionQuickAction.nonce;
-      setProductionTab(isQuickInput ? 'fg' : 'queue');
+      setProductionTab(isQuickInput ? 'fg' : 'process');
     } else if (kanbanSubTab === 'delivery') {
       setDeliveryWorkflowTab('upload-dn');
     }
@@ -3350,7 +3355,9 @@ const TabKanban = (props) => {
   useEffect(() => {
     if (kanbanSubTab !== 'production') return;
     fetchProductionDrafts();
-    if (productionTab === 'fg') {
+    if (productionTab === 'process') {
+      fetchProductionProcessDashboard();
+    } else if (productionTab === 'fg') {
       fetchProductionImportHistory();
       fetchProductionOrderHistory();
     } else if (productionTab === 'wip') {
@@ -3412,6 +3419,39 @@ const TabKanban = (props) => {
       setProductionDraftError(error.message || 'Gagal memuat draft produksi.');
     } finally {
       setProductionDraftLoading(false);
+    }
+  };
+
+  const fetchProductionProcessDashboard = async () => {
+    if (!canProduction) return;
+    setProductionProcessLoading(true);
+    setProductionProcessError('');
+    try {
+      const data = await apiFetch('/api/kanban/process-dashboard');
+      setProductionProcessDashboard({
+        summary: data?.summary || {},
+        rows: Array.isArray(data?.rows) ? data.rows : [],
+      });
+    } catch (error) {
+      setProductionProcessDashboard({ summary: {}, rows: [] });
+      setProductionProcessError(error.message || 'Gagal memuat dashboard proses produksi.');
+    } finally {
+      setProductionProcessLoading(false);
+    }
+  };
+
+  const postKanbanDeliveryDraft = async (row) => {
+    const deliveryPostId = Number(row?.delivery_post_id || 0);
+    if (!deliveryPostId) return;
+    setDeliveryDraftPostingId(deliveryPostId);
+    try {
+      const result = await apiFetch(`/api/kanban/delivery-posts/${deliveryPostId}/post`, { method: 'POST' });
+      notifyMessage(result?.alreadyPosted ? 'Delivery sudah pernah diposting.' : 'Delivery berhasil diposting dan stok barang keluar diperbarui.');
+      await fetchKanbanEmptyLogs?.({ silent: true });
+    } catch (error) {
+      notifyMessage(error.message || 'Draft delivery belum dapat diposting.');
+    } finally {
+      setDeliveryDraftPostingId(null);
     }
   };
 
@@ -9903,7 +9943,7 @@ ${reasons.join('\n')}`);
 
                     <div className="bg-white rounded-xl border p-4">
                       <div className="text-sm font-semibold mb-1">Log Kanban Kosong Aktual</div>
-                      <div className="text-xs text-slate-500 mb-3">{isProductionUser ? 'Riwayat transaksi stok dari scan/kanban kosong.' : 'Riwayat transaksi stok, request, dan lot FIFO dari kanban kosong.'}</div>
+                      <div className="text-xs text-slate-500 mb-3">{isProductionUser ? 'Riwayat delivery, replenishment, dan draft review dari Kanban Kosong.' : 'Riwayat delivery/stock-out, request replenishment, dan lot FIFO dari Kanban Kosong.'}</div>
                       <div className="overflow-x-auto">
                         <div className={`${isProductionUser ? 'min-w-[1140px]' : 'min-w-[1600px]'} text-xs`}>
                           <div className="bg-slate-100 grid items-center" style={{ gridTemplateColumns: isProductionUser ? '160px 180px minmax(220px, 1fr) 150px 90px minmax(220px, 1fr) 120px' : emptyLogGrid }}>
@@ -9951,7 +9991,19 @@ ${reasons.join('\n')}`);
                                       <div className="p-2 truncate" title={lotSummary}>{lotSummary}</div>
                                       {!isProductionUser && <div className="p-2">{extractAreaNote(row.notes)}</div>}
                                       {!isProductionUser && <div className="p-2">{getCategoryLabel(setting?.item_type)}</div>}
-                                      <div className="p-2">{row.status}</div>
+                                      <div className="p-2">
+                                        <div>{row.status}</div>
+                                        {statusKey === 'draft_review' && row.delivery_post_id && (canEditSchedules || canProduction) && (
+                                          <button
+                                            type="button"
+                                            onClick={() => void postKanbanDeliveryDraft(row)}
+                                            disabled={Number(deliveryDraftPostingId) === Number(row.delivery_post_id)}
+                                            className="mt-1 rounded bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50"
+                                          >
+                                            {Number(deliveryDraftPostingId) === Number(row.delivery_post_id) ? 'Posting...' : 'Posting Delivery'}
+                                          </button>
+                                        )}
+                                      </div>
                                       {!isProductionUser && <div className="p-2">{row.dn_id ? `DN-${row.dn_id}` : '-'}</div>}
                                       {!isProductionUser && (
                                         <div className="p-2 flex flex-wrap items-center gap-1">
@@ -10006,6 +10058,11 @@ ${reasons.join('\n')}`);
                     <div className="bg-white/90 rounded-xl border px-4">
                       <div className="flex flex-wrap items-center gap-6 text-sm">
                         {[
+                          {
+                            key: 'process',
+                            label: 'Proses Berjalan',
+                            badge: Number(productionProcessDashboard?.summary?.total || 0),
+                          },
                           { key: 'queue', label: 'Production Queue' },
                           { key: 'fg', label: 'Input Produksi' },
                           {
@@ -10041,6 +10098,101 @@ ${reasons.join('\n')}`);
                         ))}
                       </div>
                     </div>
+                    {productionTab === 'process' && (
+                      <div className="space-y-4">
+                        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border bg-white p-4">
+                          <div>
+                            <div className="text-sm font-semibold text-slate-900">Dashboard Proses Produksi Belum Selesai</div>
+                            <div className="mt-1 text-xs text-slate-500">Setiap Start/Finish QR Kanban tercatat per kartu, proses, work center, operator, waktu, dan status transaksi.</div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={fetchProductionProcessDashboard}
+                            disabled={productionProcessLoading}
+                            className="inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold text-slate-700 disabled:opacity-50"
+                          >
+                            <RotateCcw size={14} className={productionProcessLoading ? 'animate-spin' : ''} /> Refresh
+                          </button>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+                          {[
+                            ['Total Aktif', productionProcessDashboard?.summary?.total || 0, 'text-slate-900'],
+                            ['Sedang Proses', productionProcessDashboard?.summary?.inProcess || 0, 'text-sky-700'],
+                            ['Menunggu Scan', productionProcessDashboard?.summary?.waiting || 0, 'text-amber-700'],
+                            ['Draft Review', productionProcessDashboard?.summary?.draftReview || 0, 'text-rose-700'],
+                          ].map(([label, value, tone]) => (
+                            <div key={label} className="rounded-xl border bg-white p-4">
+                              <div className="text-[10px] font-semibold uppercase text-slate-400">{label}</div>
+                              <div className={`mt-2 text-2xl font-bold ${tone}`}>{value}</div>
+                            </div>
+                          ))}
+                        </div>
+                        {productionProcessError && (
+                          <div className="rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-700">{productionProcessError}</div>
+                        )}
+                        <div className="overflow-x-auto rounded-xl border bg-white">
+                          <table className="min-w-[1100px] w-full text-xs">
+                            <thead className="bg-slate-50 text-[10px] uppercase text-slate-500">
+                              <tr>
+                                <th className="p-3 text-left">Kanban / Item</th>
+                                <th className="p-3 text-left">Proses Sekarang</th>
+                                <th className="p-3 text-left">Progress Route</th>
+                                <th className="p-3 text-left">Operator / Scan</th>
+                                <th className="p-3 text-left">Transaksi</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {productionProcessLoading && (
+                                <tr><td colSpan={5} className="p-6 text-center text-slate-400">Memuat proses produksi...</td></tr>
+                              )}
+                              {!productionProcessLoading && productionProcessDashboard.rows.length === 0 && (
+                                <tr><td colSpan={5} className="p-6 text-center text-slate-400">Tidak ada proses produksi yang belum selesai.</td></tr>
+                              )}
+                              {!productionProcessLoading && productionProcessDashboard.rows.map((row) => {
+                                const steps = Array.isArray(row.steps) ? row.steps : [];
+                                const completed = steps.filter((step) => String(step.status || '').toLowerCase() === 'done').length;
+                                const status = String(row.transaction_status || 'pending').toLowerCase();
+                                const transactionClass = status === 'draft_review'
+                                  ? 'bg-rose-100 text-rose-700'
+                                  : status === 'material_consumed'
+                                    ? 'bg-sky-100 text-sky-700'
+                                    : 'bg-slate-100 text-slate-700';
+                                return (
+                                  <tr key={row.id} className="border-t align-top">
+                                    <td className="p-3">
+                                      <div className="font-semibold text-slate-900">{row.kanban_id}</div>
+                                      <div className="mt-1 text-slate-600">{row.item_code} - {row.item_name || '-'}</div>
+                                    </td>
+                                    <td className="p-3">
+                                      <div className="font-semibold">{row.current_step_name || row.current_step_code || '-'}</div>
+                                      <div className="mt-1 text-slate-500">{row.current_work_center || '-'}</div>
+                                      <div className="mt-1 uppercase text-[10px] text-slate-400">{String(row.current_status || '-').replaceAll('_', ' ')}</div>
+                                    </td>
+                                    <td className="p-3">
+                                      <div className="font-semibold">{completed} / {steps.length} selesai</div>
+                                      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-100">
+                                        <div className="h-full bg-emerald-500" style={{ width: `${steps.length ? Math.min(100, (completed / steps.length) * 100) : 0}%` }} />
+                                      </div>
+                                    </td>
+                                    <td className="p-3">
+                                      <div>{row.operator_name || '-'}</div>
+                                      <div className="mt-1 text-slate-500">{row.last_scanned_at ? new Date(row.last_scanned_at).toLocaleString('id-ID') : '-'}</div>
+                                    </td>
+                                    <td className="p-3">
+                                      <span className={`inline-flex rounded-full px-2 py-1 text-[10px] font-semibold uppercase ${transactionClass}`}>
+                                        {status.replaceAll('_', ' ')}
+                                      </span>
+                                      {row.draft_no && <div className="mt-2 font-semibold text-rose-700">{row.draft_no}</div>}
+                                      {row.abnormal_reason && <div className="mt-1 max-w-[260px] text-[10px] text-rose-600">{row.abnormal_reason}</div>}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
                     {productionTab === 'queue' && (
                       <div className="space-y-4">
                         <div className="grid grid-cols-1 gap-3 md:grid-cols-3 xl:grid-cols-6">
@@ -10413,7 +10565,7 @@ ${reasons.join('\n')}`);
                       <div className="flex flex-wrap items-start justify-between gap-3">
                         <div>
                           <div className="text-sm font-semibold text-slate-900">Draft Produksi</div>
-                          <div className="text-xs text-slate-500">Draft tidak mengubah stok, batch FIFO, ledger, maupun output produksi sebelum diposting.</div>
+                          <div className="text-xs text-slate-500">Draft manual tidak mengubah stok sebelum diposting. Draft abnormal dari scan Kanban mempertahankan transaksi proses yang sudah aman dan menunggu koreksi admin.</div>
                         </div>
                         <div className="flex items-center gap-2">
                           <button
@@ -10483,6 +10635,8 @@ ${reasons.join('\n')}`);
                                   <td className="p-2">
                                     <div className="font-semibold text-slate-800">{draft.draft_no || `DRF-${draft.id}`}</div>
                                     <div className="text-[10px] text-slate-400">{draft.created_by_name || '-'}</div>
+                                    {draft.kanban_id && <div className="mt-1 text-[10px] font-semibold text-indigo-600">{draft.kanban_id}</div>}
+                                    {draft.abnormal_reason && <div className="mt-1 max-w-[220px] text-[10px] text-rose-600">{draft.abnormal_reason}</div>}
                                   </td>
                                   <td className="p-2">{formatProductionDateValue(draft.production_date)}</td>
                                   <td className="p-2">
@@ -10524,7 +10678,7 @@ ${reasons.join('\n')}`);
                                       <div className="flex flex-wrap gap-1">
                                         <button type="button" disabled={isBusy} onClick={() => handleProductionDraftAction(draft, 'check')} className="rounded border px-2 py-1 text-[10px] disabled:opacity-50">Cek Stok</button>
                                         <button type="button" disabled={isBusy} onClick={() => handleEditProductionDraft(draft)} className="rounded border px-2 py-1 text-[10px] disabled:opacity-50">Edit</button>
-                                        <button type="button" disabled={isBusy || status !== 'READY'} onClick={() => handleProductionDraftAction(draft, 'post')} className="rounded bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-40">Posting</button>
+                                        <button type="button" disabled={isBusy || (status !== 'READY' && !(draft.kanban_id && draft.process_card_id))} onClick={() => handleProductionDraftAction(draft, 'post')} className="rounded bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-40">Posting</button>
                                         <button type="button" disabled={isBusy} onClick={() => handleProductionDraftAction(draft, 'cancel')} className="rounded border border-red-200 px-2 py-1 text-[10px] text-red-600 disabled:opacity-50">Batalkan</button>
                                       </div>
                                     )}

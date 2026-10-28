@@ -4228,6 +4228,105 @@ const ensureSchema = async () => {
   `);
 
   await pool.query(`
+    alter table production_drafts
+    add column if not exists kanban_id text;
+  `);
+
+  await pool.query(`
+    alter table production_drafts
+    add column if not exists process_card_id integer references kanban_process_cards(id) on delete set null;
+  `);
+
+  await pool.query(`
+    alter table production_drafts
+    add column if not exists abnormal_reason text;
+  `);
+
+  await pool.query(`
+    create unique index if not exists idx_production_drafts_active_kanban
+    on production_drafts (kanban_id)
+    where kanban_id is not null and status <> 'CANCELLED';
+  `);
+
+  await pool.query(`
+    alter table kanban_process_cards
+    add column if not exists production_id integer references production_orders(id) on delete set null;
+  `);
+
+  await pool.query(`
+    alter table kanban_process_cards
+    add column if not exists production_draft_id integer references production_drafts(id) on delete set null;
+  `);
+
+  await pool.query(`
+    alter table kanban_process_cards
+    add column if not exists material_consumed_at timestamptz;
+  `);
+
+  await pool.query(`
+    alter table kanban_process_cards
+    add column if not exists output_posted_at timestamptz;
+  `);
+
+  await pool.query(`
+    alter table kanban_process_cards
+    add column if not exists transaction_status text not null default 'pending';
+  `);
+
+  await pool.query(`
+    alter table kanban_process_cards
+    add column if not exists abnormal_reason text;
+  `);
+
+  await pool.query(`
+    create index if not exists idx_kanban_process_cards_dashboard
+    on kanban_process_cards (current_status, transaction_status, updated_at desc);
+  `);
+
+  await pool.query(`
+    create table if not exists kanban_empty_scan_logs (
+      id serial primary key,
+      kanban_id text,
+      item_code text not null references items(code),
+      qty numeric not null default 0,
+      action_type text not null,
+      status text not null default 'posted',
+      payload jsonb not null default '{}'::jsonb,
+      created_by integer references users(id) on delete set null,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_kanban_empty_scan_logs_recent
+    on kanban_empty_scan_logs (kanban_id, created_at desc);
+  `);
+
+  await pool.query(`
+    create table if not exists kanban_delivery_posts (
+      id serial primary key,
+      kanban_id text not null,
+      item_code text not null references items(code),
+      qty numeric not null check (qty > 0),
+      delivery_no text not null unique,
+      consumed jsonb not null default '[]'::jsonb,
+      status text not null default 'POSTED',
+      posted_by integer references users(id) on delete set null,
+      posted_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    create index if not exists idx_kanban_delivery_posts_item_date
+    on kanban_delivery_posts (item_code, posted_at desc);
+  `);
+
+  await pool.query(`
+    create index if not exists idx_kanban_delivery_posts_status
+    on kanban_delivery_posts (status, posted_at desc);
+  `);
+
+  await pool.query(`
     create index if not exists idx_production_drafts_status_date
     on production_drafts (status, production_date desc, id desc);
   `);
@@ -5996,6 +6095,15 @@ const isAllowedProductionOutputType = (typeValue) => {
   if (raw.includes("sub-assy") || raw.includes("sub assy") || raw.includes("subassy")) return true;
   if (raw.includes("sub") && !raw.includes("subcon")) return true;
   return false;
+};
+
+const isKanbanDeliveryOutputType = (typeValue) => {
+  const raw = String(typeValue || "").trim().toLowerCase();
+  if (!raw || raw.includes("raw") || raw.includes("child") || raw === "cp" || raw.startsWith("cp")) return false;
+  if (raw.includes("finished") || raw === "fg" || raw.includes(" fg")) return true;
+  if (raw === "assy" || raw.includes(" assy")) return true;
+  if (raw.includes("sub-assy") || raw.includes("sub assy") || raw.includes("subassy")) return true;
+  return raw.includes("sub") && !raw.includes("subcon");
 };
 
 const addMonthsToDate = (dateValue, months) => {
@@ -12976,6 +13084,24 @@ const buildKanbanScanPreview = async (client, { kanbanId = "", itemCode = "", qt
   });
   const inputMode = await resolveKanbanInputMode(client, rawKanbanId || itemRow.code, itemRow.code);
   const displayKanbanId = inputMode === "manual_uniq" ? itemRow.code : (rawKanbanId || itemRow.code);
+  const qtyMismatch = Number.isFinite(qtyValue)
+    && qtyValue > 0
+    && Number.isFinite(fallbackQty)
+    && fallbackQty > 0
+    && Math.abs(qtyValue - fallbackQty) > 0.000001;
+  const scanWarnings = [
+    cardMeta.warning,
+    qtyMismatch ? `Qty QR ${qtyValue} berbeda dari Qty/Kanban master ${fallbackQty}. Transaksi memakai snapshot qty dari QR.` : null,
+  ].filter(Boolean);
+  const effectiveActionMeta = inputMode === "manual_uniq"
+    ? {
+        ...actionMeta,
+        actionType: "verification_only",
+        actionLabel: "Verifikasi Part",
+        actionHint: "QR Unique hanya memverifikasi identitas part. Scan QR Kanban ID untuk transaksi.",
+        nextDestination: "Scan QR Kanban ID",
+      }
+    : actionMeta;
   const currentProcessStep = processState.currentStep || nextStep || null;
   const nextProcessStep = processState.exists
     ? (processState.nextStep || null)
@@ -13000,14 +13126,17 @@ const buildKanbanScanPreview = async (client, { kanbanId = "", itemCode = "", qt
     category: itemRow.type || "",
     itemCategoryCode: actionMeta.categoryCode,
     itemCategoryLabel: actionMeta.categoryLabel,
-    actionType: actionMeta.actionType,
-    actionLabel: actionMeta.actionLabel,
-    actionHint: actionMeta.actionHint,
-    nextDestination: actionMeta.nextDestination,
+    actionType: effectiveActionMeta.actionType,
+    actionLabel: effectiveActionMeta.actionLabel,
+    actionHint: effectiveActionMeta.actionHint,
+    nextDestination: effectiveActionMeta.nextDestination,
     qty: Number.isFinite(resolvedQty) && resolvedQty > 0 ? resolvedQty : "",
+    qrQty: Number.isFinite(qtyValue) && qtyValue > 0 ? qtyValue : null,
+    masterQty: Number.isFinite(fallbackQty) && fallbackQty > 0 ? fallbackQty : null,
+    qtyMismatch,
     prlPlan,
     cardMeta,
-    scanWarnings: [cardMeta.warning].filter(Boolean),
+    scanWarnings,
     currentPosition: {
       code: currentPositionCode || "-",
       name: currentPositionName || "-",
@@ -13050,14 +13179,14 @@ const buildKanbanScanPreview = async (client, { kanbanId = "", itemCode = "", qt
       status: processState.currentStatus || "waiting",
     } : {
       code: "-",
-      name: actionMeta.actionLabel || actionMeta.categoryLabel || "Aktivitas",
-      label: actionMeta.actionLabel || actionMeta.categoryLabel || "-",
-      processType: actionMeta.actionType || "",
+      name: effectiveActionMeta.actionLabel || effectiveActionMeta.categoryLabel || "Aktivitas",
+      label: effectiveActionMeta.actionLabel || effectiveActionMeta.categoryLabel || "-",
+      processType: effectiveActionMeta.actionType || "",
       appliesToLevel: "All",
-      workCenter: actionMeta.nextDestination || currentPositionLabel || "",
+      workCenter: effectiveActionMeta.nextDestination || currentPositionLabel || "",
       sequence: 0,
       standardTime: 0,
-      status: actionMeta.actionType || "idle",
+      status: effectiveActionMeta.actionType || "idle",
     },
     processState: {
       exists: processState.exists,
@@ -22072,7 +22201,68 @@ app.get("/api/kanban/empty-log", authenticate, requireAnyPermission("editSchedul
       `,
       [limit],
     );
-    res.json(result.rows.map((row) => ({
+    const currentResult = await pool.query(
+      `
+      select
+        (-1 * l.id) as id,
+        l.created_at,
+        l.item_code,
+        i.name as item_name,
+        i.type as item_type,
+        i.location_id,
+        coalesce(nullif(ml.line_description, ''), nullif(i.location_name, ''), nullif(i.location_id, ''), '-') as location_label,
+        l.kanban_id,
+        case when l.action_type = 'delivery' and l.status = 'posted' then l.qty else 0 end as consumed_qty,
+        nullif(l.payload ->> 'deliveryId', '')::integer as delivery_post_id,
+        coalesce(l.payload ->> 'deliveryNo', l.payload ->> 'requestGroup', '-') as reference_doc,
+        l.action_type as remarks,
+        coalesce(kr.status, l.status) as status,
+        kr.id as request_id,
+        kr.request_code,
+        kr.request_group,
+        kr.dn_id,
+        coalesce(lots.lot_count, 0)::int as lot_count,
+        coalesce(lots.lot_summary, '') as lot_summary
+      from kanban_empty_scan_logs l
+      join items i on i.code = l.item_code
+      left join master_locations ml on ml.id = i.location_id
+      left join lateral (
+        select request.*
+        from kanban_requests request
+        where request.item_code = l.item_code
+          and (
+            request.id::text = nullif(l.payload ->> 'requestId', '')
+            or (l.kanban_id is not null and request.notes ilike ('%' || 'kanban:' || l.kanban_id || '%'))
+          )
+        order by request.created_at desc, request.id desc
+        limit 1
+      ) kr on true
+      left join lateral (
+        select
+          count(distinct sm.batch_id) as lot_count,
+          string_agg(
+            distinct concat(coalesce(sb.batch_no, concat('BATCH-', sm.batch_id::text)), ': ', trim(to_char(sm.qty, 'FM999999999990.##'))),
+            ', '
+          ) as lot_summary
+        from stock_movements sm
+        left join stock_batches sb on sb.id = sm.batch_id
+        where sm.item_code = l.item_code
+          and sm.reason = 'kanban_delivery'
+          and sm.direction = 'out'
+          and (
+            (l.kanban_id is not null and sm.kanban_id = l.kanban_id)
+            or sm.created_at between l.created_at - interval '10 seconds' and l.created_at + interval '10 seconds'
+          )
+      ) lots on true
+      order by l.created_at desc, l.id desc
+      limit $1
+      `,
+      [limit],
+    );
+    const rows = [...result.rows, ...currentResult.rows]
+      .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
+      .slice(0, limit);
+    res.json(rows.map((row) => ({
       ...row,
       kanban_id: extractKanbanIdToken(row.kanban_id),
     })));
@@ -28629,7 +28819,7 @@ const handleKanbanEmptyScan = async (req, res) => {
 
     const itemInfoResult = await client.query(
       `
-      select i.name, i.part_no, i.vendor_id, i.supplier_name, i.type_pack, mp.name as type_pack_name
+      select i.name, i.part_no, i.type, i.vendor_id, i.supplier_name, i.type_pack, mp.name as type_pack_name
       from items i
       left join master_packings mp on mp.code = i.type_pack
       where i.code = $1
@@ -28642,6 +28832,7 @@ const handleKanbanEmptyScan = async (req, res) => {
     }
     const itemName = itemInfoResult.rows[0]?.name || null;
     const partNo = itemInfoResult.rows[0]?.part_no || null;
+    const itemType = itemInfoResult.rows[0]?.type || "";
     const typePack = itemInfoResult.rows[0]?.type_pack || "";
     const typePackName = itemInfoResult.rows[0]?.type_pack_name || "";
     const supplierHint = itemInfoResult.rows[0]?.vendor_id || itemInfoResult.rows[0]?.supplier_name || "";
@@ -28666,22 +28857,124 @@ const handleKanbanEmptyScan = async (req, res) => {
     if (isScan && rawKanbanId) {
       const dupResult = await client.query(
         `
-        select id
-        from inventory_ledgers
+        select id, action_type, status, payload
+        from kanban_empty_scan_logs
         where kanban_id = $1
-          and transaction_type = 'PRODUCTION'
-          and qty_out > 0
-          and remarks in ('kanban_scan', 'kanban_empty')
-          and date >= (now() - interval '5 minutes')
+          and created_at >= (now() - interval '5 minutes')
+        order by created_at desc
         limit 1
         `,
         [rawKanbanId],
       );
       if (dupResult.rows.length > 0) {
-        await client.query("rollback");
-        res.status(409).json({ error: "Kanban sudah discan dalam 5 menit terakhir." });
+        await client.query("commit");
+        res.json({
+          ok: true,
+          duplicateIgnored: true,
+          actionType: dupResult.rows[0].action_type,
+          status: dupResult.rows[0].status,
+          notice: "Scan yang sama dalam 5 menit diabaikan agar transaksi tidak dobel.",
+          data: dupResult.rows[0].payload || {},
+        });
         return;
       }
+    }
+
+    const operatorId = req.user?.id || null;
+    const scanTimestamp = new Date();
+    if (isScan && rawKanbanId && isKanbanDeliveryOutputType(itemType)) {
+      const deliveryNo = `KDL-${scanTimestamp.toISOString().slice(0, 10).replaceAll("-", "")}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+      const availableQty = await getItemAvailableQty(client, itemCode);
+      if (availableQty + 0.000001 < qtyValue) {
+        const postResult = await client.query(
+          `
+          insert into kanban_delivery_posts
+            (kanban_id, item_code, qty, delivery_no, consumed, status, posted_by)
+          values ($1,$2,$3,$4,'[]'::jsonb,'DRAFT_REVIEW',$5)
+          returning *
+          `,
+          [rawKanbanId, itemCode, qtyValue, deliveryNo, operatorId],
+        );
+        const payload = {
+          deliveryId: postResult.rows[0]?.id || null,
+          deliveryNo,
+          itemCode,
+          qty: qtyValue,
+          availableQty,
+          shortageQty: Math.max(qtyValue - availableQty, 0),
+        };
+        await client.query(
+          `
+          insert into kanban_empty_scan_logs
+            (kanban_id, item_code, qty, action_type, status, payload, created_by)
+          values ($1,$2,$3,'delivery','draft_review',$4::jsonb,$5)
+          `,
+          [rawKanbanId, itemCode, qtyValue, JSON.stringify(payload), operatorId],
+        );
+        await client.query("commit");
+        res.json({
+          ok: true,
+          actionType: "delivery",
+          deliveryDraft: true,
+          status: "draft_review",
+          consumedQty: 0,
+          consumedBatches: 0,
+          notice: `Stock ${itemCode} kurang ${payload.shortageQty}. Scan diterima sebagai Draft Delivery untuk review admin.`,
+          data: payload,
+        });
+        return;
+      }
+
+      const { consumed, warnings } = await consumeStockFifo(client, itemCode, qtyValue, "kanban_delivery", {
+        kanbanId: rawKanbanId,
+        sourceRefType: "kanban_delivery",
+      });
+      const postResult = await client.query(
+        `
+        insert into kanban_delivery_posts
+          (kanban_id, item_code, qty, delivery_no, consumed, status, posted_by)
+        values ($1,$2,$3,$4,$5::jsonb,'POSTED',$6)
+        returning *
+        `,
+        [rawKanbanId, itemCode, qtyValue, deliveryNo, JSON.stringify(consumed || []), operatorId],
+      );
+      const deliveryId = postResult.rows[0]?.id || null;
+      await insertInventoryLedger(client, {
+        itemCode,
+        transactionType: "DELIVERY",
+        referenceDoc: deliveryNo,
+        qtyIn: 0,
+        qtyOut: qtyValue,
+        userId: operatorId,
+        remarks: "kanban_empty_delivery",
+        kanbanId: rawKanbanId,
+        locationId,
+        sourceRefType: "kanban_delivery",
+        sourceRefId: deliveryId,
+      });
+      const payload = { deliveryId, deliveryNo, itemCode, qty: qtyValue, consumed, warnings };
+      await client.query(
+        `
+        insert into kanban_empty_scan_logs
+          (kanban_id, item_code, qty, action_type, status, payload, created_by)
+        values ($1,$2,$3,'delivery','posted',$4::jsonb,$5)
+        `,
+        [rawKanbanId, itemCode, qtyValue, JSON.stringify(payload), operatorId],
+      );
+      await client.query("commit");
+      res.json({
+        ok: true,
+        actionType: "delivery",
+        deliveryPosted: true,
+        status: "posted",
+        notice: `Barang keluar ${itemCode} sebanyak ${qtyValue} berhasil diposting (${deliveryNo}).`,
+        data: payload,
+        consumed,
+        consumedQty: qtyValue,
+        consumedBatches: consumed.length,
+        warnings,
+      });
+      return;
     }
 
     const vendorInfo = await getVendorRoleForItem(client, itemCode);
@@ -28693,66 +28986,35 @@ const handleKanbanEmptyScan = async (req, res) => {
     const supplierRaw = manualSupplier?.supplier || vendorInfo.supplier || supplierHint;
     const supplierCode = manualSupplier?.supplierCode || (supplierRaw ? await resolveSupplierCode(client, supplierRaw) : "");
     const supplierName = manualSupplier?.supplierName || "";
-    let productionId = null;
-    const operatorId = req.user?.id || null;
-    const scanTimestamp = new Date();
-    if (isScan) {
-      const productionDate = scanTimestamp.toISOString().slice(0, 10);
-      const prodResult = await client.query(
-        `
-        insert into production_orders (product_code, supplier, qty, source, kanban_id, part_no, created_by, scanned_at, production_date)
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        returning id
-        `,
-        [itemCode, supplierCode || null, qtyValue, "SCAN_APP", rawKanbanId || null, partNo, operatorId, scanTimestamp, productionDate],
-      );
-      productionId = prodResult.rows[0]?.id || null;
-    }
-
-    let consumed = [];
-    let warnings = [];
-    try {
-      ({ consumed, warnings } = await consumeStockFifo(client, itemCode, qtyValue, "kanban_empty", {
-        kanbanId: rawKanbanId || null,
-        sourceRefType: productionId ? "production_order" : null,
-        sourceRefId: productionId,
-      }));
-    } catch (error) {
-      error.statusCode = error.statusCode || 409;
-      throw error;
-    }
-    const consumedQty = consumed.reduce((sum, row) => sum + Number(row.qty || 0), 0);
-    const consumedBatches = consumed.length;
-
-    await insertInventoryLedger(client, {
-      itemCode,
-      transactionType: "PRODUCTION",
-      referenceDoc: productionId ? `PROD-${productionId}` : `KANBAN-${formatDateStamp()}`,
-      qtyIn: 0,
-      qtyOut: qtyValue,
-      userId: operatorId,
-      remarks: isScan ? "kanban_scan" : "kanban_empty",
-      kanbanId: rawKanbanId || null,
-      locationId,
-      sourceRefType: productionId ? "production_order" : null,
-      sourceRefId: productionId,
-    });
+    const productionId = null;
+    const consumed = [];
+    const warnings = [];
+    const consumedQty = 0;
+    const consumedBatches = 0;
 
     const effectiveVendorRole = manualSupplier?.role || vendorInfo.role;
     if (isScheduleVendor(effectiveVendorRole)) {
+      const logPayload = { itemCode, qty: qtyValue, notice: "Cek Inbound Schedule." };
+      await client.query(
+        `insert into kanban_empty_scan_logs
+          (kanban_id, item_code, qty, action_type, status, payload, created_by)
+         values ($1,$2,$3,'replenishment_signal','posted',$4::jsonb,$5)`,
+        [rawKanbanId || null, itemCode, qtyValue, JSON.stringify(logPayload), operatorId],
+      );
       await client.query("commit");
       void recordActivityNotification(pool, {
         userId: req.user?.id || null,
         module: "Kanban",
         severity: "info",
-        title: `Scan kanban konsumsi ${itemCode}.`,
-        detail: `Qty ${qtyValue} diproses sebagai consumption/issue.`,
+        title: `Kanban kosong ${itemCode} tercatat.`,
+        detail: `Qty ${qtyValue} menjadi sinyal replenishment tanpa konsumsi stok ulang.`,
         entityType: "kanban_scan",
         entityId: String(rawKanbanId || itemCode),
-        payload: { itemCode, qty: qtyValue, actionType: "stock_movement" },
+          payload: { itemCode, qty: qtyValue, actionType: "replenishment_signal" },
       }).catch((error) => console.warn("Kanban notification failed:", error.message));
       const responsePayload = {
         ok: true,
+        actionType: "replenishment_signal",
         consumed,
         updatedLots: consumedBatches,
         consumedBatches,
@@ -28765,7 +29027,7 @@ const handleKanbanEmptyScan = async (req, res) => {
       };
       if (isScan) {
         responsePayload.status = "success";
-        responsePayload.message = "Consumption Recorded";
+        responsePayload.message = "Replenishment Signal Recorded";
         responsePayload.data = {
           part_name: itemName || "-",
           qty: qtyValue,
@@ -28781,6 +29043,13 @@ const handleKanbanEmptyScan = async (req, res) => {
     const cardMeta = await resolveKanbanCardScanMeta(client, rawKanbanId || itemCode, itemCode);
     if (cardMeta.warning) warnings.push(cardMeta.warning);
     if (!prlPlan.eligible) {
+      const logPayload = { itemCode, qty: qtyValue, notice: prlPlan.notice || "PRL tidak tersedia." };
+      await client.query(
+        `insert into kanban_empty_scan_logs
+          (kanban_id, item_code, qty, action_type, status, payload, created_by)
+         values ($1,$2,$3,'replenishment_signal','posted',$4::jsonb,$5)`,
+        [rawKanbanId || null, itemCode, qtyValue, JSON.stringify(logPayload), operatorId],
+      );
       await client.query("commit");
       void recordActivityNotification(pool, {
         userId: req.user?.id || null,
@@ -28790,10 +29059,11 @@ const handleKanbanEmptyScan = async (req, res) => {
         detail: prlPlan.notice || "PRL bulan berjalan tidak tersedia untuk request ulang.",
         entityType: "kanban_scan",
         entityId: String(rawKanbanId || itemCode),
-        payload: { itemCode, qty: qtyValue, prlPlan, actionType: "consumption_only" },
+        payload: { itemCode, qty: qtyValue, prlPlan, actionType: "replenishment_signal" },
       }).catch((error) => console.warn("Kanban notification failed:", error.message));
       const responsePayload = {
         ok: true,
+        actionType: "replenishment_signal",
         consumed,
         updatedLots: consumedBatches,
         consumedBatches,
@@ -28807,7 +29077,7 @@ const handleKanbanEmptyScan = async (req, res) => {
       };
       if (isScan) {
         responsePayload.status = "success";
-        responsePayload.message = "Consumption Recorded";
+        responsePayload.message = "Replenishment Signal Recorded";
         responsePayload.data = {
           part_name: itemName || "-",
           qty: qtyValue,
@@ -28869,6 +29139,19 @@ const handleKanbanEmptyScan = async (req, res) => {
     await syncKanbanRequestHealthByIds(client, createdRequests.map((row) => row.id), { syncPrlDrafts: true });
     const requestId = createdRequests[0]?.id || null;
     const requestCreated = createdRequests.length > 0;
+    const logPayload = {
+      itemCode,
+      qty: qtyValue,
+      requestId,
+      requestIds: createdRequests.map((row) => row.id),
+      requestGroup: requestCode,
+    };
+    await client.query(
+      `insert into kanban_empty_scan_logs
+        (kanban_id, item_code, qty, action_type, status, payload, created_by)
+       values ($1,$2,$3,'replenishment_request','posted',$4::jsonb,$5)`,
+      [rawKanbanId || null, itemCode, qtyValue, JSON.stringify(logPayload), operatorId],
+    );
     await client.query("commit");
     void recordActivityNotification(pool, {
       userId: req.user?.id || null,
@@ -28878,10 +29161,11 @@ const handleKanbanEmptyScan = async (req, res) => {
       detail: `${createdRequests.length} request dibuat dari scan.`,
       entityType: "kanban_scan",
       entityId: String(rawKanbanId || itemCode),
-      payload: { itemCode, qty: requestQtyFromPrl, consumedQty: qtyValue, requestGroup: requestCode, requestCount: createdRequests.length, prlPlan },
+      payload: { itemCode, qty: requestQtyFromPrl, consumedQty: 0, requestGroup: requestCode, requestCount: createdRequests.length, prlPlan },
     }).catch((error) => console.warn("Kanban notification failed:", error.message));
     const responsePayload = {
       ok: true,
+      actionType: "replenishment_request",
       consumed,
       updatedLots: consumedBatches,
       consumedBatches,
@@ -28898,7 +29182,7 @@ const handleKanbanEmptyScan = async (req, res) => {
     };
     if (isScan) {
       responsePayload.status = "success";
-      responsePayload.message = "Consumption Recorded";
+      responsePayload.message = "Replenishment Request Created";
       responsePayload.data = {
         part_name: itemName || "-",
         qty: qtyValue,
@@ -28924,6 +29208,63 @@ app.post("/api/kanban/scan", authenticate, requireAnyPermission("editSchedules",
   if (!req.body) req.body = {};
   req.body.kanbanId = req.body.kanbanId || req.body.kanban_uuid || req.body.kanban_id || null;
   handleKanbanEmptyScan(req, res);
+});
+
+app.post("/api/kanban/delivery-posts/:id/post", authenticate, requireAnyPermission("editSchedules", "production"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) throw createHttpError(400, "Draft delivery tidak valid.");
+    await client.query("begin");
+    const postResult = await client.query("select * from kanban_delivery_posts where id = $1 for update", [id]);
+    const post = postResult.rows[0];
+    if (!post) throw createHttpError(404, "Draft delivery tidak ditemukan.");
+    if (post.status === "POSTED") {
+      await client.query("commit");
+      res.json({ ok: true, alreadyPosted: true, delivery: post });
+      return;
+    }
+    const availableQty = await getItemAvailableQty(client, post.item_code);
+    if (availableQty + 0.000001 < Number(post.qty)) {
+      throw createHttpError(409, `Stok ${post.item_code} masih kurang ${Math.max(Number(post.qty) - availableQty, 0)}.`);
+    }
+    const { consumed, warnings } = await consumeStockFifo(client, post.item_code, Number(post.qty), "kanban_delivery", {
+      kanbanId: post.kanban_id,
+      sourceRefType: "kanban_delivery",
+      sourceRefId: post.id,
+    });
+    await insertInventoryLedger(client, {
+      itemCode: post.item_code,
+      transactionType: "DELIVERY",
+      referenceDoc: post.delivery_no,
+      qtyIn: 0,
+      qtyOut: Number(post.qty),
+      userId: req.user?.id || null,
+      remarks: "kanban_empty_delivery",
+      kanbanId: post.kanban_id,
+      sourceRefType: "kanban_delivery",
+      sourceRefId: post.id,
+    });
+    const updatedResult = await client.query(
+      `update kanban_delivery_posts
+       set consumed=$1::jsonb, status='POSTED', posted_by=$2, posted_at=now()
+       where id=$3 returning *`,
+      [JSON.stringify(consumed || []), req.user?.id || null, post.id],
+    );
+    await client.query(
+      `update kanban_empty_scan_logs
+       set status='posted', payload=payload || $1::jsonb
+       where action_type='delivery' and payload ->> 'deliveryId' = $2`,
+      [JSON.stringify({ consumed, warnings, postedAt: new Date().toISOString() }), String(post.id)],
+    );
+    await client.query("commit");
+    res.json({ ok: true, delivery: updatedResult.rows[0], consumed, warnings });
+  } catch (error) {
+    await client.query("rollback").catch(() => {});
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
 });
 
 app.post("/api/kanban/scan-preview", authenticate, requireAnyPermission("editSchedules", "production"), async (req, res) => {
@@ -28958,7 +29299,42 @@ app.post("/api/kanban/process/start", authenticate, requireAnyPermission("editSc
       res.status(409).json({ error: "Item ini tidak memakai routing execution." });
       return;
     }
+    if (preview.inputMode !== "kanban_card") {
+      res.status(409).json({ error: "QR Unique hanya untuk verifikasi. Scan QR Kanban ID untuk transaksi proses." });
+      return;
+    }
     await client.query("begin");
+    if (!Array.isArray(preview.routingSteps) || preview.routingSteps.length === 0) {
+      const state = await ensureKanbanProcessCard(client, {
+        kanbanId: preview.kanbanId,
+        itemRow: { code: preview.itemCode, type: preview.category },
+        actionMeta: preview,
+        routingSteps: [],
+        userId: req.user?.id || null,
+        currentPositionLabel: preview.currentPosition?.label || "",
+        targetLabel: preview.nextDestination || "",
+      });
+      const productionTransaction = await createOrRefreshKanbanProductionDraft(client, {
+        preview,
+        processCard: state.card,
+        reason: "Routing proses belum tersedia di Master Item.",
+        userId: req.user?.id || null,
+      });
+      await appendKanbanProcessLog(client, {
+        cardId: state.card?.id,
+        action: "scan_abnormal",
+        message: "Scan diterima tanpa routing; dibuat Draft Review",
+        payload: { reason: "Routing proses belum tersedia di Master Item." },
+        operatorId: req.user?.id || null,
+      });
+      await client.query("commit");
+      res.json({
+        ok: true,
+        state,
+        productionTransaction: { mode: "draft_review", draftId: productionTransaction.draft.id },
+      });
+      return;
+    }
     const state = await startKanbanProcessStep(client, {
       kanbanId: preview.kanbanId,
       itemRow: { code: preview.itemCode, type: preview.category },
@@ -28967,6 +29343,11 @@ app.post("/api/kanban/process/start", authenticate, requireAnyPermission("editSc
       userId: req.user?.id || null,
       currentPositionLabel: preview.currentPosition?.label || "",
       targetLabel: preview.nextProcess?.workCenter || preview.nextDestination || "",
+    });
+    const productionTransaction = await startKanbanProductionTransaction(client, {
+      preview,
+      processState: state,
+      userId: req.user?.id || null,
     });
     await client.query("commit");
     void recordActivityNotification(pool, {
@@ -28979,7 +29360,7 @@ app.post("/api/kanban/process/start", authenticate, requireAnyPermission("editSc
       entityId: String(preview.kanbanId || ""),
       payload: { actionType: preview.actionType, nextProcess: preview.nextProcess || null },
     }).catch((error) => console.warn("Kanban notification failed:", error.message));
-    res.json({ ok: true, state });
+    res.json({ ok: true, state, productionTransaction });
   } catch (error) {
     await client.query("rollback");
     res.status(error.statusCode || 500).json({ error: error.message });
@@ -29002,6 +29383,10 @@ app.post("/api/kanban/process/finish", authenticate, requireAnyPermission("editS
       res.status(409).json({ error: "Item ini tidak memakai routing execution." });
       return;
     }
+    if (preview.inputMode !== "kanban_card") {
+      res.status(409).json({ error: "QR Unique hanya untuk verifikasi. Scan QR Kanban ID untuk transaksi proses." });
+      return;
+    }
     await client.query("begin");
     const state = await finishKanbanProcessStep(client, {
       kanbanId: preview.kanbanId,
@@ -29011,6 +29396,11 @@ app.post("/api/kanban/process/finish", authenticate, requireAnyPermission("editS
       userId: req.user?.id || null,
       currentPositionLabel: preview.currentPosition?.label || "",
       targetLabel: preview.nextProcess?.workCenter || preview.nextDestination || "",
+    });
+    const productionTransaction = await finishKanbanProductionTransaction(client, {
+      preview,
+      processState: state,
+      userId: req.user?.id || null,
     });
     await client.query("commit");
     void recordActivityNotification(pool, {
@@ -29023,12 +29413,66 @@ app.post("/api/kanban/process/finish", authenticate, requireAnyPermission("editS
       entityId: String(preview.kanbanId || ""),
       payload: { actionType: preview.actionType, nextProcess: preview.nextProcess || null },
     }).catch((error) => console.warn("Kanban notification failed:", error.message));
-    res.json({ ok: true, state });
+    res.json({ ok: true, state, productionTransaction });
   } catch (error) {
     await client.query("rollback");
     res.status(error.statusCode || 500).json({ error: error.message });
   } finally {
     client.release();
+  }
+});
+
+app.get("/api/kanban/process-dashboard", authenticate, requireAnyPermission("editSchedules", "production"), async (_req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      select
+        c.*,
+        i.name as item_name,
+        i.part_no,
+        i.unit,
+        u.username as operator_name,
+        d.draft_no,
+        d.status as draft_status,
+        coalesce((
+          select jsonb_agg(jsonb_build_object(
+            'sequence', s.sequence,
+            'processCode', s.process_code,
+            'processName', s.process_name,
+            'workCenter', s.work_center,
+            'status', s.status,
+            'startedAt', s.started_at,
+            'finishedAt', s.finished_at,
+            'operatorId', s.operator_id
+          ) order by s.sequence)
+          from kanban_process_card_steps s
+          where s.kanban_card_id = c.id
+        ), '[]'::jsonb) as steps
+      from kanban_process_cards c
+      join items i on i.code = c.item_code
+      left join users u on u.id = c.updated_by
+      left join production_drafts d on d.id = c.production_draft_id
+      where c.current_status <> 'done'
+         or c.transaction_status = 'draft_review'
+      order by
+        case when c.transaction_status = 'draft_review' then 0 else 1 end,
+        c.updated_at desc,
+        c.id desc
+      limit 500
+      `,
+    );
+    const rows = result.rows || [];
+    res.json({
+      summary: {
+        total: rows.length,
+        inProcess: rows.filter((row) => row.current_status === "in_process").length,
+        waiting: rows.filter((row) => row.current_status === "waiting").length,
+        draftReview: rows.filter((row) => row.transaction_status === "draft_review").length,
+      },
+      rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -36056,12 +36500,284 @@ const saveProductionDraftRequirements = async (client, draft) => {
   return { draft: updatedResult.rows[0] || { ...draft, status }, requirements: rows, blockingRows };
 };
 
+const createOrRefreshKanbanProductionDraft = async (client, {
+  preview,
+  processCard,
+  reason,
+  userId = null,
+} = {}) => {
+  const kanbanId = String(preview?.kanbanId || processCard?.kanban_id || "").trim();
+  const productCode = String(preview?.itemCode || processCard?.item_code || "").trim();
+  const qty = Number(preview?.qty || processCard?.qty || 0);
+  const productionDate = getTodayDateOnly();
+  if (!kanbanId || !productCode || !Number.isFinite(qty) || qty <= 0) {
+    throw createHttpError(400, "Data draft produksi dari kanban tidak lengkap.");
+  }
+  let draftResult = await client.query(
+    "select * from production_drafts where kanban_id = $1 and status <> 'CANCELLED' order by id desc limit 1 for update",
+    [kanbanId],
+  );
+  let draft = draftResult.rows[0] || null;
+  if (!draft) {
+    const draftNo = `DRF-KBN-${productionDate.replaceAll("-", "")}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+    draftResult = await client.query(
+      `
+      insert into production_drafts
+        (draft_no, product_code, qty, production_date, source, line_code, document_no, notes,
+         status, shortage_count, kanban_id, process_card_id, abnormal_reason, created_by, updated_by)
+      values ($1,$2,$3,$4,'KANBAN_ROUTING',$5,$6,$7,'WAITING_STOCK',1,$8,$9,$10,$11,$11)
+      returning *
+      `,
+      [
+        draftNo,
+        productCode,
+        qty,
+        productionDate,
+        preview?.currentProcess?.workCenter || preview?.nextProcess?.workCenter || null,
+        kanbanId,
+        `Draft otomatis dari scan kanban. ${reason || "Perlu review admin."}`,
+        kanbanId,
+        processCard?.id || null,
+        reason || "Perlu review admin.",
+        userId,
+      ],
+    );
+    draft = draftResult.rows[0];
+  } else {
+    draftResult = await client.query(
+      `
+      update production_drafts
+      set qty=$1, production_date=$2, process_card_id=coalesce($3, process_card_id),
+          abnormal_reason=$4, notes=$5, updated_by=$6, updated_at=now()
+      where id=$7
+      returning *
+      `,
+      [
+        qty,
+        productionDate,
+        processCard?.id || null,
+        reason || draft.abnormal_reason || "Perlu review admin.",
+        `Draft otomatis dari scan kanban. ${reason || draft.abnormal_reason || "Perlu review admin."}`,
+        userId,
+        draft.id,
+      ],
+    );
+    draft = draftResult.rows[0];
+  }
+
+  let refreshed = { draft, requirements: [], blockingRows: [] };
+  try {
+    refreshed = await saveProductionDraftRequirements(client, draft);
+  } catch (error) {
+    const fallbackResult = await client.query(
+      `
+      update production_drafts
+      set status='WAITING_STOCK', shortage_count=greatest(shortage_count, 1),
+          abnormal_reason=$1, updated_at=now(), updated_by=$2
+      where id=$3
+      returning *
+      `,
+      [error.message || reason || "BOM atau stok perlu diperiksa.", userId, draft.id],
+    );
+    refreshed = { draft: fallbackResult.rows[0] || draft, requirements: [], blockingRows: [] };
+  }
+  await insertProductionDraftEvent(client, refreshed.draft.id, "KANBAN_ABNORMAL", {
+    kanbanId,
+    reason: reason || refreshed.draft.abnormal_reason || "Perlu review admin.",
+  }, userId);
+  if (processCard?.id) {
+    await client.query(
+      `
+      update kanban_process_cards
+      set production_draft_id=$1, transaction_status='draft_review', abnormal_reason=$2,
+          updated_by=$3, updated_at=now()
+      where id=$4
+      `,
+      [refreshed.draft.id, reason || refreshed.draft.abnormal_reason || null, userId, processCard.id],
+    );
+  }
+  return refreshed;
+};
+
+const startKanbanProductionTransaction = async (client, { preview, processState, userId = null } = {}) => {
+  const card = processState?.card;
+  if (!card || processState.currentIndex !== 0 || !isAllowedProductionOutputType(preview?.category)) {
+    return { mode: "routing_only" };
+  }
+  const lockedResult = await client.query("select * from kanban_process_cards where id = $1 for update", [card.id]);
+  const lockedCard = lockedResult.rows[0] || card;
+  if (lockedCard.material_consumed_at || lockedCard.production_id) {
+    return { mode: "already_consumed", productionId: lockedCard.production_id || null };
+  }
+  if (lockedCard.production_draft_id) {
+    return { mode: "draft_review", draftId: lockedCard.production_draft_id };
+  }
+
+  await client.query("savepoint kanban_production_start");
+  try {
+    const qty = Number(preview?.qty || 0);
+    if (!Number.isFinite(qty) || qty <= 0) throw createHttpError(409, "Qty/Kanban tidak valid.");
+    const requirementRows = await getProductionRequirementRows(client, {
+      productCode: preview.itemCode,
+      qty,
+      asOfDate: getTodayDateOnly(),
+    });
+    const blockingRows = requirementRows.filter((row) => Number(row.shortage || 0) > 0 && !row.allowPendingReconciliation);
+    if (blockingRows.length > 0) {
+      const summary = blockingRows.slice(0, 5).map((row) => `${row.itemCode} kurang ${row.shortage}`).join(", ");
+      throw createHttpError(409, `Material kurang: ${summary}`);
+    }
+    const orderResult = await client.query(
+      `
+      insert into production_orders
+        (product_code, qty, source, kanban_id, created_by, scanned_at, production_date, line_code,
+         document_no, notes, request_qty, actual_qty, order_status)
+      values ($1,$2,'KANBAN_ROUTING',$3,$4,now(),$5,$6,$3,$7,$2,$2,'in_process')
+      returning *
+      `,
+      [
+        preview.itemCode,
+        qty,
+        preview.kanbanId,
+        userId,
+        getTodayDateOnly(),
+        preview?.currentProcess?.workCenter || preview?.nextProcess?.workCenter || null,
+        "Backflush BOM otomatis saat Start proses pertama.",
+      ],
+    );
+    const production = orderResult.rows[0];
+    const consumed = await applyProductionConsumption(
+      client,
+      preview.itemCode,
+      qty,
+      production.id,
+      "",
+      userId,
+      getTodayDateOnly(),
+    );
+    await client.query(
+      `
+      update kanban_process_cards
+      set production_id=$1, material_consumed_at=now(), transaction_status='material_consumed',
+          abnormal_reason=null, updated_by=$2, updated_at=now()
+      where id=$3
+      `,
+      [production.id, userId, lockedCard.id],
+    );
+    await appendKanbanProcessLog(client, {
+      cardId: lockedCard.id,
+      action: "material_consumed",
+      message: "BOM dikonsumsi otomatis saat Start proses pertama",
+      payload: { productionId: production.id, qty, requirements: consumed.requirements },
+      operatorId: userId,
+    });
+    await client.query("release savepoint kanban_production_start");
+    return { mode: "posted", productionId: production.id, ...consumed };
+  } catch (error) {
+    await client.query("rollback to savepoint kanban_production_start");
+    const draft = await createOrRefreshKanbanProductionDraft(client, {
+      preview,
+      processCard: lockedCard,
+      reason: error.message || "Backflush BOM perlu review admin.",
+      userId,
+    });
+    await appendKanbanProcessLog(client, {
+      cardId: lockedCard.id,
+      action: "production_draft_created",
+      message: "Scan diterima; transaksi produksi masuk draft review",
+      payload: { draftId: draft.draft.id, reason: error.message || null },
+      operatorId: userId,
+    });
+    return { mode: "draft_review", draftId: draft.draft.id, reason: error.message || null };
+  }
+};
+
+const finishKanbanProductionTransaction = async (client, { preview, processState, userId = null } = {}) => {
+  const card = processState?.card;
+  if (!card || processState.currentStatus !== "done" || !isAllowedProductionOutputType(preview?.category)) {
+    return { mode: "routing_only" };
+  }
+  const lockedResult = await client.query("select * from kanban_process_cards where id = $1 for update", [card.id]);
+  const lockedCard = lockedResult.rows[0] || card;
+  if (lockedCard.output_posted_at) {
+    return { mode: "already_posted", productionId: lockedCard.production_id || null };
+  }
+  if (lockedCard.production_draft_id || !lockedCard.production_id) {
+    const draft = await createOrRefreshKanbanProductionDraft(client, {
+      preview,
+      processCard: lockedCard,
+      reason: lockedCard.abnormal_reason || "Hasil produksi menunggu review transaksi awal.",
+      userId,
+    });
+    return { mode: "draft_review", draftId: draft.draft.id };
+  }
+
+  await client.query("savepoint kanban_production_finish");
+  try {
+    const productionResult = await client.query("select * from production_orders where id = $1 for update", [lockedCard.production_id]);
+    const production = productionResult.rows[0];
+    if (!production) throw createHttpError(404, "Transaksi produksi awal tidak ditemukan.");
+    const existingOutput = await client.query(
+      "select id from stock_batches where do_number = $1 and qty_in > 0 limit 1",
+      [`PROD-${production.id}`],
+    );
+    let outputBatch = null;
+    if (existingOutput.rows.length === 0) {
+      outputBatch = await receiveProductionOutput(
+        client,
+        production.product_code,
+        Number(production.qty),
+        production.id,
+        production.production_date,
+        userId,
+        { snpQty: Number(preview?.qty || production.qty), kanbanId: preview?.kanbanId || lockedCard.kanban_id },
+      );
+    }
+    await client.query(
+      `
+      update production_orders
+      set order_status='completed', actual_qty=qty, output_label_summary=$1::jsonb
+      where id=$2
+      `,
+      [JSON.stringify(outputBatch?.labelSummary || production.output_label_summary || []), production.id],
+    );
+    await client.query(
+      `
+      update kanban_process_cards
+      set output_posted_at=now(), transaction_status='posted', abnormal_reason=null,
+          updated_by=$1, updated_at=now()
+      where id=$2
+      `,
+      [userId, lockedCard.id],
+    );
+    await appendKanbanProcessLog(client, {
+      cardId: lockedCard.id,
+      action: "production_output_posted",
+      message: "Hasil produksi diposting otomatis saat Finish proses terakhir",
+      payload: { productionId: production.id, qty: Number(production.qty), outputBatch },
+      operatorId: userId,
+    });
+    await autoTriggerKanbanRequests(client, { note: "auto-trigger (kanban routing output)", userId });
+    await client.query("release savepoint kanban_production_finish");
+    return { mode: "posted", productionId: production.id, outputBatch };
+  } catch (error) {
+    await client.query("rollback to savepoint kanban_production_finish");
+    const draft = await createOrRefreshKanbanProductionDraft(client, {
+      preview,
+      processCard: lockedCard,
+      reason: error.message || "Posting hasil produksi perlu review admin.",
+      userId,
+    });
+    return { mode: "draft_review", draftId: draft.draft.id, reason: error.message || null };
+  }
+};
+
 const createProductionFromPayload = async (client, payload, userId = null) => {
   const orderResult = await client.query(
     `
     insert into production_orders
-      (product_code, supplier, qty, source, created_by, production_date, line_code, shift_label, document_no, notes)
-    values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      (product_code, supplier, qty, source, created_by, production_date, line_code, shift_label, document_no, notes, kanban_id)
+    values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
     returning *
     `,
     [
@@ -36075,6 +36791,7 @@ const createProductionFromPayload = async (client, payload, userId = null) => {
       payload.shiftLabel || null,
       payload.documentNo || null,
       payload.notes || null,
+      payload.kanbanId || null,
     ],
   );
   const productionId = orderResult.rows[0].id;
@@ -36094,6 +36811,7 @@ const createProductionFromPayload = async (client, payload, userId = null) => {
     productionId,
     payload.productionDate,
     userId,
+    { kanbanId: payload.kanbanId || null, snpQty: Number(payload.snpQty || 0) },
   );
   const autoCreated = await autoTriggerKanbanRequests(client, {
     note: payload.autoTriggerNote || "auto-trigger (production)",
@@ -36318,6 +37036,55 @@ app.post("/api/production/drafts/:id/post", authenticate, requirePermission("pro
       return;
     }
     if (draft.status === "CANCELLED") throw createHttpError(409, "Draft sudah dibatalkan.");
+    const processCardResult = draft.process_card_id
+      ? await client.query("select * from kanban_process_cards where id = $1 for update", [draft.process_card_id])
+      : { rows: [] };
+    const processCard = processCardResult.rows[0] || null;
+    if (processCard && processCard.current_status !== "done") {
+      throw createHttpError(409, "Routing kanban belum selesai. Draft dapat diposting setelah proses terakhir Finish.");
+    }
+    if (processCard?.production_id && processCard.material_consumed_at) {
+      const productionResult = await client.query("select * from production_orders where id = $1 for update", [processCard.production_id]);
+      const production = productionResult.rows[0];
+      if (!production) throw createHttpError(404, "Transaksi produksi awal tidak ditemukan.");
+      let outputBatch = null;
+      if (!processCard.output_posted_at) {
+        outputBatch = await receiveProductionOutput(
+          client,
+          production.product_code,
+          Number(production.qty),
+          production.id,
+          production.production_date,
+          req.user?.id || null,
+          { kanbanId: draft.kanban_id || processCard.kanban_id, snpQty: Number(draft.qty || production.qty) },
+        );
+      }
+      await client.query(
+        "update production_orders set order_status='completed', actual_qty=qty, output_label_summary=$1::jsonb where id=$2",
+        [JSON.stringify(outputBatch?.labelSummary || production.output_label_summary || []), production.id],
+      );
+      await client.query(
+        `update kanban_process_cards
+         set output_posted_at=coalesce(output_posted_at, now()), transaction_status='posted', abnormal_reason=null,
+             updated_by=$1, updated_at=now()
+         where id=$2`,
+        [req.user?.id || null, processCard.id],
+      );
+      const finalResult = await client.query(
+        `update production_drafts
+         set status='POSTED', shortage_count=0, posted_production_id=$1, posted_at=now(), updated_at=now(), updated_by=$2
+         where id=$3 returning *`,
+        [production.id, req.user?.id || null, id],
+      );
+      await insertProductionDraftEvent(client, id, "POSTED", {
+        productionId: production.id,
+        outputOnly: true,
+      }, req.user?.id || null);
+      await autoTriggerKanbanRequests(client, { note: "auto-trigger (kanban draft output)", userId: req.user?.id || null });
+      await client.query("commit");
+      res.json({ ok: true, productionId: production.id, outputBatch, draft: finalResult.rows[0] });
+      return;
+    }
     const refreshed = await saveProductionDraftRequirements(client, draft);
     if (refreshed.blockingRows.length > 0) {
       await insertProductionDraftEvent(client, id, "POST_BLOCKED", {
@@ -36341,6 +37108,8 @@ app.post("/api/production/drafts/:id/post", authenticate, requirePermission("pro
       shiftLabel: draft.shift_label,
       documentNo: draft.document_no,
       notes: draft.notes,
+      kanbanId: draft.kanban_id || null,
+      snpQty: Number(draft.qty || 0),
       autoTriggerNote: "auto-trigger (production draft)",
     }, req.user?.id || null);
     const finalResult = await client.query(
@@ -36355,6 +37124,16 @@ app.post("/api/production/drafts/:id/post", authenticate, requirePermission("pro
     await insertProductionDraftEvent(client, id, "POSTED", {
       productionId: posted.productionId,
     }, req.user?.id || null);
+    if (processCard) {
+      await client.query(
+        `update kanban_process_cards
+         set production_id=$1, material_consumed_at=coalesce(material_consumed_at, now()),
+             output_posted_at=coalesce(output_posted_at, now()), transaction_status='posted', abnormal_reason=null,
+             updated_by=$2, updated_at=now()
+         where id=$3`,
+        [posted.productionId, req.user?.id || null, processCard.id],
+      );
+    }
     await client.query("commit");
     res.json({ ok: true, ...posted, draft: finalResult.rows[0] });
   } catch (error) {
@@ -37199,7 +37978,7 @@ app.get("/api/production/compare", authenticate, requirePermission("production")
           coalesce(po.production_date, po.created_at::date) as prod_date,
           sum(po.qty)::numeric as production_qty
         from production_orders po
-        where po.source in ('IMPORT', 'MANUAL_REPORT')
+        where po.source in ('IMPORT', 'MANUAL_REPORT', 'KANBAN_ROUTING')
         group by po.product_code, coalesce(po.production_date, po.created_at::date)
       ),
       kanban_out as (

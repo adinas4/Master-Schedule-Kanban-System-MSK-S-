@@ -8611,7 +8611,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
       return { ok: false, reason: 'Kanban ID tidak valid.' };
     }
     try {
-      await apiFetch('/api/kanban/process/start', {
+      const response = await apiFetch('/api/kanban/process/start', {
         method: 'POST',
         body: JSON.stringify({
           kanbanId: result.kanbanId,
@@ -8621,7 +8621,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         }),
       });
       await refreshScanPreviewResult(result);
-      return { ok: true };
+      return { ok: true, productionTransaction: response?.productionTransaction || null };
     } catch (error) {
       return { ok: false, reason: error.message || 'Gagal start proses.' };
     }
@@ -8632,7 +8632,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
       return { ok: false, reason: 'Kanban ID tidak valid.' };
     }
     try {
-      await apiFetch('/api/kanban/process/finish', {
+      const response = await apiFetch('/api/kanban/process/finish', {
         method: 'POST',
         body: JSON.stringify({
           kanbanId: result.kanbanId,
@@ -8642,7 +8642,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         }),
       });
       await refreshScanPreviewResult(result);
-      return { ok: true };
+      return { ok: true, productionTransaction: response?.productionTransaction || null };
     } catch (error) {
       return { ok: false, reason: error.message || 'Gagal finish proses.' };
     }
@@ -8752,9 +8752,24 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
           manualInput: options.source === 'manual_confirm',
         }),
       });
+      if (result?.duplicateIgnored) {
+        const message = result?.notice || 'Scan duplikat diabaikan agar transaksi tidak dobel.';
+        showToastMessage(message);
+        await fetchKanbanEmptyLogs({ silent: true });
+        return { ok: true, message, duplicateIgnored: true };
+      }
       const consumedQty = Number(result?.consumedQty ?? qty);
       const consumedBatches = Number(result?.consumedBatches ?? result?.updatedLots ?? 0);
-      const stockNote = `Stok terpotong ${formatNumber0(consumedQty)}${consumedBatches ? ` (${consumedBatches} lot)` : ''}.`;
+      const isDeliveryPosting = result?.actionType === 'delivery';
+      const isReplenishmentOnly = ['replenishment_signal', 'replenishment_request'].includes(result?.actionType)
+        || (!isDeliveryPosting && consumedQty === 0);
+      const stockNote = isDeliveryPosting
+        ? (result?.deliveryPosted
+          ? `Barang keluar ${formatNumber0(consumedQty)}${consumedBatches ? ` (${consumedBatches} lot)` : ''} berhasil diposting.`
+          : 'Delivery masuk Draft Review; stok belum dipotong.')
+        : isReplenishmentOnly
+          ? 'Sinyal replenishment tercatat tanpa konsumsi stok ulang.'
+          : `Stok terpotong ${formatNumber0(consumedQty)}${consumedBatches ? ` (${consumedBatches} lot)` : ''}.`;
       const lotSummary = buildLotSummaryText(result?.consumed, { label: 'Lot terpakai' });
       const prlNotice = result?.prlPlan?.notice || result?.notice || '';
       const scanWarning = Array.isArray(result?.warnings) && result.warnings.length ? ` ${result.warnings.join(' ')}` : '';
@@ -8911,11 +8926,15 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         }),
       });
       if (preview?.isManualUniqInput || preview?.inputMode === 'manual_uniq' || isManualUniqKanbanInput(value)) {
-        return await openEmptyKanbanManualConfirm(value, selectedArea, { preview });
+        const message = `Part ${preview?.itemCode || code || value} terverifikasi. Scan QR Kanban ID untuk transaksi Kanban Kosong.`;
+        showToastMessage(message);
+        return { ok: true, verificationOnly: true, message };
       }
     } catch (_error) {
       if (isManualUniqKanbanInput(value)) {
-        return await openEmptyKanbanManualConfirm(value, selectedArea);
+        const message = `Part ${code || value} terverifikasi. Scan QR Kanban ID untuk transaksi Kanban Kosong.`;
+        showToastMessage(message);
+        return { ok: true, verificationOnly: true, message };
       }
     } finally {
       setEmptyKanbanConfirmLoading(false);
@@ -8970,7 +8989,13 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'approve' })}`);
         if (result?.notice) {
           const consumedQty = Number(result?.consumedQty ?? qty);
           const consumedBatches = Number(result?.consumedBatches ?? result?.updatedLots ?? 0);
-          const stockNote = `Stok terpotong ${formatNumber0(consumedQty)}${consumedBatches ? ` (${consumedBatches} lot)` : ''}.`;
+          const stockNote = result?.actionType === 'delivery'
+            ? (result?.deliveryPosted
+              ? `Barang keluar ${formatNumber0(consumedQty)}${consumedBatches ? ` (${consumedBatches} lot)` : ''} berhasil diposting.`
+              : 'Delivery masuk Draft Review; stok belum dipotong.')
+            : consumedQty === 0
+              ? 'Sinyal replenishment tercatat tanpa konsumsi stok ulang.'
+              : `Stok terpotong ${formatNumber0(consumedQty)}${consumedBatches ? ` (${consumedBatches} lot)` : ''}.`;
           const lotSummary = buildLotSummaryText(result?.consumed, { label: 'Lot terpakai' });
           const scanWarning = Array.isArray(result?.warnings) && result.warnings.length ? ` ${result.warnings.join(' ')}` : '';
           notices.push(`${id}: ${stockNote}${lotSummary ? ` ${lotSummary}.` : ''} ${result.notice}${scanWarning}`);
@@ -10435,8 +10460,16 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       || /\brm\b|raw|indirect|consum/.test(categoryText);
     const routingAction = actionType === 'routing_execution';
     const subconAction = actionType === 'external_transfer';
+    const verificationOnly = actionType === 'verification_only';
 
     try {
+      if (verificationOnly) {
+        return {
+          ok: true,
+          actionType,
+          message: `Part ${result.itemCode || result.kanbanId} terverifikasi. Scan QR Kanban ID untuk transaksi.`,
+        };
+      }
       if (issueAction) {
         const outcome = await consumeStockFromScan(result);
         if (!outcome.ok) return { ok: false, reason: outcome.reason || 'Gagal potong stok.' };
@@ -10450,7 +10483,17 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
           ? await handleKanbanProcessFinish(result)
           : await handleKanbanProcessStart(result);
         if (!outcome.ok) return { ok: false, reason: outcome.reason || (isInProcess ? 'Gagal finish proses.' : 'Gagal start proses.') };
-        return { ok: true, actionType };
+        const transactionMode = outcome?.productionTransaction?.mode || '';
+        const transactionMessage = transactionMode === 'draft_review'
+          ? ' Scan proses tersimpan; transaksi abnormal masuk Draft Produksi untuk review admin.'
+          : transactionMode === 'posted'
+            ? (isInProcess ? ' Hasil produksi berhasil diposting.' : ' Konsumsi BOM berhasil diposting.')
+            : '';
+        return {
+          ok: true,
+          actionType,
+          message: `${isInProcess ? 'Finish proses tersimpan.' : 'Start proses tersimpan.'}${transactionMessage}`,
+        };
       }
       if (subconAction) {
         if (isProductionUser || options.source === 'camera') {
@@ -14698,6 +14741,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
     extractKanbanIdNote,
     fetchKanbanRequests,
     fetchKanbanSettings,
+    fetchKanbanEmptyLogs,
     fetchDeliveryNotes,
     fetchReceiveNotes,
     refreshSchedules,

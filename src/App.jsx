@@ -12479,17 +12479,36 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
         const rawCode = String(step.code || step.processCode || step.process_code || '').trim();
         const masterProcess = rawCode ? masterProcessesByCode.get(rawCode) : null;
         const label = step.name || step.processName || masterProcess?.name || rawCode || '';
-        const workCenter = step.workCenter || step.work_center || masterProcess?.work_center || '';
-        return [workCenter, label].filter(Boolean).join(' / ') || '-';
+        return String(label || '').trim() || '-';
       }
       const raw = String(step || '').trim();
       const masterProcess = raw ? masterProcessesByCode.get(raw) : null;
       return masterProcess
-        ? [masterProcess.work_center, masterProcess.name || masterProcess.code].filter(Boolean).join(' / ')
+        ? (masterProcess.name || masterProcess.code || '-')
         : raw;
     };
     const resolveCardNextProcess = (row, masterItem, supplierMeta) => {
       const categoryKey = getCardCategoryKey(row?.item_type || masterItem?.type || '');
+      const routingSource = normalizeRoutingSource(masterItem?.process_routing);
+      const flowSource = normalizeRoutingSource(masterItem?.process_flow);
+      const routeSteps = (routingSource.length > 0 ? routingSource : flowSource)
+        .map((step, index) => ({
+          step,
+          sequence: Number(
+            step && typeof step === 'object'
+              ? (step.sequence ?? step.seq ?? step.order ?? index + 1)
+              : index + 1,
+          ),
+          index,
+        }))
+        .sort((left, right) => left.sequence - right.sequence || left.index - right.index);
+      const routeLabels = routeSteps
+        .map(({ step }) => formatRoutingStepDestination(step))
+        .map((label) => String(label || '').trim())
+        .filter((label) => label && label !== '-')
+        .filter((label, index, labels) => labels.indexOf(label) === index);
+      if (routeLabels.length > 0) return routeLabels.join(' → ');
+
       const vendorKey = String(supplierMeta?.supplierCode || supplierMeta?.supplierName || '').trim();
       const vendor = vendorKey
         ? masterVendorsById.get(vendorKey)
@@ -12503,16 +12522,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
         const subconTarget = vendor?.subcon_warehouse_id || vendor?.subconWarehouseId || vendor?.id || vendorKey || vendor?.name || 'SUBCON';
         return `SUBCON ${subconTarget}`;
       }
-      const routingSource = normalizeRoutingSource(masterItem?.process_routing);
-      const flowSource = normalizeRoutingSource(masterItem?.process_flow);
-      const firstStep = routingSource[0] || flowSource[0] || null;
-      const routingLabel = formatRoutingStepDestination(firstStep);
-      if (routingLabel) {
-        const isNonParentRoutingCategory = categoryKey === 'child' || !['fg', 'assy', 'raw', 'subcon'].includes(categoryKey);
-        if (isNonParentRoutingCategory) return `NEXT LINE ${routingLabel}`;
-        return routingLabel;
-      }
-      return masterItem?.line_production || masterItem?.location_name || masterItem?.location_id || '-';
+      return '-';
     };
     filteredKanbanItems.forEach((row) => {
       const cardPlan = getKanbanCardPlan(row);
@@ -12790,7 +12800,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
                 <div className="text-[10px] font-bold">{payload.pressLocation || '-'}</div>
               </div>
               <div className="border-r border-slate-500 p-1">
-                <div className="text-[8px] uppercase text-slate-500">Next Proses</div>
+                <div className="text-[8px] uppercase text-slate-500">Process Route</div>
                 <div className="text-[10px] font-bold leading-tight" style={{ overflowWrap: 'anywhere' }}>{payload.nextProcessLabel || '-'}</div>
               </div>
               <div className="p-1">

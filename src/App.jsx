@@ -12533,7 +12533,8 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       const masterLocation = masterLocationsById.get(masterItem?.location_id || row.drop_zone);
       const masterWarehouse = masterWarehouses.find((warehouse) => warehouse.id === masterLocation?.warehouse_id);
       const masterArea = masterAreas.find((area) => (
-        area.id === row.drop_zone
+        area.id === masterLocation?.area_id
+        || area.id === row.drop_zone
         || area.id === masterWarehouse?.area_id
         || area.warehouse_id === masterWarehouse?.id
         || area.warehouse_id === masterLocation?.warehouse_id
@@ -12559,7 +12560,13 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
       const itemImageUrl = masterItem?.image_thumb_url || masterItem?.imageThumbUrl || masterItem?.image_url || masterItem?.imageUrl || '';
       const qtyBox = lotQty || row.min_qty || '';
       const itemUnit = row.item_unit || masterItem?.unit || '';
-      const areaId = masterArea?.id || row.drop_zone || masterLocation?.id || '';
+      const areaId = masterArea?.id || masterLocation?.area_id || row.drop_zone || masterLocation?.id || '';
+      const partLocationLabel = masterLocation?.line_description
+        || masterItem?.location_name
+        || masterItem?.line_production
+        || masterLocation?.id
+        || row.drop_zone
+        || '';
       const dockCode = masterDelivery?.id || '';
       const progressLine = masterWarehouse?.id || masterLocation?.warehouse_id || '';
       const plantName = masterPlant?.name || masterPlant?.id || '';
@@ -12612,7 +12619,7 @@ ${describeKanbanSelectionIssues(selectedRows, { mode: 'dn' })}`);
           seq: idx + 1,
           totalCards,
         }),
-        pressLocation: areaId,
+        pressLocation: partLocationLabel,
         pressBarcodeValue,
         plantName,
         lotBatch,
